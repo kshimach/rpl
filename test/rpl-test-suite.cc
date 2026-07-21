@@ -15,7 +15,9 @@
 #include "ns3/rpl-helper.h"
 #include "ns3/rpl-routing-protocol.h"
 #include "ns3/rpl-trickle-timer.h"
+#include "ns3/simple-channel.h"
 #include "ns3/simple-net-device-helper.h"
+#include "ns3/simple-net-device.h"
 #include "ns3/simulator.h"
 #include "ns3/test.h"
 
@@ -195,6 +197,137 @@ RplDioUnknownOptionTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief Check that a DAO and a DAO-ACK survive a round trip.
+ */
+class RplDaoHeaderTestCase : public TestCase
+{
+  public:
+    RplDaoHeaderTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplDaoHeaderTestCase::RplDaoHeaderTestCase()
+    : TestCase("DAO and DAO-ACK serialization")
+{
+}
+
+void
+RplDaoHeaderTestCase::DoRun()
+{
+    RplDaoHeader dao;
+    dao.SetInstanceId(9);
+    dao.SetSequence(77);
+    dao.SetAckRequested(true);
+    dao.SetDodagId(Ipv6Address("2001:1::1"));
+    dao.SetTarget(Ipv6Address("2001:1::5"));
+    dao.SetTransitInformation(Ipv6Address("2001:1::4"), 3, 30);
+
+    // Four bytes of base object, the DODAGID, then the Target and the Transit
+    // Information options.
+    NS_TEST_ASSERT_MSG_EQ(dao.GetSerializedSize(), 4 + 16 + 20 + 22, "Unexpected DAO size");
+
+    Ptr<Packet> packet = Create<Packet>();
+    packet->AddHeader(dao);
+
+    RplDaoHeader received;
+    packet->RemoveHeader(received);
+
+    NS_TEST_ASSERT_MSG_EQ(received.GetInstanceId(), 9, "Wrong RPLInstanceID");
+    NS_TEST_ASSERT_MSG_EQ(received.GetSequence(), 77, "Wrong DAO sequence");
+    NS_TEST_ASSERT_MSG_EQ(received.GetAckRequested(), true, "The K flag was lost");
+    NS_TEST_ASSERT_MSG_EQ(received.GetDodagId(), Ipv6Address("2001:1::1"), "Wrong DODAGID");
+    NS_TEST_ASSERT_MSG_EQ(received.GetTarget(), Ipv6Address("2001:1::5"), "Wrong target");
+    NS_TEST_ASSERT_MSG_EQ(received.GetTargetPrefixLength(), 128, "Wrong target prefix length");
+    NS_TEST_ASSERT_MSG_EQ(received.GetParent(), Ipv6Address("2001:1::4"), "Wrong parent");
+    NS_TEST_ASSERT_MSG_EQ(received.GetPathSequence(), 3, "Wrong path sequence");
+    NS_TEST_ASSERT_MSG_EQ(received.GetPathLifetime(), 30, "Wrong path lifetime");
+
+    // Without the DODAGID the 'D' flag has to stay clear and the header shrink.
+    RplDaoHeader noPath;
+    noPath.SetTarget(Ipv6Address("2001:1::5"));
+    noPath.SetTransitInformation(Ipv6Address("2001:1::4"), 4, 0);
+    NS_TEST_ASSERT_MSG_EQ(noPath.GetSerializedSize(), 4 + 20 + 22, "Unexpected DAO size");
+
+    packet = Create<Packet>();
+    packet->AddHeader(noPath);
+    packet->RemoveHeader(received);
+    NS_TEST_ASSERT_MSG_EQ(received.GetDodagId(), Ipv6Address::GetAny(), "The D flag leaked");
+    NS_TEST_ASSERT_MSG_EQ(received.GetAckRequested(), false, "The K flag leaked");
+    NS_TEST_ASSERT_MSG_EQ(received.GetPathLifetime(), 0, "A No-Path did not survive");
+
+    RplDaoAckHeader daoAck;
+    daoAck.SetInstanceId(9);
+    daoAck.SetSequence(77);
+    daoAck.SetStatus(0);
+    daoAck.SetDodagId(Ipv6Address("2001:1::1"));
+    NS_TEST_ASSERT_MSG_EQ(daoAck.GetSerializedSize(), 20, "Unexpected DAO-ACK size");
+
+    packet = Create<Packet>();
+    packet->AddHeader(daoAck);
+
+    RplDaoAckHeader receivedAck;
+    packet->RemoveHeader(receivedAck);
+    NS_TEST_ASSERT_MSG_EQ(receivedAck.GetInstanceId(), 9, "Wrong RPLInstanceID");
+    NS_TEST_ASSERT_MSG_EQ(receivedAck.GetSequence(), 77, "Wrong DAO sequence");
+    NS_TEST_ASSERT_MSG_EQ(receivedAck.GetStatus(), 0, "Wrong status");
+    NS_TEST_ASSERT_MSG_EQ(receivedAck.GetDodagId(), Ipv6Address("2001:1::1"), "Wrong DODAGID");
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief Check that the source route survives being attached to a packet, and
+ *        that it costs what an uncompressed RFC 6554 RH3 would.
+ */
+class RplSourceRouteTagTestCase : public TestCase
+{
+  public:
+    RplSourceRouteTagTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplSourceRouteTagTestCase::RplSourceRouteTagTestCase()
+    : TestCase("Source route tag")
+{
+}
+
+void
+RplSourceRouteTagTestCase::DoRun()
+{
+    std::vector<Ipv6Address> hops = {Ipv6Address("2001:1::2"), Ipv6Address("2001:1::3")};
+
+    RplSourceRouteTag tag;
+    tag.SetHops(hops);
+    tag.SetSegmentsLeft(2);
+
+    // Eight bytes of RH3 and one uncompressed address per hop.
+    NS_TEST_ASSERT_MSG_EQ(tag.GetSerializedSize(), 8 + 2 * 16, "Unexpected source route size");
+
+    Ptr<Packet> packet = Create<Packet>();
+    packet->AddPacketTag(tag);
+
+    RplSourceRouteTag received;
+    NS_TEST_ASSERT_MSG_EQ(packet->PeekPacketTag(received), true, "The tag was lost");
+    NS_TEST_ASSERT_MSG_EQ(received.GetSegmentsLeft(), 2, "Wrong number of segments left");
+    NS_TEST_ASSERT_MSG_EQ(received.GetHops().size(), 2, "Wrong number of hops");
+    NS_TEST_ASSERT_MSG_EQ(received.GetHops()[0], hops[0], "Wrong first hop");
+    NS_TEST_ASSERT_MSG_EQ(received.GetHops()[1], hops[1], "Wrong second hop");
+
+    // A packet the tag was taken off carries nothing, which is what tells the
+    // last router before the destination it is done.
+    packet->RemovePacketTag(received);
+    NS_TEST_ASSERT_MSG_EQ(packet->PeekPacketTag(received), false, "The tag was not removed");
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Check the Trickle timer of RFC 6206: the interval doubles up to Imax,
  *        every transmission falls in [I/2, I), a reset goes back to Imin and
  *        the redundancy constant suppresses a redundant transmission.
@@ -304,8 +437,12 @@ RplTrickleTimerTestCase::DoRun()
  * @brief Build a DODAG over a line of three nodes and check the ranks, the
  *        preferred parents and the upward route that comes out of it.
  *
- * Each hop is its own SimpleNetDevice channel, so a node only ever hears its
- * neighbours and the line cannot collapse into a single hop.
+ * All three nodes sit on one SimpleNetDevice channel, with the two ends
+ * blacklisted against each other so that only neighbours hear one another.
+ * Giving every node a single interface on a single prefix is what an LLN looks
+ * like, and what RPL assumes: a node learns the address of a neighbour by
+ * putting the interface identifier of its link-local address under the prefix
+ * of the DODAGID, which only works when there is one of each.
  */
 class RplDodagFormationTestCase : public TestCase
 {
@@ -327,12 +464,16 @@ RplDodagFormationTestCase::DoRun()
     NodeContainer nodes;
     nodes.Create(3);
 
-    // One channel per hop: node 0 and node 2 are two hops apart.
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
     SimpleNetDeviceHelper simpleNetDevice;
-    NetDeviceContainer devices01 =
-        simpleNetDevice.Install(NodeContainer(nodes.Get(0), nodes.Get(1)));
-    NetDeviceContainer devices12 =
-        simpleNetDevice.Install(NodeContainer(nodes.Get(1), nodes.Get(2)));
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    // The two ends of the line cannot hear each other, which is what makes it
+    // a line rather than one big neighbourhood.
+    Ptr<SimpleNetDevice> first = DynamicCast<SimpleNetDevice>(devices.Get(0));
+    Ptr<SimpleNetDevice> last = DynamicCast<SimpleNetDevice>(devices.Get(2));
+    channel->BlackList(first, last);
+    channel->BlackList(last, first);
 
     RplHelper rplHelper;
     InternetStackHelper internetv6;
@@ -341,14 +482,12 @@ RplDodagFormationTestCase::DoRun()
 
     Ipv6AddressHelper ipv6;
     ipv6.SetBase(Ipv6Address("2001:1::"), Ipv6Prefix(64));
-    Ipv6InterfaceContainer interfaces01 = ipv6.Assign(devices01);
-    ipv6.SetBase(Ipv6Address("2001:2::"), Ipv6Prefix(64));
-    Ipv6InterfaceContainer interfaces12 = ipv6.Assign(devices12);
+    Ipv6InterfaceContainer interfaces = ipv6.Assign(devices);
 
-    interfaces01.SetForwarding(0, true);
-    interfaces01.SetForwarding(1, true);
-    interfaces12.SetForwarding(0, true);
-    interfaces12.SetForwarding(1, true);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
 
     rplHelper.SetRoot(nodes.Get(0));
     rplHelper.AssignStreams(nodes, 1);
@@ -362,7 +501,9 @@ RplDodagFormationTestCase::DoRun()
     Ptr<RplRoutingProtocol> middle = nodes.Get(1)->GetObject<RplRoutingProtocol>();
     Ptr<RplRoutingProtocol> leaf = nodes.Get(2)->GetObject<RplRoutingProtocol>();
 
-    Ipv6Address dodagId = interfaces01.GetAddress(0, 1);
+    Ipv6Address dodagId = interfaces.GetAddress(0, 1);
+    Ipv6Address middleAddress = interfaces.GetAddress(1, 1);
+    Ipv6Address leafAddress = interfaces.GetAddress(2, 1);
 
     NS_TEST_ASSERT_MSG_EQ(root->IsRoot(), true, "Node 0 is not the root");
     NS_TEST_ASSERT_MSG_EQ(root->IsJoined(), true, "The root is not in its own DODAG");
@@ -391,7 +532,7 @@ RplDodagFormationTestCase::DoRun()
                           rootIpv6->GetAddress(1, 0).GetAddress(),
                           "Node 1 did not pick the root as its parent");
     NS_TEST_ASSERT_MSG_EQ(leaf->GetPreferredParent(),
-                          middleIpv6->GetAddress(2, 0).GetAddress(),
+                          middleIpv6->GetAddress(1, 0).GetAddress(),
                           "Node 2 did not pick node 1 as its parent");
 
     // An upward route exists and points at the preferred parent.
@@ -400,10 +541,56 @@ RplDodagFormationTestCase::DoRun()
     Socket::SocketErrno sockerr;
     Ptr<Ipv6Route> route =
         leaf->RouteOutput(Create<Packet>(), header, nullptr, sockerr);
-    NS_TEST_ASSERT_MSG_NE(route, nullptr, "Node 2 has no route to the root");
+    NS_TEST_ASSERT_MSG_EQ(route != nullptr, true, "Node 2 has no route to the root");
     NS_TEST_ASSERT_MSG_EQ(route->GetGateway(),
                           leaf->GetPreferredParent(),
                           "The route to the root does not go through the preferred parent");
+
+    // The DAOs told the root where both other nodes sit.
+    NS_TEST_ASSERT_MSG_EQ(root->GetTopologySize(), 2, "The root did not hear from both nodes");
+    NS_TEST_ASSERT_MSG_EQ(middle->GetTopologySize(), 0, "A node that is not the root kept a topology");
+
+    // Node 1 hangs off the root, so a packet for it needs no path in it.
+    std::vector<Ipv6Address> hops;
+    NS_TEST_ASSERT_MSG_EQ(root->ComputeSourceRoute(middleAddress, hops),
+                          true,
+                          "The root cannot reach node 1");
+    NS_TEST_ASSERT_MSG_EQ(hops.size(), 0, "A direct child needs no source route");
+
+    // Node 2 is behind node 1, so the path has to name node 1.
+    NS_TEST_ASSERT_MSG_EQ(root->ComputeSourceRoute(leafAddress, hops),
+                          true,
+                          "The root cannot reach node 2");
+    NS_TEST_ASSERT_MSG_EQ(hops.size(), 1, "The path to node 2 should hold one router");
+    NS_TEST_ASSERT_MSG_EQ(hops[0], middleAddress, "The path to node 2 does not go through node 1");
+
+    NS_TEST_ASSERT_MSG_EQ(root->ComputeSourceRoute(Ipv6Address("2001:9::1"), hops),
+                          false,
+                          "The root invented a path to a node it never heard of");
+
+    // A packet the root sends to node 2 leaves with that path attached.
+    Ptr<Packet> downward = Create<Packet>();
+    header.SetDestination(leafAddress);
+    route = root->RouteOutput(downward, header, nullptr, sockerr);
+    NS_TEST_ASSERT_MSG_EQ(route != nullptr, true, "The root has no route down to node 2");
+    NS_TEST_ASSERT_MSG_EQ(route->GetGateway(),
+                          middleAddress,
+                          "The packet for node 2 does not leave towards node 1");
+
+    RplSourceRouteTag tag;
+    NS_TEST_ASSERT_MSG_EQ(downward->PeekPacketTag(tag), true, "The packet carries no source route");
+    NS_TEST_ASSERT_MSG_EQ(tag.GetSegmentsLeft(), 1, "Wrong number of segments left");
+    NS_TEST_ASSERT_MSG_EQ(tag.GetHops().size(), 1, "Wrong number of hops");
+    NS_TEST_ASSERT_MSG_EQ(tag.GetHops()[0], middleAddress, "Wrong first hop");
+
+    // Node 1 is one hop away, so its packet carries nothing.
+    Ptr<Packet> direct = Create<Packet>();
+    header.SetDestination(middleAddress);
+    route = root->RouteOutput(direct, header, nullptr, sockerr);
+    NS_TEST_ASSERT_MSG_EQ(route != nullptr, true, "The root has no route down to node 1");
+    NS_TEST_ASSERT_MSG_EQ(direct->PeekPacketTag(tag),
+                          false,
+                          "A packet for a direct child was given a source route");
 
     Simulator::Destroy();
 }
@@ -426,6 +613,8 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplDisHeaderTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDioHeaderTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDioUnknownOptionTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplDaoHeaderTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplSourceRouteTagTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplTrickleTimerTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDodagFormationTestCase, TestCase::Duration::QUICK);
 }

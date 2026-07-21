@@ -32,6 +32,8 @@ namespace rpl
 /// @defgroup rpl RPL Routing
 
 class RplDioHeader;
+class RplDaoHeader;
+class RplDaoAckHeader;
 
 /**
  * @ingroup rpl
@@ -49,9 +51,11 @@ class RplDioHeader;
  * layer-4 demux. No modification of the ns-3 core is required.
  *
  * The upward routes of the DODAG are built from DIOs paced by a Trickle timer,
- * with ranks computed by OF0 (RFC 6552). Downward routes, which in non-storing
- * mode need DAOs and a source routing header, are not implemented yet: traffic
- * towards a destination that is not on-link is sent to the preferred parent.
+ * with ranks computed by OF0 (RFC 6552). The downward routes are those of the
+ * non-storing mode: every node tells the root, with a DAO, which parent it
+ * sits under, so only the root holds a picture of the topology and it puts the
+ * whole path into every packet it sends down. @see RplSourceRouteTag for how
+ * that path is carried and what it costs in fidelity.
  */
 class RplRoutingProtocol : public Ipv6RoutingProtocol
 {
@@ -134,6 +138,25 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     Ipv6Address GetPreferredParent() const;
 
     /**
+     * @brief Get how many nodes the root has heard a DAO from.
+     *
+     * Only meaningful on the root, which is the only node that keeps the
+     * topology in non-storing mode.
+     *
+     * @return the number of nodes in the topology this node knows about
+     */
+    uint32_t GetTopologySize() const;
+
+    /**
+     * @brief Get the path the root would put in a packet for a destination.
+     *
+     * @param destination the address to reach
+     * @param [out] hops the routers to traverse, root and destination excluded
+     * @return true if a path was found
+     */
+    bool ComputeSourceRoute(Ipv6Address destination, std::vector<Ipv6Address>& hops) const;
+
+    /**
      * @brief Assign a fixed stream number to the random variables used here.
      * @param stream first stream index to use
      * @return the number of stream indices assigned
@@ -154,6 +177,14 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
         uint8_t dtsn{0};    //!< the neighbour's DTSN, used by DAO in non-storing mode
         Time lastHeard;     //!< when the last DIO from this neighbour arrived
         uint8_t freshness{0}; //!< how many DIOs this neighbour has been heard with
+    };
+
+    /// What the root remembers about one node of the DODAG, learnt from DAOs.
+    struct TopologyEntry
+    {
+        Ipv6Address parent;     //!< the parent the node reports sitting under
+        uint8_t pathSequence{0}; //!< path sequence of the DAO this came from
+        Time expire;            //!< when the entry goes stale
     };
 
     /**
@@ -251,6 +282,74 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     bool SelectPreferredParent();
 
     /**
+     * @brief Advertise this node to the root, RFC 6550 section 6.4.
+     *
+     * The DAO travels to the DODAGID like any other upward traffic, so every
+     * node on the way just forwards it and only the root ever reads it.
+     */
+    void SendDao();
+
+    /**
+     * @brief Send a DAO now and schedule the next refresh.
+     */
+    void DaoTimerExpire();
+
+    /**
+     * @brief Re-send the DAO that was not acknowledged, or give up.
+     */
+    void DaoRetry();
+
+    /**
+     * @brief Act on a received DAO. Only the root ever gets one.
+     * @param dao the DAO
+     * @param from the address of the node that advertised itself
+     */
+    void HandleDao(const RplDaoHeader& dao, Ipv6Address from);
+
+    /**
+     * @brief Act on a received DAO-ACK, i.e. stop retrying.
+     * @param daoAck the DAO-ACK
+     * @param from the sender
+     */
+    void HandleDaoAck(const RplDaoAckHeader& daoAck, Ipv6Address from);
+
+    /**
+     * @brief Drop the topology entries whose lifetime has run out.
+     */
+    void PurgeTopology();
+
+    /**
+     * @brief Build the global address a neighbour has on the DODAG prefix.
+     *
+     * A DAO has to name the parent by an address the root can use, and RPL
+     * only ever learns the link-local address of a neighbour. The global
+     * address is rebuilt the way Contiki-NG does it, by putting the interface
+     * identifier of the link-local address under the prefix of the DODAGID.
+     * This assumes the DODAG runs on a single prefix and that a node keeps one
+     * interface identifier across its addresses, which is what an autoconfigured
+     * LLN looks like.
+     *
+     * @param linkLocal the link-local address of the neighbour
+     * @return the global address of the neighbour, :: if it cannot be built
+     */
+    Ipv6Address GlobalAddressOf(Ipv6Address linkLocal) const;
+
+    /**
+     * @brief Find the interface a one-hop neighbour sits on.
+     * @param neighbour the global address of the neighbour
+     * @return the interface index, 0 if it cannot be told
+     */
+    uint32_t InterfaceForNeighbour(Ipv6Address neighbour) const;
+
+    /**
+     * @brief Build a route handing a packet straight to a one-hop neighbour.
+     * @param neighbour the address of the neighbour to send to
+     * @param dst the destination to put in the route
+     * @return the route, nullptr if the neighbour is on no known interface
+     */
+    Ptr<Ipv6Route> RouteToNeighbour(Ipv6Address neighbour, Ipv6Address dst) const;
+
+    /**
      * @brief Send an already-built RPL message body on every RPL interface.
      * @param packet the ICMPv6 payload, without the ICMPv6 header
      * @param code the RPL message code
@@ -325,9 +424,25 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     uint8_t m_dioIntervalDoublings; //!< Trickle doublings for DIOs
     uint8_t m_dioRedundancy;        //!< Trickle redundancy constant for DIOs
 
-    RplTrickleTimer m_dioTrickle;           //!< paces the multicast DIOs
+    RplTrickleTimer m_dioTrickle;            //!< paces the multicast DIOs
     std::map<Ipv6Address, Parent> m_parents; //!< candidate parents, by link-local address
     Ipv6Address m_preferredParent;           //!< link-local address of the preferred parent
+
+    Time m_daoInterval;      //!< how often this node refreshes its DAO
+    Time m_daoAckTimeout;    //!< how long to wait for a DAO-ACK
+    uint8_t m_daoRetries;    //!< how many times an unacknowledged DAO is resent
+    uint8_t m_pathLifetime;  //!< lifetime this node advertises, in lifetime units
+    uint16_t m_lifetimeUnit; //!< the unit of the path lifetime, in seconds
+
+    uint8_t m_daoSequence;   //!< sequence of the last DAO this node sent
+    uint8_t m_pathSequence;  //!< path sequence of the route this node advertises
+    uint8_t m_daoRetriesLeft; //!< retries left for the DAO awaiting an acknowledgement
+    bool m_daoAckPending;    //!< true while a DAO-ACK is being waited for
+    EventId m_daoEvent;      //!< schedules the periodic DAO
+    EventId m_daoRetryEvent; //!< schedules the retry of an unacknowledged DAO
+
+    /// The root only: which parent each node reports sitting under.
+    std::map<Ipv6Address, TopologyEntry> m_topology;
 };
 
 } // namespace rpl

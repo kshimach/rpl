@@ -10,15 +10,14 @@
  *   n0 (root) ---- n1 ---- n2 ---- ...
  *
  * The nodes are spaced so that only neighbours hear each other, which forces a
- * multi-hop DODAG. Once the DODAG has converged the last node sends UDP packets
- * to the root, which exercises the upward routes: every hop forwards them to
- * its preferred parent. The traffic only flows that way, because the downward
- * routes of the non-storing mode need the DAOs and the source routing header,
- * which are not implemented yet.
+ * multi-hop DODAG. Once the DODAG has converged the last node pings the root
+ * and the root answers, which exercises both directions: the request climbs to
+ * the root through the preferred parents, and the reply comes back down the
+ * path the root put together out of the DAOs it collected.
  */
 
-#include "ns3/applications-module.h"
 #include "ns3/core-module.h"
+#include "ns3/internet-apps-module.h"
 #include "ns3/internet-module.h"
 #include "ns3/lr-wpan-module.h"
 #include "ns3/mobility-module.h"
@@ -61,7 +60,7 @@ main(int argc, char** argv)
 
     CommandLine cmd(__FILE__);
     cmd.AddValue("nNodes", "number of nodes in the line", nNodes);
-    cmd.AddValue("nPackets", "number of packets the last node sends to the root", nPackets);
+    cmd.AddValue("nPackets", "number of echo requests the last node sends to the root", nPackets);
     cmd.AddValue("distance", "spacing between neighbouring nodes, in metres", distance);
     cmd.AddValue("stopTime", "simulation duration, in seconds", stopTime);
     cmd.AddValue("verbose", "turn on RPL logging", verbose);
@@ -122,20 +121,15 @@ main(int argc, char** argv)
     streamNumber += rplHelper.AssignStreams(nodes, streamNumber);
 
     // The DODAG needs a few Trickle intervals to reach the far end of the line,
-    // so the traffic only starts in the second half of the run.
-    uint16_t port = 9;
-    UdpServerHelper server(port);
-    ApplicationContainer serverApp = server.Install(nodes.Get(0));
-    serverApp.Start(Seconds(0));
-    serverApp.Stop(Seconds(stopTime));
-
-    UdpClientHelper client(interfaces.GetAddress(0, 1), port);
-    client.SetAttribute("MaxPackets", UintegerValue(nPackets));
-    client.SetAttribute("Interval", TimeValue(Seconds(2)));
-    client.SetAttribute("PacketSize", UintegerValue(32));
-    ApplicationContainer clientApp = client.Install(nodes.Get(nNodes - 1));
-    clientApp.Start(Seconds(stopTime / 2));
-    clientApp.Stop(Seconds(stopTime));
+    // and the DAOs another moment to get back to the root, so the traffic only
+    // starts in the second half of the run. A ping needs both directions to
+    // work, which is the point of the exercise.
+    PingHelper ping(interfaces.GetAddress(0, 1));
+    ping.SetAttribute("Count", UintegerValue(nPackets));
+    ping.SetAttribute("Interval", TimeValue(Seconds(2)));
+    ApplicationContainer pingApp = ping.Install(nodes.Get(nNodes - 1));
+    pingApp.Start(Seconds(stopTime / 2));
+    pingApp.Stop(Seconds(stopTime));
 
     if (pcap)
     {
@@ -146,11 +140,6 @@ main(int argc, char** argv)
 
     Simulator::Stop(Seconds(stopTime));
     Simulator::Run();
-
-    uint64_t received = DynamicCast<UdpServer>(serverApp.Get(0))->GetReceived();
-    std::cout << "Root received " << received << " of the " << nPackets
-              << " packets sent by node " << nNodes - 1 << std::endl;
-
     Simulator::Destroy();
 
     return 0;

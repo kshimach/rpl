@@ -73,7 +73,29 @@ RplRoutingProtocol::GetTypeId()
                           "MinHopRankIncrease, which is also the rank of the root.",
                           UintegerValue(RPL_MIN_HOPRANKINC),
                           MakeUintegerAccessor(&RplRoutingProtocol::m_minHopRankIncrease),
-                          MakeUintegerChecker<uint16_t>(1, RPL_INFINITE_RANK));
+                          MakeUintegerChecker<uint16_t>(1, RPL_INFINITE_RANK))
+            .AddAttribute("DaoInterval",
+                          "How often a node repeats the DAO that tells the root where it sits. "
+                          "It has to stay well below PathLifetime times the lifetime unit, "
+                          "otherwise the root lets the entry expire between two DAOs.",
+                          TimeValue(Seconds(60)),
+                          MakeTimeAccessor(&RplRoutingProtocol::m_daoInterval),
+                          MakeTimeChecker())
+            .AddAttribute("DaoAckTimeout",
+                          "How long a node waits for a DAO-ACK before resending the DAO.",
+                          TimeValue(Seconds(5)),
+                          MakeTimeAccessor(&RplRoutingProtocol::m_daoAckTimeout),
+                          MakeTimeChecker())
+            .AddAttribute("DaoRetries",
+                          "How many times an unacknowledged DAO is resent.",
+                          UintegerValue(3),
+                          MakeUintegerAccessor(&RplRoutingProtocol::m_daoRetries),
+                          MakeUintegerChecker<uint8_t>())
+            .AddAttribute("PathLifetime",
+                          "Lifetime of the downward route a node advertises, in lifetime units.",
+                          UintegerValue(RPL_DEFAULT_LIFETIME),
+                          MakeUintegerAccessor(&RplRoutingProtocol::m_pathLifetime),
+                          MakeUintegerChecker<uint8_t>(1, RPL_INFINITE_LIFETIME));
     return tid;
 }
 
@@ -97,7 +119,16 @@ RplRoutingProtocol::RplRoutingProtocol()
       m_dioIntervalMin(MilliSeconds(1 << RPL_DIO_INTERVAL_MIN)),
       m_dioIntervalDoublings(RPL_DIO_INTERVAL_DOUBLINGS),
       m_dioRedundancy(RPL_DIO_REDUNDANCY),
-      m_preferredParent(Ipv6Address::GetAny())
+      m_preferredParent(Ipv6Address::GetAny()),
+      m_daoInterval(Seconds(60)),
+      m_daoAckTimeout(Seconds(5)),
+      m_daoRetries(3),
+      m_pathLifetime(RPL_DEFAULT_LIFETIME),
+      m_lifetimeUnit(RPL_DEFAULT_LIFETIME_UNIT),
+      m_daoSequence(0),
+      m_pathSequence(0),
+      m_daoRetriesLeft(0),
+      m_daoAckPending(false)
 {
     NS_LOG_FUNCTION(this);
     m_jitter = CreateObject<UniformRandomVariable>();
@@ -167,6 +198,8 @@ RplRoutingProtocol::DoDispose()
 
     m_disTimer.Cancel();
     m_dioTrickle.Stop();
+    m_daoEvent.Cancel();
+    m_daoRetryEvent.Cancel();
     for (auto& [socket, interface] : m_socketToIfc)
     {
         socket->Close();
@@ -174,6 +207,7 @@ RplRoutingProtocol::DoDispose()
     m_socketToIfc.clear();
     m_ifcToSocket.clear();
     m_parents.clear();
+    m_topology.clear();
     m_ipv6 = nullptr;
 
     Ipv6RoutingProtocol::DoDispose();
@@ -337,12 +371,20 @@ RplRoutingProtocol::RecvRpl(Ptr<Socket> socket)
         HandleDio(dio, from, interface);
         break;
     }
-    case RPL_CODE_DAO:
-        NS_LOG_INFO("Received a DAO from " << from << " on interface " << interface);
+    case RPL_CODE_DAO: {
+        RplDaoHeader dao;
+        packet->RemoveHeader(dao);
+        NS_LOG_INFO("Received a DAO from " << from << ": " << dao);
+        HandleDao(dao, from);
         break;
-    case RPL_CODE_DAO_ACK:
-        NS_LOG_INFO("Received a DAO-ACK from " << from << " on interface " << interface);
+    }
+    case RPL_CODE_DAO_ACK: {
+        RplDaoAckHeader daoAck;
+        packet->RemoveHeader(daoAck);
+        NS_LOG_INFO("Received a DAO-ACK from " << from << ": " << daoAck);
+        HandleDaoAck(daoAck, from);
         break;
+    }
     default:
         NS_LOG_WARN("Unsupported RPL message code " << +icmpv6Header.GetCode() << " from " << from);
         break;
@@ -375,7 +417,13 @@ RplRoutingProtocol::SendRplMessageOn(uint32_t interface,
         return;
     }
 
-    Ipv6Address src = GetLinkLocalAddress(interface);
+    // A DAO travels several hops to the root, so its source has to be the
+    // global address rather than the link-local one used on the link-local
+    // messages. Ipv6RawSocketImpl::SendTo() sends with the source of the route
+    // that RouteOutput() hands back, so asking for the same selection here is
+    // what keeps the checksum in step with the address that ends up in the
+    // IPv6 header.
+    Ipv6Address src = m_ipv6->SourceAddressSelection(interface, dst);
 
     // Ipv6RawSocketImpl only fixes up the checksum of echo requests, so the
     // RPL header has to carry a checksum computed against the source address.
@@ -619,6 +667,291 @@ RplRoutingProtocol::LeaveDodag()
     m_preferredParent = Ipv6Address::GetAny();
     m_parents.clear();
     m_dioTrickle.Stop();
+    m_daoEvent.Cancel();
+    m_daoRetryEvent.Cancel();
+    m_daoAckPending = false;
+}
+
+Ipv6Address
+RplRoutingProtocol::GlobalAddressOf(Ipv6Address linkLocal) const
+{
+    if (m_dodagId.IsAny() || linkLocal.IsAny())
+    {
+        return Ipv6Address::GetAny();
+    }
+
+    uint8_t prefix[16];
+    uint8_t identifier[16];
+    m_dodagId.GetBytes(prefix);
+    linkLocal.GetBytes(identifier);
+
+    uint8_t global[16];
+    std::copy(prefix, prefix + 8, global);
+    std::copy(identifier + 8, identifier + 16, global + 8);
+    return Ipv6Address(global);
+}
+
+void
+RplRoutingProtocol::SendDao()
+{
+    NS_LOG_FUNCTION(this);
+
+    if (!m_joined || m_isRoot || m_preferredParent.IsAny())
+    {
+        return;
+    }
+
+    Ipv6Address target = GetGlobalAddress();
+    Ipv6Address parent = GlobalAddressOf(m_preferredParent);
+    if (target.IsAny() || parent.IsAny())
+    {
+        NS_LOG_LOGIC("Not advertising yet: no global address for this node or its parent");
+        return;
+    }
+
+    RplDaoHeader dao;
+    dao.SetInstanceId(m_instanceId);
+    dao.SetDodagId(m_dodagId);
+    dao.SetSequence(++m_daoSequence);
+    dao.SetAckRequested(true);
+    dao.SetTarget(target);
+    dao.SetTransitInformation(parent, m_pathSequence, m_pathLifetime);
+
+    Ptr<Packet> packet = Create<Packet>();
+    packet->AddHeader(dao);
+
+    // The DAO is addressed to the root and finds its way there hop by hop, on
+    // the upward routes the DIOs built.
+    SendRplMessage(packet, RPL_CODE_DAO, m_dodagId);
+
+    m_daoAckPending = true;
+    m_daoRetriesLeft = m_daoRetries;
+    m_daoRetryEvent.Cancel();
+    m_daoRetryEvent = Simulator::Schedule(m_daoAckTimeout, &RplRoutingProtocol::DaoRetry, this);
+}
+
+void
+RplRoutingProtocol::DaoTimerExpire()
+{
+    NS_LOG_FUNCTION(this);
+
+    SendDao();
+    m_daoEvent.Cancel();
+    m_daoEvent = Simulator::Schedule(m_daoInterval, &RplRoutingProtocol::DaoTimerExpire, this);
+}
+
+void
+RplRoutingProtocol::DaoRetry()
+{
+    NS_LOG_FUNCTION(this << +m_daoRetriesLeft);
+
+    if (!m_daoAckPending)
+    {
+        return;
+    }
+
+    if (m_daoRetriesLeft == 0)
+    {
+        // The path is not getting through. The next periodic DAO will try
+        // again, by then possibly through a different parent.
+        NS_LOG_WARN("No DAO-ACK for sequence " << +m_daoSequence << ", giving up until the "
+                                                                    "next refresh");
+        m_daoAckPending = false;
+        return;
+    }
+
+    m_daoRetriesLeft--;
+
+    RplDaoHeader dao;
+    dao.SetInstanceId(m_instanceId);
+    dao.SetDodagId(m_dodagId);
+    dao.SetSequence(m_daoSequence);
+    dao.SetAckRequested(true);
+    dao.SetTarget(GetGlobalAddress());
+    dao.SetTransitInformation(GlobalAddressOf(m_preferredParent), m_pathSequence, m_pathLifetime);
+
+    Ptr<Packet> packet = Create<Packet>();
+    packet->AddHeader(dao);
+    SendRplMessage(packet, RPL_CODE_DAO, m_dodagId);
+
+    m_daoRetryEvent = Simulator::Schedule(m_daoAckTimeout, &RplRoutingProtocol::DaoRetry, this);
+}
+
+void
+RplRoutingProtocol::HandleDao(const RplDaoHeader& dao, Ipv6Address from)
+{
+    NS_LOG_FUNCTION(this << from);
+
+    if (!m_isRoot)
+    {
+        // In non-storing mode a DAO is addressed to the root, so a node that
+        // is not the root only ever forwards one. Getting here means the
+        // sender is confused about who the root is.
+        NS_LOG_WARN("Ignoring a DAO from " << from << ": this node is not the root");
+        return;
+    }
+
+    if (dao.GetInstanceId() != m_instanceId ||
+        (!dao.GetDodagId().IsAny() && dao.GetDodagId() != m_dodagId))
+    {
+        NS_LOG_LOGIC("Ignoring a DAO for another DODAG");
+        return;
+    }
+
+    Ipv6Address target = dao.GetTarget();
+    if (target.IsAny())
+    {
+        NS_LOG_WARN("Ignoring a DAO from " << from << " with no target");
+        return;
+    }
+
+    if (dao.GetPathLifetime() == 0)
+    {
+        // A No-Path, RFC 6550 section 6.4.3: the target has moved away.
+        NS_LOG_INFO("No-Path for " << target << ", dropping it from the topology");
+        m_topology.erase(target);
+    }
+    else
+    {
+        TopologyEntry& entry = m_topology[target];
+        entry.parent = dao.GetParent();
+        entry.pathSequence = dao.GetPathSequence();
+        entry.expire = Simulator::Now() + Seconds(dao.GetPathLifetime() * m_lifetimeUnit);
+        NS_LOG_INFO("Topology: " << target << " sits under " << entry.parent);
+    }
+
+    if (dao.GetAckRequested())
+    {
+        RplDaoAckHeader daoAck;
+        daoAck.SetInstanceId(m_instanceId);
+        daoAck.SetDodagId(m_dodagId);
+        daoAck.SetSequence(dao.GetSequence());
+        daoAck.SetStatus(0); // unqualified acceptance
+
+        Ptr<Packet> packet = Create<Packet>();
+        packet->AddHeader(daoAck);
+        // The acknowledgement travels back down, which the root can do now
+        // that it has just learnt where the sender sits.
+        SendRplMessage(packet, RPL_CODE_DAO_ACK, from);
+    }
+}
+
+void
+RplRoutingProtocol::HandleDaoAck(const RplDaoAckHeader& daoAck, Ipv6Address from)
+{
+    NS_LOG_FUNCTION(this << from);
+
+    if (daoAck.GetSequence() != m_daoSequence)
+    {
+        NS_LOG_LOGIC("Ignoring a DAO-ACK for sequence " << +daoAck.GetSequence() << ", waiting "
+                                                        << "for " << +m_daoSequence);
+        return;
+    }
+
+    if (daoAck.GetStatus() != 0)
+    {
+        NS_LOG_WARN("The root rejected the DAO with status " << +daoAck.GetStatus());
+        return;
+    }
+
+    NS_LOG_INFO("The root acknowledged DAO " << +m_daoSequence);
+    m_daoAckPending = false;
+    m_daoRetryEvent.Cancel();
+}
+
+void
+RplRoutingProtocol::PurgeTopology()
+{
+    Time now = Simulator::Now();
+    for (auto it = m_topology.begin(); it != m_topology.end();)
+    {
+        it = (it->second.expire <= now) ? m_topology.erase(it) : std::next(it);
+    }
+}
+
+bool
+RplRoutingProtocol::ComputeSourceRoute(Ipv6Address destination,
+                                       std::vector<Ipv6Address>& hops) const
+{
+    hops.clear();
+
+    if (!m_isRoot || m_topology.find(destination) == m_topology.end())
+    {
+        return false;
+    }
+
+    Time now = Simulator::Now();
+    Ipv6Address current = destination;
+
+    // Walk up the parents until the root is reached, collecting the routers in
+    // between. The loop cannot run longer than the topology is wide, which is
+    // what keeps a cycle in the reported parents from hanging the simulation.
+    for (size_t step = 0; step <= m_topology.size(); step++)
+    {
+        auto it = m_topology.find(current);
+        if (it == m_topology.end() || it->second.expire <= now)
+        {
+            return false;
+        }
+
+        current = it->second.parent;
+        if (current == m_dodagId)
+        {
+            std::reverse(hops.begin(), hops.end());
+            return true;
+        }
+        hops.push_back(current);
+    }
+
+    NS_LOG_WARN("The reported parents of " << destination << " do not lead to the root");
+    hops.clear();
+    return false;
+}
+
+uint32_t
+RplRoutingProtocol::InterfaceForNeighbour(Ipv6Address neighbour) const
+{
+    // A neighbour is known by its link-local address, so it is the interface
+    // identifier that tells which of them the global address belongs to.
+    uint8_t wanted[16];
+    neighbour.GetBytes(wanted);
+
+    for (const auto& [address, parent] : m_parents)
+    {
+        uint8_t candidate[16];
+        address.GetBytes(candidate);
+        if (std::equal(wanted + 8, wanted + 16, candidate + 8))
+        {
+            return parent.interface;
+        }
+    }
+
+    // Nothing was ever heard from that neighbour. On a node with a single RPL
+    // interface there is only one answer anyway.
+    return m_ifcToSocket.empty() ? 0 : m_ifcToSocket.begin()->first;
+}
+
+Ptr<Ipv6Route>
+RplRoutingProtocol::RouteToNeighbour(Ipv6Address neighbour, Ipv6Address dst) const
+{
+    uint32_t interface = InterfaceForNeighbour(neighbour);
+    if (interface == 0)
+    {
+        return nullptr;
+    }
+
+    Ptr<Ipv6Route> route = Create<Ipv6Route>();
+    route->SetDestination(dst);
+    route->SetGateway(neighbour);
+    route->SetOutputDevice(m_ipv6->GetNetDevice(interface));
+    route->SetSource(m_ipv6->SourceAddressSelection(interface, dst));
+    return route;
+}
+
+uint32_t
+RplRoutingProtocol::GetTopologySize() const
+{
+    return m_topology.size();
 }
 
 uint16_t
@@ -730,8 +1063,21 @@ RplRoutingProtocol::SelectPreferredParent()
 
     NS_LOG_INFO("Preferred parent is " << best << ", rank " << bestRank << " (was "
                                        << m_preferredParent << ", rank " << m_rank << ")");
+    bool parentChanged = (best != m_preferredParent);
     m_preferredParent = best;
     m_rank = bestRank;
+
+    if (parentChanged)
+    {
+        // RFC 6550, section 9.5: a node that changes parent has to tell the
+        // root about it. The path sequence is what lets the root tell the new
+        // report from the one the old parent may still be relaying.
+        m_pathSequence++;
+        m_daoEvent.Cancel();
+        m_daoEvent = Simulator::Schedule(Seconds(m_jitter->GetValue(0.0, 1.0)),
+                                         &RplRoutingProtocol::DaoTimerExpire,
+                                         this);
+    }
     return true;
 }
 
@@ -806,9 +1152,34 @@ RplRoutingProtocol::RouteOutput(Ptr<Packet> p,
     // it matches the prefix of one of our own addresses: an LLN shares one
     // prefix across the whole DODAG, most of which is several hops away, which
     // is why RFC 6550 section 6.7.10 has the root advertise the prefix with the
-    // on-link flag clear. Everything global therefore goes up the DODAG.
-    // Reaching a destination that sits below another node needs the source
-    // routing header of RFC 6554, which arrives with the DAO handling.
+    // on-link flag clear.
+    //
+    // The root is the only node that knows how to go down, so it is the only
+    // one that can put a path into a packet; everyone else sends everything to
+    // its preferred parent and lets the root turn it around.
+    if (m_isRoot)
+    {
+        std::vector<Ipv6Address> hops;
+        if (ComputeSourceRoute(dst, hops))
+        {
+            if (!hops.empty())
+            {
+                RplSourceRouteTag tag;
+                tag.SetHops(hops);
+                tag.SetSegmentsLeft(static_cast<uint8_t>(hops.size()));
+                p->AddPacketTag(tag);
+            }
+            Ipv6Address nextHop = hops.empty() ? dst : hops.front();
+            NS_LOG_LOGIC("Source routing " << dst << " through " << hops.size()
+                                           << " router(s), first hop " << nextHop);
+            Ptr<Ipv6Route> route = RouteToNeighbour(nextHop, dst);
+            if (route)
+            {
+                return route;
+            }
+        }
+    }
+
     Ptr<Ipv6Route> route = RouteViaPreferredParent(dst);
     if (route)
     {
@@ -848,6 +1219,55 @@ RplRoutingProtocol::RouteInput(Ptr<const Packet> p,
         NS_LOG_LOGIC("Forwarding is disabled on the input interface");
         ecb(p, header, Socket::ERROR_NOROUTETOHOST);
         return false;
+    }
+
+    // A packet the root sent down carries the rest of its path with it, so
+    // this node does not have to know anything about where the destination is.
+    RplSourceRouteTag tag;
+    Ptr<Packet> packet = p->Copy();
+    if (packet->RemovePacketTag(tag))
+    {
+        const std::vector<Ipv6Address>& hops = tag.GetHops();
+        uint8_t segmentsLeft = tag.GetSegmentsLeft();
+
+        if (segmentsLeft == 0 || segmentsLeft > hops.size())
+        {
+            NS_LOG_WARN("Dropping a source routed packet for " << dst << ": " << +segmentsLeft
+                                                               << " segments left of " << hops.size());
+            ecb(p, header, Socket::ERROR_NOROUTETOHOST);
+            return false;
+        }
+
+        // This node is the hop the previous one aimed at, so it is now done.
+        segmentsLeft--;
+
+        Ipv6Address nextHop;
+        if (segmentsLeft > 0)
+        {
+            nextHop = hops[hops.size() - segmentsLeft];
+            tag.SetSegmentsLeft(segmentsLeft);
+            packet->AddPacketTag(tag);
+        }
+        else
+        {
+            // Last router before the destination. The tag is left off, since
+            // Ipv6L3Protocol delivers a packet addressed to a node without
+            // ever asking the routing protocol, so the destination would have
+            // no chance to strip it.
+            nextHop = dst;
+        }
+
+        Ptr<Ipv6Route> sourceRoute = RouteToNeighbour(nextHop, dst);
+        if (!sourceRoute)
+        {
+            NS_LOG_WARN("Dropping a source routed packet: " << nextHop << " is on no interface");
+            ecb(p, header, Socket::ERROR_NOROUTETOHOST);
+            return false;
+        }
+
+        NS_LOG_LOGIC("Source routing " << dst << " onwards to " << nextHop);
+        ucb(sourceRoute->GetOutputDevice(), sourceRoute, packet, header);
+        return true;
     }
 
     Ptr<Ipv6Route> route = RouteViaPreferredParent(dst);
@@ -983,6 +1403,16 @@ RplRoutingProtocol::PrintRoutingTable(Ptr<OutputStreamWrapper> stream, Time::Uni
         *os << "    " << address << " rank " << parent.rank << " via interface " << parent.interface
             << ", heard " << +parent.freshness << " times, last "
             << (Now() - parent.lastHeard).As(unit) << " ago" << std::endl;
+    }
+
+    if (m_isRoot)
+    {
+        *os << "  Topology learnt from the DAOs:" << std::endl;
+        for (const auto& [target, entry] : m_topology)
+        {
+            *os << "    " << target << " under " << entry.parent << ", expires in "
+                << (entry.expire - Now()).As(unit) << std::endl;
+        }
     }
 
     os->copyfmt(oldState);
