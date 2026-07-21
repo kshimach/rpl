@@ -351,11 +351,34 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
 
     /**
      * @brief Send an already-built RPL message body on every RPL interface.
+     *
+     * For a multicast destination, e.g. ff02::1a. A unicast message has to
+     * reach only one neighbour, so looping over every interface here would
+     * hand every socket the same packet, and each socket's raw send would
+     * independently ask RouteOutput() for the way there and each get back the
+     * one correct route, resulting in as many duplicate transmissions as this
+     * node has RPL interfaces. @see SendRplMessageUnicast for that case.
+     *
      * @param packet the ICMPv6 payload, without the ICMPv6 header
      * @param code the RPL message code
      * @param dst the destination address
      */
-    void SendRplMessage(Ptr<Packet> packet, uint8_t code, Ipv6Address dst);
+    void SendRplMessageMulticast(Ptr<Packet> packet, uint8_t code, Ipv6Address dst);
+
+    /**
+     * @brief Send an already-built RPL message body to a single destination.
+     *
+     * For a DAO or a DAO-ACK, both unicast. RouteOutput() resolves the actual
+     * next hop for a global destination from this node's own state, the
+     * preferred parent or, on the root, the topology learnt from DAOs, rather
+     * than from which socket the call came in on, so sending through any one
+     * open RPL interface reaches the right neighbour; only one send is needed.
+     *
+     * @param packet the ICMPv6 payload, without the ICMPv6 header
+     * @param code the RPL message code
+     * @param dst the destination address
+     */
+    void SendRplMessageUnicast(Ptr<Packet> packet, uint8_t code, Ipv6Address dst);
 
     /**
      * @brief Send an already-built RPL message body on one interface.
@@ -438,8 +461,8 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     uint8_t m_pathSequence;  //!< path sequence of the route this node advertises
     uint8_t m_daoRetriesLeft; //!< retries left for the DAO awaiting an acknowledgement
     bool m_daoAckPending;    //!< true while a DAO-ACK is being waited for
-    EventId m_daoEvent;      //!< schedules the periodic DAO
-    EventId m_daoRetryEvent; //!< schedules the retry of an unacknowledged DAO
+    Timer m_daoEvent;        //!< schedules the periodic DAO
+    Timer m_daoRetryEvent;   //!< schedules the retry of an unacknowledged DAO
 
     /// The root only: which parent each node reports sitting under.
     std::map<Ipv6Address, TopologyEntry> m_topology;

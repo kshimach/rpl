@@ -23,9 +23,13 @@ RplTrickleTimer::RplTrickleTimer()
       m_interval(Seconds(1)),
       m_redundancy(0),
       m_counter(0),
-      m_running(false)
+      m_running(false),
+      m_transmitTimer(Timer::CANCEL_ON_DESTROY),
+      m_intervalTimer(Timer::CANCEL_ON_DESTROY)
 {
     m_rng = CreateObject<UniformRandomVariable>();
+    m_transmitTimer.SetFunction(&RplTrickleTimer::TransmitEvent, this);
+    m_intervalTimer.SetFunction(&RplTrickleTimer::IntervalEvent, this);
 }
 
 RplTrickleTimer::~RplTrickleTimer()
@@ -62,8 +66,8 @@ RplTrickleTimer::Stop()
 {
     NS_LOG_FUNCTION(this);
     m_running = false;
-    m_transmitEvent.Cancel();
-    m_intervalEvent.Cancel();
+    m_transmitTimer.Cancel();
+    m_intervalTimer.Cancel();
 }
 
 bool
@@ -80,10 +84,8 @@ RplTrickleTimer::Reset()
     {
         return;
     }
-    m_transmitEvent.Cancel();
-    m_intervalEvent.Cancel();
     m_interval = m_intervalMin;
-    NewInterval();
+    NewInterval(); // cancels and reschedules both timers
 }
 
 void
@@ -109,8 +111,16 @@ RplTrickleTimer::NewInterval()
     double half = m_interval.GetSeconds() / 2.0;
     Time t = Seconds(m_rng->GetValue(half, m_interval.GetSeconds()));
 
-    m_transmitEvent = Simulator::Schedule(t, &RplTrickleTimer::TransmitEvent, this);
-    m_intervalEvent = Simulator::Schedule(m_interval, &RplTrickleTimer::IntervalEvent, this);
+    // Timer::Schedule() asserts if an event is still pending, unlike a raw
+    // EventId reassignment, which would silently leak the old one; the
+    // Cancel() here is a no-op once a timer has already fired (as
+    // m_transmitTimer always has by the time IntervalEvent() calls back into
+    // here), and is what makes Reset() safe to call mid-interval, when both
+    // timers can still be pending.
+    m_transmitTimer.Cancel();
+    m_transmitTimer.Schedule(t);
+    m_intervalTimer.Cancel();
+    m_intervalTimer.Schedule(m_interval);
 }
 
 void

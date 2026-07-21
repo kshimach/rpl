@@ -10,10 +10,10 @@
 #define RPL_TRICKLE_TIMER_H
 
 #include "ns3/callback.h"
-#include "ns3/event-id.h"
 #include "ns3/nstime.h"
 #include "ns3/ptr.h"
 #include "ns3/random-variable-stream.h"
+#include "ns3/timer.h"
 
 namespace ns3
 {
@@ -123,8 +123,8 @@ class RplTrickleTimer
     uint8_t m_redundancy;   //!< the redundancy constant k
     uint16_t m_counter;     //!< consistent messages heard during this interval
     bool m_running;         //!< true between Start() and Stop()
-    EventId m_transmitEvent; //!< fires at t inside the interval
-    EventId m_intervalEvent; //!< fires at the end of the interval
+    Timer m_transmitTimer; //!< fires at t inside the interval
+    Timer m_intervalTimer; //!< fires at the end of the interval
     Callback<void> m_callback;       //!< called on transmission
     Ptr<UniformRandomVariable> m_rng; //!< picks t inside [I/2, I)
 };

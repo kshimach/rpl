@@ -128,7 +128,9 @@ RplRoutingProtocol::RplRoutingProtocol()
       m_daoSequence(0),
       m_pathSequence(0),
       m_daoRetriesLeft(0),
-      m_daoAckPending(false)
+      m_daoAckPending(false),
+      m_daoEvent(Timer::CANCEL_ON_DESTROY),
+      m_daoRetryEvent(Timer::CANCEL_ON_DESTROY)
 {
     NS_LOG_FUNCTION(this);
     m_jitter = CreateObject<UniformRandomVariable>();
@@ -181,6 +183,8 @@ RplRoutingProtocol::DoInitialize()
     else
     {
         m_disTimer.SetFunction(&RplRoutingProtocol::DisTimerExpire, this);
+        m_daoEvent.SetFunction(&RplRoutingProtocol::DaoTimerExpire, this);
+        m_daoRetryEvent.SetFunction(&RplRoutingProtocol::DaoRetry, this);
         // Spread the initial solicitations so that a whole network booting at
         // once does not send every DIS in the same slot.
         Simulator::Schedule(Seconds(m_jitter->GetValue(0.0, 1.0)),
@@ -392,7 +396,7 @@ RplRoutingProtocol::RecvRpl(Ptr<Socket> socket)
 }
 
 void
-RplRoutingProtocol::SendRplMessage(Ptr<Packet> packet, uint8_t code, Ipv6Address dst)
+RplRoutingProtocol::SendRplMessageMulticast(Ptr<Packet> packet, uint8_t code, Ipv6Address dst)
 {
     NS_LOG_FUNCTION(this << packet << +code << dst);
 
@@ -400,6 +404,20 @@ RplRoutingProtocol::SendRplMessage(Ptr<Packet> packet, uint8_t code, Ipv6Address
     {
         SendRplMessageOn(interface, packet->Copy(), code, dst);
     }
+}
+
+void
+RplRoutingProtocol::SendRplMessageUnicast(Ptr<Packet> packet, uint8_t code, Ipv6Address dst)
+{
+    NS_LOG_FUNCTION(this << packet << +code << dst);
+
+    if (m_ifcToSocket.empty())
+    {
+        NS_LOG_WARN("No RPL interface is up, dropping code " << +code << " to " << dst);
+        return;
+    }
+
+    SendRplMessageOn(m_ifcToSocket.begin()->first, packet, code, dst);
 }
 
 void
@@ -455,7 +473,7 @@ RplRoutingProtocol::SendDis(Ipv6Address dst)
     RplDisHeader dis;
     Ptr<Packet> packet = Create<Packet>();
     packet->AddHeader(dis);
-    SendRplMessage(packet, RPL_CODE_DIS, dst);
+    SendRplMessageMulticast(packet, RPL_CODE_DIS, dst);
 }
 
 void
@@ -509,7 +527,7 @@ RplRoutingProtocol::SendDio(Ipv6Address dst, uint32_t interface)
 
     if (interface == 0)
     {
-        SendRplMessage(packet, RPL_CODE_DIO, dst);
+        SendRplMessageMulticast(packet, RPL_CODE_DIO, dst);
     }
     else
     {
@@ -722,12 +740,12 @@ RplRoutingProtocol::SendDao()
 
     // The DAO is addressed to the root and finds its way there hop by hop, on
     // the upward routes the DIOs built.
-    SendRplMessage(packet, RPL_CODE_DAO, m_dodagId);
+    SendRplMessageUnicast(packet, RPL_CODE_DAO, m_dodagId);
 
     m_daoAckPending = true;
     m_daoRetriesLeft = m_daoRetries;
     m_daoRetryEvent.Cancel();
-    m_daoRetryEvent = Simulator::Schedule(m_daoAckTimeout, &RplRoutingProtocol::DaoRetry, this);
+    m_daoRetryEvent.Schedule(m_daoAckTimeout);
 }
 
 void
@@ -737,7 +755,7 @@ RplRoutingProtocol::DaoTimerExpire()
 
     SendDao();
     m_daoEvent.Cancel();
-    m_daoEvent = Simulator::Schedule(m_daoInterval, &RplRoutingProtocol::DaoTimerExpire, this);
+    m_daoEvent.Schedule(m_daoInterval);
 }
 
 void
@@ -772,9 +790,10 @@ RplRoutingProtocol::DaoRetry()
 
     Ptr<Packet> packet = Create<Packet>();
     packet->AddHeader(dao);
-    SendRplMessage(packet, RPL_CODE_DAO, m_dodagId);
+    SendRplMessageUnicast(packet, RPL_CODE_DAO, m_dodagId);
 
-    m_daoRetryEvent = Simulator::Schedule(m_daoAckTimeout, &RplRoutingProtocol::DaoRetry, this);
+    m_daoRetryEvent.Cancel();
+    m_daoRetryEvent.Schedule(m_daoAckTimeout);
 }
 
 void
@@ -832,7 +851,7 @@ RplRoutingProtocol::HandleDao(const RplDaoHeader& dao, Ipv6Address from)
         packet->AddHeader(daoAck);
         // The acknowledgement travels back down, which the root can do now
         // that it has just learnt where the sender sits.
-        SendRplMessage(packet, RPL_CODE_DAO_ACK, from);
+        SendRplMessageUnicast(packet, RPL_CODE_DAO_ACK, from);
     }
 }
 
@@ -1074,9 +1093,7 @@ RplRoutingProtocol::SelectPreferredParent()
         // report from the one the old parent may still be relaying.
         m_pathSequence++;
         m_daoEvent.Cancel();
-        m_daoEvent = Simulator::Schedule(Seconds(m_jitter->GetValue(0.0, 1.0)),
-                                         &RplRoutingProtocol::DaoTimerExpire,
-                                         this);
+        m_daoEvent.Schedule(Seconds(m_jitter->GetValue(0.0, 1.0)));
     }
     return true;
 }
@@ -1159,6 +1176,12 @@ RplRoutingProtocol::RouteOutput(Ptr<Packet> p,
     // its preferred parent and lets the root turn it around.
     if (m_isRoot)
     {
+        // Lazy cleanup, on the routing hot path rather than on a dedicated
+        // timer, the way AODV's RoutingProtocol::Forwarding() purges its
+        // table: the root only needs an up-to-date topology when it is about
+        // to use it.
+        PurgeTopology();
+
         std::vector<Ipv6Address> hops;
         if (ComputeSourceRoute(dst, hops))
         {
