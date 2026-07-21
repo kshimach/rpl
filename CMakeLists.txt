@@ -1,0 +1,18 @@
+build_lib(
+  LIBNAME rpl
+  SOURCE_FILES
+    helper/rpl-helper.cc
+    model/rpl-header.cc
+    model/rpl-routing-protocol.cc
+    model/rpl-trickle-timer.cc
+  HEADER_FILES
+    helper/rpl-helper.h
+    model/rpl-conf.h
+    model/rpl-header.h
+    model/rpl-routing-protocol.h
+    model/rpl-trickle-timer.h
+  LIBRARIES_TO_LINK
+    ${libinternet}
+    ${libsixlowpan}
+  TEST_SOURCES
+)
