@@ -15,4 +15,5 @@ build_lib(
     ${libinternet}
     ${libsixlowpan}
   TEST_SOURCES
+    test/rpl-test-suite.cc
 )
