@@ -785,111 +785,117 @@ RplDaoAckHeader::GetDodagId() const
     return m_dodagId;
 }
 
-NS_OBJECT_ENSURE_REGISTERED(RplSourceRouteTag);
+NS_OBJECT_ENSURE_REGISTERED(RplSourceRoutingHeader);
 
-RplSourceRouteTag::RplSourceRouteTag()
-    : m_segmentsLeft(0)
+RplSourceRoutingHeader::RplSourceRoutingHeader()
 {
+    SetTypeRouting(RPL_RH_TYPE_SRH);
 }
 
 TypeId
-RplSourceRouteTag::GetTypeId()
+RplSourceRoutingHeader::GetTypeId()
 {
-    static TypeId tid = TypeId("ns3::rpl::RplSourceRouteTag")
-                            .SetParent<Tag>()
+    static TypeId tid = TypeId("ns3::rpl::RplSourceRoutingHeader")
+                            .SetParent<Ipv6ExtensionRoutingHeader>()
                             .SetGroupName("Rpl")
-                            .AddConstructor<RplSourceRouteTag>();
+                            .AddConstructor<RplSourceRoutingHeader>();
     return tid;
 }
 
 TypeId
-RplSourceRouteTag::GetInstanceTypeId() const
+RplSourceRoutingHeader::GetInstanceTypeId() const
 {
     return GetTypeId();
 }
 
+void
+RplSourceRoutingHeader::Print(std::ostream& os) const
+{
+    os << "SRH segments left " << +GetSegmentsLeft() << " addresses";
+    for (const auto& address : m_addresses)
+    {
+        os << " " << address;
+    }
+}
+
 uint32_t
-RplSourceRouteTag::GetSerializedSize() const
+RplSourceRoutingHeader::GetSerializedSize() const
 {
     // Next Header, Hdr Ext Len, Routing Type and Segments Left, then CmprI,
     // CmprE, Pad and the reserved bits, then the uncompressed addresses.
-    return 8 + 16 * m_hops.size();
+    return 8 + 16 * m_addresses.size();
 }
 
 void
-RplSourceRouteTag::Serialize(TagBuffer buffer) const
+RplSourceRoutingHeader::Serialize(Buffer::Iterator start) const
 {
-    buffer.WriteU8(0); // Next Header, unused: the tag rides beside the packet
+    Buffer::Iterator i = start;
+
+    i.WriteU8(GetNextHeader());
     // Hdr Ext Len counts 8-byte units after the first eight bytes.
-    buffer.WriteU8(static_cast<uint8_t>(2 * m_hops.size()));
-    buffer.WriteU8(RPL_RH_TYPE_SRH);
-    buffer.WriteU8(m_segmentsLeft);
+    i.WriteU8(static_cast<uint8_t>(2 * m_addresses.size()));
+    i.WriteU8(GetTypeRouting());
+    i.WriteU8(GetSegmentsLeft());
 
-    buffer.WriteU8(0); // CmprI and CmprE, both zero: no compression
-    buffer.WriteU8(0); // Pad and the top of the reserved field
-    buffer.WriteU16(0);
+    i.WriteU8(0); // CmprI and CmprE, both zero: no compression
+    i.WriteU8(0); // Pad and the top of the reserved field
+    i.WriteU16(0);
 
     uint8_t buf[16];
-    for (const auto& hop : m_hops)
+    for (const auto& address : m_addresses)
     {
-        hop.Serialize(buf);
-        buffer.Write(buf, 16);
+        address.Serialize(buf);
+        i.Write(buf, 16);
     }
 }
 
-void
-RplSourceRouteTag::Deserialize(TagBuffer buffer)
+uint32_t
+RplSourceRoutingHeader::Deserialize(Buffer::Iterator start)
 {
-    buffer.ReadU8(); // Next Header
-    uint8_t extensionLength = buffer.ReadU8();
-    buffer.ReadU8(); // Routing Type
-    m_segmentsLeft = buffer.ReadU8();
+    Buffer::Iterator i = start;
 
-    buffer.ReadU8(); // CmprI and CmprE
-    buffer.ReadU8(); // Pad and the top of the reserved field
-    buffer.ReadU16();
+    SetNextHeader(i.ReadU8());
+    uint8_t extensionLength = i.ReadU8();
+    SetTypeRouting(i.ReadU8());
+    SetSegmentsLeft(i.ReadU8());
 
-    m_hops.clear();
+    i.ReadU8(); // CmprI and CmprE, assumed zero: no compression support
+    i.ReadU8(); // Pad and the top of the reserved field
+    i.ReadU16();
+
+    m_addresses.clear();
     uint8_t buf[16];
-    for (uint8_t hop = 0; hop < extensionLength / 2; hop++)
+    for (uint8_t index = 0; index < extensionLength / 2; index++)
     {
-        buffer.Read(buf, 16);
-        m_hops.push_back(Ipv6Address::Deserialize(buf));
+        i.Read(buf, 16);
+        m_addresses.push_back(Ipv6Address::Deserialize(buf));
     }
+
+    return GetSerializedSize();
 }
 
 void
-RplSourceRouteTag::Print(std::ostream& os) const
+RplSourceRoutingHeader::SetAddresses(const std::vector<Ipv6Address>& addresses)
 {
-    os << "SRH segments left " << +m_segmentsLeft << " hops";
-    for (const auto& hop : m_hops)
-    {
-        os << " " << hop;
-    }
-}
-
-void
-RplSourceRouteTag::SetHops(const std::vector<Ipv6Address>& hops)
-{
-    m_hops = hops;
+    m_addresses = addresses;
 }
 
 const std::vector<Ipv6Address>&
-RplSourceRouteTag::GetHops() const
+RplSourceRoutingHeader::GetAddresses() const
 {
-    return m_hops;
+    return m_addresses;
 }
 
 void
-RplSourceRouteTag::SetSegmentsLeft(uint8_t segmentsLeft)
+RplSourceRoutingHeader::SetAddress(uint8_t index, Ipv6Address address)
 {
-    m_segmentsLeft = segmentsLeft;
+    m_addresses.at(index) = address;
 }
 
-uint8_t
-RplSourceRouteTag::GetSegmentsLeft() const
+Ipv6Address
+RplSourceRoutingHeader::GetAddress(uint8_t index) const
 {
-    return m_segmentsLeft;
+    return m_addresses.at(index);
 }
 
 } // namespace rpl

@@ -13,7 +13,7 @@
 
 #include "ns3/header.h"
 #include "ns3/ipv6-address.h"
-#include "ns3/tag.h"
+#include "ns3/ipv6-extension-header.h"
 
 #include <vector>
 
@@ -479,30 +479,16 @@ class RplDaoAckHeader : public Header
  * @brief The source routing header of RFC 6554, which carries the downward
  *        route the root computed for a packet.
  *
- * The serialized form is the RH3 of RFC 6554 with CmprI and CmprE left at
- * zero, i.e. with uncompressed 16-byte addresses. Compressing the addresses
- * against the common prefix, which is what makes an RH3 affordable in a real
- * LLN, is not implemented.
- *
- * @internal
- * This is an ns-3 tag rather than an IPv6 extension header, because ns-3 gives
- * no way to add one at the node that originates a packet:
- * Ipv6L3Protocol::Send() builds the IPv6 header, payload length included,
- * before it calls RouteOutput(), and passes it on as a constant; bytes added
- * to the packet afterwards push the tail of the payload past the length in the
- * header, and Ipv6L3Protocol::Receive() then truncates it away. Carrying RPL
- * information in a tag is the same workaround Baranyai (TU Wien, 2024) used
- * for the RPL hop-by-hop option.
- *
- * The consequence is that a source routed packet is 8 + 16n bytes lighter on
- * the wire than it would be in reality, which matters in an LLN where the
- * frame is 127 bytes: measurements of the downward traffic volume are
- * optimistic by that much. Everything else, the format included, is what
- * RFC 6554 prescribes. Putting the real bytes on the wire needs a hook in
- * Ipv6L3Protocol::Send().
- * @endinternal
+ * The wire format is the RH3 of RFC 6554 with CmprI, CmprE and Pad always
+ * zero, i.e. every address is carried in full rather than compressed against
+ * a common prefix; compressing addresses, which is what makes an RH3 cheap in
+ * a real LLN, is not implemented. This is a genuine IPv6 extension header,
+ * inserted at the node that originates the packet by
+ * Ipv6RoutingProtocol::PrepareOutgoingPacket() and processed hop by hop by
+ * RplIpv6ExtensionSourceRouting, the way RFC 6554 prescribes: nothing about
+ * the downward path is carried out of band.
  */
-class RplSourceRouteTag : public Tag
+class RplSourceRoutingHeader : public Ipv6ExtensionRoutingHeader
 {
   public:
     /**
@@ -511,45 +497,47 @@ class RplSourceRouteTag : public Tag
      */
     static TypeId GetTypeId();
 
-    RplSourceRouteTag();
+    RplSourceRoutingHeader();
 
     TypeId GetInstanceTypeId() const override;
-    uint32_t GetSerializedSize() const override;
-    void Serialize(TagBuffer buffer) const override;
-    void Deserialize(TagBuffer buffer) override;
     void Print(std::ostream& os) const override;
+    uint32_t GetSerializedSize() const override;
+    void Serialize(Buffer::Iterator start) const override;
+    uint32_t Deserialize(Buffer::Iterator start) override;
 
     /**
-     * @brief Set the hops the packet has to traverse, in order.
+     * @brief Set the addresses of RFC 6554 section 3, in order.
      *
-     * The list holds the routers between the root and the destination; the
-     * destination itself stays in the IPv6 header and is not repeated here.
+     * The last address is the packet's real final destination; the IPv6
+     * header carries the address of the first hop instead, which is why it is
+     * not repeated here.
      *
-     * @param hops the addresses of the routers to traverse
+     * @param addresses the addresses to visit, in order
      */
-    void SetHops(const std::vector<Ipv6Address>& hops);
+    void SetAddresses(const std::vector<Ipv6Address>& addresses);
 
     /**
-     * @brief Get the hops the packet has to traverse.
-     * @return the addresses of the routers to traverse
+     * @brief Get the addresses of RFC 6554 section 3.
+     * @return the addresses to visit, in order
      */
-    const std::vector<Ipv6Address>& GetHops() const;
+    const std::vector<Ipv6Address>& GetAddresses() const;
 
     /**
-     * @brief Set how many hops are still to be visited.
-     * @param segmentsLeft the number of hops left
+     * @brief Set one address of the list.
+     * @param index the index of the address
+     * @param address the new value
      */
-    void SetSegmentsLeft(uint8_t segmentsLeft);
+    void SetAddress(uint8_t index, Ipv6Address address);
 
     /**
-     * @brief Get how many hops are still to be visited.
-     * @return the number of hops left
+     * @brief Get one address of the list.
+     * @param index the index of the address
+     * @return the address at that index
      */
-    uint8_t GetSegmentsLeft() const;
+    Ipv6Address GetAddress(uint8_t index) const;
 
   private:
-    uint8_t m_segmentsLeft;          //!< hops still to be visited
-    std::vector<Ipv6Address> m_hops; //!< the routers to traverse, in order
+    std::vector<Ipv6Address> m_addresses; //!< addresses of RFC 6554 section 3, in order
 };
 
 } // namespace rpl

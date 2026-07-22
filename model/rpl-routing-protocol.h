@@ -54,8 +54,9 @@ class RplDaoAckHeader;
  * with ranks computed by OF0 (RFC 6552). The downward routes are those of the
  * non-storing mode: every node tells the root, with a DAO, which parent it
  * sits under, so only the root holds a picture of the topology and it puts the
- * whole path into every packet it sends down. @see RplSourceRouteTag for how
- * that path is carried and what it costs in fidelity.
+ * whole path into every packet it sends down, as a real RFC 6554 Routing
+ * Header. @see RplSourceRoutingHeader for the wire format and
+ * RplIpv6ExtensionSourceRouting for how it is processed hop by hop.
  */
 class RplRoutingProtocol : public Ipv6RoutingProtocol
 {
@@ -98,6 +99,9 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     void SetIpv6(Ptr<Ipv6> ipv6) override;
     void PrintRoutingTable(Ptr<OutputStreamWrapper> stream,
                            Time::Unit unit = Time::S) const override;
+    void PrepareOutgoingPacket(Ptr<Packet> packet,
+                               Ipv6Header& header,
+                               Ptr<Ipv6Route> route) override;
 
     /**
      * @brief Make this node the root of the DODAG.
@@ -148,10 +152,24 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     uint32_t GetTopologySize() const;
 
     /**
-     * @brief Get the path the root would put in a packet for a destination.
+     * @brief Get the path the root would put in a Routing Header for a
+     *        destination.
      *
-     * @param destination the address to reach
-     * @param [out] hops the routers to traverse, root and destination excluded
+     * Per RFC 6554 section 3, the IPv6 header's own destination field becomes
+     * the first hop and the Routing Header's address list holds every hop
+     * after that, the final destination included as its own last entry: that
+     * is what lets each router along the way find the address it was just
+     * addressed under by reading the current destination field, without
+     * knowing anything about the rest of the path. Since a DODAG's downward
+     * routes only ever cross one radio hop at a time between consecutive
+     * entries, every address returned here is link-local, resolved the same
+     * way the address of a one-hop neighbour is elsewhere in this class.
+     *
+     * @param destination the address to reach, root excluded
+     * @param [out] hops every hop after the root, in order, as link-local
+     *              addresses, destination included as the last entry; a
+     *              single entry means destination is a direct child of the
+     *              root and needs no Routing Header at all
      * @return true if a path was found
      */
     bool ComputeSourceRoute(Ipv6Address destination, std::vector<Ipv6Address>& hops) const;
@@ -333,6 +351,20 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      * @return the global address of the neighbour, :: if it cannot be built
      */
     Ipv6Address GlobalAddressOf(Ipv6Address linkLocal) const;
+
+    /**
+     * @brief Build the link-local address that shares an interface identifier
+     *        with a global address.
+     *
+     * The inverse of GlobalAddressOf(): used to turn the global addresses
+     * ComputeSourceRoute() finds in the topology into the link-local
+     * addresses a Routing Header actually carries, under the same
+     * one-interface-identifier-per-node assumption.
+     *
+     * @param global the global address of a node
+     * @return the link-local address of the same node
+     */
+    Ipv6Address LinkLocalOf(Ipv6Address global) const;
 
     /**
      * @brief Find the interface a one-hop neighbour sits on.

@@ -279,49 +279,51 @@ RplDaoHeaderTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
- * @brief Check that the source route survives being attached to a packet, and
- *        that it costs what an uncompressed RFC 6554 RH3 would.
+ * @brief Check that the RFC 6554 Routing Header survives a serialize and
+ *        deserialize round trip, at the size an uncompressed RH3 costs.
  */
-class RplSourceRouteTagTestCase : public TestCase
+class RplSourceRoutingHeaderTestCase : public TestCase
 {
   public:
-    RplSourceRouteTagTestCase();
+    RplSourceRoutingHeaderTestCase();
 
   private:
     void DoRun() override;
 };
 
-RplSourceRouteTagTestCase::RplSourceRouteTagTestCase()
-    : TestCase("Source route tag")
+RplSourceRoutingHeaderTestCase::RplSourceRoutingHeaderTestCase()
+    : TestCase("Source routing header")
 {
 }
 
 void
-RplSourceRouteTagTestCase::DoRun()
+RplSourceRoutingHeaderTestCase::DoRun()
 {
-    std::vector<Ipv6Address> hops = {Ipv6Address("2001:1::2"), Ipv6Address("2001:1::3")};
+    std::vector<Ipv6Address> addresses = {Ipv6Address("fe80::2"), Ipv6Address("fe80::3")};
 
-    RplSourceRouteTag tag;
-    tag.SetHops(hops);
-    tag.SetSegmentsLeft(2);
+    RplSourceRoutingHeader srh;
+    srh.SetNextHeader(17); // UDP, as an example inner protocol
+    srh.SetSegmentsLeft(2);
+    srh.SetAddresses(addresses);
 
-    // Eight bytes of RH3 and one uncompressed address per hop.
-    NS_TEST_ASSERT_MSG_EQ(tag.GetSerializedSize(), 8 + 2 * 16, "Unexpected source route size");
+    NS_TEST_ASSERT_MSG_EQ(srh.GetTypeRouting(), RPL_RH_TYPE_SRH, "Wrong Routing Type");
+
+    // Eight bytes of RH3 and one uncompressed address per entry.
+    NS_TEST_ASSERT_MSG_EQ(srh.GetSerializedSize(), 8 + 2 * 16, "Unexpected header size");
 
     Ptr<Packet> packet = Create<Packet>();
-    packet->AddPacketTag(tag);
+    packet->AddHeader(srh);
+    NS_TEST_ASSERT_MSG_EQ(packet->GetSize(), 8 + 2 * 16, "Unexpected packet size");
 
-    RplSourceRouteTag received;
-    NS_TEST_ASSERT_MSG_EQ(packet->PeekPacketTag(received), true, "The tag was lost");
+    RplSourceRoutingHeader received;
+    NS_TEST_ASSERT_MSG_EQ(packet->RemoveHeader(received), 8 + 2 * 16, "Unexpected deserialized size");
+    NS_TEST_ASSERT_MSG_EQ(received.GetNextHeader(), 17, "Wrong next header");
+    NS_TEST_ASSERT_MSG_EQ(received.GetTypeRouting(), RPL_RH_TYPE_SRH, "Wrong Routing Type");
     NS_TEST_ASSERT_MSG_EQ(received.GetSegmentsLeft(), 2, "Wrong number of segments left");
-    NS_TEST_ASSERT_MSG_EQ(received.GetHops().size(), 2, "Wrong number of hops");
-    NS_TEST_ASSERT_MSG_EQ(received.GetHops()[0], hops[0], "Wrong first hop");
-    NS_TEST_ASSERT_MSG_EQ(received.GetHops()[1], hops[1], "Wrong second hop");
-
-    // A packet the tag was taken off carries nothing, which is what tells the
-    // last router before the destination it is done.
-    packet->RemovePacketTag(received);
-    NS_TEST_ASSERT_MSG_EQ(packet->PeekPacketTag(received), false, "The tag was not removed");
+    NS_TEST_ASSERT_MSG_EQ(received.GetAddresses().size(), 2, "Wrong number of addresses");
+    NS_TEST_ASSERT_MSG_EQ(received.GetAddress(0), addresses[0], "Wrong first address");
+    NS_TEST_ASSERT_MSG_EQ(received.GetAddress(1), addresses[1], "Wrong second address");
+    NS_TEST_ASSERT_MSG_EQ(packet->GetSize(), 0, "The header did not consume the whole packet");
 }
 
 /**
@@ -550,47 +552,72 @@ RplDodagFormationTestCase::DoRun()
     NS_TEST_ASSERT_MSG_EQ(root->GetTopologySize(), 2, "The root did not hear from both nodes");
     NS_TEST_ASSERT_MSG_EQ(middle->GetTopologySize(), 0, "A node that is not the root kept a topology");
 
-    // Node 1 hangs off the root, so a packet for it needs no path in it.
+    // A Routing Header carries link-local addresses, one radio hop apart, the
+    // same as any other RPL neighbour address.
+    Ipv6Address middleLinkLocal = middleIpv6->GetAddress(1, 0).GetAddress();
+    Ptr<Ipv6L3Protocol> leafIpv6 = nodes.Get(2)->GetObject<Ipv6L3Protocol>();
+    Ipv6Address leafLinkLocal = leafIpv6->GetAddress(1, 0).GetAddress();
+
+    // Node 1 hangs off the root: one hop, itself, so no Routing Header is
+    // needed to reach it.
     std::vector<Ipv6Address> hops;
     NS_TEST_ASSERT_MSG_EQ(root->ComputeSourceRoute(middleAddress, hops),
                           true,
                           "The root cannot reach node 1");
-    NS_TEST_ASSERT_MSG_EQ(hops.size(), 0, "A direct child needs no source route");
+    NS_TEST_ASSERT_MSG_EQ(hops.size(), 1, "A direct child is one hop: itself");
+    NS_TEST_ASSERT_MSG_EQ(hops[0], middleLinkLocal, "Wrong hop for node 1");
 
-    // Node 2 is behind node 1, so the path has to name node 1.
+    // Node 2 is behind node 1, so the path has to name node 1, then node 2.
     NS_TEST_ASSERT_MSG_EQ(root->ComputeSourceRoute(leafAddress, hops),
                           true,
                           "The root cannot reach node 2");
-    NS_TEST_ASSERT_MSG_EQ(hops.size(), 1, "The path to node 2 should hold one router");
-    NS_TEST_ASSERT_MSG_EQ(hops[0], middleAddress, "The path to node 2 does not go through node 1");
+    NS_TEST_ASSERT_MSG_EQ(hops.size(), 2, "The path to node 2 should hold two hops");
+    NS_TEST_ASSERT_MSG_EQ(hops[0], middleLinkLocal, "The path to node 2 does not go through node 1");
+    NS_TEST_ASSERT_MSG_EQ(hops[1], leafLinkLocal, "The path to node 2 does not end at node 2");
 
     NS_TEST_ASSERT_MSG_EQ(root->ComputeSourceRoute(Ipv6Address("2001:9::1"), hops),
                           false,
                           "The root invented a path to a node it never heard of");
 
-    // A packet the root sends to node 2 leaves with that path attached.
+    // A packet the root sends to node 2 leaves towards node 1, and
+    // PrepareOutgoingPacket() -- called by Ipv6L3Protocol::Send() right
+    // before a packet reaches the wire -- attaches the real Routing Header
+    // that gets it the rest of the way.
     Ptr<Packet> downward = Create<Packet>();
     header.SetDestination(leafAddress);
+    header.SetNextHeader(17); // UDP, as an example inner protocol
     route = root->RouteOutput(downward, header, nullptr, sockerr);
     NS_TEST_ASSERT_MSG_EQ(route != nullptr, true, "The root has no route down to node 2");
     NS_TEST_ASSERT_MSG_EQ(route->GetGateway(),
-                          middleAddress,
+                          middleLinkLocal,
                           "The packet for node 2 does not leave towards node 1");
 
-    RplSourceRouteTag tag;
-    NS_TEST_ASSERT_MSG_EQ(downward->PeekPacketTag(tag), true, "The packet carries no source route");
-    NS_TEST_ASSERT_MSG_EQ(tag.GetSegmentsLeft(), 1, "Wrong number of segments left");
-    NS_TEST_ASSERT_MSG_EQ(tag.GetHops().size(), 1, "Wrong number of hops");
-    NS_TEST_ASSERT_MSG_EQ(tag.GetHops()[0], middleAddress, "Wrong first hop");
+    root->PrepareOutgoingPacket(downward, header, route);
+    NS_TEST_ASSERT_MSG_EQ(header.GetDestination(),
+                          middleLinkLocal,
+                          "The wire header was not redirected to the first hop");
+    NS_TEST_ASSERT_MSG_EQ(header.GetNextHeader(),
+                          Ipv6Header::IPV6_EXT_ROUTING,
+                          "The next header was not set to Routing");
 
-    // Node 1 is one hop away, so its packet carries nothing.
+    RplSourceRoutingHeader srh;
+    NS_TEST_ASSERT_MSG_EQ(downward->RemoveHeader(srh), 8 + 16, "Unexpected Routing Header size");
+    NS_TEST_ASSERT_MSG_EQ(srh.GetNextHeader(), 17, "The inner protocol was not carried forward");
+    NS_TEST_ASSERT_MSG_EQ(srh.GetSegmentsLeft(), 1, "Wrong number of segments left");
+    NS_TEST_ASSERT_MSG_EQ(srh.GetAddresses().size(), 1, "Wrong number of addresses");
+    NS_TEST_ASSERT_MSG_EQ(srh.GetAddress(0), leafLinkLocal, "Wrong final address");
+
+    // Node 1 is one hop away, so its packet gets no Routing Header at all,
+    // and the wire destination stays node 1's own address.
     Ptr<Packet> direct = Create<Packet>();
     header.SetDestination(middleAddress);
     route = root->RouteOutput(direct, header, nullptr, sockerr);
     NS_TEST_ASSERT_MSG_EQ(route != nullptr, true, "The root has no route down to node 1");
-    NS_TEST_ASSERT_MSG_EQ(direct->PeekPacketTag(tag),
-                          false,
-                          "A packet for a direct child was given a source route");
+    root->PrepareOutgoingPacket(direct, header, route);
+    NS_TEST_ASSERT_MSG_EQ(direct->GetSize(), 0, "A direct child's packet was given a Routing Header");
+    NS_TEST_ASSERT_MSG_EQ(header.GetDestination(),
+                          middleAddress,
+                          "A direct child's packet had its destination rewritten");
 
     Simulator::Destroy();
 }
@@ -614,7 +641,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplDioHeaderTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDioUnknownOptionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDaoHeaderTestCase, TestCase::Duration::QUICK);
-    AddTestCase(new RplSourceRouteTagTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplSourceRoutingHeaderTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplTrickleTimerTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDodagFormationTestCase, TestCase::Duration::QUICK);
 }

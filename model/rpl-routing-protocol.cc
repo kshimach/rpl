@@ -10,10 +10,12 @@
 #include "rpl-routing-protocol.h"
 
 #include "rpl-header.h"
+#include "rpl-source-routing-extension.h"
 
 #include "ns3/icmpv6-header.h"
 #include "ns3/icmpv6-l4-protocol.h"
 #include "ns3/inet6-socket-address.h"
+#include "ns3/ipv6-extension.h"
 #include "ns3/ipv6-raw-socket-factory.h"
 #include "ns3/ipv6-route.h"
 #include "ns3/log.h"
@@ -156,6 +158,22 @@ void
 RplRoutingProtocol::DoInitialize()
 {
     NS_LOG_FUNCTION(this);
+
+    // Every node can end up relaying a source routed packet, not just the
+    // root that originates one, since RFC 6554 processing is triggered by the
+    // packet being addressed to whichever node currently holds it.
+    Ptr<Ipv6ExtensionRoutingDemux> routingExtensionDemux =
+        m_ipv6->GetObject<Ipv6ExtensionRoutingDemux>();
+    NS_ASSERT_MSG(routingExtensionDemux,
+                  "RPL requires Ipv6L3Protocol::RegisterExtensions() to have run, which "
+                  "InternetStackHelper does automatically");
+    if (!routingExtensionDemux->GetExtensionRouting(RplIpv6ExtensionSourceRouting::TYPE_ROUTING))
+    {
+        Ptr<RplIpv6ExtensionSourceRouting> sourceRoutingExtension =
+            CreateObject<RplIpv6ExtensionSourceRouting>();
+        sourceRoutingExtension->SetNode(m_ipv6->GetObject<Node>());
+        routingExtensionDemux->Insert(sourceRoutingExtension);
+    }
 
     // Interface 0 is the loopback; RPL never runs there.
     for (uint32_t i = 1; i < m_ipv6->GetNInterfaces(); i++)
@@ -709,6 +727,20 @@ RplRoutingProtocol::GlobalAddressOf(Ipv6Address linkLocal) const
     return Ipv6Address(global);
 }
 
+Ipv6Address
+RplRoutingProtocol::LinkLocalOf(Ipv6Address global) const
+{
+    static const uint8_t linkLocalPrefix[8] = {0xfe, 0x80, 0, 0, 0, 0, 0, 0};
+
+    uint8_t identifier[16];
+    global.GetBytes(identifier);
+
+    uint8_t linkLocal[16];
+    std::copy(linkLocalPrefix, linkLocalPrefix + 8, linkLocal);
+    std::copy(identifier + 8, identifier + 16, linkLocal + 8);
+    return Ipv6Address(linkLocal);
+}
+
 void
 RplRoutingProtocol::SendDao()
 {
@@ -901,10 +933,12 @@ RplRoutingProtocol::ComputeSourceRoute(Ipv6Address destination,
 
     Time now = Simulator::Now();
     Ipv6Address current = destination;
+    std::vector<Ipv6Address> globalChain; // destination first, root's direct child last
 
     // Walk up the parents until the root is reached, collecting the routers in
-    // between. The loop cannot run longer than the topology is wide, which is
-    // what keeps a cycle in the reported parents from hanging the simulation.
+    // between, destination included. The loop cannot run longer than the
+    // topology is wide, which is what keeps a cycle in the reported parents
+    // from hanging the simulation.
     for (size_t step = 0; step <= m_topology.size(); step++)
     {
         auto it = m_topology.find(current);
@@ -913,13 +947,17 @@ RplRoutingProtocol::ComputeSourceRoute(Ipv6Address destination,
             return false;
         }
 
+        globalChain.push_back(current);
         current = it->second.parent;
         if (current == m_dodagId)
         {
-            std::reverse(hops.begin(), hops.end());
+            std::reverse(globalChain.begin(), globalChain.end());
+            for (const auto& global : globalChain)
+            {
+                hops.push_back(LinkLocalOf(global));
+            }
             return true;
         }
-        hops.push_back(current);
     }
 
     NS_LOG_WARN("The reported parents of " << destination << " do not lead to the root");
@@ -1185,17 +1223,11 @@ RplRoutingProtocol::RouteOutput(Ptr<Packet> p,
         std::vector<Ipv6Address> hops;
         if (ComputeSourceRoute(dst, hops))
         {
-            if (!hops.empty())
-            {
-                RplSourceRouteTag tag;
-                tag.SetHops(hops);
-                tag.SetSegmentsLeft(static_cast<uint8_t>(hops.size()));
-                p->AddPacketTag(tag);
-            }
-            Ipv6Address nextHop = hops.empty() ? dst : hops.front();
-            NS_LOG_LOGIC("Source routing " << dst << " through " << hops.size()
-                                           << " router(s), first hop " << nextHop);
-            Ptr<Ipv6Route> route = RouteToNeighbour(nextHop, dst);
+            NS_ASSERT(!hops.empty());
+            NS_LOG_LOGIC("Source routing " << dst << " through " << (hops.size() - 1)
+                                           << " intermediate router(s), first hop "
+                                           << hops.front());
+            Ptr<Ipv6Route> route = RouteToNeighbour(hops.front(), dst);
             if (route)
             {
                 return route;
@@ -1213,6 +1245,46 @@ RplRoutingProtocol::RouteOutput(Ptr<Packet> p,
     NS_LOG_LOGIC("No route to " << dst);
     sockerr = Socket::ERROR_NOROUTETOHOST;
     return nullptr;
+}
+
+void
+RplRoutingProtocol::PrepareOutgoingPacket(Ptr<Packet> packet, Ipv6Header& header, Ptr<Ipv6Route> route)
+{
+    NS_LOG_FUNCTION(this << packet << header << route);
+
+    if (!m_isRoot)
+    {
+        // Only the root has the topology to compute a downward path; every
+        // other node's traffic goes up, which needs no Routing Header.
+        return;
+    }
+
+    Ipv6Address dst = header.GetDestination();
+    if (dst.IsMulticast() || dst.IsLinkLocal())
+    {
+        // RPL's own control traffic, and anything already scoped to one hop.
+        return;
+    }
+
+    std::vector<Ipv6Address> hops;
+    if (!ComputeSourceRoute(dst, hops) || hops.size() <= 1)
+    {
+        // No known path, or destination is a direct child of the root: either
+        // way there is nothing to put in a Routing Header.
+        return;
+    }
+
+    RplSourceRoutingHeader srh;
+    srh.SetNextHeader(header.GetNextHeader());
+    srh.SetSegmentsLeft(static_cast<uint8_t>(hops.size() - 1));
+    srh.SetAddresses(std::vector<Ipv6Address>(hops.begin() + 1, hops.end()));
+
+    packet->AddHeader(srh);
+    header.SetNextHeader(Ipv6Header::IPV6_EXT_ROUTING);
+    header.SetDestination(hops.front());
+
+    NS_LOG_LOGIC("Attached a Routing Header for " << dst << " with " << (hops.size() - 1)
+                                                   << " address(es), first hop " << hops.front());
 }
 
 bool
@@ -1244,55 +1316,13 @@ RplRoutingProtocol::RouteInput(Ptr<const Packet> p,
         return false;
     }
 
-    // A packet the root sent down carries the rest of its path with it, so
-    // this node does not have to know anything about where the destination is.
-    RplSourceRouteTag tag;
-    Ptr<Packet> packet = p->Copy();
-    if (packet->RemovePacketTag(tag))
-    {
-        const std::vector<Ipv6Address>& hops = tag.GetHops();
-        uint8_t segmentsLeft = tag.GetSegmentsLeft();
-
-        if (segmentsLeft == 0 || segmentsLeft > hops.size())
-        {
-            NS_LOG_WARN("Dropping a source routed packet for " << dst << ": " << +segmentsLeft
-                                                               << " segments left of " << hops.size());
-            ecb(p, header, Socket::ERROR_NOROUTETOHOST);
-            return false;
-        }
-
-        // This node is the hop the previous one aimed at, so it is now done.
-        segmentsLeft--;
-
-        Ipv6Address nextHop;
-        if (segmentsLeft > 0)
-        {
-            nextHop = hops[hops.size() - segmentsLeft];
-            tag.SetSegmentsLeft(segmentsLeft);
-            packet->AddPacketTag(tag);
-        }
-        else
-        {
-            // Last router before the destination. The tag is left off, since
-            // Ipv6L3Protocol delivers a packet addressed to a node without
-            // ever asking the routing protocol, so the destination would have
-            // no chance to strip it.
-            nextHop = dst;
-        }
-
-        Ptr<Ipv6Route> sourceRoute = RouteToNeighbour(nextHop, dst);
-        if (!sourceRoute)
-        {
-            NS_LOG_WARN("Dropping a source routed packet: " << nextHop << " is on no interface");
-            ecb(p, header, Socket::ERROR_NOROUTETOHOST);
-            return false;
-        }
-
-        NS_LOG_LOGIC("Source routing " << dst << " onwards to " << nextHop);
-        ucb(sourceRoute->GetOutputDevice(), sourceRoute, packet, header);
-        return true;
-    }
-
+    // A source routed downward packet is never seen here: RFC 6554 processing
+    // (RplIpv6ExtensionSourceRouting) is driven by the packet being addressed
+    // to whichever node currently holds it, so it is handled as a local
+    // receive, one hop at a time, and re-injected through RouteOutput()
+    // rather than ever reaching RouteInput(). What is left to forward here is
+    // upward traffic, which always goes to the preferred parent regardless of
+    // its destination.
     Ptr<Ipv6Route> route = RouteViaPreferredParent(dst);
     if (route)
     {

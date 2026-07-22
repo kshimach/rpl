@@ -1,0 +1,184 @@
+/*
+ * Copyright (c) 2026 ns-3 RPL module contributors
+ *
+ * SPDX-License-Identifier: GPL-2.0-only
+ */
+
+#include "rpl-source-routing-extension.h"
+
+#include "rpl-header.h"
+
+#include "ns3/icmpv6-header.h"
+#include "ns3/icmpv6-l4-protocol.h"
+#include "ns3/ipv6-l3-protocol.h"
+#include "ns3/ipv6-route.h"
+#include "ns3/ipv6-routing-protocol.h"
+#include "ns3/log.h"
+#include "ns3/node.h"
+
+namespace ns3
+{
+
+NS_LOG_COMPONENT_DEFINE("RplIpv6ExtensionSourceRouting");
+
+namespace rpl
+{
+
+NS_OBJECT_ENSURE_REGISTERED(RplIpv6ExtensionSourceRouting);
+
+TypeId
+RplIpv6ExtensionSourceRouting::GetTypeId()
+{
+    static TypeId tid = TypeId("ns3::rpl::RplIpv6ExtensionSourceRouting")
+                            .SetParent<Ipv6ExtensionRouting>()
+                            .SetGroupName("Rpl")
+                            .AddConstructor<RplIpv6ExtensionSourceRouting>();
+    return tid;
+}
+
+RplIpv6ExtensionSourceRouting::RplIpv6ExtensionSourceRouting()
+{
+}
+
+RplIpv6ExtensionSourceRouting::~RplIpv6ExtensionSourceRouting()
+{
+}
+
+uint8_t
+RplIpv6ExtensionSourceRouting::GetTypeRouting() const
+{
+    return TYPE_ROUTING;
+}
+
+Ipv6ExtensionRoutingHeader*
+RplIpv6ExtensionSourceRouting::GetExtensionRoutingHeaderPtr()
+{
+    return new RplSourceRoutingHeader();
+}
+
+uint8_t
+RplIpv6ExtensionSourceRouting::Process(Ptr<Packet>& packet,
+                                       uint8_t offset,
+                                       const Ipv6Header& ipv6Header,
+                                       Ipv6Address dst,
+                                       uint8_t* nextHeader,
+                                       bool& stopProcessing,
+                                       bool& isDropped,
+                                       Ipv6L3Protocol::DropReason& dropReason)
+{
+    NS_LOG_FUNCTION(this << packet << offset << ipv6Header << dst << nextHeader << isDropped);
+
+    // For ICMPv6 Error packets.
+    Ptr<Packet> malformedPacket = packet->Copy();
+    malformedPacket->AddHeader(ipv6Header);
+
+    Ptr<Packet> p = packet->Copy();
+    p->RemoveAtStart(offset);
+
+    // Copy IPv6 Header: ipv6Header -> ipv6header, so it can be mutated below.
+    Buffer tmp;
+    tmp.AddAtStart(ipv6Header.GetSerializedSize());
+    Buffer::Iterator it = tmp.Begin();
+    Ipv6Header ipv6header;
+    ipv6Header.Serialize(it);
+    ipv6header.Deserialize(it);
+
+    RplSourceRoutingHeader routingHeader;
+    p->RemoveHeader(routingHeader);
+
+    if (nextHeader)
+    {
+        *nextHeader = routingHeader.GetNextHeader();
+    }
+
+    Ptr<Icmpv6L4Protocol> icmpv6 = GetNode()->GetObject<Ipv6L3Protocol>()->GetIcmpv6();
+
+    Ipv6Address srcAddress = ipv6header.GetSource();
+    Ipv6Address destAddress = ipv6header.GetDestination();
+    uint8_t hopLimit = ipv6header.GetHopLimit();
+    uint8_t segmentsLeft = routingHeader.GetSegmentsLeft();
+    uint8_t nbAddress = static_cast<uint8_t>(routingHeader.GetAddresses().size());
+
+    if (segmentsLeft == 0)
+    {
+        // This node is the packet's real final destination: nothing more to
+        // do, let the rest of the extension chain, or the upper layer, run.
+        isDropped = false;
+        return routingHeader.GetSerializedSize();
+    }
+
+    if (segmentsLeft > nbAddress)
+    {
+        NS_LOG_LOGIC("Malformed header. Drop!");
+        icmpv6->SendErrorParameterError(malformedPacket,
+                                        srcAddress,
+                                        Icmpv6Header::ICMPV6_MALFORMED_HEADER,
+                                        offset + 3);
+        dropReason = Ipv6L3Protocol::DROP_MALFORMED_HEADER;
+        isDropped = true;
+        stopProcessing = true;
+        return routingHeader.GetSerializedSize();
+    }
+
+    uint8_t nextAddressIndex = nbAddress - segmentsLeft;
+    Ipv6Address nextAddress = routingHeader.GetAddress(nextAddressIndex);
+
+    if (nextAddress.IsMulticast() || destAddress.IsMulticast())
+    {
+        // RFC 6554 section 4.1: neither the destination nor a listed address
+        // may be multicast.
+        dropReason = Ipv6L3Protocol::DROP_MALFORMED_HEADER;
+        isDropped = true;
+        stopProcessing = true;
+        return routingHeader.GetSerializedSize();
+    }
+
+    if (hopLimit <= 1)
+    {
+        NS_LOG_LOGIC("Time Exceeded: Hop Limit <= 1. Drop!");
+        icmpv6->SendErrorTimeExceeded(malformedPacket, srcAddress, Icmpv6Header::ICMPV6_HOPLIMIT);
+        dropReason = Ipv6L3Protocol::DROP_MALFORMED_HEADER;
+        isDropped = true;
+        stopProcessing = true;
+        return routingHeader.GetSerializedSize();
+    }
+
+    // RFC 6554 section 4.1: this node was addressed under destAddress, so
+    // that is what the current slot is for from now on; the packet moves on
+    // addressed to whatever was listed there.
+    routingHeader.SetSegmentsLeft(segmentsLeft - 1);
+    routingHeader.SetAddress(nextAddressIndex, destAddress);
+    ipv6header.SetDestination(nextAddress);
+    ipv6header.SetHopLimit(hopLimit - 1);
+    p->AddHeader(routingHeader);
+
+    // Short-circuit: the packet was addressed to us, so it is re-sent to the
+    // new destination rather than handed further up the receive path.
+    Ptr<Ipv6L3Protocol> ipv6 = GetNode()->GetObject<Ipv6L3Protocol>();
+    Ptr<Ipv6RoutingProtocol> ipv6rp = ipv6->GetRoutingProtocol();
+    Socket::SocketErrno err;
+    NS_ASSERT(ipv6rp);
+
+    Ptr<Ipv6Route> rtentry = ipv6rp->RouteOutput(p, ipv6header, nullptr, err);
+    if (rtentry)
+    {
+        ipv6->SendRealOut(rtentry, p, ipv6header);
+    }
+    else
+    {
+        NS_LOG_INFO("No route for the next router of the source route");
+    }
+
+    // The packet was fully handled by the resend above: stopProcessing must
+    // be set, not just isDropped, or Ipv6L3Protocol::LocalDeliver()'s caller
+    // loop, which only inspects stopProcessing, keeps walking the untouched
+    // copy of the packet it holds and ends up delivering the inner payload to
+    // this node's own upper layers too, as if this node, and not the one
+    // named in the Routing Header, were the real destination.
+    isDropped = true;
+    stopProcessing = true;
+    return routingHeader.GetSerializedSize();
+}
+
+} // namespace rpl
+} // namespace ns3
