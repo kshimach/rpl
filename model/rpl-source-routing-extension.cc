@@ -72,6 +72,16 @@ RplIpv6ExtensionSourceRouting::Process(Ptr<Packet>& packet,
     Ptr<Packet> malformedPacket = packet->Copy();
     malformedPacket->AddHeader(ipv6Header);
 
+    // Whatever precedes the Routing Header, e.g. an RPL Option in a
+    // Hop-by-Hop header, is not this function's to touch, but it does have
+    // to survive onto the packet this hop resends: RFC 6553's Hop-by-Hop
+    // option is meant to be examined and updated at every hop of the path,
+    // not just the first, and it already was, by its own Process(), earlier
+    // in this same dispatch chain. header's next header field still says so
+    // regardless of what happens below, so silently dropping it here would
+    // leave that claim false on the wire.
+    Ptr<Packet> prefix = packet->CreateFragment(0, offset);
+
     Ptr<Packet> p = packet->Copy();
     p->RemoveAtStart(offset);
 
@@ -151,6 +161,7 @@ RplIpv6ExtensionSourceRouting::Process(Ptr<Packet>& packet,
     ipv6header.SetDestination(nextAddress);
     ipv6header.SetHopLimit(hopLimit - 1);
     p->AddHeader(routingHeader);
+    prefix->AddAtEnd(p);
 
     // Short-circuit: the packet was addressed to us, so it is re-sent to the
     // new destination rather than handed further up the receive path.
@@ -159,10 +170,10 @@ RplIpv6ExtensionSourceRouting::Process(Ptr<Packet>& packet,
     Socket::SocketErrno err;
     NS_ASSERT(ipv6rp);
 
-    Ptr<Ipv6Route> rtentry = ipv6rp->RouteOutput(p, ipv6header, nullptr, err);
+    Ptr<Ipv6Route> rtentry = ipv6rp->RouteOutput(prefix, ipv6header, nullptr, err);
     if (rtentry)
     {
-        ipv6->SendRealOut(rtentry, p, ipv6header);
+        ipv6->SendRealOut(rtentry, prefix, ipv6header);
     }
     else
     {

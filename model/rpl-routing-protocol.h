@@ -142,6 +142,17 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     Ipv6Address GetPreferredParent() const;
 
     /**
+     * @brief Act on a rank inconsistency reported by the RPL Option (RFC 6553,
+     *        RFC 6550 section 11.2), the way a multicast DIS does: reset the
+     *        Trickle timer so an up to date DIO goes out sooner than it
+     *        otherwise would, in case this node's own view of the DODAG is
+     *        what is stale.
+     *
+     * Called by RplIpv6OptionRpl, not by anything in this class.
+     */
+    void NotifyRankInconsistency();
+
+    /**
      * @brief Get how many nodes the root has heard a DAO from.
      *
      * Only meaningful on the root, which is the only node that keeps the

@@ -12,12 +12,14 @@
 #include "ns3/ipv6-address-helper.h"
 #include "ns3/ipv6-extension.h"
 #include "ns3/ipv6-l3-protocol.h"
+#include "ns3/ipv6-option-demux.h"
 #include "ns3/ipv6-raw-socket-factory.h"
 #include "ns3/ipv6-route.h"
 #include "ns3/node-container.h"
 #include "ns3/packet.h"
 #include "ns3/rpl-header.h"
 #include "ns3/rpl-helper.h"
+#include "ns3/rpl-packet-info-option.h"
 #include "ns3/rpl-routing-protocol.h"
 #include "ns3/rpl-source-routing-extension.h"
 #include "ns3/rpl-trickle-timer.h"
@@ -643,7 +645,8 @@ RplDodagFormationTestCase::DoRun()
     // A packet the root sends to node 2 leaves towards node 1, and
     // PrepareOutgoingPacket() -- called by Ipv6L3Protocol::Send() right
     // before a packet reaches the wire -- attaches the real Routing Header
-    // that gets it the rest of the way.
+    // that gets it the rest of the way, behind an RPL Option (RFC 6553) that
+    // every packet gets regardless of whether it needs a Routing Header too.
     Ptr<Packet> downward = Create<Packet>();
     header.SetDestination(leafAddress);
     header.SetNextHeader(17); // UDP, as an example inner protocol
@@ -658,8 +661,19 @@ RplDodagFormationTestCase::DoRun()
                           middleLinkLocal,
                           "The wire header was not redirected to the first hop");
     NS_TEST_ASSERT_MSG_EQ(header.GetNextHeader(),
-                          Ipv6Header::IPV6_EXT_ROUTING,
-                          "The next header was not set to Routing");
+                          Ipv6Header::IPV6_EXT_HOP_BY_HOP,
+                          "The next header was not set to Hop-by-Hop");
+
+    // The RPL Option: Next Header, Hdr Ext Len, then the option itself
+    // (Type, Length, Flags, RPLInstanceID, SenderRank), 8 bytes total, no
+    // padding needed.
+    uint8_t hbh[8];
+    downward->CopyData(hbh, sizeof(hbh));
+    NS_TEST_ASSERT_MSG_EQ(+hbh[0], Ipv6Header::IPV6_EXT_ROUTING, "Hop-by-Hop does not lead to Routing");
+    NS_TEST_ASSERT_MSG_EQ(+hbh[2], RPL_HBH_OPTION_TYPE, "Wrong option type");
+    NS_TEST_ASSERT_MSG_EQ(+hbh[4] & RPL_HDR_OPT_DOWN, RPL_HDR_OPT_DOWN, "The 'O' flag was not set");
+    NS_TEST_ASSERT_MSG_EQ((hbh[6] << 8) | hbh[7], root->GetRank(), "Wrong SenderRank");
+    downward->RemoveAtStart(sizeof(hbh));
 
     RplSourceRoutingHeader srh;
     NS_TEST_ASSERT_MSG_EQ(downward->RemoveHeader(srh), 8 + 16, "Unexpected Routing Header size");
@@ -668,17 +682,24 @@ RplDodagFormationTestCase::DoRun()
     NS_TEST_ASSERT_MSG_EQ(srh.GetAddresses().size(), 1, "Wrong number of addresses");
     NS_TEST_ASSERT_MSG_EQ(srh.GetAddress(0), leafLinkLocal, "Wrong final address");
 
-    // Node 1 is one hop away, so its packet gets no Routing Header at all,
-    // and the wire destination stays node 1's own address.
+    // Node 1 is one hop away, so its packet gets no Routing Header, only the
+    // RPL Option, and the wire destination stays node 1's own address.
     Ptr<Packet> direct = Create<Packet>();
     header.SetDestination(middleAddress);
+    header.SetNextHeader(17);
     route = root->RouteOutput(direct, header, nullptr, sockerr);
     NS_TEST_ASSERT_MSG_EQ(route != nullptr, true, "The root has no route down to node 1");
     root->PrepareOutgoingPacket(direct, header, route);
-    NS_TEST_ASSERT_MSG_EQ(direct->GetSize(), 0, "A direct child's packet was given a Routing Header");
+    NS_TEST_ASSERT_MSG_EQ(direct->GetSize(), 8, "Wrong size for an RPL Option with no Routing Header");
+    NS_TEST_ASSERT_MSG_EQ(header.GetNextHeader(),
+                          Ipv6Header::IPV6_EXT_HOP_BY_HOP,
+                          "The next header was not set to Hop-by-Hop");
     NS_TEST_ASSERT_MSG_EQ(header.GetDestination(),
                           middleAddress,
                           "A direct child's packet had its destination rewritten");
+
+    direct->CopyData(hbh, sizeof(hbh));
+    NS_TEST_ASSERT_MSG_EQ(+hbh[0], 17, "Hop-by-Hop does not lead to the inner protocol");
 
     Simulator::Destroy();
 }
@@ -1157,6 +1178,221 @@ RplDaoAckRetryTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief Check that the RPL Option (RPI, RFC 6553) survives a serialize and
+ *        deserialize round trip, flags included.
+ */
+class RplPacketInfoHeaderTestCase : public TestCase
+{
+  public:
+    RplPacketInfoHeaderTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplPacketInfoHeaderTestCase::RplPacketInfoHeaderTestCase()
+    : TestCase("RPL Option (RPI) header serialization")
+{
+}
+
+void
+RplPacketInfoHeaderTestCase::DoRun()
+{
+    RplPacketInfoHeader rpi;
+    rpi.SetDown(true);
+    rpi.SetInstanceId(7);
+    rpi.SetSenderRank(384);
+
+    NS_TEST_ASSERT_MSG_EQ(rpi.GetSerializedSize(), 6, "The RPI option is 6 bytes");
+
+    Ptr<Packet> packet = Create<Packet>();
+    packet->AddHeader(rpi);
+    NS_TEST_ASSERT_MSG_EQ(packet->GetSize(), 6, "Unexpected packet size");
+
+    RplPacketInfoHeader received;
+    NS_TEST_ASSERT_MSG_EQ(packet->RemoveHeader(received), 6, "Unexpected deserialized size");
+    NS_TEST_ASSERT_MSG_EQ(received.GetDown(), true, "The 'O' flag did not survive");
+    NS_TEST_ASSERT_MSG_EQ(received.GetRankError(), false, "The 'R' flag leaked");
+    NS_TEST_ASSERT_MSG_EQ(received.GetForwardingError(), false, "The 'F' flag leaked");
+    NS_TEST_ASSERT_MSG_EQ(received.GetInstanceId(), 7, "Wrong RPLInstanceID");
+    NS_TEST_ASSERT_MSG_EQ(received.GetSenderRank(), 384, "Wrong SenderRank");
+    NS_TEST_ASSERT_MSG_EQ(packet->GetSize(), 0, "The header did not consume the whole packet");
+
+    // All three flags share one byte: check none of them clobbers another.
+    RplPacketInfoHeader allFlags;
+    allFlags.SetDown(true);
+    allFlags.SetRankError(true);
+    allFlags.SetForwardingError(true);
+    packet = Create<Packet>();
+    packet->AddHeader(allFlags);
+    packet->RemoveHeader(received);
+    NS_TEST_ASSERT_MSG_EQ(received.GetDown(), true, "The 'O' flag was lost among the others");
+    NS_TEST_ASSERT_MSG_EQ(received.GetRankError(), true, "The 'R' flag was lost among the others");
+    NS_TEST_ASSERT_MSG_EQ(received.GetForwardingError(),
+                          true,
+                          "The 'F' flag was lost among the others");
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief Check RplIpv6OptionRpl::Process(): the rank consistency check in
+ *        both directions, the once-then-confirmed inconsistency sequence of
+ *        RFC 6550 section 11.2, and that processing the same packet twice
+ *        only acts on it once.
+ */
+class RplPacketInfoProcessTestCase : public TestCase
+{
+  public:
+    RplPacketInfoProcessTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplPacketInfoProcessTestCase::RplPacketInfoProcessTestCase()
+    : TestCase("RPL Option processing: rank consistency and idempotency")
+{
+}
+
+void
+RplPacketInfoProcessTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(1);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.SetBase(Ipv6Address("2001:1::"), Ipv6Prefix(64));
+    ipv6.Assign(devices);
+
+    rplHelper.SetRoot(nodes.Get(0));
+
+    // Only needs DoInitialize() to have run, which is what registers
+    // RplIpv6OptionRpl and puts the root at a fixed, known rank.
+    Simulator::Stop(Seconds(0));
+    Simulator::Run();
+
+    Ptr<Node> node = nodes.Get(0);
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+    uint16_t ownRank = rpl->GetRank();
+    NS_TEST_ASSERT_MSG_EQ(ownRank, RPL_MIN_HOPRANKINC, "The root is not at a fixed, known rank");
+
+    Ptr<Ipv6OptionDemux> demux = node->GetObject<Ipv6OptionDemux>();
+    Ptr<Ipv6Option> option = demux->GetOption(RPL_HBH_OPTION_TYPE);
+    NS_TEST_ASSERT_MSG_EQ(option != nullptr, true, "RplIpv6OptionRpl was not registered");
+
+    Ipv6Header ipv6Header;
+    ipv6Header.SetSource(Ipv6Address("fe80::9"));
+    ipv6Header.SetDestination(Ipv6Address("2001:1::ff:fe00:1"));
+    ipv6Header.SetHopLimit(64);
+
+    // A consistent upward packet: the sender is further from the root (a
+    // higher rank) than this node, so this checks out; SenderRank is
+    // rewritten to this node's own rank for the next hop to check against.
+    {
+        RplPacketInfoHeader rpi;
+        rpi.SetDown(false);
+        rpi.SetSenderRank(ownRank + RPL_MIN_HOPRANKINC);
+
+        Ptr<Packet> packet = Create<Packet>();
+        packet->AddHeader(rpi);
+
+        bool isDropped = false;
+        uint8_t processed = option->Process(packet, 0, ipv6Header, isDropped);
+        NS_TEST_ASSERT_MSG_EQ(isDropped, false, "A consistent packet was dropped");
+        NS_TEST_ASSERT_MSG_EQ(processed, 6, "Wrong number of bytes reported consumed");
+
+        RplPacketInfoHeader received;
+        packet->RemoveHeader(received);
+        NS_TEST_ASSERT_MSG_EQ(received.GetRankError(),
+                              false,
+                              "The 'R' flag was set for a consistent packet");
+        NS_TEST_ASSERT_MSG_EQ(received.GetSenderRank(),
+                              ownRank,
+                              "SenderRank was not rewritten to this node's own rank");
+    }
+
+    // An inconsistent upward packet: the sender claims to be no further from
+    // the root than this node, which moving up should never see. Flagged
+    // once, not (yet) treated as a confirmed loop.
+    {
+        RplPacketInfoHeader rpi;
+        rpi.SetDown(false);
+        rpi.SetSenderRank(ownRank);
+
+        Ptr<Packet> packet = Create<Packet>();
+        packet->AddHeader(rpi);
+
+        bool isDropped = false;
+        option->Process(packet, 0, ipv6Header, isDropped);
+        NS_TEST_ASSERT_MSG_EQ(isDropped,
+                              false,
+                              "The first inconsistency was already treated as confirmed");
+
+        RplPacketInfoHeader received;
+        packet->RemoveHeader(received);
+        NS_TEST_ASSERT_MSG_EQ(received.GetRankError(),
+                              true,
+                              "The 'R' flag was not set on the first inconsistency");
+    }
+
+    // A second inconsistency right after the first is RFC 6550 section
+    // 11.2's confirmed loop: traced as dropped, even though
+    // Ipv6Option::Process() has no way to actually stop the packet here (see
+    // design-constraints.md).
+    {
+        RplPacketInfoHeader rpi;
+        rpi.SetDown(false);
+        rpi.SetSenderRank(ownRank);
+
+        Ptr<Packet> packet = Create<Packet>();
+        packet->AddHeader(rpi);
+
+        bool isDropped = false;
+        option->Process(packet, 0, ipv6Header, isDropped);
+        NS_TEST_ASSERT_MSG_EQ(isDropped, true, "A confirmed inconsistency was not traced as dropped");
+    }
+
+    // Ipv6L3Protocol::Receive() walks the Hop-by-Hop chain twice for a
+    // locally-destined packet; the second call must be a no-op rather than
+    // re-checking the SenderRank this same call already rewrote to this
+    // node's own.
+    {
+        RplPacketInfoHeader rpi;
+        rpi.SetDown(false);
+        rpi.SetSenderRank(ownRank + RPL_MIN_HOPRANKINC);
+
+        Ptr<Packet> packet = Create<Packet>();
+        packet->AddHeader(rpi);
+
+        bool isDropped = false;
+        option->Process(packet, 0, ipv6Header, isDropped);
+        NS_TEST_ASSERT_MSG_EQ(isDropped, false, "The first call of the pair was dropped");
+
+        uint8_t processedAgain = option->Process(packet, 0, ipv6Header, isDropped);
+        NS_TEST_ASSERT_MSG_EQ(isDropped, false, "The second call of the pair acted on the packet");
+        NS_TEST_ASSERT_MSG_EQ(processedAgain,
+                              6,
+                              "Wrong number of bytes reported consumed on the repeat call");
+    }
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief The RPL test suite.
  */
 class RplTestSuite : public TestSuite
@@ -1178,6 +1414,8 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplDodagFormationTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplNoPathDaoTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDaoAckRetryTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplPacketInfoHeaderTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplPacketInfoProcessTestCase, TestCase::Duration::QUICK);
 }
 
 /// Static variable for test initialization.

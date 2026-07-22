@@ -10,12 +10,15 @@
 #include "rpl-routing-protocol.h"
 
 #include "rpl-header.h"
+#include "rpl-packet-info-option.h"
 #include "rpl-source-routing-extension.h"
 
 #include "ns3/icmpv6-header.h"
 #include "ns3/icmpv6-l4-protocol.h"
 #include "ns3/inet6-socket-address.h"
 #include "ns3/ipv6-extension.h"
+#include "ns3/ipv6-option-demux.h"
+#include "ns3/ipv6-option.h"
 #include "ns3/ipv6-raw-socket-factory.h"
 #include "ns3/ipv6-route.h"
 #include "ns3/log.h"
@@ -173,6 +176,21 @@ RplRoutingProtocol::DoInitialize()
             CreateObject<RplIpv6ExtensionSourceRouting>();
         sourceRoutingExtension->SetNode(m_ipv6->GetObject<Node>());
         routingExtensionDemux->Insert(sourceRoutingExtension);
+    }
+
+    // Likewise, every node needs to check and update the RPL Option (RFC
+    // 6553) of every data packet it is on the path of, not just the ones it
+    // originates or is the final destination of: an option carried in a
+    // Hop-by-Hop header, unlike a Routing Header, is examined at every hop.
+    Ptr<Ipv6OptionDemux> optionDemux = m_ipv6->GetObject<Ipv6OptionDemux>();
+    NS_ASSERT_MSG(optionDemux,
+                  "RPL requires Ipv6L3Protocol::RegisterOptions() to have run, which "
+                  "InternetStackHelper does automatically");
+    if (!optionDemux->GetOption(RPL_HBH_OPTION_TYPE))
+    {
+        Ptr<RplIpv6OptionRpl> packetInfoOption = CreateObject<RplIpv6OptionRpl>();
+        packetInfoOption->SetNode(m_ipv6->GetObject<Node>());
+        optionDemux->Insert(packetInfoOption);
     }
 
     // Interface 0 is the loopback; RPL never runs there.
@@ -1258,39 +1276,60 @@ RplRoutingProtocol::PrepareOutgoingPacket(Ptr<Packet> packet, Ipv6Header& header
 {
     NS_LOG_FUNCTION(this << packet << header << route);
 
-    if (!m_isRoot)
-    {
-        // Only the root has the topology to compute a downward path; every
-        // other node's traffic goes up, which needs no Routing Header.
-        return;
-    }
-
     Ipv6Address dst = header.GetDestination();
     if (dst.IsMulticast() || dst.IsLinkLocal())
     {
-        // RPL's own control traffic, and anything already scoped to one hop.
+        // RPL's own control traffic, and anything already scoped to one hop:
+        // never crosses more than one radio hop, so neither the Routing
+        // Header nor the RPL Option would have anything to say.
         return;
     }
 
-    std::vector<Ipv6Address> hops;
-    if (!ComputeSourceRoute(dst, hops) || hops.size() <= 1)
+    uint8_t innerNextHeader = header.GetNextHeader();
+    bool hasRoutingHeader = false;
+
+    // The Routing Header (RFC 6554), root only: only the root has the
+    // topology to compute a downward path at all; every other node's
+    // traffic goes up, which needs no Routing Header.
+    if (m_isRoot)
     {
-        // No known path, or destination is a direct child of the root: either
-        // way there is nothing to put in a Routing Header.
-        return;
+        std::vector<Ipv6Address> hops;
+        if (ComputeSourceRoute(dst, hops) && hops.size() > 1)
+        {
+            RplSourceRoutingHeader srh;
+            srh.SetNextHeader(innerNextHeader);
+            srh.SetSegmentsLeft(static_cast<uint8_t>(hops.size() - 1));
+            srh.SetAddresses(std::vector<Ipv6Address>(hops.begin() + 1, hops.end()));
+
+            packet->AddHeader(srh);
+            header.SetDestination(hops.front());
+            innerNextHeader = Ipv6Header::IPV6_EXT_ROUTING;
+            hasRoutingHeader = true;
+
+            NS_LOG_LOGIC("Attached a Routing Header for "
+                        << dst << " with " << (hops.size() - 1) << " address(es), first hop "
+                        << hops.front());
+        }
     }
 
-    RplSourceRoutingHeader srh;
-    srh.SetNextHeader(header.GetNextHeader());
-    srh.SetSegmentsLeft(static_cast<uint8_t>(hops.size() - 1));
-    srh.SetAddresses(std::vector<Ipv6Address>(hops.begin() + 1, hops.end()));
+    // The RPL Option (RFC 6553), on every node's own traffic: the root's is
+    // always heading down, since the root never originates traffic of its
+    // own going up, and everyone else's is always heading up, since a
+    // non-storing mode node other than the root never originates downward
+    // traffic itself, only relays what the root already source routed.
+    RplPacketInfoHeader rpi;
+    rpi.SetDown(m_isRoot);
+    rpi.SetInstanceId(m_instanceId);
+    rpi.SetSenderRank(m_rank);
 
-    packet->AddHeader(srh);
-    header.SetNextHeader(Ipv6Header::IPV6_EXT_ROUTING);
-    header.SetDestination(hops.front());
+    Ipv6ExtensionHopByHopHeader hbh;
+    hbh.AddOption(rpi);
+    hbh.SetNextHeader(innerNextHeader);
+    packet->AddHeader(hbh);
+    header.SetNextHeader(Ipv6Header::IPV6_EXT_HOP_BY_HOP);
 
-    NS_LOG_LOGIC("Attached a Routing Header for " << dst << " with " << (hops.size() - 1)
-                                                   << " address(es), first hop " << hops.front());
+    NS_LOG_LOGIC("Attached an RPL Option to a packet for "
+                << dst << (hasRoutingHeader ? ", behind the Routing Header" : ""));
 }
 
 bool
@@ -1433,6 +1472,13 @@ Ipv6Address
 RplRoutingProtocol::GetPreferredParent() const
 {
     return m_preferredParent;
+}
+
+void
+RplRoutingProtocol::NotifyRankInconsistency()
+{
+    NS_LOG_FUNCTION(this);
+    m_dioTrickle.Reset();
 }
 
 void

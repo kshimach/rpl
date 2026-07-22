@@ -180,17 +180,20 @@
   (`contrib/rpl/doc/rpl.rst`、`utils/create-module.py` の標準構成に
   準拠。本体 doc ビルドへの登録は行っていない — contrib モジュールで
   upstream 予定もないため)。
-- **既知の非対応事項**: RFC 6553 (Hop-by-Hop header 内 RPL Option) は
-  未実装。storing mode (MOP=2) は方針により対象外。RH3 アドレス圧縮
+- **既知の非対応事項**: RFC 6553 (RPL Option, RPI) は 12 節の通り実装済み。
+  storing mode (MOP=2) は方針により対象外。RH3 アドレス圧縮
   (CmprI/CmprE) 未実装、6LoWPAN NHC 圧縮も Routing Header では効かない
-  (11 節)。
+  (11 節)。RPI の確認済みループ (RFC 6550 section 11.2 の「2 回連続で
+  不整合」) は実際にはパケットを止められない、既知の制約あり (12.2 節)。
 
-## 11. ns-3 コアで見つかった既存バグ 2 件 (SRH 実装作業中に発覚)
+## 11. ns-3 コアで見つかった既存バグ、および本実装側のバグ
 
-正確な RH3 実装に切り替えた際、これまで一度も実運用パスを通っていなかった
-ns-3 コアの Routing Header 関連コードで、独立した既存バグを 2 件発見・修正した。
-どちらも RPL 固有ではなく、RFC 2460 RH0 (`Ipv6ExtensionLooseRouting`) を
-6LoWPAN 経由で使うだけでも再現する。
+正確な RH3 実装、および後述の RFC 6553 (RPI) 実装に切り替えた際、これまで
+一度も実運用パスを通っていなかった ns-3 コアの IPv6 拡張ヘッダー/オプション
+関連コードで、独立した既存バグを計 3 件発見・修正した (11.1〜11.3)。
+このうち 2 件 (11.1, 11.2) は RPL 固有ではなく、RFC 2460 RH0
+(`Ipv6ExtensionLooseRouting`) を 6LoWPAN 経由や、Hop-by-Hop header の後ろに
+置いて使うだけでも再現する。11.4 は本実装 (contrib/rpl) 側の実装ミス。
 
 ### 11.1 SixLowPan の NHC 圧縮が Routing Header のアドレスを握り潰す
 
@@ -247,3 +250,123 @@ ns-3 コアの Routing Header 関連コードで、独立した既存バグを 2
 - **修正**: 再送出後に `stopProcessing = true;` を明示的に設定
   (`rpl-source-routing-extension.cc`)。中継ノードが呼び出し元ループに
   「この受信処理は完了した、これ以上何もしなくてよい」と正しく伝える。
+
+### 11.3 `Ipv6ExtensionRouting::Process()` が offset 未対応のまま `packet` を直読み
+
+- **症状**: RPI (12 節) 追加後、Routing Header の直前に Hop-by-Hop header が
+  付くようになった途端 (offset が 0 から 8 に変化)、中継先で
+  `ICMPV6_UNKNOWN_OPTION` の Parameter Error が飛び、下り DAO-ACK やping応答が
+  一切届かなくなった。
+- **原因**: `Ipv6ExtensionRouting::Process()` (`src/internet/model/ipv6-extension.cc`)
+  は `Ptr<Packet> p = packet->Copy(); p->RemoveAtStart(offset);` で offset 分
+  読み飛ばした `p` を用意しておきながら、直後の
+  `uint8_t buf[4]; packet->CopyData(buf, sizeof(buf));` で **`p` でなく
+  `packet` を offset 0 から読んでいた**。`p` はこの関数内でこの1回しか
+  使われず、完全な dead code だった。offset が常に 0 だった (Routing Header
+  の前に何も無かった) これまでは症状が出ようがなく、埋もれていたバグ。
+  Routing Type バイトを誤読した結果、無関係な値 (このケースでは RPI 自身の
+  option type 0x63) を「未登録の Routing Type」と誤認し、
+  `Ipv6ExtensionRoutingDemux::GetExtensionRouting()` が nullptr を返す経路に
+  落ち、malformed 扱いで ICMP エラー送信・`stopProcessing=true` による
+  即時ドロップに至っていた。
+- **修正**: `packet->CopyData(buf, sizeof(buf));` を `p->CopyData(buf, sizeof(buf));`
+  に変更。1 行の修正。
+
+### 11.4 SRH 中継が Hop-by-Hop header を巻き込んで破棄していた (本実装側)
+
+- **症状**: 11.3 を修正した後もダウンストリームの DAO-ACK/ping 応答が
+  2 ホップ目から先に届かない。
+- **原因**: `RplIpv6ExtensionSourceRouting::Process()` は中継用パケットを
+  `p = packet->Copy(); p->RemoveAtStart(offset);` で組み立てる。RPI 追加前は
+  Routing Header が常に packet の先頭 (offset=0) だったため、この
+  「offset 分を読み飛ばす」操作は実質何も捨てていなかった。RPI 追加後は
+  offset=8 (Hop-by-Hop header 分) になり、この操作が **HBH+RPI をそのまま
+  捨てる** ことになっていた。次ホップへの再送出パケットに Hop-by-Hop
+  header が存在しないにもかかわらず、IPv6 header の Next Header
+  フィールドは (関数内でコピーしただけで書き換えていないため)
+  "Hop-by-Hop" を指したままだったので、次ホップは Routing Header の
+  先頭バイト列を Hop-by-Hop header として誤読した (11.3 の誤読とは別に、
+  今度は正しい offset 計算でも中身自体が入れ替わっているため発生)。
+  RFC 6553 は RPI がパス上の全ホップで検査・更新されることを前提とする
+  ため、これは単なる見落としでは済まず、中継のたびに RPI が消える
+  という実質的な仕様違反だった。
+- **修正**: `Process()` の冒頭で
+  `Ptr<Packet> prefix = packet->CreateFragment(0, offset);` により
+  offset より前のバイト列 (HBH+RPI、この関数に来る前に RPI 自身の
+  `Process()` で既に更新済み) を保存しておき、Routing Header の
+  読み替え処理が終わった後で `prefix->AddAtEnd(p);` により結合、
+  `RouteOutput()`/`SendRealOut()` には `p` でなく `prefix`
+  (＝ [HBH+RPI][更新済み Routing Header][payload]) を渡すよう変更。
+  offset=0 (RPI が無い場合) では `prefix` が空パケットになるだけなので、
+  既存の動作に影響しない。
+
+## 12. RFC 6553 (RPL Option, RPI) の実装
+
+Hop-by-Hop header に載る RPI (data-path validation、rank 不整合＝ループの
+早期検知) を実装した。SRH と違い、RPI は「パケットが今どのノード宛か」に
+関わらず経路上の全ホップで検査・更新される必要があり、SRH (11 節) とは
+別種の課題が出た。
+
+### 12.1 コア変更は 1 行のみ
+
+`ns3::Ipv6Option` (`src/internet/model/ipv6-option.h`) は RH0/RH3 のときの
+`Ipv6ExtensionRouting`/`Ipv6ExtensionRoutingDemux` と同じ「サブクラス化して
+demux に登録する」設計になっており、`Ipv6OptionDemux::Insert()` も public。
+ただし `ipv6-option-demux.h` 自体が (`ipv6-extension-demux.h` と違って)
+public header の一覧に入っておらず、contrib からは include できなかった。
+`src/internet/CMakeLists.txt` の `HEADER_FILES` に1行追加して解消。
+`friend` 宣言は不要だった (`Ipv6Option` に private メンバへのアクセスが
+要る API は無い)。
+
+### 12.2 Hop-by-Hop header の二重ディスパッチとその対処
+
+`Ipv6L3Protocol::Receive()` は Hop-by-Hop header を、宛先判定より前に
+自分で 1 回、その後、自分宛だった場合は `LocalDeliver()` の中でもう 1 回、
+計 2 回処理する (`Ipv6ExtensionHopByHop::Process()` はどちらも `packet`
+自体は書き換えず、ローカルコピー上でしかパースしないため、この二重呼び出し
+自体は既存の Pad1/PadN/Jumbogram/RouterAlert のような無内容なオプションでは
+無害だった、というのが埋もれていた理由と見ている)。RPI のように
+SenderRank を実際に書き換える option だと、2 回目の呼び出しが「自分が
+1 回目で書き換えた後の SenderRank」を見て再度整合性チェックしてしまう。
+
+`PacketTag` で「処理済み」を示す案は、中継が必要な場合にこの node が
+パケットを次ホップへ送り出すところまでで tag を消し切れる保証がなく
+(その後の伝送で tag が生き残るかは NetDevice/Channel 実装依存)、
+不採用。代わりに `Packet::GetUid()` を使った: `RplIpv6OptionRpl` が
+node ごとに最後に処理した Uid を覚えておき、同じ Uid が来たら 2 回目と
+みなして完全に素通りさせる。この state は「object ごと」(node ごとに
+1 個だけ登録される) であり、パケット側には何も残さないため、他ノードや
+後続パケットとの衝突を考える必要が無い。
+
+### 12.3 確認済みループは実際には止められない
+
+`Ipv6Extension::Process()` は `stopProcessing` という「これ以上何もするな」
+を呼び出し元に伝える出力引数を持つが、`Ipv6Option::Process()`
+(`virtual uint8_t Process(Ptr<Packet> packet, uint8_t offset, const
+Ipv6Header& ipv6Header, bool& isDropped)`) には無い。`isDropped` はあるが
+`Ipv6Extension::ProcessOptions()` はこれを一切 `stopProcessing` に変換
+しないため、`isDropped=true` はトレース (drop trace 発火) のみで、実際には
+パケントはそのまま配送・転送され続ける。
+
+RFC 6550 section 11.2 は「2 回連続で rank 不整合を検知したら確認済み
+ループとして扱う」としており、`RplIpv6OptionRpl::Process()` は R フラグの
+付与とトレースまでは行うが、上記の理由で実際にパケットを止めることは
+できない。対処として考えられるのは (a) `Ipv6Option::Process()` へ
+`stopProcessing` 相当を追加するコア変更、(b) この場でパケットの中身を
+壊して後続処理を意図的に失敗させる、の 2 つだが、(a) は
+`Ipv6OptionDemux` に登録された全 option 実装への破壊的変更になり
+影響範囲が読み切れず、(b) は 11.1 のバグと同種のクラッシュを自ら
+誘発しかねない。ループが実際に確認される (2 パケット連続で不整合)
+のはそもそも稀なケースであるため、今回は見送った。RFC 6550 が意図する
+「早期復旧」の実利 (R フラグ・Trickle リセットによる DIO 再送) は
+1 回目の不整合検知の時点で既に得られている。
+
+### 12.4 送信側: Hop-by-Hop header の組み立て
+
+`PrepareOutgoingPacket()` は、root かどうかで O フラグを決める
+(root は常に down=true、それ以外は常に down=false — non-storing mode の
+非 root ノードは自分から下り方向のトラフィックを発信することが無いため)。
+`Ipv6ExtensionHopByHopHeader`(コア既存クラス) の `AddOption()` に
+`RplPacketInfoHeader` を渡すだけで、8 バイト境界のパディング計算等は
+既存コードに任せられる。SRH と両方付く場合は HBH が外側 (RFC 8200 の
+推奨順序通り)。

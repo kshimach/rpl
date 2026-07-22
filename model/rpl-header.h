@@ -14,6 +14,7 @@
 #include "ns3/header.h"
 #include "ns3/ipv6-address.h"
 #include "ns3/ipv6-extension-header.h"
+#include "ns3/ipv6-option-header.h"
 
 #include <vector>
 
@@ -538,6 +539,105 @@ class RplSourceRoutingHeader : public Ipv6ExtensionRoutingHeader
 
   private:
     std::vector<Ipv6Address> m_addresses; //!< addresses of RFC 6554 section 3, in order
+};
+
+/**
+ * @ingroup rpl
+ *
+ * @brief The RPL Option (RPI), RFC 6553, carried in an IPv6 Hop-by-Hop header.
+ *
+ * Every data packet that travels along a DODAG carries one of these, giving
+ * each router on the path the rank and direction (the 'O' flag: up towards
+ * the root, or down away from it) the sender expected the packet to move in.
+ * A router that finds the direction and the relative rank of the sender
+ * inconsistent, e.g. a packet claiming to move up arriving from a sender of
+ * lower rank, has a loop, or a stale downward route, on its hands: RFC 6550
+ * section 11.2 has it flag the inconsistency once, with the 'R' flag, and
+ * treat a second one in a row as confirmed. @see RplIpv6OptionRpl for what
+ * this implementation can and cannot actually do about a confirmed one.
+ *
+ * The 'F' flag (Forwarding-Error, set by a storing-mode router unable to find
+ * a downward route to relay the packet through) is defined for completeness
+ * but never set by this implementation: non-storing mode's only forwarding
+ * decision for downward traffic is the one the Routing Header already makes.
+ */
+class RplPacketInfoHeader : public Ipv6OptionHeader
+{
+  public:
+    /**
+     * @brief Get the type ID.
+     * @return the object TypeId
+     */
+    static TypeId GetTypeId();
+
+    RplPacketInfoHeader();
+
+    TypeId GetInstanceTypeId() const override;
+    void Print(std::ostream& os) const override;
+    uint32_t GetSerializedSize() const override;
+    void Serialize(Buffer::Iterator start) const override;
+    uint32_t Deserialize(Buffer::Iterator start) override;
+
+    /**
+     * @brief Set the 'O' flag: true if the packet is moving down, away from
+     *        the root; false if it is moving up, towards it.
+     * @param down true for a downward packet
+     */
+    void SetDown(bool down);
+    /**
+     * @brief Get the 'O' flag.
+     * @return true if the packet is moving down
+     */
+    bool GetDown() const;
+
+    /**
+     * @brief Set the 'R' flag: a rank inconsistency was already flagged once.
+     * @param rankError true if a router already found the rank inconsistent
+     */
+    void SetRankError(bool rankError);
+    /**
+     * @brief Get the 'R' flag.
+     * @return true if a rank inconsistency was already flagged
+     */
+    bool GetRankError() const;
+
+    /**
+     * @brief Set the 'F' flag. Never set by this implementation; see class docs.
+     * @param forwardingError true if a router could not forward the packet
+     */
+    void SetForwardingError(bool forwardingError);
+    /**
+     * @brief Get the 'F' flag.
+     * @return true if a router could not forward the packet
+     */
+    bool GetForwardingError() const;
+
+    /**
+     * @brief Set the RPL instance this packet's DODAG belongs to.
+     * @param instanceId the RPLInstanceID
+     */
+    void SetInstanceId(uint8_t instanceId);
+    /**
+     * @brief Get the RPL instance this packet's DODAG belongs to.
+     * @return the RPLInstanceID
+     */
+    uint8_t GetInstanceId() const;
+
+    /**
+     * @brief Set the rank of the router that last touched this field.
+     * @param rank the sender's rank
+     */
+    void SetSenderRank(uint16_t rank);
+    /**
+     * @brief Get the rank of the router that last touched this field.
+     * @return the sender's rank
+     */
+    uint16_t GetSenderRank() const;
+
+  private:
+    uint8_t m_flags;      //!< O, R and F flags in the top three bits
+    uint8_t m_instanceId; //!< RPLInstanceID
+    uint16_t m_senderRank; //!< rank of the router that last touched this field
 };
 
 } // namespace rpl

@@ -10,11 +10,12 @@ This chapter describes ``contrib/rpl``, an implementation of RPL (RFC 6550),
 the IPv6 Routing Protocol for Low-Power and Lossy Networks, for ns-3. The
 implementation covers non-storing mode (MOP 1) only: DODAG formation from
 DIS/DIO exchanges paced by a Trickle timer (RFC 6206), rank computed by
-Objective Function Zero (RFC 6552), and downward routes built from the DAOs
-every node sends to the root, delivered with a real RFC 6554 Source Routing
-Header. The protocol is designed to run over 6LoWPAN in route-over mode,
-i.e. installed on the IPv6 interfaces that sit on ``SixLowPanNetDevice``,
-not directly on the link-layer device underneath.
+Objective Function Zero (RFC 6552), downward routes built from the DAOs
+every node sends to the root and delivered with a real RFC 6554 Source
+Routing Header, and per-hop rank consistency checking with a real RFC 6553
+RPL Option in a Hop-by-Hop header. The protocol is designed to run over
+6LoWPAN in route-over mode, i.e. installed on the IPv6 interfaces that sit
+on ``SixLowPanNetDevice``, not directly on the link-layer device underneath.
 
 The source code lives in ``contrib/rpl/``.
 
@@ -35,6 +36,12 @@ What the model does:
   3), inserted at the node that originates the packet and processed hop by
   hop by every router along the way, the same way ``Ipv6ExtensionLooseRouting``
   processes RFC 2460's Type 0 Routing Header elsewhere in |ns3|.
+* Attaches a real RFC 6553 RPL Option to the same Hop-by-Hop header on every
+  packet a node originates, carrying its own rank and the direction (up or
+  down) the packet is expected to move in; every router the packet crosses
+  checks the two against its own rank and updates the option for the next
+  hop, flagging, and after a second inconsistency in a row treating as
+  confirmed, a possible loop or stale route (RFC 6550 section 11.2).
 * Receives its ICMPv6 type 155 control messages through an ``Ipv6RawSocket``
   per interface, since |ns3|'s ``Icmpv6L4Protocol`` silently discards ICMPv6
   types it does not know about.
@@ -46,9 +53,10 @@ What it does not do:
   ``contrib/rpl/doc/design-constraints.md`` section 1.
 * RH3 address compression (CmprI/CmprE, RFC 6554 section 3) is not
   implemented; every address in a Routing Header is carried in full.
-* The RPL Option in a Hop-by-Hop header (RFC 6553), used for loop detection
-  in storing mode, is not implemented, consistent with not implementing
-  storing mode.
+* A confirmed rank inconsistency (RFC 6550 section 11.2) is flagged and
+  traced but not actually dropped: |ns3|'s ``Ipv6Option::Process()`` has no
+  way to stop a packet the way ``Ipv6Extension::Process()`` can. See
+  ``contrib/rpl/doc/design-constraints.md`` section 12.3.
 * No security modes (RFC 6550 section 10): every control message is sent
   unsecured.
 * No P2P-RPL (RFC 6997) and no support for multiple concurrent RPL
@@ -111,6 +119,20 @@ packet through ``RouteOutput()``, the same algorithm
 ``Ipv6ExtensionLooseRouting`` already runs for RFC 2460's RH0. Since a node
 processing this header is always addressed to itself at that point, every
 address the header carries, including the final destination, is link-local.
+
+RPL Option (data-path validation)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``RplPacketInfoHeader`` (``rpl-header.h``) is an ``Ipv6OptionHeader``
+subclass carrying the RFC 6553 wire format. ``RplIpv6OptionRpl``
+(``rpl-packet-info-option.h``) is an ``Ipv6Option`` subclass, registered on
+every node's ``Ipv6OptionDemux``, that processes it. Unlike the Routing
+Header, a Hop-by-Hop option is examined at every hop regardless of whether
+the packet is addressed to that node, and ``Ipv6L3Protocol::Receive()``
+happens to run the Hop-by-Hop chain twice for a packet that is: once itself
+and once more inside ``LocalDeliver()``. ``RplIpv6OptionRpl`` tracks the
+``Packet::GetUid()`` of the last packet it actually acted on so the second
+call is a no-op rather than re-checking a rank it just rewrote to its own.
 
 Trickle timer
 ~~~~~~~~~~~~~
@@ -197,13 +219,18 @@ Tests
 
 The ``rpl`` test suite (``test/rpl-test-suite.cc``) is a unit suite covering:
 
-* Serialization round trips of every control message header and of the
-  source routing header.
+* Serialization round trips of every control message header, the source
+  routing header, and the RPL Option.
 * ``RplIpv6ExtensionSourceRouting::Process()``'s boundary and error paths:
   a malformed Segments Left, a multicast address in the path, hop limit
   exhaustion, a relay hop correctly stopping the receive chain instead of
   also delivering the packet locally, and a hop recognising itself as the
   real destination.
+* ``RplIpv6OptionRpl::Process()``: the rank consistency check in both
+  directions, the RFC 6550 section 11.2 once-then-confirmed inconsistency
+  sequence, and that processing the same packet twice, the way
+  ``Ipv6L3Protocol::Receive()`` does for one addressed to this node, only
+  acts on it once.
 * The Trickle timer of RFC 6206: interval doubling up to Imax, transmission
   within [I/2, I), a reset returning to Imin, and redundancy suppression.
 * DODAG formation over a line of three nodes: rank progression, preferred
@@ -221,9 +248,12 @@ The test suite above is the formal validation; it is run with
 ``./test.py -s rpl``. Beyond the unit level, ``rpl-6lowpan-simple`` has been
 run over topologies of 3 to 6 nodes with the full IEEE 802.15.4/6LoWPAN
 stack, confirming 100% ping delivery in both directions, including with the
-Routing Header actually on the wire (i.e. without |ns3| core's IPHC
-compression silently corrupting it, a bug this module's development
-surfaced and worked around; see design-constraints.md section 11).
+Routing Header and the RPL Option actually on the wire together (i.e.
+without |ns3| core's IPHC compression silently corrupting the former, or
+either header getting lost in the process of the latter riding along on
+every hop of a source routed packet's relay: two of the four |ns3| core and
+module bugs this development surfaced; see design-constraints.md section
+11).
 
 References
 ----------

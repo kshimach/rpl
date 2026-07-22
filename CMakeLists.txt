@@ -3,6 +3,7 @@ build_lib(
   SOURCE_FILES
     helper/rpl-helper.cc
     model/rpl-header.cc
+    model/rpl-packet-info-option.cc
     model/rpl-routing-protocol.cc
     model/rpl-source-routing-extension.cc
     model/rpl-trickle-timer.cc
@@ -10,6 +11,7 @@ build_lib(
     helper/rpl-helper.h
     model/rpl-conf.h
     model/rpl-header.h
+    model/rpl-packet-info-option.h
     model/rpl-routing-protocol.h
     model/rpl-source-routing-extension.h
     model/rpl-trickle-timer.h

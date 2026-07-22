@@ -898,5 +898,152 @@ RplSourceRoutingHeader::GetAddress(uint8_t index) const
     return m_addresses.at(index);
 }
 
+NS_OBJECT_ENSURE_REGISTERED(RplPacketInfoHeader);
+
+RplPacketInfoHeader::RplPacketInfoHeader()
+    : m_flags(0),
+      m_instanceId(RPL_DEFAULT_INSTANCE),
+      m_senderRank(0)
+{
+    SetType(RPL_HBH_OPTION_TYPE);
+    SetLength(4); // Flags, RPLInstanceID, SenderRank
+}
+
+TypeId
+RplPacketInfoHeader::GetTypeId()
+{
+    static TypeId tid = TypeId("ns3::rpl::RplPacketInfoHeader")
+                            .SetParent<Ipv6OptionHeader>()
+                            .SetGroupName("Rpl")
+                            .AddConstructor<RplPacketInfoHeader>();
+    return tid;
+}
+
+TypeId
+RplPacketInfoHeader::GetInstanceTypeId() const
+{
+    return GetTypeId();
+}
+
+void
+RplPacketInfoHeader::Print(std::ostream& os) const
+{
+    os << "RPI down " << GetDown() << " rankError " << GetRankError() << " forwardingError "
+       << GetForwardingError() << " instance " << +m_instanceId << " senderRank " << m_senderRank;
+}
+
+uint32_t
+RplPacketInfoHeader::GetSerializedSize() const
+{
+    return GetLength() + 2;
+}
+
+void
+RplPacketInfoHeader::Serialize(Buffer::Iterator start) const
+{
+    Buffer::Iterator i = start;
+
+    i.WriteU8(GetType());
+    i.WriteU8(GetLength());
+    i.WriteU8(m_flags);
+    i.WriteU8(m_instanceId);
+    i.WriteHtonU16(m_senderRank);
+}
+
+uint32_t
+RplPacketInfoHeader::Deserialize(Buffer::Iterator start)
+{
+    Buffer::Iterator i = start;
+
+    SetType(i.ReadU8());
+    SetLength(i.ReadU8());
+    m_flags = i.ReadU8();
+    m_instanceId = i.ReadU8();
+    m_senderRank = i.ReadNtohU16();
+
+    return GetSerializedSize();
+}
+
+void
+RplPacketInfoHeader::SetDown(bool down)
+{
+    if (down)
+    {
+        m_flags |= RPL_HDR_OPT_DOWN;
+    }
+    else
+    {
+        m_flags &= ~RPL_HDR_OPT_DOWN;
+    }
+}
+
+bool
+RplPacketInfoHeader::GetDown() const
+{
+    return (m_flags & RPL_HDR_OPT_DOWN) != 0;
+}
+
+void
+RplPacketInfoHeader::SetRankError(bool rankError)
+{
+    if (rankError)
+    {
+        m_flags |= RPL_HDR_OPT_RANK_ERR;
+    }
+    else
+    {
+        m_flags &= ~RPL_HDR_OPT_RANK_ERR;
+    }
+}
+
+bool
+RplPacketInfoHeader::GetRankError() const
+{
+    return (m_flags & RPL_HDR_OPT_RANK_ERR) != 0;
+}
+
+void
+RplPacketInfoHeader::SetForwardingError(bool forwardingError)
+{
+    if (forwardingError)
+    {
+        m_flags |= RPL_HDR_OPT_FWD_ERR;
+    }
+    else
+    {
+        m_flags &= ~RPL_HDR_OPT_FWD_ERR;
+    }
+}
+
+bool
+RplPacketInfoHeader::GetForwardingError() const
+{
+    return (m_flags & RPL_HDR_OPT_FWD_ERR) != 0;
+}
+
+void
+RplPacketInfoHeader::SetInstanceId(uint8_t instanceId)
+{
+    m_instanceId = instanceId;
+}
+
+uint8_t
+RplPacketInfoHeader::GetInstanceId() const
+{
+    return m_instanceId;
+}
+
+void
+RplPacketInfoHeader::SetSenderRank(uint16_t rank)
+{
+    m_senderRank = rank;
+}
+
+uint16_t
+RplPacketInfoHeader::GetSenderRank() const
+{
+    return m_senderRank;
+}
+
 } // namespace rpl
 } // namespace ns3
