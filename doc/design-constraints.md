@@ -571,6 +571,48 @@ end-to-end の到達性に影響は無い。ただし直線トポロジのため
 - DODAG version number の lollipop 比較が未実装という既存の制限
   (10 節) は MRHOF 下でも変わらず残る。
 
+### 13.8 コードレビューで見つかった 2 件のバグとその修正
+
+実装後の自己レビューで、13.5 節のヒステリシス処理と、
+`RplDioHeader::Deserialize()` の DAG Metric Container 解析に、
+それぞれ実害のあるバグが見つかった。
+
+**ヒステリシスが loop-avoidance / freshness フィルタを再適用しない**
+
+`SelectPreferredParent()` のヒステリシスブロックは、`best` を選ぶ
+メインループを通過した候補にのみ課している loop-avoidance チェック
+(`parent.rank >= currentRank` の候補を除外) と freshness チェックを、
+現在の preferred parent に対しては再適用せず `m_parents.find()` で
+直接引いていた。そのため、現在の親のランクが悪化してメインループでは
+除外されるようになっても、パス費用さえ `best` に近ければヒステリシスが
+無条件にその親を復活させてしまい、RFC 6552 のループ防止不変条件を
+ヒステリシスの側から迂回できてしまっていた。メインループと同じ 3 条件
+(freshness、loop-avoidance rank、`RankViaParent()` が
+`RPL_INFINITE_RANK` でないこと) をヒステリシスブロックにも追加して
+修正した。
+
+**`i.Next(objLength)` がバッファ境界を越えて読み進める**
+
+未知の Routing Metric/Constraint type を読み飛ばす分岐が、外側で
+既に検証済みのオプション長 (`length == METRIC_CONTAINER_OPTION_LENGTH`)
+ではなく、パケットの中身からそのまま読んだ `objLength`
+(0-255、送信元が自由に設定できる) を `Buffer::Iterator::Next()` に
+そのまま渡していた。DIO は本実装では未認証のため、隣接ノードが
+`objLength = 255` のような値を仕込んだ DIO を送るだけで、debug
+ビルドでは `NS_ASSERT(m_current + delta <= m_dataEnd)` (`buffer.h`)
+が落ちてプロセスごと abort、NDEBUG ビルドではアサートなしにバッファ
+末尾を越えて読み進む。オプション自体のサイズは呼び出し側で既に
+確定しているので、`objLength` を信用せず
+`METRIC_CONTAINER_OPTION_LENGTH - 4` (共通ヘッダ 4 バイト分を引いた
+残りバイト数) だけ読み飛ばすように直した。
+
+回帰テストとして `RplDioUnknownMetricTypeTestCase`
+(`test/rpl-test-suite.cc`) を追加した。未知の mcType かつ
+`objLength = 255` を持つ Metric Container オプションの直後に既知の
+ETX オプションを続け、修正前のコードではこのテストが上記の
+`NS_ASSERT` で落ちること、修正後は後続の ETX オプションが正しく
+パースされることの両方を確認している。
+
 ## 14. RFC 6551 (LQL) の実装、および RSSI の取得
 
 「LQL を実装、RSSI と LQL の対応は任意に変更できるようにすること」という

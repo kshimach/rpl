@@ -288,7 +288,12 @@ RplDioHeader::Deserialize(Buffer::Iterator start)
             {
                 NS_LOG_LOGIC("Skipping a Routing Metric/Constraint object of "
                             << "unsupported type " << +mcType);
-                i.Next(objLength);
+                // objLength is attacker-controlled and must not drive the
+                // seek: the option's total size was already validated above
+                // (length == METRIC_CONTAINER_OPTION_LENGTH), so skip only
+                // the bytes that are actually left in it (4 header bytes --
+                // mcType, Res+P+C+O+R, A+Prec, objLength -- already consumed).
+                i.Next(METRIC_CONTAINER_OPTION_LENGTH - 4);
             }
         }
         else

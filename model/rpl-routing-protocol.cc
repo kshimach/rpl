@@ -1447,16 +1447,24 @@ RplRoutingProtocol::SelectPreferredParent()
         // RFC 6719 section 3.3: hysteresis. Keep the current preferred
         // parent over a candidate of lower path cost unless the difference
         // exceeds PARENT_SWITCH_THRESHOLD, so the node does not flap between
-        // parents of near-identical quality.
+        // parents of near-identical quality. The current parent still has
+        // to clear the same freshness and loop-avoidance filters applied to
+        // every other candidate above; otherwise hysteresis could keep a
+        // stale or newly-looped parent selected indefinitely.
         auto current = m_parents.find(m_preferredParent);
-        if (current != m_parents.end() && current->second.etx < RPL_MRHOF_MAX_LINK_METRIC)
+        if (current != m_parents.end() &&
+            (!haveFresh || current->second.freshness >= RPL_FRESHNESS_TARGET) &&
+            (!m_joined || currentRank == RPL_INFINITE_RANK || current->second.rank < currentRank) &&
+            current->second.etx < RPL_MRHOF_MAX_LINK_METRIC)
         {
+            uint16_t currentCandidateRank = RankViaParent(current->second);
             uint32_t currentPathCost = PathCostViaParent(current->second);
-            if (currentPathCost < RPL_MRHOF_MAX_PATH_COST &&
+            if (currentCandidateRank != RPL_INFINITE_RANK &&
+                currentPathCost < RPL_MRHOF_MAX_PATH_COST &&
                 currentPathCost <= bestPathCost + RPL_MRHOF_PARENT_SWITCH_THRESHOLD)
             {
                 best = m_preferredParent;
-                bestRank = RankViaParent(current->second);
+                bestRank = currentCandidateRank;
                 bestPathCost = currentPathCost;
             }
         }

@@ -294,6 +294,84 @@ RplDioUnknownOptionTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief Check that a DAG Metric Container option carrying a Routing
+ *        Metric/Constraint object type this implementation does not know
+ *        is skipped using the option's own validated size, not the
+ *        attacker-controlled object-length field inside it.
+ */
+class RplDioUnknownMetricTypeTestCase : public TestCase
+{
+  public:
+    RplDioUnknownMetricTypeTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplDioUnknownMetricTypeTestCase::RplDioUnknownMetricTypeTestCase()
+    : TestCase("DIO with an unknown Routing Metric-Constraint type")
+{
+}
+
+void
+RplDioUnknownMetricTypeTestCase::DoRun()
+{
+    RplDioHeader dio;
+    dio.SetRank(256);
+    dio.SetDodagId(Ipv6Address("2001:1::1"));
+
+    Ptr<Packet> packet = Create<Packet>();
+    packet->AddHeader(dio);
+
+    // A DAG Metric Container option (type 2, length 6, i.e.
+    // METRIC_CONTAINER_OPTION_LENGTH) whose Routing Metric/Constraint object
+    // type (0xff) is not one this implementation understands. Its
+    // object-length byte claims 255 bytes of body, far beyond what the
+    // option actually carries; a correct parser skips the option using its
+    // own validated length (6), not this attacker-controlled value.
+    uint8_t unknownMetric[8] = {
+        RPL_OPTION_DAG_METRIC_CONTAINER,
+        6,    // length
+        0xff, // mcType: not RPL_DAG_MC_ETX or RPL_DAG_MC_LQL
+        0,    // Res+P+C+O+R
+        0,    // A+Prec
+        255,  // objLength: bogus, must not be trusted
+        0xaa,
+        0xbb,
+    };
+    Ptr<Packet> trailer = Create<Packet>(unknownMetric, sizeof(unknownMetric));
+    packet->AddAtEnd(trailer);
+
+    // A known ETX metric container right after it. If the unknown option
+    // above was skipped by its own size, this one parses cleanly; if the
+    // parser instead trusted objLength=255, it would run off the end of the
+    // buffer before ever reaching this option.
+    RplDioHeader known;
+    known.SetRank(256);
+    known.SetDodagId(Ipv6Address("2001:1::1"));
+    known.SetMetricContainer(320);
+    Ptr<Packet> knownOptionPacket = Create<Packet>();
+    knownOptionPacket->AddHeader(known);
+    // The ETX option is the last 8 bytes of that serialization.
+    Ptr<Packet> etxOption =
+        knownOptionPacket->CreateFragment(knownOptionPacket->GetSize() - 8, 8);
+    packet->AddAtEnd(etxOption);
+
+    RplDioHeader received;
+    packet->RemoveHeader(received);
+
+    NS_TEST_ASSERT_MSG_EQ(received.GetRank(), 256, "Wrong rank");
+    NS_TEST_ASSERT_MSG_EQ(received.HasMetricContainer(),
+                          true,
+                          "The unknown option was not skipped by its own size, so the "
+                          "known ETX option after it was never reached");
+    NS_TEST_ASSERT_MSG_EQ(received.GetPathEtx(), 320, "The known ETX option was misparsed");
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Check that a DAO and a DAO-ACK survive a round trip.
  */
 class RplDaoHeaderTestCase : public TestCase
@@ -1649,6 +1727,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplDisHeaderTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDioHeaderTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDioUnknownOptionTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplDioUnknownMetricTypeTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDaoHeaderTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplSourceRoutingHeaderTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplSourceRoutingProcessTestCase, TestCase::Duration::QUICK);
