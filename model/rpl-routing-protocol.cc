@@ -864,6 +864,12 @@ RplRoutingProtocol::HandleDao(const RplDaoHeader& dao, Ipv6Address from)
     }
     else
     {
+        // The path sequence is stored but, like the DODAG version number in
+        // HandleDio(), never compared: this always accepts the latest DAO
+        // that arrived rather than the one with the highest (lollipop, RFC
+        // 6550 section 7.2) sequence, so a DAO reordered by the network could
+        // overwrite a newer entry with a stale one until the next DAO sets it
+        // straight again.
         TopologyEntry& entry = m_topology[target];
         entry.parent = dao.GetParent();
         entry.pathSequence = dao.GetPathSequence();

@@ -1,0 +1,249 @@
+RPL: IPv6 Routing Protocol for Low-Power and Lossy Networks
+=============================================================
+
+.. heading hierarchy:
+   ============= Module Name
+   ------------- Section (#.#)
+   ~~~~~~~~~~~~~ Subsection (#.#.#)
+
+This chapter describes ``contrib/rpl``, an implementation of RPL (RFC 6550),
+the IPv6 Routing Protocol for Low-Power and Lossy Networks, for ns-3. The
+implementation covers non-storing mode (MOP 1) only: DODAG formation from
+DIS/DIO exchanges paced by a Trickle timer (RFC 6206), rank computed by
+Objective Function Zero (RFC 6552), and downward routes built from the DAOs
+every node sends to the root, delivered with a real RFC 6554 Source Routing
+Header. The protocol is designed to run over 6LoWPAN in route-over mode,
+i.e. installed on the IPv6 interfaces that sit on ``SixLowPanNetDevice``,
+not directly on the link-layer device underneath.
+
+The source code lives in ``contrib/rpl/``.
+
+Scope and Limitations
+----------------------
+
+What the model does:
+
+* Builds and maintains a DODAG: DIS solicitation, Trickle-paced DIO
+  advertisement, rank computation with OF0, parent selection with a
+  freshness gate against spurious long-range PHY reception, and DODAG
+  version changes.
+* Builds downward routes the way non-storing mode does: every node tells the
+  root, with a DAO, which parent it sits under; only the root keeps a picture
+  of the whole topology, and it computes and attaches a source route to every
+  packet it sends down.
+* Attaches that source route as a real IPv6 Routing Header (RFC 6554, Type
+  3), inserted at the node that originates the packet and processed hop by
+  hop by every router along the way, the same way ``Ipv6ExtensionLooseRouting``
+  processes RFC 2460's Type 0 Routing Header elsewhere in |ns3|.
+* Receives its ICMPv6 type 155 control messages through an ``Ipv6RawSocket``
+  per interface, since |ns3|'s ``Icmpv6L4Protocol`` silently discards ICMPv6
+  types it does not know about.
+
+What it does not do:
+
+* Storing mode (MOP 2/3) is not implemented. This is a deliberate scope
+  decision, not a missing feature: see
+  ``contrib/rpl/doc/design-constraints.md`` section 1.
+* RH3 address compression (CmprI/CmprE, RFC 6554 section 3) is not
+  implemented; every address in a Routing Header is carried in full.
+* The RPL Option in a Hop-by-Hop header (RFC 6553), used for loop detection
+  in storing mode, is not implemented, consistent with not implementing
+  storing mode.
+* No security modes (RFC 6550 section 10): every control message is sent
+  unsecured.
+* No P2P-RPL (RFC 6997) and no support for multiple concurrent RPL
+  instances or DODAGs on the same node.
+* The DODAG version number and the DAO path sequence are compared as plain
+  integers, not with the lollipop comparison of RFC 6550 section 7.2, so a
+  sequence number wrapping around past 255 is not detected. In practice this
+  needs 256 DODAG version changes, or 256 parent changes by the same node, to
+  matter, and a node that misreads a wrapped sequence as stale converges
+  again on the next DIO or DAO regardless.
+* A No-Path DAO (RFC 6550 section 6.4.3) is understood on receipt, but this
+  implementation never sends one: a downward route is only ever dropped once
+  its lifetime runs out. A node leaving a DODAG is consequently visible to
+  the root only after that lifetime expires, not immediately.
+* Every design decision forced by an |ns3| constraint, e.g. why the Routing
+  Header needed a small core change to attach at the origin, is written up
+  in ``contrib/rpl/doc/design-constraints.md`` alongside the ns-3 core bugs
+  that surfaced while getting there. That document is the detailed
+  companion to this overview.
+
+Design
+------
+
+RplRoutingProtocol
+~~~~~~~~~~~~~~~~~~~
+
+``rpl::RplRoutingProtocol`` implements ``Ipv6RoutingProtocol``. Beside
+``RouteOutput()``/``RouteInput()``, the notable override is
+``PrepareOutgoingPacket()``, called by ``Ipv6L3Protocol::Send()`` right
+before a packet reaches the device: on the root, for a global destination
+more than one hop away, it computes the source route and attaches a
+``RplSourceRoutingHeader``. Every other node, and every packet that does
+not need one, leaves it untouched.
+
+A node's own state (rank, preferred parent, DODAG identity, Trickle
+parameters) lives directly on the ``RplRoutingProtocol`` instance. The root
+additionally keeps a topology map, one entry per node in the DODAG, built
+from the target and parent that node's DAOs report; everyone else keeps
+none, which is what makes the mode non-storing.
+
+Control message headers
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+``RplDisHeader``, ``RplDioHeader``, ``RplDaoHeader`` and ``RplDaoAckHeader``
+(``rpl-header.h``) are the RPL message bodies of RFC 6550 section 6, each a
+plain ``Header``. The ICMPv6 type/code/checksum envelope around them is a
+separate, composed ``Icmpv6Header`` rather than a base class every message
+header inherits from; see design-constraints.md section 2 for why.
+
+Source routing
+~~~~~~~~~~~~~~
+
+``RplSourceRoutingHeader`` (``rpl-header.h``) is an
+``Ipv6ExtensionRoutingHeader`` subclass carrying the RFC 6554 wire format.
+``RplIpv6ExtensionSourceRouting`` (``rpl-source-routing-extension.h``) is an
+``Ipv6ExtensionRouting`` subclass, registered on every node's
+``Ipv6ExtensionRoutingDemux``, that processes it: swap the current
+destination into the address list, read the next one out, and re-inject the
+packet through ``RouteOutput()``, the same algorithm
+``Ipv6ExtensionLooseRouting`` already runs for RFC 2460's RH0. Since a node
+processing this header is always addressed to itself at that point, every
+address the header carries, including the final destination, is link-local.
+
+Trickle timer
+~~~~~~~~~~~~~
+
+``RplTrickleTimer`` (``rpl-trickle-timer.h``) is a small, self-contained
+implementation of RFC 6206, independent of the rest of the module, used to
+pace DIO transmission.
+
+Usage
+-----
+
+A node running RPL needs ``RplHelper`` passed to
+``InternetStackHelper::SetRoutingHelper()`` before the stack is installed,
+one node marked as the DODAG root after its global address exists, and, for
+route-over operation, the IPv6 interfaces installed on
+``SixLowPanNetDevice`` rather than directly on the link layer. See
+``contrib/rpl/examples/rpl-6lowpan-simple.cc`` for a complete example.
+
+Helpers
+~~~~~~~
+
+::
+
+  RplHelper rplHelper;
+  InternetStackHelper internetv6;
+  internetv6.SetRoutingHelper(rplHelper);
+  internetv6.Install(nodes);
+
+  // ... assign IPv6 addresses ...
+
+  rplHelper.SetRoot(nodes.Get(0));       // after global addresses exist
+  rplHelper.AssignStreams(nodes, 1);
+  rplHelper.Set("DaoInterval", TimeValue(Seconds(30)));  // before Install(),
+                                                          // to reach every node
+
+Attributes
+~~~~~~~~~~
+
+All attributes are on ``ns3::rpl::RplRoutingProtocol``:
+
+* ``DisInterval``: period of the unsolicited multicast DIS a node sends
+  while it has not joined a DODAG.
+* ``DioIntervalMin``: Trickle Imin for DIOs. Only the root's value matters;
+  every other node takes it from the DODAG Configuration option of the DIO
+  it joins on.
+* ``DioIntervalDoublings``: number of Trickle doublings between Imin and
+  Imax.
+* ``DioRedundancy``: the Trickle redundancy constant k; 0 disables
+  suppression.
+* ``MinHopRankIncrease``: MinHopRankIncrease, which is also the rank of the
+  root.
+* ``DaoInterval``: how often a node repeats the DAO telling the root where
+  it sits.
+* ``DaoAckTimeout``: how long a node waits for a DAO-ACK before resending
+  the DAO.
+* ``DaoRetries``: how many times an unacknowledged DAO is resent before a
+  node gives up until the next periodic refresh.
+* ``PathLifetime``: lifetime of the downward route a node advertises, in
+  lifetime units.
+
+Traces
+~~~~~~
+
+Not applicable: the module does not currently define any trace sources of
+its own. ``Ipv6L3Protocol``'s own Tx/Rx/Drop traces apply to RPL traffic
+like any other IPv6 traffic.
+
+Examples and Tests
+-------------------
+
+Examples
+~~~~~~~~
+
+``rpl-6lowpan-simple.cc`` builds a line of IEEE 802.15.4 nodes running RPL
+over 6LoWPAN in route-over mode, spaced so that only neighbours hear each
+other, forcing a multi-hop DODAG. Once it has converged, the last node
+pings the root and the root answers, exercising both the upward route (the
+request climbing through preferred parents) and the downward one (the
+reply following the source route the root computed from the DAOs it
+collected).
+
+Tests
+~~~~~
+
+The ``rpl`` test suite (``test/rpl-test-suite.cc``) is a unit suite covering:
+
+* Serialization round trips of every control message header and of the
+  source routing header.
+* ``RplIpv6ExtensionSourceRouting::Process()``'s boundary and error paths:
+  a malformed Segments Left, a multicast address in the path, hop limit
+  exhaustion, a relay hop correctly stopping the receive chain instead of
+  also delivering the packet locally, and a hop recognising itself as the
+  real destination.
+* The Trickle timer of RFC 6206: interval doubling up to Imax, transmission
+  within [I/2, I), a reset returning to Imin, and redundancy suppression.
+* DODAG formation over a line of three nodes: rank progression, preferred
+  parent selection, the resulting upward route, and the downward route and
+  Routing Header the root builds for each of a direct child and a
+  grandchild.
+* A No-Path DAO removing a topology entry at the root.
+* An unacknowledged DAO being retried the configured number of times at the
+  configured timeout, then given up on until the next periodic refresh.
+
+Validation
+----------
+
+The test suite above is the formal validation; it is run with
+``./test.py -s rpl``. Beyond the unit level, ``rpl-6lowpan-simple`` has been
+run over topologies of 3 to 6 nodes with the full IEEE 802.15.4/6LoWPAN
+stack, confirming 100% ping delivery in both directions, including with the
+Routing Header actually on the wire (i.e. without |ns3| core's IPHC
+compression silently corrupting it, a bug this module's development
+surfaced and worked around; see design-constraints.md section 11).
+
+References
+----------
+
+[`1 <https://www.rfc-editor.org/rfc/rfc6550>`_] T. Winter, Ed., et al.,
+"RPL: IPv6 Routing Protocol for Low-Power and Lossy Networks," RFC 6550,
+March 2012.
+
+[`2 <https://www.rfc-editor.org/rfc/rfc6552>`_] T. Thubert, Ed., "Objective
+Function Zero for the Routing Protocol for Low-Power and Lossy Networks
+(RPL)," RFC 6552, March 2012.
+
+[`3 <https://www.rfc-editor.org/rfc/rfc6206>`_] P. Levis et al., "The
+Trickle Algorithm," RFC 6206, March 2011.
+
+[`4 <https://www.rfc-editor.org/rfc/rfc6554>`_] J. Hui, J. Vasseur, D.
+Culler, and V. Manral, "An IPv6 Routing Header for Source Routes with the
+Routing Protocol for Low-Power and Lossy Networks (RPL)," RFC 6554, March
+2012.
+
+[`5 <https://www.rfc-editor.org/rfc/rfc6553>`_] J. Hui and JP. Vasseur,
+"The Routing Protocol for Low-Power and Lossy Networks (RPL) Option for
+Carrying RPL Information in Data-Plane Datagrams," RFC 6553, March 2012.

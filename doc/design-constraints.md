@@ -170,8 +170,16 @@
   root 上の監視用 raw socket による送信回数カウントで検証、private
   state には触れない) をそれぞれ追加。ただし No-Path DAO 自体を
   本実装から**送信**する経路はまだ無い (下記参照)。
-- **Low**: DAO/path sequence の uint8_t wraparound (lollipop 比較) の
-  ドキュメント化、Sphinx モデルドキュメントの作成、が未着手。
+- **Low (ドキュメント化のみ完了、未修正)**: DODAG version number
+  (`HandleDio()`) と DAO path sequence (`HandleDao()`) は、いずれも
+  RFC 6550 section 7.2 の lollipop 比較を実装せず、素の整数比較
+  (version) または比較なしの無条件上書き (path sequence) になっている。
+  コード側にコメントで明記済み。256 回のバージョン変更・親変更が
+  必要になる程度の実害のため、修正は見送り。
+- **Low (完了)**: Sphinx モデルドキュメント作成
+  (`contrib/rpl/doc/rpl.rst`、`utils/create-module.py` の標準構成に
+  準拠。本体 doc ビルドへの登録は行っていない — contrib モジュールで
+  upstream 予定もないため)。
 - **既知の非対応事項**: RFC 6553 (Hop-by-Hop header 内 RPL Option) は
   未実装。storing mode (MOP=2) は方針により対象外。RH3 アドレス圧縮
   (CmprI/CmprE) 未実装、6LoWPAN NHC 圧縮も Routing Header では効かない
