@@ -48,22 +48,23 @@ namespace
 {
 
 /**
- * @brief Stand-in for ns3::lrwpan::LrWpanLqiTag's wire format: a single
- *        byte, the total packet success rate scaled to 0-255.
+ * @brief Stand-in for the wire format ns3::lrwpan::LrWpanLqiTag and
+ *        ns3::lrwpan::LrWpanRssiTag share: a single byte payload (an
+ *        unsigned LQI or a signed RSSI in dBm, the caller knows which).
  *
- * Used only to decode the bytes of a tag added by the real LrWpanLqiTag,
- * matched by its globally registered TypeId name (see LinkEtxFromPacket()):
- * PacketTagIterator::Item::GetTag() only checks that GetInstanceTypeId()
- * matches, so this reads the tag's payload without librpl ever
- * #include-ing, or linking against, the lr-wpan module.
+ * Used only to decode the byte of a tag added by the real lr-wpan tag,
+ * matched by its globally registered TypeId name (see LinkEtxFromPacket()
+ * and LinkLqlFromPacket()): PacketTagIterator::Item::GetTag() only checks
+ * that GetInstanceTypeId() matches, so this reads the tag's payload without
+ * librpl ever #include-ing, or linking against, the lr-wpan module.
  */
-class LrWpanLqiPeekTag : public Tag
+class LrWpanPeekByteTag : public Tag
 {
   public:
     /**
-     * @param tid the real LrWpanLqiTag's TypeId, looked up by name
+     * @param tid the real tag's TypeId, looked up by name
      */
-    explicit LrWpanLqiPeekTag(TypeId tid)
+    explicit LrWpanPeekByteTag(TypeId tid)
         : m_tid(tid)
     {
     }
@@ -80,72 +81,23 @@ class LrWpanLqiPeekTag : public Tag
 
     void Serialize(TagBuffer i) const override
     {
-        i.WriteU8(m_lqi);
+        i.WriteU8(m_byte);
     }
 
     void Deserialize(TagBuffer i) override
     {
-        m_lqi = i.ReadU8();
+        m_byte = i.ReadU8();
     }
 
     void Print(std::ostream& os) const override
     {
-        os << "Lqi=" << +m_lqi;
+        os << "Byte=" << +m_byte;
     }
 
-    uint8_t m_lqi{0}; //!< the decoded LQI, 0-255
+    uint8_t m_byte{0}; //!< the decoded payload byte
 
   private:
-    TypeId m_tid; //!< the real LrWpanLqiTag's TypeId
-};
-
-/**
- * @brief Stand-in for ns3::lrwpan::LrWpanRssiTag's wire format: a single
- *        signed byte, the RSSI in dBm.
- *
- * Same purpose and technique as LrWpanLqiPeekTag, applied to
- * ns3::lrwpan::LrWpanRssiTag (see LinkLqlFromPacket()).
- */
-class LrWpanRssiPeekTag : public Tag
-{
-  public:
-    /**
-     * @param tid the real LrWpanRssiTag's TypeId, looked up by name
-     */
-    explicit LrWpanRssiPeekTag(TypeId tid)
-        : m_tid(tid)
-    {
-    }
-
-    TypeId GetInstanceTypeId() const override
-    {
-        return m_tid;
-    }
-
-    uint32_t GetSerializedSize() const override
-    {
-        return 1;
-    }
-
-    void Serialize(TagBuffer i) const override
-    {
-        i.WriteU8(static_cast<uint8_t>(m_rssi));
-    }
-
-    void Deserialize(TagBuffer i) override
-    {
-        m_rssi = static_cast<int8_t>(i.ReadU8());
-    }
-
-    void Print(std::ostream& os) const override
-    {
-        os << "Rssi=" << +m_rssi;
-    }
-
-    int8_t m_rssi{0}; //!< the decoded RSSI, dBm
-
-  private:
-    TypeId m_tid; //!< the real LrWpanRssiTag's TypeId
+    TypeId m_tid; //!< the real tag's TypeId
 };
 
 /**
@@ -1231,7 +1183,7 @@ RplRoutingProtocol::GetTopologySize() const
 }
 
 uint16_t
-RplRoutingProtocol::RankViaParent(const Parent& parent) const
+RplRoutingProtocol::RankViaParent(const Parent& parent, uint32_t* pathCost) const
 {
     if (parent.rank == RPL_INFINITE_RANK)
     {
@@ -1245,7 +1197,12 @@ RplRoutingProtocol::RankViaParent(const Parent& parent) const
         // that undercuts the parent's own rank plus MinHopRankIncrease, in
         // which case the rank must not claim a shorter path than the hop
         // count actually taken.
-        rank = std::max(rank, PathCostViaParent(parent));
+        uint32_t cost = PathCostViaParent(parent);
+        if (pathCost)
+        {
+            *pathCost = cost;
+        }
+        rank = std::max(rank, cost);
     }
     return rank >= RPL_INFINITE_RANK ? RPL_INFINITE_RANK : static_cast<uint16_t>(rank);
 }
@@ -1270,6 +1227,8 @@ RplRoutingProtocol::LinkEtxFromPacket(Ptr<const Packet> packet) const
     TypeId lqiTid;
     if (!TypeId::LookupByNameFailSafe("ns3::lrwpan::LrWpanLqiTag", &lqiTid))
     {
+        NS_LOG_LOGIC("ns3::lrwpan::LrWpanLqiTag is not registered (lr-wpan not linked in, or "
+                     "renamed); link ETX falls back to the neutral default");
         return RPL_ETX_FIXED_POINT;
     }
 
@@ -1282,9 +1241,9 @@ RplRoutingProtocol::LinkEtxFromPacket(Ptr<const Packet> packet) const
             continue;
         }
 
-        LrWpanLqiPeekTag tag(lqiTid);
+        LrWpanPeekByteTag tag(lqiTid);
         item.GetTag(tag);
-        if (tag.m_lqi == 0)
+        if (tag.m_byte == 0)
         {
             // No successful reception at all: as bad a link as this fixed
             // point scale can express.
@@ -1293,7 +1252,7 @@ RplRoutingProtocol::LinkEtxFromPacket(Ptr<const Packet> packet) const
 
         // The LQI is the packet success rate scaled to 0-255 (LrWpanLqiTag's
         // own doc comment), so 255 / lqi approximates ETX = 1 / PRR.
-        uint32_t instantEtx = (255u * RPL_ETX_FIXED_POINT) / tag.m_lqi;
+        uint32_t instantEtx = (255u * RPL_ETX_FIXED_POINT) / tag.m_byte;
         return static_cast<uint16_t>(std::min<uint32_t>(instantEtx, RPL_MRHOF_MAX_LINK_METRIC));
     }
     return RPL_ETX_FIXED_POINT;
@@ -1309,7 +1268,14 @@ RplRoutingProtocol::SetRssiToLqlMapping(Callback<uint8_t, double> mapping)
 uint8_t
 RplRoutingProtocol::RssiToLql(double rssiDbm) const
 {
-    return m_rssiToLql.IsNull() ? RPL_LQL_UNDETERMINED : m_rssiToLql(rssiDbm);
+    if (m_rssiToLql.IsNull())
+    {
+        return RPL_LQL_UNDETERMINED;
+    }
+    // A user-supplied mapping (SetRssiToLqlMapping()) is free-form and not
+    // guaranteed to respect RFC 6551's 0-7 range, so clamp here rather than
+    // relying on every caller (and RplDioHeader::SetLql()) to do it.
+    return std::min(m_rssiToLql(rssiDbm), RPL_LQL_WORST);
 }
 
 uint8_t
@@ -1318,6 +1284,8 @@ RplRoutingProtocol::LinkLqlFromPacket(Ptr<const Packet> packet) const
     TypeId rssiTid;
     if (!TypeId::LookupByNameFailSafe("ns3::lrwpan::LrWpanRssiTag", &rssiTid))
     {
+        NS_LOG_LOGIC("ns3::lrwpan::LrWpanRssiTag is not registered (lr-wpan not linked in, or "
+                     "renamed); LQL falls back to undetermined");
         return RPL_LQL_UNDETERMINED;
     }
 
@@ -1330,9 +1298,9 @@ RplRoutingProtocol::LinkLqlFromPacket(Ptr<const Packet> packet) const
             continue;
         }
 
-        LrWpanRssiPeekTag tag(rssiTid);
+        LrWpanPeekByteTag tag(rssiTid);
         item.GetTag(tag);
-        return RssiToLql(double(tag.m_rssi));
+        return RssiToLql(double(static_cast<int8_t>(tag.m_byte)));
     }
     return RPL_LQL_UNDETERMINED;
 }
@@ -1412,7 +1380,8 @@ RplRoutingProtocol::SelectPreferredParent()
             continue;
         }
 
-        uint16_t rank = RankViaParent(parent);
+        uint32_t pathCost = 0;
+        uint16_t rank = RankViaParent(parent, &pathCost);
         if (rank == RPL_INFINITE_RANK)
         {
             continue;
@@ -1420,7 +1389,6 @@ RplRoutingProtocol::SelectPreferredParent()
 
         if (m_ocp == RPL_OCP_MRHOF)
         {
-            uint32_t pathCost = PathCostViaParent(parent);
             if (pathCost >= RPL_MRHOF_MAX_PATH_COST)
             {
                 NS_LOG_LOGIC("Neighbour " << address << " has too high a path cost");
@@ -1457,8 +1425,8 @@ RplRoutingProtocol::SelectPreferredParent()
             (!m_joined || currentRank == RPL_INFINITE_RANK || current->second.rank < currentRank) &&
             current->second.etx < RPL_MRHOF_MAX_LINK_METRIC)
         {
-            uint16_t currentCandidateRank = RankViaParent(current->second);
-            uint32_t currentPathCost = PathCostViaParent(current->second);
+            uint32_t currentPathCost = 0;
+            uint16_t currentCandidateRank = RankViaParent(current->second, &currentPathCost);
             if (currentCandidateRank != RPL_INFINITE_RANK &&
                 currentPathCost < RPL_MRHOF_MAX_PATH_COST &&
                 currentPathCost <= bestPathCost + RPL_MRHOF_PARENT_SWITCH_THRESHOLD)
@@ -1470,7 +1438,13 @@ RplRoutingProtocol::SelectPreferredParent()
         }
     }
 
-    bool changed = (best != m_preferredParent) || (bestRank != m_rank);
+    // Under MRHOF the rank can stay floor-clamped at parent.rank +
+    // MinHopRankIncrease (RFC 6719 section 3.3) while the underlying path
+    // cost still drifts, so the path cost has to be compared too -- looking
+    // only at rank/parent would leave the advertised m_pathEtx stale.
+    bool pathCostChanged = m_ocp == RPL_OCP_MRHOF && !best.IsAny() &&
+                          static_cast<uint16_t>(bestPathCost) != m_pathEtx;
+    bool changed = (best != m_preferredParent) || (bestRank != m_rank) || pathCostChanged;
     if (!changed)
     {
         return false;

@@ -8,6 +8,8 @@
 
 #include "ns3/log.h"
 
+#include <algorithm>
+
 namespace ns3
 {
 
@@ -281,8 +283,10 @@ RplDioHeader::Deserialize(Buffer::Iterator start)
                 i.ReadU8(); // Res (RFC 6551 section 4.6), not checked
                 uint8_t subObject = i.ReadU8();
                 m_hasLql = true;
-                m_lql = subObject >> 4; // Val, the high nibble; Counter (low
-                                        // nibble) not checked, always 1 here
+                // Val, the high nibble; Counter (low nibble) not checked,
+                // always 1 here. Clamped to keep GetLql()'s documented
+                // 0-7 range even if a peer sends a Val above RPL_LQL_WORST.
+                m_lql = std::min<uint8_t>(subObject >> 4, RPL_LQL_WORST);
             }
             else
             {
@@ -506,7 +510,11 @@ void
 RplDioHeader::SetLql(uint8_t lql)
 {
     m_hasLql = true;
-    m_lql = lql;
+    // The wire format's Val sub-field is 4 bits (RFC 6551 section 4.6), and
+    // RPL_LQL_WORST (7) is the worst defined value on top of that; clamp so
+    // a caller passing an out-of-range value (e.g. an unclamped RSSI-to-LQL
+    // mapping) cannot silently truncate on the shift in Serialize().
+    m_lql = std::min(lql, RPL_LQL_WORST);
 }
 
 uint8_t

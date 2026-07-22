@@ -571,11 +571,12 @@ end-to-end の到達性に影響は無い。ただし直線トポロジのため
 - DODAG version number の lollipop 比較が未実装という既存の制限
   (10 節) は MRHOF 下でも変わらず残る。
 
-### 13.8 コードレビューで見つかった 2 件のバグとその修正
+### 13.8 コードレビューで見つかった問題の修正
 
 実装後の自己レビューで、13.5 節のヒステリシス処理と、
 `RplDioHeader::Deserialize()` の DAG Metric Container 解析に、
-それぞれ実害のあるバグが見つかった。
+それぞれ実害のあるバグが見つかった。続けて行った、より広い範囲の
+セルフレビューでさらに数件見つかり、あわせて修正した (下記)。
 
 **ヒステリシスが loop-avoidance / freshness フィルタを再適用しない**
 
@@ -612,6 +613,69 @@ end-to-end の到達性に影響は無い。ただし直線トポロジのため
 ETX オプションを続け、修正前のコードではこのテストが上記の
 `NS_ASSERT` で落ちること、修正後は後続の ETX オプションが正しく
 パースされることの両方を確認している。
+
+**`m_pathEtx` がランクの floor-clamp 中は陳腐化する**
+
+`SelectPreferredParent()` の `changed` 判定 (再選択の結果を適用するか
+どうか) が `best != m_preferredParent || bestRank != m_rank` だけを
+見ていた。ランクは `parent.rank + MinHopRankIncrease` で
+floor-clamp されることがあり (13.5 節)、その状態が続く間はパス費用が
+動いてもランクは動かないため、`changed` が false のまま早期 return
+し、この node が次の DIO で advertise する `m_pathEtx` が更新され
+なくなっていた。MRHOF かつ親が決まっている場合はパス費用の差分も
+`changed` の判定に加えて修正した。
+
+**`RankViaParent()` と `PathCostViaParent()` の重複計算**
+
+`SelectPreferredParent()` はメインループ、ヒステリシスブロックの
+双方で、同じ候補について `RankViaParent()` (内部で
+`PathCostViaParent()` を呼ぶ) を呼んだ直後に、もう一度独立して
+`PathCostViaParent()` を呼んでいた。`RankViaParent()` に
+`uint32_t* pathCost` の out パラメータ (既定 `nullptr`) を追加し、
+呼び出し側が計算済みのパス費用をそのまま受け取れるようにして、
+二重計算を無くした。
+
+**example: `LrWpanErrorModel` がフラグに関係なく全ノードに付く**
+
+`rpl-6lowpan-simple.cc` で `LrWpanErrorModel` の生成/設定が
+`--mrhof`/`--lql` の分岐より前にあり、フラグなしのデフォルト実行
+(単なる到達性デモとして使われることを想定) でも実際にフレーム損失が
+発生するようになっていた。LQL は RSSI (伝搬減衰だけで既に変動する)
+由来なので実際に必要なのは MRHOF の ETX だけであり、
+`LrWpanErrorModel` の設定を `if (mrhof)` の中に移した。
+
+**`LrWpanLqiPeekTag` / `LrWpanRssiPeekTag` の重複**
+
+13.3 節、14.2 節でそれぞれ追加した、実際の lr-wpan タグの中身を
+TypeId 名前解決経由で読むためのスタンドインタグが、ペイロードの型
+(`uint8_t` の LQI、`int8_t` の RSSI) が違うだけでほぼ同一の実装
+だった。1 バイトのペイロードをそのまま (`uint8_t`) 保持する
+`LrWpanPeekByteTag` 1 つにまとめ、RSSI 側の呼び出し元で
+`static_cast<int8_t>` するように変更した。
+
+**TypeId 解決失敗が無警告だった**
+
+`LinkEtxFromPacket()`/`LinkLqlFromPacket()` は `lr-wpan` の
+タグ TypeId が見つからない場合、無警告のまま中立値
+(ETX 1.0 相当、LQL undetermined) にフォールバックしていた。
+`librpl` が `liblr-wpan` にリンクしない構成 (13.3 節) では毎回
+この経路を通るのが正常系なので警告ログにはせず、`NS_LOG_LOGIC`
+(既定で出力されない) を追加するに留めた — 将来 lr-wpan 側でタグの
+クラス名が変わってフォールバックが意図せず発動するようになった
+場合でも、ログを有効にすれば追跡できるようにするため。
+
+**見送った指摘: PHY 側での RSSI タグの無条件付与**
+
+`src/lr-wpan/model/lr-wpan-phy.cc` の `EndRx()` は、RPL が
+`LrWpanRssiTag` を使うかどうかに関わらず、受信した全フレームに
+無条件でこのタグを付けている (`PdDataRequest()` 側で送信前に
+剥がす処理も LQI/RSSI で 2 回の独立したスキャンになっている)。
+ただし同じ関数はもともと LQI についても同様に全フレームで
+インクリメンタルに計算・付与しており (`CheckInterference()` 経由)、
+1 バイトのタグ追加はその既存コストに比べて無視できる。RPL を
+使わない lr-wpan シミュレーションのためだけに新しい attribute
+(例えば "RSSI タグを付けるか") を `src/lr-wpan` 側に追加するのは、
+得られる効果に対してコアモジュールへの変更が過大と判断し、見送った。
 
 ## 14. RFC 6551 (LQL) の実装、および RSSI の取得
 
@@ -680,7 +744,7 @@ PASS しており、既存動作への影響は無い。
 全く同じ TypeId 名前解決 + `PacketTagIterator` の手法を踏襲しており、
 今回も `liblr-wpan` への直接依存を増やしていない。
 
-### 14.3 RSSI → LQL の対応を任意に変更可能にする
+### 14.3 RSSI から LQL への対応を任意に変更可能にする
 
 指示の核心部分。RFC 6551 の LQL は "The reliability value is computed by
 the sending node according to a metric that is implementation specific"
@@ -707,6 +771,20 @@ Wi-Fi 的な閾値 (-60〜-85 dBm) では全リンクが最悪値 (LQL=7) に張
 至った直接のきっかけになった。RFC が「implementation specific」と
 明言している理由を、まさにこのモジュール自身のデフォルト値選びで
 再確認した形になる。
+
+`SetRssiToLqlMapping()` が受け取るコールバックは丸ごと差し替え可能な
+自由形式であり、0-7 の範囲を守る保証がない。コードレビューで、
+`RssiToLql()` がその戻り値をそのまま返し、`RplDioHeader::SetLql()`
+も範囲検証なしに `m_lql` へ代入していたことが見つかった。7 を超える
+値を返すマッピングを設定すると、`RplDioHeader::Serialize()` の
+`(m_lql << 4) | 0x1` で上位ビットが静かに切り詰められ、advertise
+される LQL がワイヤ上で破損する。`RssiToLql()` (境界: ユーザー
+コールバックの出口) と `RplDioHeader::SetLql()` (境界: DIO ヘッダの
+公開 API) の双方に `RPL_LQL_WORST` へのクランプを追加した。あわせて
+`RplDioHeader::Deserialize()` 側の LQL Val サブフィールド読み取り
+(14.1 節、4 bit なので 0-15 になり得る) も同じ上限でクランプし、
+`GetLql()` が文書化している 0-7 の範囲を受信経路でも保証するように
+した。
 
 ### 14.4 LQL は経路選択に使わない
 

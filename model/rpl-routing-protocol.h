@@ -342,9 +342,13 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      * rank never implies a shorter path than the hop count actually taken.
      *
      * @param parent the candidate parent
+     * @param pathCost if not null, filled with the MRHOF path cost computed
+     *                 along the way (PathCostViaParent(parent)), so a caller
+     *                 that needs both values does not have to compute the
+     *                 path cost a second time. Left untouched under OF0.
      * @return the resulting rank, RPL_INFINITE_RANK if the parent is unusable
      */
-    uint16_t RankViaParent(const Parent& parent) const;
+    uint16_t RankViaParent(const Parent& parent, uint32_t* pathCost = nullptr) const;
 
     /**
      * @brief Compute the path cost this node would advertise through a given

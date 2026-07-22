@@ -102,22 +102,25 @@ main(int argc, char** argv)
     streamNumber += lrWpanHelper.AssignStreams(lrwpanDevices, streamNumber);
     lrWpanHelper.CreateAssociatedPan(lrwpanDevices, 1);
 
-    // Without an error model the PHY never touches the LQI it tags every
-    // received frame with (it stays pinned at the "perfect" default), which
-    // would make MRHOF's ETX indistinguishable from OF0's hop count. One
-    // shared LrWpanErrorModel, driven by the SINR the spectrum channel
-    // already computes from the distances above, is what gives every hop a
-    // real, and different, link quality to measure.
-    Ptr<lrwpan::LrWpanErrorModel> errorModel = CreateObject<lrwpan::LrWpanErrorModel>();
-    for (auto i = lrwpanDevices.Begin(); i != lrwpanDevices.End(); i++)
-    {
-        DynamicCast<lrwpan::LrWpanNetDevice>(*i)->GetPhy()->SetErrorModel(errorModel);
-    }
-
     RplHelper rplHelper;
     if (mrhof)
     {
         rplHelper.Set("Ocp", UintegerValue(rpl::RPL_OCP_MRHOF));
+
+        // Without an error model the PHY never touches the LQI it tags every
+        // received frame with (it stays pinned at the "perfect" default),
+        // which would make MRHOF's ETX indistinguishable from OF0's hop
+        // count. One shared LrWpanErrorModel, driven by the SINR the
+        // spectrum channel already computes from the distances above, is
+        // what gives every hop a real, and different, link quality to
+        // measure. Only wired in for --mrhof: RSSI (and so LQL) already
+        // varies with distance without it, and leaving the default run
+        // (neither flag set) loss-free keeps it a plain reachability demo.
+        Ptr<lrwpan::LrWpanErrorModel> errorModel = CreateObject<lrwpan::LrWpanErrorModel>();
+        for (auto i = lrwpanDevices.Begin(); i != lrwpanDevices.End(); i++)
+        {
+            DynamicCast<lrwpan::LrWpanNetDevice>(*i)->GetPhy()->SetErrorModel(errorModel);
+        }
     }
     if (lql)
     {
