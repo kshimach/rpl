@@ -7,6 +7,7 @@
 #include "ns3/boolean.h"
 #include "ns3/internet-stack-helper.h"
 #include "ns3/ipv6-address-helper.h"
+#include "ns3/ipv6-extension.h"
 #include "ns3/ipv6-l3-protocol.h"
 #include "ns3/ipv6-route.h"
 #include "ns3/node-container.h"
@@ -14,6 +15,7 @@
 #include "ns3/rpl-header.h"
 #include "ns3/rpl-helper.h"
 #include "ns3/rpl-routing-protocol.h"
+#include "ns3/rpl-source-routing-extension.h"
 #include "ns3/rpl-trickle-timer.h"
 #include "ns3/simple-channel.h"
 #include "ns3/simple-net-device-helper.h"
@@ -626,6 +628,252 @@ RplDodagFormationTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief Exercise RplIpv6ExtensionSourceRouting::Process() directly, at the
+ *        boundary and error paths RFC 6554 section 4.1 specifies: a
+ *        malformed Segments Left, a multicast address in the path, hop limit
+ *        exhaustion, and the two ways a hop can finish (relay onward, or
+ *        recognise itself as the real destination).
+ *
+ * These do not depend on a live multi-hop delivery, so a single node with RPL
+ * installed is enough: what is under test is the header parsing and the
+ * outcome flags Process() reports back to Ipv6L3Protocol::LocalDeliver(), not
+ * the routing decision that follows.
+ */
+class RplSourceRoutingProcessTestCase : public TestCase
+{
+  public:
+    RplSourceRoutingProcessTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplSourceRoutingProcessTestCase::RplSourceRoutingProcessTestCase()
+    : TestCase("Source routing header processing, boundary and error paths")
+{
+}
+
+void
+RplSourceRoutingProcessTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(1);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.SetBase(Ipv6Address("2001:1::"), Ipv6Prefix(64));
+    ipv6.Assign(devices);
+
+    // Nothing here needs simulated time to pass, only DoInitialize() to have
+    // run, which is what registers RplIpv6ExtensionSourceRouting.
+    Simulator::Stop(Seconds(0));
+    Simulator::Run();
+
+    Ptr<Node> node = nodes.Get(0);
+    Ptr<Ipv6L3Protocol> nodeIpv6 = node->GetObject<Ipv6L3Protocol>();
+    Ptr<Ipv6ExtensionRoutingDemux> demux = node->GetObject<Ipv6ExtensionRoutingDemux>();
+    NS_TEST_ASSERT_MSG_EQ(demux != nullptr, true, "No routing extension demux on the node");
+
+    Ptr<Ipv6ExtensionRouting> extension =
+        demux->GetExtensionRouting(RplIpv6ExtensionSourceRouting::TYPE_ROUTING);
+    NS_TEST_ASSERT_MSG_EQ(extension != nullptr,
+                          true,
+                          "RplIpv6ExtensionSourceRouting was not registered");
+
+    Ipv6Address linkLocal = nodeIpv6->GetAddress(1, 0).GetAddress();
+
+    // Segments Left greater than the number of addresses: malformed, dropped.
+    {
+        RplSourceRoutingHeader srh;
+        srh.SetNextHeader(59); // No Next Header
+        srh.SetSegmentsLeft(5);
+        srh.SetAddresses({Ipv6Address("fe80::2")});
+
+        Ptr<Packet> packet = Create<Packet>();
+        packet->AddHeader(srh);
+
+        Ipv6Header ipv6Header;
+        ipv6Header.SetSource(Ipv6Address("fe80::3"));
+        ipv6Header.SetDestination(linkLocal);
+        ipv6Header.SetHopLimit(64);
+
+        bool stopProcessing = false;
+        bool isDropped = false;
+        Ipv6L3Protocol::DropReason dropReason;
+        extension->Process(packet,
+                           0,
+                           ipv6Header,
+                           linkLocal,
+                           nullptr,
+                           stopProcessing,
+                           isDropped,
+                           dropReason);
+
+        NS_TEST_ASSERT_MSG_EQ(isDropped, true, "A malformed header was not dropped");
+        NS_TEST_ASSERT_MSG_EQ(stopProcessing,
+                              true,
+                              "Processing was not stopped for a malformed header");
+        NS_TEST_ASSERT_MSG_EQ(dropReason,
+                              Ipv6L3Protocol::DROP_MALFORMED_HEADER,
+                              "Wrong drop reason for a malformed header");
+    }
+
+    // A multicast address in the path: RFC 6554 section 4.1 forbids it.
+    {
+        RplSourceRoutingHeader srh;
+        srh.SetNextHeader(59);
+        srh.SetSegmentsLeft(1);
+        srh.SetAddresses({Ipv6Address("ff02::1a")});
+
+        Ptr<Packet> packet = Create<Packet>();
+        packet->AddHeader(srh);
+
+        Ipv6Header ipv6Header;
+        ipv6Header.SetSource(Ipv6Address("fe80::3"));
+        ipv6Header.SetDestination(linkLocal);
+        ipv6Header.SetHopLimit(64);
+
+        bool stopProcessing = false;
+        bool isDropped = false;
+        Ipv6L3Protocol::DropReason dropReason;
+        extension->Process(packet,
+                           0,
+                           ipv6Header,
+                           linkLocal,
+                           nullptr,
+                           stopProcessing,
+                           isDropped,
+                           dropReason);
+
+        NS_TEST_ASSERT_MSG_EQ(isDropped, true, "A multicast next hop was not dropped");
+        NS_TEST_ASSERT_MSG_EQ(stopProcessing,
+                              true,
+                              "Processing was not stopped for a multicast next hop");
+    }
+
+    // Hop limit already at 1: one more hop would make it 0, so RFC 8200 has
+    // this dropped instead, with a Time Exceeded sent back.
+    {
+        RplSourceRoutingHeader srh;
+        srh.SetNextHeader(59);
+        srh.SetSegmentsLeft(1);
+        srh.SetAddresses({Ipv6Address("fe80::4")});
+
+        Ptr<Packet> packet = Create<Packet>();
+        packet->AddHeader(srh);
+
+        Ipv6Header ipv6Header;
+        ipv6Header.SetSource(Ipv6Address("fe80::3"));
+        ipv6Header.SetDestination(linkLocal);
+        ipv6Header.SetHopLimit(1);
+
+        bool stopProcessing = false;
+        bool isDropped = false;
+        Ipv6L3Protocol::DropReason dropReason;
+        extension->Process(packet,
+                           0,
+                           ipv6Header,
+                           linkLocal,
+                           nullptr,
+                           stopProcessing,
+                           isDropped,
+                           dropReason);
+
+        NS_TEST_ASSERT_MSG_EQ(isDropped, true, "A hop limit of 1 did not drop the packet");
+        NS_TEST_ASSERT_MSG_EQ(stopProcessing,
+                              true,
+                              "Processing was not stopped for hop limit exhaustion");
+    }
+
+    // A relay hop (Segments Left still nonzero, otherwise valid) always stops
+    // the caller's receive loop, whether or not a route to the next hop
+    // exists: this is the regression test for the bug where a relay hop both
+    // resent the packet on its own and let the original fall through to
+    // local delivery too, corrupting whatever was listening on this node.
+    {
+        RplSourceRoutingHeader srh;
+        srh.SetNextHeader(59);
+        srh.SetSegmentsLeft(1);
+        srh.SetAddresses({Ipv6Address("fe80::4")}); // heard from nobody: no route
+
+        Ptr<Packet> packet = Create<Packet>();
+        packet->AddHeader(srh);
+
+        Ipv6Header ipv6Header;
+        ipv6Header.SetSource(Ipv6Address("fe80::3"));
+        ipv6Header.SetDestination(linkLocal);
+        ipv6Header.SetHopLimit(64);
+
+        bool stopProcessing = false;
+        bool isDropped = false;
+        Ipv6L3Protocol::DropReason dropReason;
+        extension->Process(packet,
+                           0,
+                           ipv6Header,
+                           linkLocal,
+                           nullptr,
+                           stopProcessing,
+                           isDropped,
+                           dropReason);
+
+        NS_TEST_ASSERT_MSG_EQ(isDropped, true, "A relay hop did not mark the packet as handled");
+        NS_TEST_ASSERT_MSG_EQ(stopProcessing,
+                              true,
+                              "A relay hop did not stop the caller's receive loop");
+    }
+
+    // Segments Left already zero: this node is the real destination, so
+    // nothing is touched and the rest of the receive chain takes over.
+    {
+        RplSourceRoutingHeader srh;
+        srh.SetNextHeader(58); // ICMPv6, a plausible inner protocol
+        srh.SetSegmentsLeft(0);
+        srh.SetAddresses({Ipv6Address("fe80::4")});
+
+        Ptr<Packet> packet = Create<Packet>();
+        packet->AddHeader(srh);
+
+        Ipv6Header ipv6Header;
+        ipv6Header.SetSource(Ipv6Address("fe80::3"));
+        ipv6Header.SetDestination(linkLocal);
+        ipv6Header.SetHopLimit(64);
+
+        bool stopProcessing = false;
+        bool isDropped = false;
+        uint8_t nextHeader = 0;
+        Ipv6L3Protocol::DropReason dropReason;
+        uint8_t processed = extension->Process(packet,
+                                               0,
+                                               ipv6Header,
+                                               linkLocal,
+                                               &nextHeader,
+                                               stopProcessing,
+                                               isDropped,
+                                               dropReason);
+
+        NS_TEST_ASSERT_MSG_EQ(isDropped, false, "A fully-arrived packet was dropped");
+        NS_TEST_ASSERT_MSG_EQ(stopProcessing,
+                              false,
+                              "A fully-arrived packet stopped the rest of the receive chain");
+        NS_TEST_ASSERT_MSG_EQ(nextHeader, 58, "The inner next header was not reported");
+        NS_TEST_ASSERT_MSG_EQ(processed, 8 + 16, "Wrong number of bytes reported consumed");
+    }
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief The RPL test suite.
  */
 class RplTestSuite : public TestSuite
@@ -642,6 +890,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplDioUnknownOptionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDaoHeaderTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplSourceRoutingHeaderTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplSourceRoutingProcessTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplTrickleTimerTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDodagFormationTestCase, TestCase::Duration::QUICK);
 }
