@@ -5,10 +5,14 @@
  */
 
 #include "ns3/boolean.h"
+#include "ns3/icmpv6-header.h"
+#include "ns3/icmpv6-l4-protocol.h"
+#include "ns3/inet6-socket-address.h"
 #include "ns3/internet-stack-helper.h"
 #include "ns3/ipv6-address-helper.h"
 #include "ns3/ipv6-extension.h"
 #include "ns3/ipv6-l3-protocol.h"
+#include "ns3/ipv6-raw-socket-factory.h"
 #include "ns3/ipv6-route.h"
 #include "ns3/node-container.h"
 #include "ns3/packet.h"
@@ -21,10 +25,65 @@
 #include "ns3/simple-net-device-helper.h"
 #include "ns3/simple-net-device.h"
 #include "ns3/simulator.h"
+#include "ns3/socket.h"
 #include "ns3/test.h"
+#include "ns3/uinteger.h"
 
 using namespace ns3;
 using namespace ns3::rpl;
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief Send a hand-built RPL control message from a node's own raw socket,
+ *        bypassing RplRoutingProtocol entirely.
+ *
+ * This is what lets a test drive RecvRpl() with a message the protocol itself
+ * would never construct, e.g. a No-Path DAO, which nothing in this
+ * implementation sends yet even though HandleDao() knows how to act on one.
+ *
+ * @param node the node to send from
+ * @param interface the interface to send on
+ * @param body the RPL message body, e.g. a RplDaoHeader
+ * @param code the RPL message code
+ * @param src the source address to check the ICMPv6 checksum against
+ * @param dst the destination address
+ */
+template <typename T>
+static void
+SendRawRplMessage(Ptr<Node> node,
+                  uint32_t interface,
+                  const T& body,
+                  uint8_t code,
+                  Ipv6Address src,
+                  Ipv6Address dst)
+{
+    Ptr<Ipv6L3Protocol> ipv6 = node->GetObject<Ipv6L3Protocol>();
+    Ptr<Socket> socket = Socket::CreateSocket(node, Ipv6RawSocketFactory::GetTypeId());
+    socket->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    socket->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    socket->BindToNetDevice(ipv6->GetNetDevice(interface));
+
+    Ptr<Packet> packet = Create<Packet>();
+    packet->AddHeader(body);
+
+    Icmpv6Header icmpv6Header;
+    icmpv6Header.SetType(ICMPV6_RPL);
+    icmpv6Header.SetCode(code);
+    icmpv6Header.CalculatePseudoHeaderChecksum(src,
+                                               dst,
+                                               packet->GetSize() + icmpv6Header.GetSerializedSize(),
+                                               Icmpv6L4Protocol::GetStaticProtocolNumber());
+    packet->AddHeader(icmpv6Header);
+
+    SocketIpv6HopLimitTag hopLimitTag;
+    hopLimitTag.SetHopLimit(255);
+    packet->AddPacketTag(hopLimitTag);
+
+    socket->SendTo(packet, 0, Inet6SocketAddress(dst, 0));
+    socket->Close();
+}
 
 /**
  * @ingroup rpl
@@ -874,6 +933,230 @@ RplSourceRoutingProcessTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief Check that a No-Path DAO (RFC 6550 section 6.4.3, path lifetime
+ *        zero) removes the target from the root's topology.
+ *
+ * Nothing in this implementation sends a No-Path DAO yet (see
+ * doc/design-constraints.md section 10): a node's downward route is only ever
+ * dropped by PurgeTopology() once its lifetime runs out. HandleDao() does
+ * know what to do with one, though, e.g. from another implementation sharing
+ * the DODAG, so this builds one by hand with SendRawRplMessage() and checks
+ * that path.
+ */
+class RplNoPathDaoTestCase : public TestCase
+{
+  public:
+    RplNoPathDaoTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplNoPathDaoTestCase::RplNoPathDaoTestCase()
+    : TestCase("No-Path DAO removes a topology entry")
+{
+}
+
+void
+RplNoPathDaoTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.SetBase(Ipv6Address("2001:1::"), Ipv6Prefix(64));
+    Ipv6InterfaceContainer interfaces = ipv6.Assign(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0));
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(60));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> root = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ipv6Address childAddress = interfaces.GetAddress(1, 1);
+    Ipv6Address rootAddress = interfaces.GetAddress(0, 1);
+    NS_TEST_ASSERT_MSG_EQ(root->GetTopologySize(), 1, "The root did not learn the child's DAO");
+
+    std::vector<Ipv6Address> hops;
+    NS_TEST_ASSERT_MSG_EQ(root->ComputeSourceRoute(childAddress, hops),
+                          true,
+                          "The root cannot reach the child before the No-Path");
+
+    RplDaoHeader noPath;
+    noPath.SetInstanceId(RPL_DEFAULT_INSTANCE);
+    noPath.SetSequence(99);
+    noPath.SetTarget(childAddress);
+    noPath.SetTransitInformation(Ipv6Address("2001:1::9"), 1, 0); // lifetime 0: No-Path
+
+    Simulator::Schedule(Seconds(0),
+                       &SendRawRplMessage<RplDaoHeader>,
+                       nodes.Get(1),
+                       1,
+                       noPath,
+                       static_cast<uint8_t>(RPL_CODE_DAO),
+                       childAddress,
+                       rootAddress);
+
+    Simulator::Stop(Seconds(1));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(root->GetTopologySize(), 0, "The No-Path DAO did not remove the entry");
+    NS_TEST_ASSERT_MSG_EQ(root->ComputeSourceRoute(childAddress, hops),
+                          false,
+                          "The root can still reach the child after the No-Path");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief Check that an unacknowledged DAO is retried DaoRetries times at
+ *        DaoAckTimeout, then given up on until the next periodic DAO.
+ *
+ * A raw socket installed on the root, alongside RPL's own, counts DAO
+ * arrivals without touching any of RplRoutingProtocol's private retry state:
+ * one for the DAO that follows joining the DODAG, which gets acknowledged
+ * normally, then, once the return path is cut, one for the next periodic DAO
+ * plus DaoRetries retries, none of which do.
+ */
+class RplDaoAckRetryTestCase : public TestCase
+{
+  public:
+    RplDaoAckRetryTestCase();
+
+  private:
+    void DoRun() override;
+
+    /**
+     * @brief Record the arrival of a DAO at the monitoring socket.
+     * @param socket the monitoring socket
+     */
+    void RecordDao(Ptr<Socket> socket);
+
+    std::vector<Time> m_daoArrivals; //!< when a DAO reached the monitoring socket
+};
+
+RplDaoAckRetryTestCase::RplDaoAckRetryTestCase()
+    : TestCase("DAO-ACK timeout retries the DAO, then gives up")
+{
+}
+
+void
+RplDaoAckRetryTestCase::RecordDao(Ptr<Socket> socket)
+{
+    Address sender;
+    Ptr<Packet> packet = socket->RecvFrom(sender);
+    if (!packet)
+    {
+        return;
+    }
+
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ipv6Header);
+    Icmpv6Header icmpv6Header;
+    packet->RemoveHeader(icmpv6Header);
+
+    if (icmpv6Header.GetType() == ICMPV6_RPL && icmpv6Header.GetCode() == RPL_CODE_DAO)
+    {
+        m_daoArrivals.push_back(Simulator::Now());
+    }
+}
+
+void
+RplDaoAckRetryTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    // A short, exact Imin gets the DODAG up quickly and predictably, so the
+    // margins below do not depend on how long that takes.
+    rplHelper.Set("DioIntervalMin", TimeValue(MilliSeconds(256)));
+    rplHelper.Set("DaoInterval", TimeValue(Seconds(4)));
+    rplHelper.Set("DaoAckTimeout", TimeValue(Seconds(1)));
+    rplHelper.Set("DaoRetries", UintegerValue(2));
+
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.SetBase(Ipv6Address("2001:1::"), Ipv6Prefix(64));
+    Ipv6InterfaceContainer interfaces = ipv6.Assign(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0));
+    rplHelper.AssignStreams(nodes, 1);
+
+    Ptr<Node> rootNode = nodes.Get(0);
+    Ptr<Socket> monitor = Socket::CreateSocket(rootNode, Ipv6RawSocketFactory::GetTypeId());
+    monitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    monitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    monitor->BindToNetDevice(rootNode->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+    monitor->SetRecvCallback(MakeCallback(&RplDaoAckRetryTestCase::RecordDao, this));
+
+    // The DAO that follows joining the DODAG, well before the first periodic
+    // refresh at DaoInterval later, gets acknowledged normally.
+    Simulator::Stop(Seconds(2));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(m_daoArrivals.size(), 1, "The first DAO did not arrive as expected");
+    Ptr<RplRoutingProtocol> root = rootNode->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(root->GetTopologySize(), 1, "The root did not learn the child's DAO");
+
+    // Cut the return path: the child's next DAO still reaches the root (so it
+    // still counts here), but the DAO-ACK the root sends back never does.
+    Ptr<SimpleNetDevice> rootDevice = DynamicCast<SimpleNetDevice>(devices.Get(0));
+    Ptr<SimpleNetDevice> childDevice = DynamicCast<SimpleNetDevice>(devices.Get(1));
+    channel->BlackList(rootDevice, childDevice);
+
+    // DaoTimerExpire() reschedules the next periodic DAO unconditionally,
+    // whether or not the previous one was acknowledged, so the window below
+    // has to end well inside one DaoInterval to see only one such cycle. With
+    // the streams AssignStreams() fixes above, the periodic DAO and its two
+    // retries land at 4.71, 5.71 and 6.71 s after the blacklist, and the next
+    // periodic DAO at 8.71 s; 5.5 s comfortably separates the two.
+    Simulator::Stop(Seconds(5.5));
+    Simulator::Run();
+
+    // 1 (initial, already counted) + 1 (periodic, unacknowledged) +
+    // DaoRetries (2, also unacknowledged), and no more within this window.
+    NS_TEST_ASSERT_MSG_EQ(m_daoArrivals.size(),
+                          4,
+                          "Wrong number of DAO transmissions across the periodic "
+                          "refresh and its retries");
+
+    monitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief The RPL test suite.
  */
 class RplTestSuite : public TestSuite
@@ -893,6 +1176,8 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplSourceRoutingProcessTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplTrickleTimerTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDodagFormationTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplNoPathDaoTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplDaoAckRetryTestCase, TestCase::Duration::QUICK);
 }
 
 /// Static variable for test initialization.

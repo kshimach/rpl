@@ -158,11 +158,18 @@
 
 ## 10. 未対応・既知の制限 (優先度順に未実装)
 
-- **Medium**: SRH 転送の実シミュレーション上での動作は
+- **Medium (解消)**: SRH 転送の実シミュレーション上での動作は
   `rpl-6lowpan-simple` 例 (LR-WPAN + 6LoWPAN route-over、3ノード) で
-  end-to-end 確認済み (ping 5/5)。ただし segments-left デクリメントの
-  境界値やマルチキャスト混入等を狙った専用テストケース、No-Path DAO による
-  ルート削除テスト、DAO-ACK タイムアウト・リトライ枯渇パスのテストは未整備。
+  end-to-end 確認済み (ping 5/5)。加えて `RplSourceRoutingProcessTestCase`
+  で `RplIpv6ExtensionSourceRouting::Process()` の境界値
+  (segments-left 不整合、マルチキャスト混入、hop limit 枯渇、中継 hop での
+  `stopProcessing`、到達済みパケットの pass-through) を直接検証。
+  `RplNoPathDaoTestCase` で No-Path DAO によるトポロジエントリ削除、
+  `RplDaoAckRetryTestCase` で DAO-ACK タイムアウト・リトライ・
+  リトライ枯渇 (`SendRawRplMessage()` によるパケット手動生成、および
+  root 上の監視用 raw socket による送信回数カウントで検証、private
+  state には触れない) をそれぞれ追加。ただし No-Path DAO 自体を
+  本実装から**送信**する経路はまだ無い (下記参照)。
 - **Low**: DAO/path sequence の uint8_t wraparound (lollipop 比較) の
   ドキュメント化、Sphinx モデルドキュメントの作成、が未着手。
 - **既知の非対応事項**: RFC 6553 (Hop-by-Hop header 内 RPL Option) は
