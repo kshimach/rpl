@@ -10,12 +10,16 @@ This chapter describes ``contrib/rpl``, an implementation of RPL (RFC 6550),
 the IPv6 Routing Protocol for Low-Power and Lossy Networks, for ns-3. The
 implementation covers non-storing mode (MOP 1) only: DODAG formation from
 DIS/DIO exchanges paced by a Trickle timer (RFC 6206), rank computed by
-Objective Function Zero (RFC 6552), downward routes built from the DAOs
-every node sends to the root and delivered with a real RFC 6554 Source
-Routing Header, and per-hop rank consistency checking with a real RFC 6553
-RPL Option in a Hop-by-Hop header. The protocol is designed to run over
-6LoWPAN in route-over mode, i.e. installed on the IPv6 interfaces that sit
-on ``SixLowPanNetDevice``, not directly on the link-layer device underneath.
+either Objective Function Zero (RFC 6552, hop count, the default) or MRHOF
+(RFC 6719) over the ETX routing metric (RFC 6551), downward routes built
+from the DAOs every node sends to the root and delivered with a real RFC
+6554 Source Routing Header, and per-hop rank consistency checking with a
+real RFC 6553 RPL Option in a Hop-by-Hop header. The protocol is designed to
+run over 6LoWPAN in route-over mode, i.e. installed on the IPv6 interfaces
+that sit on ``SixLowPanNetDevice``, not directly on the link-layer device
+underneath. This is also the profile Wi-SUN FAN 1.1 builds its RPL usage on
+(non-storing, MRHOF, ETX); see design-constraints.md section 13.1 for what
+of that profile is, and is not, verifiable from public sources.
 
 The source code lives in ``contrib/rpl/``.
 
@@ -25,9 +29,14 @@ Scope and Limitations
 What the model does:
 
 * Builds and maintains a DODAG: DIS solicitation, Trickle-paced DIO
-  advertisement, rank computation with OF0, parent selection with a
+  advertisement, rank computation with OF0 or MRHOF, parent selection with a
   freshness gate against spurious long-range PHY reception, and DODAG
   version changes.
+* Under MRHOF, derives the ETX routing metric from lr-wpan's per-frame LQI
+  (an EWMA-smoothed approximation of the bidirectional link quality Wi-SUN
+  FAN measures through Neighbor Discovery), and picks the preferred parent
+  by path cost with RFC 6719's hysteresis against flapping between parents
+  of near-identical quality.
 * Builds downward routes the way non-storing mode does: every node tells the
   root, with a DAO, which parent it sits under; only the root keeps a picture
   of the whole topology, and it computes and attaches a source route to every
@@ -57,6 +66,12 @@ What it does not do:
   traced but not actually dropped: |ns3|'s ``Ipv6Option::Process()`` has no
   way to stop a packet the way ``Ipv6Extension::Process()`` can. See
   ``contrib/rpl/doc/design-constraints.md`` section 12.3.
+* Wi-SUN FAN 1.1's own numeric tuning (Trickle intervals, hysteresis
+  threshold, etc.) is not publicly documented, so MRHOF uses RFC 6719's own
+  published defaults instead. See design-constraints.md section 13.1.
+* Only the ETX metric (RFC 6551 section 4.3) is implemented; LQL and
+  carrying more than one Routing Metric/Constraint object in the same DIO
+  are not.
 * No security modes (RFC 6550 section 10): every control message is sent
   unsecured.
 * No P2P-RPL (RFC 6997) and no support for multiple concurrent RPL
@@ -134,6 +149,30 @@ and once more inside ``LocalDeliver()``. ``RplIpv6OptionRpl`` tracks the
 ``Packet::GetUid()`` of the last packet it actually acted on so the second
 call is a no-op rather than re-checking a rank it just rewrote to its own.
 
+Routing metric (ETX, MRHOF)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``RplDioHeader`` optionally carries a DAG Metric Container (RFC 6550 section
+6.7.8) holding an ETX object (RFC 6551 section 4.3), the cumulative path ETX
+in the same fixed-point scale (``ETX * 128``) the wire format itself uses.
+``RplRoutingProtocol`` reads lr-wpan's per-frame LQI
+(``ns3::lrwpan::LrWpanLqiTag``) off a received DIO to estimate the
+instantaneous ETX of that link, EWMA-smooths it into a per-neighbour
+estimate, and, under MRHOF (``Ocp`` attribute set to ``RPL_OCP_MRHOF``),
+uses it in place of a plain hop count for both the rank (RFC 6719 section
+3.3) and preferred parent selection, including the hysteresis against
+flapping between near-identical parents. The tag is read by its registered
+``TypeId`` name through the generic ``PacketTagIterator`` rather than a
+direct dependency on the lr-wpan module, so ``librpl`` keeps building and
+running over any link layer, falling back to a neutral ETX (i.e. behaving
+like plain hop count) where the tag is absent. See design-constraints.md
+section 13 for the full design rationale, including what of Wi-SUN FAN
+1.1's RPL profile could and could not be verified from public sources.
+
+OF0 remains the compiled-in default; MRHOF is an explicit opt-in on the
+root, the same way every other DODAG-wide parameter propagates from the
+root's DIOs to the rest of the DODAG.
+
 Trickle timer
 ~~~~~~~~~~~~~
 
@@ -184,6 +223,10 @@ All attributes are on ``ns3::rpl::RplRoutingProtocol``:
   suppression.
 * ``MinHopRankIncrease``: MinHopRankIncrease, which is also the rank of the
   root.
+* ``Ocp``: Objective Code Point the root advertises, ``RPL_OCP_OF0`` (hop
+  count, the default) or ``RPL_OCP_MRHOF`` (RFC 6719, ETX). Only meaningful
+  on the root; every other node adopts whatever OCP the DIO it joins on
+  advertises.
 * ``DaoInterval``: how often a node repeats the DAO telling the root where
   it sits.
 * ``DaoAckTimeout``: how long a node waits for a DAO-ACK before resending
@@ -212,7 +255,10 @@ other, forcing a multi-hop DODAG. Once it has converged, the last node
 pings the root and the root answers, exercising both the upward route (the
 request climbing through preferred parents) and the downward one (the
 reply following the source route the root computed from the DAOs it
-collected).
+collected). The ``--mrhof`` command-line argument switches the DODAG from
+OF0 to MRHOF; combined with ``--verbose`` and a large enough ``--distance``
+to put a real ``LrWpanErrorModel`` into a lossy regime, the log shows each
+hop's link ETX and the cumulative path ETX every node ends up advertising.
 
 Tests
 ~~~~~
@@ -240,6 +286,10 @@ The ``rpl`` test suite (``test/rpl-test-suite.cc``) is a unit suite covering:
 * A No-Path DAO removing a topology entry at the root.
 * An unacknowledged DAO being retried the configured number of times at the
   configured timeout, then given up on until the next periodic refresh.
+* MRHOF parent selection: choosing the lower path-cost candidate between two
+  otherwise-equal neighbours, and the RFC 6719 hysteresis keeping the
+  current preferred parent over a candidate whose improvement does not
+  exceed ``PARENT_SWITCH_THRESHOLD``.
 
 Validation
 ----------
@@ -254,6 +304,14 @@ either header getting lost in the process of the latter riding along on
 every hop of a source routed packet's relay: two of the four |ns3| core and
 module bugs this development surfaced; see design-constraints.md section
 11).
+
+The same example, run with ``--mrhof`` at a distance long enough to put the
+link in a lossy regime, confirmed that ``LrWpanLqiTag`` survives the full
+receive path (PHY through ``SixLowPanNetDevice`` decompression up to
+``RplRoutingProtocol``) with real, non-neutral ETX values, and that the
+path ETX MRHOF advertises accumulates additively across hops exactly as RFC
+6551 section 4.3 defines it, with ping still succeeding end to end. See
+design-constraints.md section 13.6.
 
 References
 ----------
@@ -277,3 +335,11 @@ Routing Protocol for Low-Power and Lossy Networks (RPL)," RFC 6554, March
 [`5 <https://www.rfc-editor.org/rfc/rfc6553>`_] J. Hui and JP. Vasseur,
 "The Routing Protocol for Low-Power and Lossy Networks (RPL) Option for
 Carrying RPL Information in Data-Plane Datagrams," RFC 6553, March 2012.
+
+[`6 <https://www.rfc-editor.org/rfc/rfc6551>`_] JP. Vasseur, Ed., et al.,
+"Routing Metrics Used for Path Calculation in Low-Power and Lossy
+Networks," RFC 6551, March 2012.
+
+[`7 <https://www.rfc-editor.org/rfc/rfc6719>`_] O. Gnawali and P. Levis,
+"The Minimum Rank with Hysteresis Objective Function," RFC 6719, September
+2012.

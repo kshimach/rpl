@@ -174,6 +174,7 @@ RplDioHeaderTestCase::DoRun()
     NS_TEST_ASSERT_MSG_EQ(received.GetDtsn(), 42, "Wrong DTSN");
     NS_TEST_ASSERT_MSG_EQ(received.GetDodagId(), Ipv6Address("2001:1::1"), "Wrong DODAGID");
     NS_TEST_ASSERT_MSG_EQ(received.HasDagConfiguration(), false, "There should be no option");
+    NS_TEST_ASSERT_MSG_EQ(received.HasMetricContainer(), false, "There should be no option");
 
     // The Grounded flag, the mode of operation and the preference share a byte,
     // so a DIO that has none of them set has to come back clean.
@@ -204,6 +205,21 @@ RplDioHeaderTestCase::DoRun()
     NS_TEST_ASSERT_MSG_EQ(received.GetDefaultLifetime(), 20, "Wrong default lifetime");
     NS_TEST_ASSERT_MSG_EQ(received.GetLifetimeUnit(), 30, "Wrong lifetime unit");
     NS_TEST_ASSERT_MSG_EQ(received.GetRank(), 384, "The option ate part of the base object");
+
+    // Now also with the DAG Metric Container (RFC 6551 ETX object), as MRHOF
+    // carries alongside the DODAG Configuration option.
+    dio.SetMetricContainer(320); // ETX 2.5
+    NS_TEST_ASSERT_MSG_EQ(dio.GetSerializedSize(), 48, "The metric container adds 8 bytes");
+
+    packet = Create<Packet>();
+    packet->AddHeader(dio);
+    packet->RemoveHeader(received);
+
+    NS_TEST_ASSERT_MSG_EQ(received.HasMetricContainer(), true, "The metric container was lost");
+    NS_TEST_ASSERT_MSG_EQ(received.GetPathEtx(), 320, "Wrong path ETX");
+    NS_TEST_ASSERT_MSG_EQ(received.HasDagConfiguration(), true, "The other option was lost");
+    NS_TEST_ASSERT_MSG_EQ(received.GetOcp(), RPL_OCP_OF0, "The other option's content was lost");
+    NS_TEST_ASSERT_MSG_EQ(received.GetRank(), 384, "An option ate part of the base object");
 }
 
 /**
@@ -700,6 +716,159 @@ RplDodagFormationTestCase::DoRun()
 
     direct->CopyData(hbh, sizeof(hbh));
     NS_TEST_ASSERT_MSG_EQ(+hbh[0], 17, "Hop-by-Hop does not lead to the inner protocol");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief Check MRHOF (RFC 6719) parent selection: path cost, not just hop
+ *        count, decides the preferred parent, and hysteresis
+ *        (PARENT_SWITCH_THRESHOLD) keeps it from flapping over a marginal
+ *        improvement.
+ *
+ * One node ("leaf") is driven purely by hand-built DIOs sourced from two
+ * other real nodes ("peerA"/"peerB"), which need nothing more than a real
+ * link-local address of their own: nothing here depends on either of them
+ * running RPL themselves. None of the three is the DODAG root, so the very
+ * first DIO leaf ever sees is what bootstraps it into the DODAG, adopting
+ * MRHOF from that DIO's DODAG Configuration option exactly as any node deep
+ * in a real DODAG would. The test binary links neither lr-wpan nor its
+ * LrWpanLqiTag, so the link ETX to both peers is always the neutral default
+ * (RPL_ETX_FIXED_POINT): every difference in path cost between them comes
+ * from the path ETX each one advertises in its DAG Metric Container, which
+ * is exactly what this test controls.
+ */
+class RplMrhofSelectionTestCase : public TestCase
+{
+  public:
+    RplMrhofSelectionTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplMrhofSelectionTestCase::RplMrhofSelectionTestCase()
+    : TestCase("MRHOF path cost selection and hysteresis")
+{
+}
+
+void
+RplMrhofSelectionTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(3); // 0 = leaf under test, 1 = peerA, 2 = peerB
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.SetBase(Ipv6Address("2001:1::"), Ipv6Prefix(64));
+    Ipv6InterfaceContainer interfaces = ipv6.Assign(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.AssignStreams(nodes, 1);
+
+    Ptr<RplRoutingProtocol> leaf = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ipv6Address dodagId("2001:1::1");
+    Ipv6Address leafLinkLocal =
+        nodes.Get(0)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address peerALinkLocal =
+        nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address peerBLinkLocal =
+        nodes.Get(2)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    auto buildDio = [&dodagId](uint16_t pathEtx) {
+        RplDioHeader dio;
+        dio.SetInstanceId(RPL_DEFAULT_INSTANCE);
+        dio.SetVersionNumber(1);
+        dio.SetRank(RPL_MIN_HOPRANKINC);
+        dio.SetMop(RPL_MOP_NON_STORING);
+        dio.SetDodagId(dodagId);
+        dio.SetDagConfiguration(RPL_DIO_INTERVAL_DOUBLINGS,
+                                RPL_DIO_INTERVAL_MIN,
+                                RPL_DIO_REDUNDANCY,
+                                RPL_MAX_RANKINC,
+                                RPL_MIN_HOPRANKINC,
+                                RPL_OCP_MRHOF,
+                                RPL_DEFAULT_LIFETIME,
+                                RPL_DEFAULT_LIFETIME_UNIT);
+        dio.SetMetricContainer(pathEtx);
+        return dio;
+    };
+
+    // peerA advertises a path ETX of 300: path cost 300 + 128 (neutral link
+    // ETX) = 428. Being the first DIO leaf ever sees, it also bootstraps the
+    // join and MRHOF adoption.
+    RplDioHeader dioA = buildDio(300);
+    Simulator::Schedule(Seconds(0),
+                       &SendRawRplMessage<RplDioHeader>,
+                       nodes.Get(1),
+                       1,
+                       dioA,
+                       static_cast<uint8_t>(RPL_CODE_DIO),
+                       peerALinkLocal,
+                       leafLinkLocal);
+    Simulator::Stop(MilliSeconds(10));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(leaf->IsJoined(), true, "The DIO did not bootstrap a DODAG");
+    NS_TEST_ASSERT_MSG_EQ(leaf->GetPreferredParent(),
+                          peerALinkLocal,
+                          "peerA should be preferred, being the only parent so far");
+    NS_TEST_ASSERT_MSG_EQ(leaf->GetPathEtx(), 428, "Wrong path cost via peerA");
+    NS_TEST_ASSERT_MSG_EQ(leaf->GetRank(), 428, "Wrong MRHOF rank via peerA");
+
+    // peerB advertises a path ETX of 250: path cost 378, only 50 better than
+    // peerA's 428. RFC 6719's hysteresis (PARENT_SWITCH_THRESHOLD = 192)
+    // keeps peerA preferred rather than flapping over a marginal improvement.
+    RplDioHeader dioB1 = buildDio(250);
+    Simulator::Schedule(Seconds(0),
+                       &SendRawRplMessage<RplDioHeader>,
+                       nodes.Get(2),
+                       1,
+                       dioB1,
+                       static_cast<uint8_t>(RPL_CODE_DIO),
+                       peerBLinkLocal,
+                       leafLinkLocal);
+    Simulator::Stop(MilliSeconds(10));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(leaf->GetPreferredParent(),
+                          peerALinkLocal,
+                          "A marginal improvement should not switch the preferred parent");
+    NS_TEST_ASSERT_MSG_EQ(leaf->GetPathEtx(), 428, "The path cost should still be through peerA");
+
+    // peerB improves further, to a path ETX of 0: path cost 128, well beyond
+    // the hysteresis threshold below peerA's 428. Now it takes over.
+    RplDioHeader dioB2 = buildDio(0);
+    Simulator::Schedule(Seconds(0),
+                       &SendRawRplMessage<RplDioHeader>,
+                       nodes.Get(2),
+                       1,
+                       dioB2,
+                       static_cast<uint8_t>(RPL_CODE_DIO),
+                       peerBLinkLocal,
+                       leafLinkLocal);
+    Simulator::Stop(MilliSeconds(10));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(leaf->GetPreferredParent(),
+                          peerBLinkLocal,
+                          "A large enough improvement should switch the preferred parent");
+    NS_TEST_ASSERT_MSG_EQ(leaf->GetPathEtx(), 128, "Wrong path cost via peerB");
+    NS_TEST_ASSERT_MSG_EQ(leaf->GetRank(), 256, "Wrong MRHOF rank via peerB");
 
     Simulator::Destroy();
 }
@@ -1412,6 +1581,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplSourceRoutingProcessTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplTrickleTimerTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDodagFormationTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplMrhofSelectionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplNoPathDaoTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDaoAckRetryTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplPacketInfoHeaderTestCase, TestCase::Duration::QUICK);

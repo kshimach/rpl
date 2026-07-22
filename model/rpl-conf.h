@@ -99,6 +99,16 @@ constexpr uint16_t RPL_MAX_RANKINC = 8 * RPL_MIN_HOPRANKINC;
 constexpr uint16_t RPL_SIGNIFICANT_CHANGE_THRESHOLD = 4 * RPL_MIN_HOPRANKINC;
 constexpr uint8_t RPL_DEFAULT_INSTANCE = 0;
 
+/// Routing Metric/Constraint object types (RFC 6551, section 4).
+constexpr uint8_t RPL_DAG_MC_ETX = 7;
+
+/// MRHOF (RFC 6719) defaults, in the same fixed-point scale as the wire
+/// encoding of ETX (ETX * 128, RFC 6551 section 4.3).
+constexpr uint16_t RPL_ETX_FIXED_POINT = 128;                //!< ETX * 128
+constexpr uint16_t RPL_MRHOF_MAX_LINK_METRIC = 512;          //!< ETX 4.0
+constexpr uint32_t RPL_MRHOF_MAX_PATH_COST = 32768;          //!< ETX 256.0
+constexpr uint16_t RPL_MRHOF_PARENT_SWITCH_THRESHOLD = 192;  //!< ETX 1.5
+
 /// Neighbour freshness, mirroring the link statistics of Contiki-NG
 /// (os/net/link-stats.h). A neighbour heard only once may well be an
 /// unreliable long shot, so it is not a parent until it has been heard

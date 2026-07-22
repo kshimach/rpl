@@ -56,6 +56,7 @@ main(int argc, char** argv)
     double stopTime = 300.0;
     bool verbose = false;
     bool pcap = false;
+    bool mrhof = false;
     int64_t streamNumber = 1;
 
     CommandLine cmd(__FILE__);
@@ -65,6 +66,9 @@ main(int argc, char** argv)
     cmd.AddValue("stopTime", "simulation duration, in seconds", stopTime);
     cmd.AddValue("verbose", "turn on RPL logging", verbose);
     cmd.AddValue("pcap", "write pcap traces", pcap);
+    cmd.AddValue("mrhof",
+                "use MRHOF (RFC 6719, ETX) instead of the default OF0 (RFC 6552, hop count)",
+                mrhof);
     cmd.Parse(argc, argv);
 
     if (verbose)
@@ -93,7 +97,23 @@ main(int argc, char** argv)
     streamNumber += lrWpanHelper.AssignStreams(lrwpanDevices, streamNumber);
     lrWpanHelper.CreateAssociatedPan(lrwpanDevices, 1);
 
+    // Without an error model the PHY never touches the LQI it tags every
+    // received frame with (it stays pinned at the "perfect" default), which
+    // would make MRHOF's ETX indistinguishable from OF0's hop count. One
+    // shared LrWpanErrorModel, driven by the SINR the spectrum channel
+    // already computes from the distances above, is what gives every hop a
+    // real, and different, link quality to measure.
+    Ptr<lrwpan::LrWpanErrorModel> errorModel = CreateObject<lrwpan::LrWpanErrorModel>();
+    for (auto i = lrwpanDevices.Begin(); i != lrwpanDevices.End(); i++)
+    {
+        DynamicCast<lrwpan::LrWpanNetDevice>(*i)->GetPhy()->SetErrorModel(errorModel);
+    }
+
     RplHelper rplHelper;
+    if (mrhof)
+    {
+        rplHelper.Set("Ocp", UintegerValue(rpl::RPL_OCP_MRHOF));
+    }
     InternetStackHelper internetv6;
     internetv6.SetRoutingHelper(rplHelper);
     internetv6.Install(nodes);

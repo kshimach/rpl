@@ -181,10 +181,13 @@
   準拠。本体 doc ビルドへの登録は行っていない — contrib モジュールで
   upstream 予定もないため)。
 - **既知の非対応事項**: RFC 6553 (RPL Option, RPI) は 12 節の通り実装済み。
+  RFC 6551/6719 (ETX/MRHOF) も 13 節の通り実装済み。
   storing mode (MOP=2) は方針により対象外。RH3 アドレス圧縮
   (CmprI/CmprE) 未実装、6LoWPAN NHC 圧縮も Routing Header では効かない
   (11 節)。RPI の確認済みループ (RFC 6550 section 11.2 の「2 回連続で
   不整合」) は実際にはパケットを止められない、既知の制約あり (12.2 節)。
+  LQL (Link Quality Level) メトリック・メトリックコンテナの複数同時搭載
+  (RFC 6551 は 1 DIO に複数の Routing-MC-Type を許容) は未実装 (13.7 節)。
 
 ## 11. ns-3 コアで見つかった既存バグ、および本実装側のバグ
 
@@ -370,3 +373,205 @@ RFC 6550 section 11.2 は「2 回連続で rank 不整合を検知したら確�
 `RplPacketInfoHeader` を渡すだけで、8 バイト境界のパディング計算等は
 既存コードに任せられる。SRH と両方付く場合は HBH が外側 (RFC 8200 の
 推奨順序通り)。
+
+## 13. RFC 6551 / RFC 6719 (ETX / MRHOF) の実装
+
+これまで OF0 (RFC 6552、ホップ数のみ) しか実装しておらず、ETX は
+`RplOcp` に列挙値があるだけの未実装プレースホルダーだった。ETX を実装し、
+Wi-SUN FAN 1.1 の RPL プロファイルに合わせることを目的として、
+MRHOF (RFC 6719) を OF0 と選択制で追加した。
+
+### 13.1 Wi-SUN FAN 1.1 の RPL プロファイル調査
+
+Wi-SUN Alliance の FAN 1.1 仕様書自体は会員限定配布であり、本文を直接
+参照することはできなかった。公開されている二次情報 (IETF 6TiSCH/roll
+関連ドラフト、Wi-SUN Alliance の公開資料・プレスリリース、他 OSS
+実装のコメント) から確認できた範囲は以下の通り:
+
+- ルーティングは non-storing mode (このモジュールの前提と一致)。
+- Objective Function は MRHOF (RFC 6719)。
+- ルーティングメトリックは ETX (RFC 6551 の Routing-MC-Type=7)。
+- ETX は実機では Neighbor Discovery で得る双方向リンク品質
+  (RSL: Received Signal Level) から導出する。
+- 可能な限り 2 つ以上の親を維持することが望ましいとされる。
+
+一方、Trickle の Imin/Imax、`PARENT_SWITCH_THRESHOLD` 等の
+Wi-SUN 固有の数値チューニングは公開情報からは確認できなかった。
+そのため本実装は **RFC 6719 自身が Section 5 で示すデフォルト値**
+(`MAX_LINK_METRIC=512`、`MAX_PATH_COST=32768`、
+`PARENT_SWITCH_THRESHOLD=192`) をそのまま採用している。Contiki-NG の
+`rpl-mrhof.c` は同じ RFC を実装しながら異なるチューニング値
+(`PARENT_SWITCH_THRESHOLD=96` など) を使っており、実装ごとに現場向けの
+調整が入ることの傍証ではあるが、今回は「仕様に従う」という指示に対して
+一次資料である RFC の値を優先した。13.7 節に既知の制限として明記する。
+
+### 13.2 DAG Metric Container のワイヤフォーマット
+
+`RplDioHeader` の DODAG Configuration option (既存) と同じパターンで、
+DAG Metric Container option (RFC 6550 section 6.7.8、type=2) を追加した。
+本実装が対応するのは ETX object (RFC 6551 section 4.3) のみで、
+中身は次の 8 バイト固定:
+
+```
+type(2) length(6) MC-Type(7=ETX) Res+P+C+O+R(0) A+Prec(0) obj-length(2) ETX(u16, *128)
+```
+
+Aggregation (A) は additive (0) のみを送信・想定する
+(RFC 6551 の ETX に対する既定値そのもの)。`Res+P+C+O+R`・`Prec` は
+本実装では送信時 0 固定、受信時は無視 (未検査) している — 送るのは
+自分自身なので、他実装が送ってくる非 0 値の解釈は不要という判断。
+
+固定小数点スケールは ETX*128 (`RPL_ETX_FIXED_POINT`)。DIO のランクや
+`MinHopRankIncrease` と同じ整数 (u16) の上で、ETX object のワイヤ表現
+(RFC 6551 section 4.3 が定める `ETX * 128` の丸め整数) をそのまま
+パス費用・リンク費用の内部表現としても使い回している。
+
+なお RFC 6551 の common header (Routing-MC-Type の後に続く 2 バイトの
+フラグ/aggregation/precedence フィールド) のビット位置は、WebFetch
+経由での RFC 参照時に複数回にわたり内部矛盾する読み取り結果 (32 bit の
+はずが合計 31 bit にしかならない等) を返された。今回必要な値は
+全フィールドとも 0 なので、正確なビット位置に関わらずワイヤ上のバイト値
+(0x00, 0x00) は不変というのを根拠に、この曖昧さを実害なしとして進めた。
+ビット位置そのものへの依存 (0 以外の値を送受信する実装) が将来必要に
+なった場合は、RFC 6551 の本文を (WebFetch ではなく) 一次資料から
+直接確認すること。
+
+### 13.3 リンク ETX の取得: lr-wpan への非依存
+
+Wi-SUN FAN が実機で使う RSL 相当のものとして、lr-wpan の PHY が受信
+フレームごとに付与する `ns3::lrwpan::LrWpanLqiTag`
+(`src/lr-wpan/model/lr-wpan-lqi-tag.h`、「0-255 に正規化したパケット
+成功率」) を採用した。ETX の瞬時値は `255 / LQI` で近似する
+(LQI=0 の場合のみ `RPL_MRHOF_MAX_LINK_METRIC` に張り付ける)。
+
+`librpl` は `libinternet` と `libsixlowpan` のみをリンクしており、
+`liblr-wpan` への直接依存は無い。これは意図的な選択で、根拠は
+`sixlowpan` モジュール自身が (802.15.4 上でしか実質使われないにも
+関わらず) `liblr-wpan` を本体ライブラリではリンクせず、example だけが
+リンクしているという既存の前例。この前例に倣い、`librpl` も新規に
+`liblr-wpan` へ依存させることはせず、タグの中身は
+`Packet::GetPacketTagIterator()` と、実行時に名前で解決した
+`TypeId::LookupByNameFailSafe("ns3::lrwpan::LrWpanLqiTag", ...)`
+経由で読む (`RplRoutingProtocol::LinkEtxFromPacket()`、
+匿名名前空間の `LrWpanLqiPeekTag` がデコード用の器)。
+`PacketTagIterator::Item::GetTag()` は渡した `Tag` の
+`GetInstanceTypeId()` が一致するかしか見ないため、実際の
+`LrWpanLqiTag` と同じワイヤフォーマット (1 バイト) を持つ器を
+自前で用意し、`GetInstanceTypeId()` だけ実行時に解決した本物の
+TypeId を返す、という方法でヘッダの `#include` もリンクも回避できる。
+
+lr-wpan がリンクされていない実行体 (例: このモジュール自身のテスト
+バイナリ `rpl-test`) では `LookupByNameFailSafe()` が false を返し、
+`LinkEtxFromPacket()` は中立値 `RPL_ETX_FIXED_POINT` (ETX 1.0) に
+フォールバックする。これにより既存の `SimpleNetDevice` ベースの
+テスト群は一切影響を受けない — 全リンクが常に ETX 1.0 なので、MRHOF
+選択時でも実質ホップ数と同じ挙動になる。
+
+### 13.4 EWMA によるリンク ETX の平滑化
+
+`Parent::etx` は DIO を受信するたびに `UpdateLinkEtx()`
+(`rpl-routing-protocol.cc`) で更新する。初回サンプルは中立値からの
+ブレンドではなく直接採用し (中立値からの EWMA だと新規リンクが
+数 DIO の間「完璧なリンク」に見えてしまい本末転倒なため)、2 回目以降は
+alpha=1/8 の EWMA (`etx - (etx >> 3) + (sample >> 3)`) を使う。
+TCP の RTO 推定と同じ平滑度で、1 回のノイズに反応しすぎず、かつ実際の
+変化には追従する、という一般的なトレードオフをそのまま踏襲した。
+Wi-SUN FAN 1.1 固有の平滑化係数は 13.1 節の通り確認できていない。
+
+### 13.5 MRHOF のランクとパス費用、ヒステリシス
+
+`RankViaParent()`・新設の `PathCostViaParent()`
+(`rpl-routing-protocol.h/.cc`) が RFC 6719 section 3.3 の式をそのまま
+実装する:
+
+- パス費用 = 親の advertise するパス ETX (`parent.pathEtx`、親の DIO の
+  DAG Metric Container から) + そのリンクの ETX (`parent.etx`)。
+  RFC 6551 の additive aggregation そのもの。
+- ランク = `max(親のランク + MinHopRankIncrease, パス費用)`。
+  パス費用がどれだけ小さくても、実際に辿ったホップ数分の
+  `MinHopRankIncrease` を下回るランクを名乗ることはできない
+  (RFC 6552 のループ防止不変条件を壊さないため)。
+
+`SelectPreferredParent()` は OF0 と共通のコード (staleness pruning、
+freshness によるブートストラップ猶予) はそのまま流用しつつ、
+`m_ocp == RPL_OCP_MRHOF` の場合のみ:
+
+- リンク ETX が `RPL_MRHOF_MAX_LINK_METRIC` 以上の候補、パス費用が
+  `RPL_MRHOF_MAX_PATH_COST` 以上の候補は最初から除外 (RFC 6719
+  section 3.2)。
+- 残った候補の中でパス費用最小のものを "best" とする。
+- 現在の preferred parent が生存していて、そのパス費用が
+  `best のパス費用 + PARENT_SWITCH_THRESHOLD` 以下であれば、
+  実際にはそちらを採用せず現在の親を維持する (ヒステリシス、
+  RFC 6719 section 3.3)。
+
+この結果、この node 自身が次の DIO で advertise するパス ETX
+(`m_pathEtx`) も併せて更新する。root は常にパス ETX 0
+(`SendDio()` 内、`m_isRoot ? 0 : m_pathEtx`)。
+
+OF0 は従来通りコンパイル時のデフォルト (`m_ocp` の初期値は
+`RPL_OCP_OF0`) のまま変更していない。既存テスト
+(`RplDodagFormationTestCase` など) が OF0 のホップ数だけのランク式を
+そのまま検証しており、これを壊さないことを優先した。MRHOF は新設の
+`Ocp` attribute (root にのみ設定する — 他ノードは DIO の DODAG
+Configuration option から追従する、既存の `m_ocp` 伝搬の仕組みそのまま)
+で明示的に選択するオプトイン機能という位置付け。
+
+### 13.6 実機相当での検証: LrWpanLqiTag は 6LoWPAN 経由でも生き残るか
+
+これまで未検証だった懸念 — `LrWpanLqiTag` が
+`SixLowPanNetDevice` の圧縮解除 (`DecompressLowPanIphc()` 等) を経て
+`RplRoutingProtocol::RecvRpl()` まで実際に届くか — を
+`rpl-6lowpan-simple --mrhof --verbose --distance=100` の実行で確認した。
+既定の 60 m 間隔では `LrWpanErrorModel` を付けても LQI が飽和 (ETX
+1.0 のまま) してしまい判別できなかったため、距離を 100 m まで離して
+損失のある区間を作った結果:
+
+```
+Received a DIO from fe80::ff:fe00:1 ... (link ETX 1.04688): ... pathETX 0
+Received a DIO from fe80::ff:fe00:2 ... (link ETX 1.04688): ... pathETX 1.04688
+```
+
+のように、リンク ETX が中立値 (1.0) から外れた実測値になり、かつ
+2 ホップ目のパス ETX (2.09375) が 1 ホップ目のリンク ETX
+(1.04688) のちょうど 2 倍になっている (RFC 6551 の additive
+aggregation が正しく効いている) ことを確認した。これは同時に:
+
+- `LrWpanLqiTag` が PHY 受信 -> MAC -> `LrWpanNetDevice` ->
+  `SixLowPanNetDevice` の圧縮解除 -> `Ipv6L3Protocol` -> raw socket ->
+  `RplRoutingProtocol` という経路全体を生き残ること、
+- 13.3 節の TypeId 名前解決によるタグ読み取りが、実際に `lr-wpan` を
+  リンクした実行体で正しく機能すること、
+
+の両方を実証している。ping は 5/5 で成功しており、MRHOF 選択時でも
+end-to-end の到達性に影響は無い。ただし直線トポロジのため、実際に
+複数の親候補から異なるパス費用で選択する分岐そのものは、この example
+では再現していない (それは 13.7 節の
+`RplMrhofSelectionTestCase` で単体検証している)。
+
+### 13.7 テストと既知の制限
+
+`RplDioHeaderTestCase` に DAG Metric Container のシリアライズ/
+デシリアライズ往復を追加。新設の `RplMrhofSelectionTestCase`
+(`test/rpl-test-suite.cc`) は、実運用の DIO ではなく
+`SendRawRplMessage()` で手作りした DIO を 2 系統の擬似隣接ノードから
+注入し、パス費用に基づく選択とヒステリシスの両方を厳密な数値で検証する
+(実際に踏んだ計算過程は同ファイルのコメントを参照)。`rpl-test` は
+`liblr-wpan` をリンクしないため、この単体テストではリンク ETX は
+常に中立値になる — 差分はすべて注入した DIO のパス ETX
+(`SetMetricContainer()`) から来るように意図的に設計している。実リンク
+品質からの ETX 導出そのものは 13.6 節の example 実行でのみ検証できる。
+
+既知の制限:
+
+- Wi-SUN FAN 1.1 固有の数値チューニング (Trickle 間隔、
+  `PARENT_SWITCH_THRESHOLD` 等) は非公開のため未反映。RFC 6719 自身の
+  デフォルト値をそのまま使っている (13.1 節)。
+- `PARENT_SET_SIZE` (RFC 6719 の推奨値 3) による候補親数の上限は
+  未実装。OF0 も同様に無制限に候補を保持しており、既存の挙動を踏襲。
+- LQL (Link Quality Level) メトリックには未対応。ETX のみ。
+- 1 つの DIO に複数の Routing-MC-Type を同時搭載するケース
+  (RFC 6551 は許容) には未対応 — `RplDioHeader` は ETX object 1 個
+  のみを保持する。
+- DODAG version number の lollipop 比較が未実装という既存の制限
+  (10 節) は MRHOF 下でも変わらず残る。

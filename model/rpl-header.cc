@@ -86,7 +86,9 @@ RplDioHeader::RplDioHeader()
       m_minHopRankIncrease(RPL_MIN_HOPRANKINC),
       m_ocp(RPL_OCP_OF0),
       m_defaultLifetime(RPL_DEFAULT_LIFETIME),
-      m_lifetimeUnit(RPL_DEFAULT_LIFETIME_UNIT)
+      m_lifetimeUnit(RPL_DEFAULT_LIFETIME_UNIT),
+      m_hasMetricContainer(false),
+      m_pathEtx(0)
 {
 }
 
@@ -119,12 +121,17 @@ RplDioHeader::Print(std::ostream& os) const
     {
         os << " OCP " << m_ocp << " MinHopRankIncrease " << m_minHopRankIncrease;
     }
+    if (m_hasMetricContainer)
+    {
+        os << " pathETX " << (static_cast<double>(m_pathEtx) / RPL_ETX_FIXED_POINT);
+    }
 }
 
 uint32_t
 RplDioHeader::GetSerializedSize() const
 {
-    return 24 + (m_hasDagConf ? DAG_CONF_OPTION_SIZE : 0);
+    return 24 + (m_hasDagConf ? DAG_CONF_OPTION_SIZE : 0) +
+           (m_hasMetricContainer ? METRIC_CONTAINER_OPTION_SIZE : 0);
 }
 
 void
@@ -162,6 +169,19 @@ RplDioHeader::Serialize(Buffer::Iterator start) const
         start.WriteU8(m_defaultLifetime);
         start.WriteHtonU16(m_lifetimeUnit);
     }
+
+    if (m_hasMetricContainer)
+    {
+        start.WriteU8(RPL_OPTION_DAG_METRIC_CONTAINER);
+        start.WriteU8(METRIC_CONTAINER_OPTION_LENGTH);
+        start.WriteU8(RPL_DAG_MC_ETX);
+        start.WriteU8(0); // Res+P+C+O+R, RFC 6551 section 2.1: a plain metric,
+                          // not a constraint, that could be recorded
+        start.WriteU8(0); // A+Prec: A=0 (additive, RFC 6551 section 3), no
+                          // precedence
+        start.WriteU8(2); // Object body length: the 16-bit ETX value below
+        start.WriteHtonU16(m_pathEtx);
+    }
 }
 
 uint32_t
@@ -189,6 +209,7 @@ RplDioHeader::Deserialize(Buffer::Iterator start)
     // The DIO is the last thing in the packet, so the end of the buffer is the
     // end of the option list.
     m_hasDagConf = false;
+    m_hasMetricContainer = false;
     while (!i.IsEnd())
     {
         uint8_t type = i.ReadU8();
@@ -216,6 +237,27 @@ RplDioHeader::Deserialize(Buffer::Iterator start)
             i.ReadU8(); // Reserved
             m_defaultLifetime = i.ReadU8();
             m_lifetimeUnit = i.ReadNtohU16();
+        }
+        else if (type == RPL_OPTION_DAG_METRIC_CONTAINER &&
+                 length == METRIC_CONTAINER_OPTION_LENGTH)
+        {
+            uint8_t mcType = i.ReadU8();
+            i.ReadU8();          // Res+P+C+O+R, not checked: this implementation
+                                 // only ever sends the plain additive metric it
+                                 // expects back
+            i.ReadU8();          // A+Prec, likewise not checked
+            uint8_t objLength = i.ReadU8();
+            if (mcType == RPL_DAG_MC_ETX && objLength == 2)
+            {
+                m_hasMetricContainer = true;
+                m_pathEtx = i.ReadNtohU16();
+            }
+            else
+            {
+                NS_LOG_LOGIC("Skipping a Routing Metric/Constraint object of "
+                            << "unsupported type " << +mcType);
+                i.Next(objLength);
+            }
         }
         else
         {
@@ -396,6 +438,25 @@ uint16_t
 RplDioHeader::GetLifetimeUnit() const
 {
     return m_lifetimeUnit;
+}
+
+bool
+RplDioHeader::HasMetricContainer() const
+{
+    return m_hasMetricContainer;
+}
+
+void
+RplDioHeader::SetMetricContainer(uint16_t pathEtx)
+{
+    m_hasMetricContainer = true;
+    m_pathEtx = pathEtx;
+}
+
+uint16_t
+RplDioHeader::GetPathEtx() const
+{
+    return m_pathEtx;
 }
 
 NS_OBJECT_ENSURE_REGISTERED(RplDaoHeader);

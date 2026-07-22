@@ -232,12 +232,42 @@ class RplDioHeader : public Header
      */
     uint16_t GetLifetimeUnit() const;
 
+    /**
+     * @brief Whether the DAG Metric Container option is present.
+     * @return true if the option is present
+     */
+    bool HasMetricContainer() const;
+
+    /**
+     * @brief Attach a DAG Metric Container option carrying an ETX Routing
+     *        Metric object, RFC 6550 section 6.7.4 and RFC 6551 section 4.3.
+     *
+     * Only the ETX object is supported: this implementation has no other
+     * metric to put in the container, so it does not carry more than one.
+     *
+     * @param pathEtx the path ETX to advertise, fixed-point as ETX * 128
+     */
+    void SetMetricContainer(uint16_t pathEtx);
+
+    /**
+     * @brief Get the path ETX from the DAG Metric Container option.
+     * @return the path ETX, fixed-point as ETX * 128
+     */
+    uint16_t GetPathEtx() const;
+
   private:
     /// Serialized size of the DODAG Configuration option, type and length byte
     /// included (RFC 6550, section 6.7.6).
     static constexpr uint8_t DAG_CONF_OPTION_SIZE = 16;
     /// Value of the length field of the DODAG Configuration option.
     static constexpr uint8_t DAG_CONF_OPTION_LENGTH = DAG_CONF_OPTION_SIZE - 2;
+    /// Serialized size of the DAG Metric Container option carrying a single
+    /// ETX object: RPL option type and length (2 bytes), the RFC 6551
+    /// Routing Metric/Constraint object's own common header (4 bytes), and
+    /// the 16-bit ETX object body (2 bytes).
+    static constexpr uint8_t METRIC_CONTAINER_OPTION_SIZE = 8;
+    /// Value of the length field of the DAG Metric Container option.
+    static constexpr uint8_t METRIC_CONTAINER_OPTION_LENGTH = METRIC_CONTAINER_OPTION_SIZE - 2;
 
     uint8_t m_instanceId;    //!< RPLInstanceID
     uint8_t m_versionNumber; //!< DODAG version number
@@ -258,6 +288,9 @@ class RplDioHeader : public Header
     uint16_t m_ocp;                //!< objective code point
     uint8_t m_defaultLifetime;     //!< default lifetime of downward routes
     uint16_t m_lifetimeUnit;       //!< lifetime unit, in seconds
+
+    bool m_hasMetricContainer; //!< true if the DAG Metric Container option is present
+    uint16_t m_pathEtx;        //!< path ETX advertised by the option, as ETX * 128
 };
 
 /**

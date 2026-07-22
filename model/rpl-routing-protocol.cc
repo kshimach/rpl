@@ -28,10 +28,12 @@
 #include "ns3/packet.h"
 #include "ns3/simulator.h"
 #include "ns3/socket-factory.h"
+#include "ns3/tag.h"
 #include "ns3/uinteger.h"
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace ns3
 {
@@ -40,6 +42,63 @@ NS_LOG_COMPONENT_DEFINE("RplRoutingProtocol");
 
 namespace rpl
 {
+
+namespace
+{
+
+/**
+ * @brief Stand-in for ns3::lrwpan::LrWpanLqiTag's wire format: a single
+ *        byte, the total packet success rate scaled to 0-255.
+ *
+ * Used only to decode the bytes of a tag added by the real LrWpanLqiTag,
+ * matched by its globally registered TypeId name (see LinkEtxFromPacket()):
+ * PacketTagIterator::Item::GetTag() only checks that GetInstanceTypeId()
+ * matches, so this reads the tag's payload without librpl ever
+ * #include-ing, or linking against, the lr-wpan module.
+ */
+class LrWpanLqiPeekTag : public Tag
+{
+  public:
+    /**
+     * @param tid the real LrWpanLqiTag's TypeId, looked up by name
+     */
+    explicit LrWpanLqiPeekTag(TypeId tid)
+        : m_tid(tid)
+    {
+    }
+
+    TypeId GetInstanceTypeId() const override
+    {
+        return m_tid;
+    }
+
+    uint32_t GetSerializedSize() const override
+    {
+        return 1;
+    }
+
+    void Serialize(TagBuffer i) const override
+    {
+        i.WriteU8(m_lqi);
+    }
+
+    void Deserialize(TagBuffer i) override
+    {
+        m_lqi = i.ReadU8();
+    }
+
+    void Print(std::ostream& os) const override
+    {
+        os << "Lqi=" << +m_lqi;
+    }
+
+    uint8_t m_lqi{0}; //!< the decoded LQI, 0-255
+
+  private:
+    TypeId m_tid; //!< the real LrWpanLqiTag's TypeId
+};
+
+} // namespace
 
 NS_OBJECT_ENSURE_REGISTERED(RplRoutingProtocol);
 
@@ -79,6 +138,14 @@ RplRoutingProtocol::GetTypeId()
                           UintegerValue(RPL_MIN_HOPRANKINC),
                           MakeUintegerAccessor(&RplRoutingProtocol::m_minHopRankIncrease),
                           MakeUintegerChecker<uint16_t>(1, RPL_INFINITE_RANK))
+            .AddAttribute("Ocp",
+                          "Objective Code Point advertised by the root: RPL_OCP_OF0 (RFC "
+                          "6552, hop count) or RPL_OCP_MRHOF (RFC 6719, minimum rank with "
+                          "hysteresis over the ETX metric). Every other node adopts whatever "
+                          "OCP the DIO it joins on advertises, ignoring this attribute.",
+                          UintegerValue(RPL_OCP_OF0),
+                          MakeUintegerAccessor(&RplRoutingProtocol::m_ocp),
+                          MakeUintegerChecker<uint16_t>())
             .AddAttribute("DaoInterval",
                           "How often a node repeats the DAO that tells the root where it sits. "
                           "It has to stay well below PathLifetime times the lifetime unit, "
@@ -119,6 +186,7 @@ RplRoutingProtocol::RplRoutingProtocol()
       m_grounded(false),
       m_preference(0),
       m_ocp(RPL_OCP_OF0),
+      m_pathEtx(0),
       m_minHopRankIncrease(RPL_MIN_HOPRANKINC),
       m_maxRankIncrease(RPL_MAX_RANKINC),
       m_dioIntervalMin(MilliSeconds(1 << RPL_DIO_INTERVAL_MIN)),
@@ -407,8 +475,11 @@ RplRoutingProtocol::RecvRpl(Ptr<Socket> socket)
     case RPL_CODE_DIO: {
         RplDioHeader dio;
         packet->RemoveHeader(dio);
-        NS_LOG_INFO("Received a DIO from " << from << " on interface " << interface << ": " << dio);
-        HandleDio(dio, from, interface);
+        uint16_t linkEtx = LinkEtxFromPacket(packet);
+        double linkEtxValue = double(linkEtx) / RPL_ETX_FIXED_POINT;
+        NS_LOG_INFO("Received a DIO from " << from << " on interface " << interface << " (link ETX "
+                                           << linkEtxValue << "): " << dio);
+        HandleDio(dio, from, interface, linkEtx);
         break;
     }
     case RPL_CODE_DAO: {
@@ -558,6 +629,14 @@ RplRoutingProtocol::SendDio(Ipv6Address dst, uint32_t interface)
                             RPL_DEFAULT_LIFETIME,
                             RPL_DEFAULT_LIFETIME_UNIT);
 
+    if (m_ocp == RPL_OCP_MRHOF)
+    {
+        // RFC 6551 section 4.3, additive aggregation: the root originates the
+        // DODAG at path ETX 0, every other node advertises the path cost it
+        // computed picking its own preferred parent.
+        dio.SetMetricContainer(m_isRoot ? 0 : m_pathEtx);
+    }
+
     Ptr<Packet> packet = Create<Packet>();
     packet->AddHeader(dio);
 
@@ -601,7 +680,10 @@ RplRoutingProtocol::HandleDis(Ipv6Address from, uint32_t interface, bool toMulti
 }
 
 void
-RplRoutingProtocol::HandleDio(const RplDioHeader& dio, Ipv6Address from, uint32_t interface)
+RplRoutingProtocol::HandleDio(const RplDioHeader& dio,
+                              Ipv6Address from,
+                              uint32_t interface,
+                              uint16_t linkEtx)
 {
     NS_LOG_FUNCTION(this << from << interface);
 
@@ -665,6 +747,11 @@ RplRoutingProtocol::HandleDio(const RplDioHeader& dio, Ipv6Address from, uint32_
     parent.dtsn = dio.GetDtsn();
     parent.lastHeard = Simulator::Now();
     parent.freshness = std::min<uint8_t>(parent.freshness + 1, RPL_FRESHNESS_MAX);
+    UpdateLinkEtx(parent, linkEtx);
+    if (dio.HasMetricContainer())
+    {
+        parent.pathEtx = dio.GetPathEtx();
+    }
 
     m_dioTrickle.ConsistencyHit();
 
@@ -687,6 +774,7 @@ RplRoutingProtocol::JoinDodag(const RplDioHeader& dio)
     m_grounded = dio.GetGrounded();
     m_preference = dio.GetPreference();
     m_rank = RPL_INFINITE_RANK; // until a parent is picked
+    m_pathEtx = 0;
 
     if (dio.HasDagConfiguration())
     {
@@ -697,10 +785,10 @@ RplRoutingProtocol::JoinDodag(const RplDioHeader& dio)
         m_dioIntervalDoublings = dio.GetIntervalDoublings();
         m_dioRedundancy = dio.GetRedundancy();
 
-        if (m_ocp != RPL_OCP_OF0)
+        if (m_ocp != RPL_OCP_OF0 && m_ocp != RPL_OCP_MRHOF)
         {
             NS_LOG_WARN("DODAG " << m_dodagId << " asks for objective code point " << m_ocp
-                                 << ", but only OF0 is implemented");
+                                 << ", but only OF0 and MRHOF are implemented");
         }
     }
 
@@ -718,6 +806,7 @@ RplRoutingProtocol::LeaveDodag()
 
     m_joined = false;
     m_rank = RPL_INFINITE_RANK;
+    m_pathEtx = 0;
     m_preferredParent = Ipv6Address::GetAny();
     m_parents.clear();
     m_dioTrickle.Stop();
@@ -1044,7 +1133,64 @@ RplRoutingProtocol::RankViaParent(const Parent& parent) const
     }
 
     uint32_t rank = static_cast<uint32_t>(parent.rank) + m_minHopRankIncrease;
+    if (m_ocp == RPL_OCP_MRHOF)
+    {
+        // RFC 6719 section 3.3: the path cost through the parent, unless
+        // that undercuts the parent's own rank plus MinHopRankIncrease, in
+        // which case the rank must not claim a shorter path than the hop
+        // count actually taken.
+        rank = std::max(rank, PathCostViaParent(parent));
+    }
     return rank >= RPL_INFINITE_RANK ? RPL_INFINITE_RANK : static_cast<uint16_t>(rank);
+}
+
+uint32_t
+RplRoutingProtocol::PathCostViaParent(const Parent& parent) const
+{
+    return static_cast<uint32_t>(parent.pathEtx) + parent.etx;
+}
+
+void
+RplRoutingProtocol::UpdateLinkEtx(Parent& parent, uint16_t sample) const
+{
+    parent.etx = (parent.freshness <= 1) ? sample
+                                         : static_cast<uint16_t>(parent.etx - (parent.etx >> 3) +
+                                                                 (sample >> 3));
+}
+
+uint16_t
+RplRoutingProtocol::LinkEtxFromPacket(Ptr<const Packet> packet) const
+{
+    TypeId lqiTid;
+    if (!TypeId::LookupByNameFailSafe("ns3::lrwpan::LrWpanLqiTag", &lqiTid))
+    {
+        return RPL_ETX_FIXED_POINT;
+    }
+
+    PacketTagIterator it = packet->GetPacketTagIterator();
+    while (it.HasNext())
+    {
+        PacketTagIterator::Item item = it.Next();
+        if (item.GetTypeId() != lqiTid)
+        {
+            continue;
+        }
+
+        LrWpanLqiPeekTag tag(lqiTid);
+        item.GetTag(tag);
+        if (tag.m_lqi == 0)
+        {
+            // No successful reception at all: as bad a link as this fixed
+            // point scale can express.
+            return RPL_MRHOF_MAX_LINK_METRIC;
+        }
+
+        // The LQI is the packet success rate scaled to 0-255 (LrWpanLqiTag's
+        // own doc comment), so 255 / lqi approximates ETX = 1 / PRR.
+        uint32_t instantEtx = (255u * RPL_ETX_FIXED_POINT) / tag.m_lqi;
+        return static_cast<uint16_t>(std::min<uint32_t>(instantEtx, RPL_MRHOF_MAX_LINK_METRIC));
+    }
+    return RPL_ETX_FIXED_POINT;
 }
 
 bool
@@ -1098,6 +1244,7 @@ RplRoutingProtocol::SelectPreferredParent()
 
     Ipv6Address best = Ipv6Address::GetAny();
     uint16_t bestRank = RPL_INFINITE_RANK;
+    uint32_t bestPathCost = std::numeric_limits<uint32_t>::max();
 
     for (const auto& [address, parent] : m_parents)
     {
@@ -1114,16 +1261,60 @@ RplRoutingProtocol::SelectPreferredParent()
             continue;
         }
 
+        if (m_ocp == RPL_OCP_MRHOF && parent.etx >= RPL_MRHOF_MAX_LINK_METRIC)
+        {
+            // RFC 6719 section 3.2: a link this bad is not even considered.
+            NS_LOG_LOGIC("Neighbour " << address << " has too high a link ETX");
+            continue;
+        }
+
         uint16_t rank = RankViaParent(parent);
         if (rank == RPL_INFINITE_RANK)
         {
             continue;
         }
-        // Ties are broken on the address so that the choice is deterministic.
-        if (best.IsAny() || rank < bestRank || (rank == bestRank && address < best))
+
+        if (m_ocp == RPL_OCP_MRHOF)
+        {
+            uint32_t pathCost = PathCostViaParent(parent);
+            if (pathCost >= RPL_MRHOF_MAX_PATH_COST)
+            {
+                NS_LOG_LOGIC("Neighbour " << address << " has too high a path cost");
+                continue;
+            }
+            // Ties are broken on the address so that the choice is deterministic.
+            if (best.IsAny() || pathCost < bestPathCost ||
+                (pathCost == bestPathCost && address < best))
+            {
+                best = address;
+                bestRank = rank;
+                bestPathCost = pathCost;
+            }
+        }
+        else if (best.IsAny() || rank < bestRank || (rank == bestRank && address < best))
         {
             best = address;
             bestRank = rank;
+        }
+    }
+
+    if (m_ocp == RPL_OCP_MRHOF && !best.IsAny())
+    {
+        // RFC 6719 section 3.3: hysteresis. Keep the current preferred
+        // parent over a candidate of lower path cost unless the difference
+        // exceeds PARENT_SWITCH_THRESHOLD, so the node does not flap between
+        // parents of near-identical quality.
+        auto current = m_parents.find(m_preferredParent);
+        if (current != m_parents.end() && current->second.etx < RPL_MRHOF_MAX_LINK_METRIC)
+        {
+            uint32_t currentPathCost = PathCostViaParent(current->second);
+            if (currentPathCost < RPL_MRHOF_MAX_PATH_COST &&
+                currentPathCost <= bestPathCost + RPL_MRHOF_PARENT_SWITCH_THRESHOLD)
+            {
+                best = m_preferredParent;
+                bestRank = RankViaParent(current->second);
+                bestPathCost = currentPathCost;
+            }
         }
     }
 
@@ -1147,6 +1338,10 @@ RplRoutingProtocol::SelectPreferredParent()
     bool parentChanged = (best != m_preferredParent);
     m_preferredParent = best;
     m_rank = bestRank;
+    if (m_ocp == RPL_OCP_MRHOF)
+    {
+        m_pathEtx = static_cast<uint16_t>(bestPathCost);
+    }
 
     if (parentChanged)
     {
@@ -1462,6 +1657,12 @@ RplRoutingProtocol::GetRank() const
     return m_rank;
 }
 
+uint16_t
+RplRoutingProtocol::GetPathEtx() const
+{
+    return m_pathEtx;
+}
+
 Ipv6Address
 RplRoutingProtocol::GetDodagId() const
 {
@@ -1500,14 +1701,25 @@ RplRoutingProtocol::PrintRoutingTable(Ptr<OutputStreamWrapper> stream, Time::Uni
     }
 
     *os << "  DODAG: " << m_dodagId << ", instance " << +m_instanceId << ", version " << +m_version
-        << ", rank " << m_rank << std::endl;
+        << ", rank " << m_rank;
+    if (m_ocp == RPL_OCP_MRHOF)
+    {
+        *os << ", path ETX " << (double(m_pathEtx) / RPL_ETX_FIXED_POINT);
+    }
+    *os << std::endl;
     *os << "  Preferred parent: " << m_preferredParent << std::endl;
     *os << "  Candidate parents:" << std::endl;
     for (const auto& [address, parent] : m_parents)
     {
         *os << "    " << address << " rank " << parent.rank << " via interface " << parent.interface
             << ", heard " << +parent.freshness << " times, last "
-            << (Now() - parent.lastHeard).As(unit) << " ago" << std::endl;
+            << (Now() - parent.lastHeard).As(unit) << " ago";
+        if (m_ocp == RPL_OCP_MRHOF)
+        {
+            *os << ", link ETX " << (double(parent.etx) / RPL_ETX_FIXED_POINT) << ", path ETX "
+                << (double(parent.pathEtx) / RPL_ETX_FIXED_POINT);
+        }
+        *os << std::endl;
     }
 
     if (m_isRoot)

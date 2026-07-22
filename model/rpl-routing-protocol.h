@@ -130,6 +130,13 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     uint16_t GetRank() const;
 
     /**
+     * @brief Get this node's own path ETX under MRHOF (RFC 6719).
+     * @return the path ETX, fixed-point (*128), 0 if not running MRHOF or not
+     *         yet computed
+     */
+    uint16_t GetPathEtx() const;
+
+    /**
      * @brief Get the DODAGID of the DODAG this node belongs to.
      * @return the DODAGID, :: if this node has not joined one
      */
@@ -206,6 +213,8 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
         uint8_t dtsn{0};    //!< the neighbour's DTSN, used by DAO in non-storing mode
         Time lastHeard;     //!< when the last DIO from this neighbour arrived
         uint8_t freshness{0}; //!< how many DIOs this neighbour has been heard with
+        uint16_t etx{RPL_ETX_FIXED_POINT}; //!< EWMA link ETX to this neighbour (MRHOF, *128)
+        uint16_t pathEtx{0}; //!< the neighbour's own advertised path ETX (MRHOF, *128)
     };
 
     /// What the root remembers about one node of the DODAG, learnt from DAOs.
@@ -274,8 +283,10 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      * @param dio the DIO
      * @param from the sender's link-local address
      * @param interface the interface the DIO arrived on
+     * @param linkEtx the instantaneous link ETX to the sender, RPL_ETX_FIXED_POINT
+     *                (neutral, i.e. 1.0) if it could not be estimated
      */
-    void HandleDio(const RplDioHeader& dio, Ipv6Address from, uint32_t interface);
+    void HandleDio(const RplDioHeader& dio, Ipv6Address from, uint32_t interface, uint16_t linkEtx);
 
     /**
      * @brief Join the DODAG advertised by a DIO, adopting its configuration.
@@ -291,9 +302,12 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     /**
      * @brief Compute the rank this node would have through a given parent.
      *
-     * OF0 (RFC 6552) with a rank factor of 1, a stretch of 0 and a step of
-     * rank of 1: with no link metric available every neighbour is one
-     * MinHopRankIncrease away.
+     * Under OF0 (RFC 6552, rank factor 1, stretch 0, step of rank 1): with no
+     * link metric available every neighbour is one MinHopRankIncrease away.
+     * Under MRHOF (RFC 6719 section 3.3): the rank is the path cost through
+     * the parent, unless that is less than the parent's own rank plus
+     * MinHopRankIncrease, in which case the latter is used instead, so a
+     * rank never implies a shorter path than the hop count actually taken.
      *
      * @param parent the candidate parent
      * @return the resulting rank, RPL_INFINITE_RANK if the parent is unusable
@@ -301,10 +315,62 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     uint16_t RankViaParent(const Parent& parent) const;
 
     /**
+     * @brief Compute the path cost this node would advertise through a given
+     *        parent, MRHOF (RFC 6719) only.
+     *
+     * RFC 6551 section 4.3 defines ETX as an additive metric: the path cost
+     * is the parent's own advertised path ETX plus the ETX of the link to
+     * it.
+     *
+     * @param parent the candidate parent
+     * @return the path cost, fixed-point (*128)
+     */
+    uint32_t PathCostViaParent(const Parent& parent) const;
+
+    /**
+     * @brief Fold a new link ETX sample into a parent's EWMA estimate.
+     *
+     * The first ever sample seeds the estimate outright rather than being
+     * blended in from the neutral default, so a newly heard neighbour is not
+     * biased towards looking like a perfect link for several DIOs. Every
+     * later sample uses an EWMA with alpha = 1/8, the same smoothing TCP's
+     * RTO estimator uses for the same reason: react to real change, not to
+     * one noisy reading.
+     *
+     * @param parent the parent to update, its freshness already accounts for
+     *               this sample
+     * @param sample the instantaneous link ETX just observed, fixed-point (*128)
+     */
+    void UpdateLinkEtx(Parent& parent, uint16_t sample) const;
+
+    /**
+     * @brief Estimate the instantaneous link ETX to whoever sent a packet.
+     *
+     * Wi-SUN FAN 1.1 derives its mandatory ETX metric from the bidirectional
+     * link quality Neighbor Discovery measures on the radio. This module
+     * approximates that with lr-wpan's own per-frame LQI
+     * (ns3::lrwpan::LrWpanLqiTag), read by its registered TypeId name
+     * through the generic PacketTagIterator rather than a direct #include of
+     * lr-wpan: librpl keeps building and running over any link layer that
+     * way, matching how sixlowpan itself does not hard-depend on the link
+     * layer it is almost always paired with, and it simply falls back to a
+     * neutral ETX if the link layer does not attach the tag.
+     *
+     * @param packet the received packet, tags intact
+     * @return the instantaneous link ETX, fixed-point (*128), RPL_ETX_FIXED_POINT
+     *         (neutral, i.e. 1.0) if no LQI tag is present
+     */
+    uint16_t LinkEtxFromPacket(Ptr<const Packet> packet) const;
+
+    /**
      * @brief Re-run parent selection and update the rank.
      *
      * Candidates that have not been heard from for two maximum DIO intervals
-     * are dropped, since that is two missed DIOs in a row.
+     * are dropped, since that is two missed DIOs in a row. Under MRHOF (RFC
+     * 6719 section 3.3), the current preferred parent is kept over a
+     * candidate of lower path cost unless the difference exceeds
+     * RPL_MRHOF_PARENT_SWITCH_THRESHOLD, so the node does not flap between
+     * parents of near-identical quality.
      *
      * @return true if the preferred parent or the rank changed
      */
@@ -484,6 +550,7 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     uint8_t m_preference;  //!< preference of the DODAG
 
     uint16_t m_ocp;                //!< objective code point in use
+    uint16_t m_pathEtx; //!< this node's own path ETX under MRHOF, fixed-point (*128)
     uint16_t m_minHopRankIncrease; //!< MinHopRankIncrease, also the rank of the root
     uint16_t m_maxRankIncrease;    //!< MaxRankIncrease
     Time m_dioIntervalMin;         //!< Trickle Imin for DIOs
