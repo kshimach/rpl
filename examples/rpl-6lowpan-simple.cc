@@ -57,6 +57,7 @@ main(int argc, char** argv)
     bool verbose = false;
     bool pcap = false;
     bool mrhof = false;
+    bool lql = false;
     int64_t streamNumber = 1;
 
     CommandLine cmd(__FILE__);
@@ -69,6 +70,10 @@ main(int argc, char** argv)
     cmd.AddValue("mrhof",
                 "use MRHOF (RFC 6719, ETX) instead of the default OF0 (RFC 6552, hop count)",
                 mrhof);
+    cmd.AddValue("lql",
+                "also derive and advertise a Link Quality Level from RSSI (RFC 6551 "
+                "section 4.6)",
+                lql);
     cmd.Parse(argc, argv);
 
     if (verbose)
@@ -113,6 +118,10 @@ main(int argc, char** argv)
     if (mrhof)
     {
         rplHelper.Set("Ocp", UintegerValue(rpl::RPL_OCP_MRHOF));
+    }
+    if (lql)
+    {
+        rplHelper.Set("EnableLql", BooleanValue(true));
     }
     InternetStackHelper internetv6;
     internetv6.SetRoutingHelper(rplHelper);

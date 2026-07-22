@@ -13,6 +13,7 @@
 #include "rpl-packet-info-option.h"
 #include "rpl-source-routing-extension.h"
 
+#include "ns3/boolean.h"
 #include "ns3/icmpv6-header.h"
 #include "ns3/icmpv6-l4-protocol.h"
 #include "ns3/inet6-socket-address.h"
@@ -98,6 +99,88 @@ class LrWpanLqiPeekTag : public Tag
     TypeId m_tid; //!< the real LrWpanLqiTag's TypeId
 };
 
+/**
+ * @brief Stand-in for ns3::lrwpan::LrWpanRssiTag's wire format: a single
+ *        signed byte, the RSSI in dBm.
+ *
+ * Same purpose and technique as LrWpanLqiPeekTag, applied to
+ * ns3::lrwpan::LrWpanRssiTag (see LinkLqlFromPacket()).
+ */
+class LrWpanRssiPeekTag : public Tag
+{
+  public:
+    /**
+     * @param tid the real LrWpanRssiTag's TypeId, looked up by name
+     */
+    explicit LrWpanRssiPeekTag(TypeId tid)
+        : m_tid(tid)
+    {
+    }
+
+    TypeId GetInstanceTypeId() const override
+    {
+        return m_tid;
+    }
+
+    uint32_t GetSerializedSize() const override
+    {
+        return 1;
+    }
+
+    void Serialize(TagBuffer i) const override
+    {
+        i.WriteU8(static_cast<uint8_t>(m_rssi));
+    }
+
+    void Deserialize(TagBuffer i) override
+    {
+        m_rssi = static_cast<int8_t>(i.ReadU8());
+    }
+
+    void Print(std::ostream& os) const override
+    {
+        os << "Rssi=" << +m_rssi;
+    }
+
+    int8_t m_rssi{0}; //!< the decoded RSSI, dBm
+
+  private:
+    TypeId m_tid; //!< the real LrWpanRssiTag's TypeId
+};
+
+/**
+ * @brief The built-in RSSI -> LQL mapping, used until
+ *        RplRoutingProtocol::SetRssiToLqlMapping() replaces it.
+ *
+ * RFC 6551 section 4.6 leaves the computation "implementation specific", so
+ * this is a deliberately coarse threshold table, not calibrated against any
+ * particular radio, spaced over the receive range of a low-power LLN radio
+ * rather than a stronger-signal one (Wi-Fi, cellular): 802.15.4's O-QPZK PHY
+ * is usable down to roughly -106 dBm (see the sensitivity figure
+ * src/lr-wpan/examples/lr-wpan-per-plot.cc derives its own noise floor from),
+ * so this table's worst determined bucket starts well above that, not at a
+ * generic "weak signal" threshold that would never actually trigger on this
+ * kind of link. 1 is the best determined quality, 7 the worst; 0
+ * (undetermined) is never returned here since an actual RSSI reading is, by
+ * definition, determined.
+ *
+ * @param rssiDbm the received signal strength, in dBm
+ * @return the LQL, 1 (best) to 7 (worst)
+ */
+uint8_t
+DefaultRssiToLql(double rssiDbm)
+{
+    static const double thresholds[] = {-75.0, -82.0, -89.0, -96.0, -100.0, -103.0};
+    for (uint8_t lql = 1; lql <= 6; lql++)
+    {
+        if (rssiDbm >= thresholds[lql - 1])
+        {
+            return lql;
+        }
+    }
+    return RPL_LQL_WORST;
+}
+
 } // namespace
 
 NS_OBJECT_ENSURE_REGISTERED(RplRoutingProtocol);
@@ -146,6 +229,15 @@ RplRoutingProtocol::GetTypeId()
                           UintegerValue(RPL_OCP_OF0),
                           MakeUintegerAccessor(&RplRoutingProtocol::m_ocp),
                           MakeUintegerChecker<uint16_t>())
+            .AddAttribute("EnableLql",
+                          "Whether to derive a Link Quality Level (RFC 6551 section 4.6) "
+                          "from RSSI and advertise it in DIOs, alongside whatever OCP is "
+                          "running -- LQL is a recorded-only metric (RFC 6551 section 3.4), "
+                          "not something an Objective Function computes a rank from. Off by "
+                          "default to keep the wire format unchanged unless asked for.",
+                          BooleanValue(false),
+                          MakeBooleanAccessor(&RplRoutingProtocol::m_enableLql),
+                          MakeBooleanChecker())
             .AddAttribute("DaoInterval",
                           "How often a node repeats the DAO that tells the root where it sits. "
                           "It has to stay well below PathLifetime times the lifetime unit, "
@@ -187,6 +279,8 @@ RplRoutingProtocol::RplRoutingProtocol()
       m_preference(0),
       m_ocp(RPL_OCP_OF0),
       m_pathEtx(0),
+      m_enableLql(false),
+      m_rssiToLql(MakeCallback(&DefaultRssiToLql)),
       m_minHopRankIncrease(RPL_MIN_HOPRANKINC),
       m_maxRankIncrease(RPL_MAX_RANKINC),
       m_dioIntervalMin(MilliSeconds(1 << RPL_DIO_INTERVAL_MIN)),
@@ -476,10 +570,11 @@ RplRoutingProtocol::RecvRpl(Ptr<Socket> socket)
         RplDioHeader dio;
         packet->RemoveHeader(dio);
         uint16_t linkEtx = LinkEtxFromPacket(packet);
+        uint8_t lql = LinkLqlFromPacket(packet);
         double linkEtxValue = double(linkEtx) / RPL_ETX_FIXED_POINT;
         NS_LOG_INFO("Received a DIO from " << from << " on interface " << interface << " (link ETX "
-                                           << linkEtxValue << "): " << dio);
-        HandleDio(dio, from, interface, linkEtx);
+                                           << linkEtxValue << ", LQL " << +lql << "): " << dio);
+        HandleDio(dio, from, interface, linkEtx, lql);
         break;
     }
     case RPL_CODE_DAO: {
@@ -637,6 +732,15 @@ RplRoutingProtocol::SendDio(Ipv6Address dst, uint32_t interface)
         dio.SetMetricContainer(m_isRoot ? 0 : m_pathEtx);
     }
 
+    if (m_enableLql)
+    {
+        // LQL is recorded, not aggregated: what is advertised is this node's
+        // own link to its preferred parent, not a path-wide value. The root
+        // has no upstream link of its own to report.
+        auto preferred = m_parents.find(m_preferredParent);
+        dio.SetLql(preferred != m_parents.end() ? preferred->second.lql : RPL_LQL_UNDETERMINED);
+    }
+
     Ptr<Packet> packet = Create<Packet>();
     packet->AddHeader(dio);
 
@@ -683,7 +787,8 @@ void
 RplRoutingProtocol::HandleDio(const RplDioHeader& dio,
                               Ipv6Address from,
                               uint32_t interface,
-                              uint16_t linkEtx)
+                              uint16_t linkEtx,
+                              uint8_t lql)
 {
     NS_LOG_FUNCTION(this << from << interface);
 
@@ -748,6 +853,7 @@ RplRoutingProtocol::HandleDio(const RplDioHeader& dio,
     parent.lastHeard = Simulator::Now();
     parent.freshness = std::min<uint8_t>(parent.freshness + 1, RPL_FRESHNESS_MAX);
     UpdateLinkEtx(parent, linkEtx);
+    parent.lql = lql;
     if (dio.HasMetricContainer())
     {
         parent.pathEtx = dio.GetPathEtx();
@@ -1191,6 +1297,44 @@ RplRoutingProtocol::LinkEtxFromPacket(Ptr<const Packet> packet) const
         return static_cast<uint16_t>(std::min<uint32_t>(instantEtx, RPL_MRHOF_MAX_LINK_METRIC));
     }
     return RPL_ETX_FIXED_POINT;
+}
+
+void
+RplRoutingProtocol::SetRssiToLqlMapping(Callback<uint8_t, double> mapping)
+{
+    NS_LOG_FUNCTION(this);
+    m_rssiToLql = mapping;
+}
+
+uint8_t
+RplRoutingProtocol::RssiToLql(double rssiDbm) const
+{
+    return m_rssiToLql.IsNull() ? RPL_LQL_UNDETERMINED : m_rssiToLql(rssiDbm);
+}
+
+uint8_t
+RplRoutingProtocol::LinkLqlFromPacket(Ptr<const Packet> packet) const
+{
+    TypeId rssiTid;
+    if (!TypeId::LookupByNameFailSafe("ns3::lrwpan::LrWpanRssiTag", &rssiTid))
+    {
+        return RPL_LQL_UNDETERMINED;
+    }
+
+    PacketTagIterator it = packet->GetPacketTagIterator();
+    while (it.HasNext())
+    {
+        PacketTagIterator::Item item = it.Next();
+        if (item.GetTypeId() != rssiTid)
+        {
+            continue;
+        }
+
+        LrWpanRssiPeekTag tag(rssiTid);
+        item.GetTag(tag);
+        return RssiToLql(double(tag.m_rssi));
+    }
+    return RPL_LQL_UNDETERMINED;
 }
 
 bool
@@ -1718,6 +1862,10 @@ RplRoutingProtocol::PrintRoutingTable(Ptr<OutputStreamWrapper> stream, Time::Uni
         {
             *os << ", link ETX " << (double(parent.etx) / RPL_ETX_FIXED_POINT) << ", path ETX "
                 << (double(parent.pathEtx) / RPL_ETX_FIXED_POINT);
+        }
+        if (m_enableLql)
+        {
+            *os << ", LQL " << +parent.lql;
         }
         *os << std::endl;
     }

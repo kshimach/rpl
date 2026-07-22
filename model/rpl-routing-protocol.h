@@ -13,6 +13,7 @@
 #include "rpl-conf.h"
 #include "rpl-trickle-timer.h"
 
+#include "ns3/callback.h"
 #include "ns3/ipv6-address.h"
 #include "ns3/ipv6-interface.h"
 #include "ns3/ipv6-l3-protocol.h"
@@ -137,6 +138,30 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     uint16_t GetPathEtx() const;
 
     /**
+     * @brief Set the function that turns an RSSI reading into a Link Quality
+     *        Level (RFC 6551 section 4.6).
+     *
+     * The RFC deliberately leaves LQL "implementation specific": how a raw
+     * signal reading should map to the 0 (undetermined) - 7 (worst
+     * determined) scale depends on the radio and the deployment, so this is
+     * a plain callback rather than a fixed table. Defaults to a coarse
+     * built-in mapping; call this to replace it with one calibrated for a
+     * particular radio or scenario.
+     *
+     * @param mapping RSSI in dBm -> LQL (0-7)
+     */
+    void SetRssiToLqlMapping(Callback<uint8_t, double> mapping);
+
+    /**
+     * @brief Map an RSSI reading to a Link Quality Level using whatever
+     *        mapping is currently configured (SetRssiToLqlMapping(), or the
+     *        built-in default).
+     * @param rssiDbm the received signal strength, in dBm
+     * @return the LQL, 0 (undetermined) to 7 (worst determined)
+     */
+    uint8_t RssiToLql(double rssiDbm) const;
+
+    /**
      * @brief Get the DODAGID of the DODAG this node belongs to.
      * @return the DODAGID, :: if this node has not joined one
      */
@@ -215,6 +240,7 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
         uint8_t freshness{0}; //!< how many DIOs this neighbour has been heard with
         uint16_t etx{RPL_ETX_FIXED_POINT}; //!< EWMA link ETX to this neighbour (MRHOF, *128)
         uint16_t pathEtx{0}; //!< the neighbour's own advertised path ETX (MRHOF, *128)
+        uint8_t lql{RPL_LQL_UNDETERMINED}; //!< Link Quality Level to this neighbour (RFC 6551 4.6)
     };
 
     /// What the root remembers about one node of the DODAG, learnt from DAOs.
@@ -285,8 +311,14 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      * @param interface the interface the DIO arrived on
      * @param linkEtx the instantaneous link ETX to the sender, RPL_ETX_FIXED_POINT
      *                (neutral, i.e. 1.0) if it could not be estimated
+     * @param lql the Link Quality Level to the sender, RPL_LQL_UNDETERMINED (0)
+     *            if it could not be estimated
      */
-    void HandleDio(const RplDioHeader& dio, Ipv6Address from, uint32_t interface, uint16_t linkEtx);
+    void HandleDio(const RplDioHeader& dio,
+                   Ipv6Address from,
+                   uint32_t interface,
+                   uint16_t linkEtx,
+                   uint8_t lql);
 
     /**
      * @brief Join the DODAG advertised by a DIO, adopting its configuration.
@@ -361,6 +393,18 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      *         (neutral, i.e. 1.0) if no LQI tag is present
      */
     uint16_t LinkEtxFromPacket(Ptr<const Packet> packet) const;
+
+    /**
+     * @brief Estimate the Link Quality Level to whoever sent a packet.
+     *
+     * Reads lr-wpan's per-frame RSSI (ns3::lrwpan::LrWpanRssiTag), located
+     * the same decoupled way LinkEtxFromPacket() reads the LQI tag, and runs
+     * it through RssiToLql().
+     *
+     * @param packet the received packet, tags intact
+     * @return the LQL, RPL_LQL_UNDETERMINED (0) if no RSSI tag is present
+     */
+    uint8_t LinkLqlFromPacket(Ptr<const Packet> packet) const;
 
     /**
      * @brief Re-run parent selection and update the rank.
@@ -551,6 +595,8 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
 
     uint16_t m_ocp;                //!< objective code point in use
     uint16_t m_pathEtx; //!< this node's own path ETX under MRHOF, fixed-point (*128)
+    bool m_enableLql;   //!< whether to derive and advertise LQL (RFC 6551 section 4.6)
+    Callback<uint8_t, double> m_rssiToLql; //!< RSSI (dBm) -> LQL (0-7) mapping
     uint16_t m_minHopRankIncrease; //!< MinHopRankIncrease, also the rank of the root
     uint16_t m_maxRankIncrease;    //!< MaxRankIncrease
     Time m_dioIntervalMin;         //!< Trickle Imin for DIOs

@@ -255,6 +255,36 @@ class RplDioHeader : public Header
      */
     uint16_t GetPathEtx() const;
 
+    /**
+     * @brief Whether a DAG Metric Container option carrying a Link Quality
+     *        Level (LQL) object is present.
+     * @return true if the option is present
+     */
+    bool HasLql() const;
+
+    /**
+     * @brief Attach a DAG Metric Container option carrying a Link Quality
+     *        Level Routing Metric object, RFC 6550 section 6.7.4 and RFC
+     *        6551 section 4.6.
+     *
+     * Carried alongside, not instead of, the ETX object set with
+     * SetMetricContainer(): RFC 6551 allows more than one
+     * Routing-MC-Type object in the same DIO, and LQL is a "recorded
+     * only" link metric (RFC 6551 section 3.4), not something this
+     * implementation's Objective Functions compute a rank from, so it
+     * does not replace ETX as MRHOF's input.
+     *
+     * @param lql the Link Quality Level to advertise, 0 (undetermined) to
+     *            7 (worst determined), 1 being the best
+     */
+    void SetLql(uint8_t lql);
+
+    /**
+     * @brief Get the Link Quality Level from the DAG Metric Container option.
+     * @return the LQL, 0 (undetermined) to 7 (worst determined)
+     */
+    uint8_t GetLql() const;
+
   private:
     /// Serialized size of the DODAG Configuration option, type and length byte
     /// included (RFC 6550, section 6.7.6).
@@ -268,6 +298,14 @@ class RplDioHeader : public Header
     static constexpr uint8_t METRIC_CONTAINER_OPTION_SIZE = 8;
     /// Value of the length field of the DAG Metric Container option.
     static constexpr uint8_t METRIC_CONTAINER_OPTION_LENGTH = METRIC_CONTAINER_OPTION_SIZE - 2;
+    /// Serialized size of the DAG Metric Container option carrying a single
+    /// LQL object: RPL option type and length (2 bytes), the RFC 6551
+    /// Routing Metric/Constraint object's own common header (4 bytes), and
+    /// the 2-byte LQL object body (a reserved octet plus one LQL sub-object,
+    /// RFC 6551 section 4.6).
+    static constexpr uint8_t LQL_OPTION_SIZE = 8;
+    /// Value of the length field of the LQL DAG Metric Container option.
+    static constexpr uint8_t LQL_OPTION_LENGTH = LQL_OPTION_SIZE - 2;
 
     uint8_t m_instanceId;    //!< RPLInstanceID
     uint8_t m_versionNumber; //!< DODAG version number
@@ -289,8 +327,11 @@ class RplDioHeader : public Header
     uint8_t m_defaultLifetime;     //!< default lifetime of downward routes
     uint16_t m_lifetimeUnit;       //!< lifetime unit, in seconds
 
-    bool m_hasMetricContainer; //!< true if the DAG Metric Container option is present
+    bool m_hasMetricContainer; //!< true if the ETX DAG Metric Container option is present
     uint16_t m_pathEtx;        //!< path ETX advertised by the option, as ETX * 128
+
+    bool m_hasLql; //!< true if the LQL DAG Metric Container option is present
+    uint8_t m_lql; //!< LQL advertised by the option, 0 (undetermined) to 7
 };
 
 /**

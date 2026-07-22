@@ -100,7 +100,13 @@ constexpr uint16_t RPL_SIGNIFICANT_CHANGE_THRESHOLD = 4 * RPL_MIN_HOPRANKINC;
 constexpr uint8_t RPL_DEFAULT_INSTANCE = 0;
 
 /// Routing Metric/Constraint object types (RFC 6551, section 4).
+constexpr uint8_t RPL_DAG_MC_LQL = 6;
 constexpr uint8_t RPL_DAG_MC_ETX = 7;
+
+/// Link Quality Level (LQL) range, RFC 6551 section 4.6: 0 means undetermined,
+/// 1 is the best determined quality, 7 the worst.
+constexpr uint8_t RPL_LQL_UNDETERMINED = 0;
+constexpr uint8_t RPL_LQL_WORST = 7;
 
 /// MRHOF (RFC 6719) defaults, in the same fixed-point scale as the wire
 /// encoding of ETX (ETX * 128, RFC 6551 section 4.3).

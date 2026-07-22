@@ -181,13 +181,12 @@
   準拠。本体 doc ビルドへの登録は行っていない — contrib モジュールで
   upstream 予定もないため)。
 - **既知の非対応事項**: RFC 6553 (RPL Option, RPI) は 12 節の通り実装済み。
-  RFC 6551/6719 (ETX/MRHOF) も 13 節の通り実装済み。
+  RFC 6551/6719 (ETX/MRHOF) も 13 節の通り、RFC 6551 の LQL メトリックも
+  14 節の通り実装済み (1 DIO への ETX/LQL 同時搭載も対応)。
   storing mode (MOP=2) は方針により対象外。RH3 アドレス圧縮
   (CmprI/CmprE) 未実装、6LoWPAN NHC 圧縮も Routing Header では効かない
   (11 節)。RPI の確認済みループ (RFC 6550 section 11.2 の「2 回連続で
   不整合」) は実際にはパケットを止められない、既知の制約あり (12.2 節)。
-  LQL (Link Quality Level) メトリック・メトリックコンテナの複数同時搭載
-  (RFC 6551 は 1 DIO に複数の Routing-MC-Type を許容) は未実装 (13.7 節)。
 
 ## 11. ns-3 コアで見つかった既存バグ、および本実装側のバグ
 
@@ -569,9 +568,131 @@ end-to-end の到達性に影響は無い。ただし直線トポロジのため
   デフォルト値をそのまま使っている (13.1 節)。
 - `PARENT_SET_SIZE` (RFC 6719 の推奨値 3) による候補親数の上限は
   未実装。OF0 も同様に無制限に候補を保持しており、既存の挙動を踏襲。
-- LQL (Link Quality Level) メトリックには未対応。ETX のみ。
-- 1 つの DIO に複数の Routing-MC-Type を同時搭載するケース
-  (RFC 6551 は許容) には未対応 — `RplDioHeader` は ETX object 1 個
-  のみを保持する。
 - DODAG version number の lollipop 比較が未実装という既存の制限
   (10 節) は MRHOF 下でも変わらず残る。
+
+## 14. RFC 6551 (LQL) の実装、および RSSI の取得
+
+「LQL を実装、RSSI と LQL の対応は任意に変更できるようにすること」という
+指示を受け、RFC 6551 の Link Quality Level (LQL) メトリック
+(Routing-MC-Type=6、section 4.6) を追加した。ETX (13 節) との大きな違いは
+2 点: LQL は RFC 上「recorded only」(記録専用) の Link metric であり
+Objective Function がそこからランクを計算する対象ではないこと、そして
+信号源が LQI (ETX) ではなく RSSI であること。
+
+### 14.1 RFC 6551 の LQL オブジェクトのワイヤフォーマット
+
+RFC 6551 の LQL Reliability Object は他の Routing Metric/Constraint
+object と同じ 4 バイトの共通ヘッダ (MC-Type, Res+P+C+O+R, A+Prec,
+Length) の後に、Res オクテット (1 バイト) + LQL sub-object (1 バイト、
+上位 4 bit が Val、下位 4 bit が Counter) が続く。Val は 0 (undetermined)
+から 7 (最悪) の整数で、1 が最良 (RFC 6551 の当該箇所を WebFetch で
+複数回・複数の言い回しで取得し、"0 means undetermined and 1 indicates
+the highest link quality" および "select the path with most links
+reporting a LQL value of 3 or less" という記述が一致することを確認 —
+値が小さいほど良い、という ETX と同じ方向性)。Counter は本来「パス上で
+その LQL 値を持つリンクの本数」を数えるヒストグラム用のフィールドだが、
+本実装はホップごとのスカラー値 (自分のプリファードペアレントへのリンク
+1 本分) しか扱わないため、Counter は常に 1 を送信し、受信時は読み捨てる。
+
+`RplDioHeader` は ETX 用の DAG Metric Container (`m_hasMetricContainer`/
+`m_pathEtx`) とは独立に `m_hasLql`/`m_lql` を持ち、`Deserialize()` の
+既存の Metric Container 分岐 (type 判定後、MC-Type でさらに分岐する
+ループ) に `RPL_DAG_MC_LQL` のケースを追加する形で実装した。ETX と LQL
+の object body はどちらも 2 バイトで DAG Metric Container のオプション
+全体サイズが偶然一致する (8 バイト) ため、この既存分岐にそのまま乗せる
+ことができた。1 つの DIO に ETX と LQL の両方の Metric Container を
+同時搭載できることを `RplDioHeaderTestCase` で検証済み — 10 節で
+「未対応」としていた「1 DIO に複数の Routing-MC-Type」はこれで解消。
+
+### 14.2 RSSI の取得: ns-3 コアへの `LrWpanRssiTag` 追加
+
+ETX の元になる LQI は既に `ns3::lrwpan::LrWpanLqiTag` として PHY が
+受信フレームに付与しており (13.3 節)、そのまま読めた。RSSI は事情が
+違う: `LrWpanPhy::EndPreamble()` で `m_rssi` (int8_t, dBm) として計算
+されてはいるものの、パケットのタグにはならず、`PdDataIndicationCallback`
+の引数として `LrWpanMac::PdDataIndication()` に渡り、最終的に
+`McpsDataIndicationParams::m_rssi` に収まるだけで、そこから先
+(`LrWpanNetDevice` が上位へ渡す一般的な `NetDevice::ReceiveCallback`
+の署名にはこの手の付随情報を運ぶ余地が無い) で失われる。つまり LQI と
+違い、RSSI は 6LoWPAN より上の層に届く手段が最初から存在しなかった。
+
+対処として `src/lr-wpan/model/lr-wpan-rssi-tag.{h,cc}` を新設し、
+`LrWpanLqiTag` と全く同じ形 (1 バイトの `Tag` サブクラス、
+`AddAttribute`/`GetInstanceTypeId`/`Serialize`/`Deserialize` の並びまで
+揃えた) で `LrWpanRssiTag` を追加した。`LrWpanPhy::EndRx()` の、LQI タグ
+を読み出して `m_pdDataIndicationCallback` に渡す直前の箇所
+(`lr-wpan-phy.cc`) で `currentPacket->AddPacketTag(LrWpanRssiTag(m_rssi))`
+を 1 回呼ぶだけでよい — LQI が `CheckInterference()` で受信中に繰り返し
+更新されるのに対し、RSSI はプリアンブル時点の 1 回きりの計測値なので
+Peek+Replace は不要、Add だけで足りる。送信側 (`PdDataRequest()`) では
+既存の「前回受信時の LQI タグを消す」処理の隣に RSSI タグを消す 1 行を
+追加し、再送信時に受信時のタグを引きずらないようにした。
+
+新規ファイル 2 つと `CMakeLists.txt` への追加 4 行、`lr-wpan-phy.cc` への
+数行の追加のみで、既存の `lr-wpan`/`sixlowpan` の単体テスト
+(`lr-wpan-*`、`sixlowpan-*`、計 15 スイート) はすべて無変更のまま
+PASS しており、既存動作への影響は無い。
+
+`librpl` からの読み取り方法は ETX の LQI タグ読み取り (13.3 節) と
+全く同じ TypeId 名前解決 + `PacketTagIterator` の手法を踏襲しており、
+今回も `liblr-wpan` への直接依存を増やしていない。
+
+### 14.3 RSSI → LQL の対応を任意に変更可能にする
+
+指示の核心部分。RFC 6551 の LQL は "The reliability value is computed by
+the sending node according to a metric that is implementation specific"
+と明記しており、閾値の取り方に唯一の正解が無いことを RFC 自身が認めて
+いる。これを反映し、`RplRoutingProtocol::SetRssiToLqlMapping()` で
+`Callback<uint8_t, double>` (RSSI dBm -> LQL 0-7) を丸ごと差し替え
+られるようにした。組み込みのデフォルト実装 (`DefaultRssiToLql()`、
+匿名名前空間) は単純な閾値テーブルで、802.15.4 級 LLN 無線の受信可能
+範囲 (-106 dBm 付近が実用上の下限、`src/lr-wpan/examples/
+lr-wpan-per-plot.cc` が使っている感度の数値を参考にした) に合わせて
+おり、Wi-Fi や携帯網のような強い信号を前提にした一般的な RSSI 目盛りは
+採用していない。あくまで「それらしいデフォルト」であり、実機やシナリオ
+ごとに校正して `SetRssiToLqlMapping()` で置き換えることを前提とした
+設計。`RssiToLql()` (public) はいま設定されているマッピングをそのまま
+呼ぶだけの薄いラッパーで、単体テストからマッピング機構そのものを
+(実際の RSSI タグ無しで) 直接検証できるようにするためだけに公開した。
+
+なお `rpl-6lowpan-simple` 例で実際に測定した RSSI は、既定の 60 m 間隔で
+-100 dBm 前後だった (10 m: -76 dBm、30 m: -90 dBm、60 m: -100 dBm、
+90 m: -105 dBm — `LogDistancePropagationLossModel` の距離依存性通り、
+単調に減衰している)。これは当初デフォルトテーブルとして用意していた
+Wi-Fi 的な閾値 (-60〜-85 dBm) では全リンクが最悪値 (LQL=7) に張り付いて
+しまうことを示しており、この LLN 向けの再校正 (現在のデフォルト値) に
+至った直接のきっかけになった。RFC が「implementation specific」と
+明言している理由を、まさにこのモジュール自身のデフォルト値選びで
+再確認した形になる。
+
+### 14.4 LQL は経路選択に使わない
+
+RFC 6551 が LQL を "recorded only" と位置付けている (13.1 節で言及した
+Routing-MC-Type 一覧の取得時に確認) ことを根拠に、LQL は MRHOF のランク
+計算や親選択には一切使わない。`RplRoutingProtocol::SendDio()` は
+`EnableLql` attribute (既定 false、ワイヤフォーマットを変えない後方
+互換のため MRHOF の `Ocp` と同じくオプトイン) が立っているときのみ、
+自分のプリファードペアレントへのリンクの LQL を DIO に載せて advertise
+する。ETX のようにホップごとに積算されるパスコストではなく、あくまで
+「このノードから見た直近 1 ホップの記録」であり、受信側 (`HandleDio()`)
+もこの意味論に合わせて「自分がその隣接ノードから測った LQL
+(`parent.lql`、RSSI タグ由来)」と「その隣接ノードが DIO で自己申告した
+LQL (`dio.GetLql()`、隣接ノードとその先の親との間のリンクについての
+情報)」を混同しないよう、後者を `parent.lql` に書き込むことはしていない
+— デシリアライズはするが、経路選択にも `parent.lql` の更新にも使わない
+(パースの正しさのみ保証)。運用者や外部の監視ツールが DIO を横取りして
+ネットワーク全体の品質マップを作る、といった診断用途を主眼に置いた
+設計であり、ノード自身が能動的に使う値ではない。
+
+### 14.5 テスト
+
+`RplDioHeaderTestCase` を拡張し、同じ DIO に ETX と LQL の両
+Metric Container を載せて往復させ、両方が壊れずに残ることを確認。
+新設の `RplLqlMappingTestCase` は `RplRoutingProtocol` を単体で
+(ノードもトポロジも使わず) 生成し、`RssiToLql()` でデフォルトテーブルの
+境界値を確認したのち `SetRssiToLqlMapping()` でラムダに丸ごと差し替え、
+差し替え後は新しいマッピングだけが使われる (デフォルトとの併用ではない)
+ことを確認する。ETX のときと同様、`rpl-test` は `liblr-wpan` を
+リンクしないため、実際の RSSI タグからの LQL 導出は単体テストの対象外
+— 14.2 節の実行結果が唯一の end-to-end 検証である。

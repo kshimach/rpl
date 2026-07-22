@@ -88,7 +88,9 @@ RplDioHeader::RplDioHeader()
       m_defaultLifetime(RPL_DEFAULT_LIFETIME),
       m_lifetimeUnit(RPL_DEFAULT_LIFETIME_UNIT),
       m_hasMetricContainer(false),
-      m_pathEtx(0)
+      m_pathEtx(0),
+      m_hasLql(false),
+      m_lql(0)
 {
 }
 
@@ -125,13 +127,18 @@ RplDioHeader::Print(std::ostream& os) const
     {
         os << " pathETX " << (static_cast<double>(m_pathEtx) / RPL_ETX_FIXED_POINT);
     }
+    if (m_hasLql)
+    {
+        os << " LQL " << +m_lql;
+    }
 }
 
 uint32_t
 RplDioHeader::GetSerializedSize() const
 {
     return 24 + (m_hasDagConf ? DAG_CONF_OPTION_SIZE : 0) +
-           (m_hasMetricContainer ? METRIC_CONTAINER_OPTION_SIZE : 0);
+           (m_hasMetricContainer ? METRIC_CONTAINER_OPTION_SIZE : 0) +
+           (m_hasLql ? LQL_OPTION_SIZE : 0);
 }
 
 void
@@ -182,6 +189,22 @@ RplDioHeader::Serialize(Buffer::Iterator start) const
         start.WriteU8(2); // Object body length: the 16-bit ETX value below
         start.WriteHtonU16(m_pathEtx);
     }
+
+    if (m_hasLql)
+    {
+        start.WriteU8(RPL_OPTION_DAG_METRIC_CONTAINER);
+        start.WriteU8(LQL_OPTION_LENGTH);
+        start.WriteU8(RPL_DAG_MC_LQL);
+        start.WriteU8(0); // Res+P+C+O+R: a plain, recorded-only link metric
+        start.WriteU8(0); // A+Prec: not aggregated path-wise, no precedence
+        start.WriteU8(2); // Object body length: Res octet + one LQL sub-object
+        start.WriteU8(0); // Res (RFC 6551 section 4.6)
+        // LQL Type 1 sub-object: Val (this link's LQL) in the high nibble,
+        // Counter in the low nibble. This implementation always reports
+        // exactly one sample (its own link to its preferred parent), never a
+        // multi-hop histogram, so Counter is always 1.
+        start.WriteU8(static_cast<uint8_t>((m_lql << 4) | 0x1));
+    }
 }
 
 uint32_t
@@ -210,6 +233,7 @@ RplDioHeader::Deserialize(Buffer::Iterator start)
     // end of the option list.
     m_hasDagConf = false;
     m_hasMetricContainer = false;
+    m_hasLql = false;
     while (!i.IsEnd())
     {
         uint8_t type = i.ReadU8();
@@ -251,6 +275,14 @@ RplDioHeader::Deserialize(Buffer::Iterator start)
             {
                 m_hasMetricContainer = true;
                 m_pathEtx = i.ReadNtohU16();
+            }
+            else if (mcType == RPL_DAG_MC_LQL && objLength == 2)
+            {
+                i.ReadU8(); // Res (RFC 6551 section 4.6), not checked
+                uint8_t subObject = i.ReadU8();
+                m_hasLql = true;
+                m_lql = subObject >> 4; // Val, the high nibble; Counter (low
+                                        // nibble) not checked, always 1 here
             }
             else
             {
@@ -457,6 +489,25 @@ uint16_t
 RplDioHeader::GetPathEtx() const
 {
     return m_pathEtx;
+}
+
+bool
+RplDioHeader::HasLql() const
+{
+    return m_hasLql;
+}
+
+void
+RplDioHeader::SetLql(uint8_t lql)
+{
+    m_hasLql = true;
+    m_lql = lql;
+}
+
+uint8_t
+RplDioHeader::GetLql() const
+{
+    return m_lql;
 }
 
 NS_OBJECT_ENSURE_REGISTERED(RplDaoHeader);

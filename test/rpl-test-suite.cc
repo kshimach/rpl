@@ -220,6 +220,24 @@ RplDioHeaderTestCase::DoRun()
     NS_TEST_ASSERT_MSG_EQ(received.HasDagConfiguration(), true, "The other option was lost");
     NS_TEST_ASSERT_MSG_EQ(received.GetOcp(), RPL_OCP_OF0, "The other option's content was lost");
     NS_TEST_ASSERT_MSG_EQ(received.GetRank(), 384, "An option ate part of the base object");
+
+    // A DIO can carry more than one Routing-MC-Type object (RFC 6551): add an
+    // LQL one (section 4.6) alongside the ETX one already on this DIO and
+    // check both survive together.
+    NS_TEST_ASSERT_MSG_EQ(dio.HasLql(), false, "There is no LQL option yet");
+    dio.SetLql(3);
+    NS_TEST_ASSERT_MSG_EQ(dio.GetSerializedSize(), 56, "The LQL option adds 8 more bytes");
+
+    packet = Create<Packet>();
+    packet->AddHeader(dio);
+    packet->RemoveHeader(received);
+
+    NS_TEST_ASSERT_MSG_EQ(received.HasLql(), true, "The LQL option was lost");
+    NS_TEST_ASSERT_MSG_EQ(received.GetLql(), 3, "Wrong LQL");
+    NS_TEST_ASSERT_MSG_EQ(received.HasMetricContainer(), true, "The ETX option was lost");
+    NS_TEST_ASSERT_MSG_EQ(received.GetPathEtx(), 320, "The ETX option's content was lost");
+    NS_TEST_ASSERT_MSG_EQ(received.HasDagConfiguration(), true, "The DAG Configuration was lost");
+    NS_TEST_ASSERT_MSG_EQ(received.GetRank(), 384, "An option ate part of the base object");
 }
 
 /**
@@ -1123,6 +1141,61 @@ RplSourceRoutingProcessTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief Check the RSSI -> Link Quality Level mapping (RFC 6551 section 4.6):
+ *        the built-in default table, and that SetRssiToLqlMapping()
+ *        genuinely replaces it rather than merely supplementing it.
+ *
+ * RFC 6551 leaves how a raw signal reading becomes an LQL "implementation
+ * specific", which is exactly why this is a plain, user-replaceable
+ * callback rather than a fixed table baked into the protocol -- this test
+ * exists to hold that configurability itself to a contract, independently
+ * of whatever radio a scenario happens to use. No node or topology is
+ * needed: RssiToLql() and SetRssiToLqlMapping() touch nothing but the
+ * mapping itself.
+ */
+class RplLqlMappingTestCase : public TestCase
+{
+  public:
+    RplLqlMappingTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplLqlMappingTestCase::RplLqlMappingTestCase()
+    : TestCase("RSSI to LQL mapping, default and user-replaced")
+{
+}
+
+void
+RplLqlMappingTestCase::DoRun()
+{
+    Ptr<RplRoutingProtocol> protocol = CreateObject<RplRoutingProtocol>();
+
+    // The default table: 1 is the best determined quality, 7 the worst,
+    // never 0 (undetermined) for an actual reading.
+    NS_TEST_ASSERT_MSG_EQ(+protocol->RssiToLql(-40.0), 1, "Strong signal should be the best LQL");
+    NS_TEST_ASSERT_MSG_EQ(+protocol->RssiToLql(-75.0), 1, "Wrong LQL at the -75 dBm threshold");
+    NS_TEST_ASSERT_MSG_EQ(+protocol->RssiToLql(-75.1),
+                          2,
+                          "Wrong LQL just past the -75 dBm threshold");
+    NS_TEST_ASSERT_MSG_EQ(+protocol->RssiToLql(-103.0), 6, "Wrong LQL at the -103 dBm threshold");
+    NS_TEST_ASSERT_MSG_EQ(+protocol->RssiToLql(-120.0), 7, "Weak signal should be the worst LQL");
+
+    // A caller-supplied mapping replaces the default outright, not
+    // alongside it: a threshold the default table would call "1" has to
+    // come back however the new mapping says, here always 7 except right
+    // at 0 dBm.
+    protocol->SetRssiToLqlMapping(
+        [](double rssiDbm) -> uint8_t { return rssiDbm >= 0.0 ? 1 : 7; });
+    NS_TEST_ASSERT_MSG_EQ(+protocol->RssiToLql(-40.0), 7, "The custom mapping was not used");
+    NS_TEST_ASSERT_MSG_EQ(+protocol->RssiToLql(0.0), 1, "The custom mapping was not used");
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Check that a No-Path DAO (RFC 6550 section 6.4.3, path lifetime
  *        zero) removes the target from the root's topology.
  *
@@ -1582,6 +1655,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplTrickleTimerTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDodagFormationTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplMrhofSelectionTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplLqlMappingTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplNoPathDaoTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDaoAckRetryTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplPacketInfoHeaderTestCase, TestCase::Duration::QUICK);

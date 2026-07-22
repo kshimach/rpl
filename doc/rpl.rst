@@ -11,15 +11,17 @@ the IPv6 Routing Protocol for Low-Power and Lossy Networks, for ns-3. The
 implementation covers non-storing mode (MOP 1) only: DODAG formation from
 DIS/DIO exchanges paced by a Trickle timer (RFC 6206), rank computed by
 either Objective Function Zero (RFC 6552, hop count, the default) or MRHOF
-(RFC 6719) over the ETX routing metric (RFC 6551), downward routes built
-from the DAOs every node sends to the root and delivered with a real RFC
-6554 Source Routing Header, and per-hop rank consistency checking with a
-real RFC 6553 RPL Option in a Hop-by-Hop header. The protocol is designed to
-run over 6LoWPAN in route-over mode, i.e. installed on the IPv6 interfaces
-that sit on ``SixLowPanNetDevice``, not directly on the link-layer device
-underneath. This is also the profile Wi-SUN FAN 1.1 builds its RPL usage on
-(non-storing, MRHOF, ETX); see design-constraints.md section 13.1 for what
-of that profile is, and is not, verifiable from public sources.
+(RFC 6719) over the ETX routing metric (RFC 6551), optionally alongside a
+recorded-only Link Quality Level metric (RFC 6551 section 4.6), downward
+routes built from the DAOs every node sends to the root and delivered with a
+real RFC 6554 Source Routing Header, and per-hop rank consistency checking
+with a real RFC 6553 RPL Option in a Hop-by-Hop header. The protocol is
+designed to run over 6LoWPAN in route-over mode, i.e. installed on the IPv6
+interfaces that sit on ``SixLowPanNetDevice``, not directly on the
+link-layer device underneath. This is also the profile Wi-SUN FAN 1.1 builds
+its RPL usage on (non-storing, MRHOF, ETX); see design-constraints.md
+section 13.1 for what of that profile is, and is not, verifiable from
+public sources.
 
 The source code lives in ``contrib/rpl/``.
 
@@ -37,6 +39,11 @@ What the model does:
   FAN measures through Neighbor Discovery), and picks the preferred parent
   by path cost with RFC 6719's hysteresis against flapping between parents
   of near-identical quality.
+* Optionally derives a Link Quality Level (RFC 6551 section 4.6) from
+  lr-wpan's per-frame RSSI and advertises it, through a mapping the caller
+  can replace outright since the RFC leaves the RSSI-to-LQL computation
+  "implementation specific". Recorded only, per the RFC: it plays no part
+  in rank computation or parent selection.
 * Builds downward routes the way non-storing mode does: every node tells the
   root, with a DAO, which parent it sits under; only the root keeps a picture
   of the whole topology, and it computes and attaches a source route to every
@@ -69,9 +76,9 @@ What it does not do:
 * Wi-SUN FAN 1.1's own numeric tuning (Trickle intervals, hysteresis
   threshold, etc.) is not publicly documented, so MRHOF uses RFC 6719's own
   published defaults instead. See design-constraints.md section 13.1.
-* Only the ETX metric (RFC 6551 section 4.3) is implemented; LQL and
-  carrying more than one Routing Metric/Constraint object in the same DIO
-  are not.
+* Only the ETX and LQL metrics (RFC 6551 sections 4.3 and 4.6) are
+  implemented, out of the full set RFC 6551 defines (NSA, Node Energy, Hop
+  Count, Link Throughput, Link Latency, Link Color are not).
 * No security modes (RFC 6550 section 10): every control message is sent
   unsecured.
 * No P2P-RPL (RFC 6997) and no support for multiple concurrent RPL
@@ -173,6 +180,30 @@ OF0 remains the compiled-in default; MRHOF is an explicit opt-in on the
 root, the same way every other DODAG-wide parameter propagates from the
 root's DIOs to the rest of the DODAG.
 
+Link Quality Level (LQL)
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``RplDioHeader`` can also carry a second, independent DAG Metric Container
+holding an LQL object (RFC 6551 section 4.6) alongside the ETX one -- a DIO
+is not limited to a single Routing Metric/Constraint object. Where ETX
+drives MRHOF's rank and parent selection, LQL is what RFC 6551 itself calls
+a "recorded only" link metric: ``RplRoutingProtocol`` derives it from
+lr-wpan's per-frame RSSI (``ns3::lrwpan::LrWpanRssiTag``, read the same
+decoupled, no-lr-wpan-dependency way as the LQI tag) and advertises the
+node's own link quality to its preferred parent, but nothing here ever
+factors it into a rank or a routing decision.
+
+The RFC leaves the RSSI-to-LQL computation "implementation specific", so
+``RplRoutingProtocol::SetRssiToLqlMapping()`` takes the mapping as a plain
+``Callback<uint8_t, double>`` the caller can replace outright. The built-in
+default is a coarse threshold table calibrated for a low-power LLN radio's
+receive range rather than a stronger-signal one; ``RssiToLql()`` exposes
+whatever mapping is currently in effect for inspection. Off (``EnableLql``
+attribute, default ``false``) unless asked for, to keep the wire format
+unchanged for anyone not using it. See design-constraints.md section 14 for
+the full design rationale, including why RSSI itself needed a new
+``LrWpanRssiTag`` in the lr-wpan module to become reachable here at all.
+
 Trickle timer
 ~~~~~~~~~~~~~
 
@@ -227,6 +258,8 @@ All attributes are on ``ns3::rpl::RplRoutingProtocol``:
   count, the default) or ``RPL_OCP_MRHOF`` (RFC 6719, ETX). Only meaningful
   on the root; every other node adopts whatever OCP the DIO it joins on
   advertises.
+* ``EnableLql``: whether to derive and advertise a Link Quality Level (RFC
+  6551 section 4.6) from RSSI, independently of ``Ocp``. Off by default.
 * ``DaoInterval``: how often a node repeats the DAO telling the root where
   it sits.
 * ``DaoAckTimeout``: how long a node waits for a DAO-ACK before resending
@@ -259,6 +292,8 @@ collected). The ``--mrhof`` command-line argument switches the DODAG from
 OF0 to MRHOF; combined with ``--verbose`` and a large enough ``--distance``
 to put a real ``LrWpanErrorModel`` into a lossy regime, the log shows each
 hop's link ETX and the cumulative path ETX every node ends up advertising.
+``--lql`` additionally turns on ``EnableLql``, showing each node's
+RSSI-derived Link Quality Level to its preferred parent.
 
 Tests
 ~~~~~
@@ -290,6 +325,9 @@ The ``rpl`` test suite (``test/rpl-test-suite.cc``) is a unit suite covering:
   otherwise-equal neighbours, and the RFC 6719 hysteresis keeping the
   current preferred parent over a candidate whose improvement does not
   exceed ``PARENT_SWITCH_THRESHOLD``.
+* The RSSI-to-LQL mapping: the built-in default table's boundary values, and
+  that ``SetRssiToLqlMapping()`` replaces it outright rather than merely
+  supplementing it.
 
 Validation
 ----------
@@ -312,6 +350,14 @@ receive path (PHY through ``SixLowPanNetDevice`` decompression up to
 path ETX MRHOF advertises accumulates additively across hops exactly as RFC
 6551 section 4.3 defines it, with ping still succeeding end to end. See
 design-constraints.md section 13.6.
+
+Run again with ``--lql``, the same example confirmed the new
+``LrWpanRssiTag`` (added to the lr-wpan module for this) survives the same
+receive path with real RSSI values that vary sensibly with distance (-76
+dBm at 10 m down to -105 dBm at 90 m), and that the built-in RSSI-to-LQL
+table produces a non-degenerate spread of LQL values over that range rather
+than saturating at the worst bucket. See design-constraints.md section
+14.3.
 
 References
 ----------
