@@ -244,6 +244,13 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      */
     Ptr<Ipv6Route> RouteToNeighbour(Ipv6Address neighbour, Ipv6Address dst) const;
 
+    /**
+     * @brief Get the first global address of this node.
+     * @return the global address, :: if the node has none (including while
+     * SLAAC has not yet completed Duplicate Address Detection on it)
+     */
+    Ipv6Address GetGlobalAddress() const;
+
   protected:
     void DoInitialize() override;
     void DoDispose() override;
@@ -342,9 +349,18 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
 
     /**
      * @brief Join the DODAG advertised by a DIO, adopting its configuration.
+     *
+     * If the DIO carries a Prefix Information option, this is also what
+     * triggers SLAAC (RFC 4862) on it: Ipv6L3Protocol::
+     * AddAutoconfiguredAddress() builds the address and starts Duplicate
+     * Address Detection, asynchronously -- HandleDadSuccess() is what learns
+     * it finished.
+     *
      * @param dio the DIO
+     * @param interface the interface the DIO arrived on, i.e. the one to
+     *                  SLAAC an address onto
      */
-    void JoinDodag(const RplDioHeader& dio);
+    void JoinDodag(const RplDioHeader& dio, uint32_t interface);
 
     /**
      * @brief Leave the current DODAG and drop every candidate parent.
@@ -578,12 +594,6 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     Ipv6Address GetLinkLocalAddress(uint32_t interface) const;
 
     /**
-     * @brief Get the first global address of this node.
-     * @return the global address, :: if the node has none
-     */
-    Ipv6Address GetGlobalAddress() const;
-
-    /**
      * @brief Build the route towards the preferred parent.
      * @param dst the destination to put in the route
      * @return the route, nullptr if there is no preferred parent
@@ -619,6 +629,20 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     uint8_t m_dioIntervalDoublings; //!< Trickle doublings for DIOs
     uint8_t m_dioRedundancy;        //!< Trickle redundancy constant for DIOs
 
+    /// Whether a Prefix Information option (RFC 6550 section 6.7.10) is
+    /// being carried: always true on the root once RootPrefix takes effect,
+    /// copied from the DIO joined on by every other node (JoinDodag()) and
+    /// re-advertised unchanged on this node's own DIOs (SendDio()), the same
+    /// "root decides, everyone forwards" pattern as the DODAG Configuration
+    /// option.
+    bool m_hasPrefixInfo;
+    Ipv6Address m_prefix;         //!< the prefix this DODAG's addresses are built on
+    uint8_t m_prefixLength;       //!< prefix length of m_prefix, in bits
+    bool m_prefixOnLink;          //!< 'L' flag
+    bool m_prefixAutonomous;      //!< 'A' flag
+    uint32_t m_prefixValidLifetime;     //!< Valid Lifetime, in seconds
+    uint32_t m_prefixPreferredLifetime; //!< Preferred Lifetime, in seconds
+
     RplTrickleTimer m_dioTrickle;            //!< paces the multicast DIOs
     std::map<Ipv6Address, Parent> m_parents; //!< candidate parents, by link-local address
     Ipv6Address m_preferredParent;           //!< link-local address of the preferred parent
@@ -638,6 +662,28 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
 
     /// The root only: which parent each node reports sitting under.
     std::map<Ipv6Address, TopologyEntry> m_topology;
+
+    Ipv6Address m_rootPrefix;    //!< the root's own GUA/ULA prefix (RootPrefix attribute)
+    uint8_t m_rootPrefixLength; //!< prefix length of m_rootPrefix, in bits
+
+    /**
+     * @brief React to Neighbour Discovery confirming an address is unique.
+     *
+     * Connected once, in DoInitialize(), to Icmpv6L4Protocol's "DadSuccess"
+     * trace: the only way, short of polling, to learn that a SLAAC address
+     * this node either built for itself (root, from RootPrefix) or asked
+     * Ipv6L3Protocol::AddAutoconfiguredAddress() to build (every other node,
+     * from the DIO's Prefix Information option, see JoinDodag()) has cleared
+     * Duplicate Address Detection and is no longer TENTATIVE.
+     *
+     * On the root, this is what actually starts the DODAG: DoInitialize()
+     * only requests the address, it does not wait for it, since DAD is
+     * asynchronous. Every other node needs no action here -- SendDao()
+     * already checks GetGlobalAddress() before using it.
+     *
+     * @param address the address that just passed DAD
+     */
+    void HandleDadSuccess(const Ipv6Address& address);
 };
 
 } // namespace rpl

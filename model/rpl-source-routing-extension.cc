@@ -6,6 +6,7 @@
 
 #include "rpl-source-routing-extension.h"
 
+#include "rpl-conf.h"
 #include "rpl-header.h"
 #include "rpl-routing-protocol.h"
 
@@ -102,7 +103,8 @@ RplIpv6ExtensionSourceRouting::Process(Ptr<Packet>& packet,
         *nextHeader = routingHeader.GetNextHeader();
     }
 
-    Ptr<Icmpv6L4Protocol> icmpv6 = GetNode()->GetObject<Ipv6L3Protocol>()->GetIcmpv6();
+    Ptr<Ipv6L3Protocol> ipv6 = GetNode()->GetObject<Ipv6L3Protocol>();
+    Ptr<Icmpv6L4Protocol> icmpv6 = ipv6->GetIcmpv6();
 
     Ipv6Address srcAddress = ipv6header.GetSource();
     Ipv6Address destAddress = ipv6header.GetDestination();
@@ -144,6 +146,62 @@ RplIpv6ExtensionSourceRouting::Process(Ptr<Packet>& packet,
         return routingHeader.GetSerializedSize();
     }
 
+    // RFC 6554 section 4.2: a routing loop is present if the Routing Header
+    // names an address assigned to this router twice -- other than the
+    // entry Segments Left currently points at, which is not yet meaningful
+    // to check here, since it only becomes this router's own address as
+    // part of the swap below -- with at least one different address between
+    // the two. Ordinary forwarding along the DODAG never produces this: the
+    // root computes the whole path in one shot from the DAOs it collected,
+    // so it can only happen if that path is stale (a parent changed after
+    // the root built it) or was tampered with.
+    {
+        bool sawLocalAddress = false;
+        bool sawOtherSinceLocalAddress = false;
+        for (uint8_t i = 0; i < nbAddress; i++)
+        {
+            if (i == nextAddressIndex)
+            {
+                continue;
+            }
+
+            bool isLocal = false;
+            for (uint32_t j = 0; j < ipv6->GetNInterfaces() && !isLocal; j++)
+            {
+                for (uint32_t k = 0; k < ipv6->GetNAddresses(j); k++)
+                {
+                    if (ipv6->GetAddress(j, k).GetAddress() == routingHeader.GetAddress(i))
+                    {
+                        isLocal = true;
+                        break;
+                    }
+                }
+            }
+
+            if (isLocal)
+            {
+                if (sawLocalAddress && sawOtherSinceLocalAddress)
+                {
+                    NS_LOG_LOGIC("Routing loop: this router's address appears twice. Drop!");
+                    icmpv6->SendErrorParameterError(malformedPacket,
+                                                    srcAddress,
+                                                    Icmpv6Header::ICMPV6_MALFORMED_HEADER,
+                                                    offset + 2);
+                    dropReason = Ipv6L3Protocol::DROP_ROUTE_ERROR;
+                    isDropped = true;
+                    stopProcessing = true;
+                    return routingHeader.GetSerializedSize();
+                }
+                sawLocalAddress = true;
+                sawOtherSinceLocalAddress = false;
+            }
+            else if (sawLocalAddress)
+            {
+                sawOtherSinceLocalAddress = true;
+            }
+        }
+    }
+
     if (hopLimit <= 1)
     {
         NS_LOG_LOGIC("Time Exceeded: Hop Limit <= 1. Drop!");
@@ -166,7 +224,6 @@ RplIpv6ExtensionSourceRouting::Process(Ptr<Packet>& packet,
 
     // Short-circuit: the packet was addressed to us, so it is re-sent to the
     // new destination rather than handed further up the receive path.
-    Ptr<Ipv6L3Protocol> ipv6 = GetNode()->GetObject<Ipv6L3Protocol>();
     Ptr<Ipv6RoutingProtocol> ipv6rp = ipv6->GetRoutingProtocol();
     NS_ASSERT(ipv6rp);
 
@@ -193,7 +250,22 @@ RplIpv6ExtensionSourceRouting::Process(Ptr<Packet>& packet,
     }
     else
     {
-        NS_LOG_INFO("No route for the next router of the source route");
+        // RFC 6554 section 4.2: "if the IPv6 Destination Address is not
+        // on-link, a router MUST drop the datagram and SHOULD send an
+        // ICMPv6 Destination Unreachable message with Code 7". Both
+        // RouteToNeighbour() and the routing lookup above failed. On a node
+        // with at least one started RPL interface this cannot actually
+        // happen from nextAddress alone: RouteToNeighbour()'s
+        // InterfaceForNeighbour() deliberately treats any address as
+        // reachable through that sole interface (see its own comment) since
+        // the root, not this hop, is the one that decided nextAddress is one
+        // radio hop away -- verifying that again here would just be
+        // re-litigating a call this node has no better information to make
+        // than the root already did. This is what actually running out of
+        // RPL interfaces to send on looks like instead.
+        NS_LOG_LOGIC("No route for the next router of the source route. Drop!");
+        icmpv6->SendErrorDestinationUnreachable(malformedPacket, srcAddress, RPL_ICMPV6_SRH_ERROR);
+        dropReason = Ipv6L3Protocol::DROP_NO_ROUTE;
     }
 
     // The packet was fully handled by the resend above: stopProcessing must

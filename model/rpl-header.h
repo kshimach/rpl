@@ -285,6 +285,67 @@ class RplDioHeader : public Header
      */
     uint8_t GetLql() const;
 
+    /**
+     * @brief Whether the Prefix Information option is present.
+     * @return true if the option is present
+     */
+    bool HasPrefixInfo() const;
+
+    /**
+     * @brief Attach a Prefix Information option, RFC 6550 section 6.7.10.
+     *
+     * This is how the root disseminates the prefix a node should build its
+     * global address on: every node that joins copies this option onto its
+     * own outgoing DIOs unchanged, the same way the DODAG Configuration
+     * option propagates.
+     *
+     * @param prefix the prefix
+     * @param prefixLength the prefix length in bits
+     * @param onLink the 'L' flag: the prefix can be used for on-link
+     *               determination
+     * @param autonomous the 'A' flag: the prefix can be used for stateless
+     *                   address autoconfiguration (RFC 4862)
+     * @param validLifetime the 'Valid Lifetime', in seconds
+     * @param preferredLifetime the 'Preferred Lifetime', in seconds
+     */
+    void SetPrefixInfo(Ipv6Address prefix,
+                       uint8_t prefixLength,
+                       bool onLink,
+                       bool autonomous,
+                       uint32_t validLifetime,
+                       uint32_t preferredLifetime);
+
+    /**
+     * @brief Get the advertised prefix.
+     * @return the prefix
+     */
+    Ipv6Address GetPrefix() const;
+    /**
+     * @brief Get the advertised prefix length.
+     * @return the prefix length in bits
+     */
+    uint8_t GetPrefixLength() const;
+    /**
+     * @brief Get the 'L' (on-link) flag of the Prefix Information option.
+     * @return true if the prefix can be used for on-link determination
+     */
+    bool GetPrefixOnLink() const;
+    /**
+     * @brief Get the 'A' (autonomous) flag of the Prefix Information option.
+     * @return true if the prefix can be used for SLAAC
+     */
+    bool GetPrefixAutonomous() const;
+    /**
+     * @brief Get the Valid Lifetime of the Prefix Information option.
+     * @return the valid lifetime, in seconds
+     */
+    uint32_t GetPrefixValidLifetime() const;
+    /**
+     * @brief Get the Preferred Lifetime of the Prefix Information option.
+     * @return the preferred lifetime, in seconds
+     */
+    uint32_t GetPrefixPreferredLifetime() const;
+
   private:
     /// Serialized size of the DODAG Configuration option, type and length byte
     /// included (RFC 6550, section 6.7.6).
@@ -306,6 +367,17 @@ class RplDioHeader : public Header
     static constexpr uint8_t LQL_OPTION_SIZE = 8;
     /// Value of the length field of the LQL DAG Metric Container option.
     static constexpr uint8_t LQL_OPTION_LENGTH = LQL_OPTION_SIZE - 2;
+    /// Serialized size of the Prefix Information option, type and length
+    /// byte included (RFC 6550, section 6.7.10): Type+Length (2), Prefix
+    /// Length (1), L/A/Reserved1 (1), Valid Lifetime (4), Preferred
+    /// Lifetime (4), and the 16-byte Prefix -- unlike RFC 4861's Neighbor
+    /// Discovery PIO (32 bytes), this option has no 4-byte Reserved2 field
+    /// between Preferred Lifetime and Prefix.
+    static constexpr uint8_t PREFIX_INFO_OPTION_SIZE = 28;
+    /// Value of the length field of the Prefix Information option.
+    static constexpr uint8_t PREFIX_INFO_OPTION_LENGTH = PREFIX_INFO_OPTION_SIZE - 2;
+    static constexpr uint8_t PREFIX_INFO_L_FLAG = 0x80; //!< 'L' (on-link) flag
+    static constexpr uint8_t PREFIX_INFO_A_FLAG = 0x40; //!< 'A' (autonomous) flag
 
     uint8_t m_instanceId;    //!< RPLInstanceID
     uint8_t m_versionNumber; //!< DODAG version number
@@ -332,6 +404,14 @@ class RplDioHeader : public Header
 
     bool m_hasLql; //!< true if the LQL DAG Metric Container option is present
     uint8_t m_lql; //!< LQL advertised by the option, 0 (undetermined) to 7
+
+    bool m_hasPrefixInfo;         //!< true if the Prefix Information option is present
+    Ipv6Address m_prefix;         //!< the advertised prefix
+    uint8_t m_prefixLength;       //!< the advertised prefix length, in bits
+    bool m_prefixOnLink;          //!< 'L' flag
+    bool m_prefixAutonomous;      //!< 'A' flag
+    uint32_t m_prefixValidLifetime;     //!< Valid Lifetime, in seconds
+    uint32_t m_prefixPreferredLifetime; //!< Preferred Lifetime, in seconds
 };
 
 /**

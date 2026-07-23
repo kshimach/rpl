@@ -7,6 +7,7 @@
 #ifndef RPL_HELPER_H
 #define RPL_HELPER_H
 
+#include "ns3/ipv6-address.h"
 #include "ns3/ipv6-routing-helper.h"
 #include "ns3/node-container.h"
 #include "ns3/object-factory.h"
@@ -20,8 +21,11 @@ namespace ns3
  * @brief Helper installing rpl::RplRoutingProtocol on nodes.
  *
  * Pass it to InternetStackHelper::SetRoutingHelper() before installing the
- * stack, then mark the border router with SetRoot() once its global address
- * exists (the DODAGID is taken from that address).
+ * stack, then mark the border router with SetRoot(), giving it the GUA or
+ * ULA prefix it owns and disseminates over the DODAG (RFC 6550 section
+ * 6.7.10's Prefix Information option) for every other node's SLAAC (RFC
+ * 4862) address. The root builds its own DODAGID from that same prefix; no
+ * node's global address is assigned ahead of time by the simulation script.
  */
 class RplHelper : public Ipv6RoutingHelper
 {
@@ -48,14 +52,19 @@ class RplHelper : public Ipv6RoutingHelper
     void Set(std::string name, const AttributeValue& value);
 
     /**
-     * @brief Make a node the DODAG root.
+     * @brief Make a node the DODAG root, owning the given prefix.
      *
-     * Call this after global addresses have been assigned, since the DODAGID is
-     * the node's first global address.
+     * The node builds its own DODAGID from prefix the same way SLAAC would
+     * (RootPrefix/RootPrefixLength attributes on RplRoutingProtocol), and
+     * Duplicate Address Detection runs on it exactly as it would on any
+     * other autoconfigured address -- the DODAG only actually starts once
+     * that finishes, asynchronously, not when this call returns.
      *
      * @param node the node to promote
+     * @param prefix the GUA or ULA prefix this DODAG runs on
+     * @param prefixLength the prefix length, in bits
      */
-    void SetRoot(Ptr<Node> node) const;
+    void SetRoot(Ptr<Node> node, Ipv6Address prefix, uint8_t prefixLength = 64) const;
 
     /**
      * @brief Assign fixed streams to the random variables used by RPL.

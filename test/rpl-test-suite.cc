@@ -238,6 +238,38 @@ RplDioHeaderTestCase::DoRun()
     NS_TEST_ASSERT_MSG_EQ(received.GetPathEtx(), 320, "The ETX option's content was lost");
     NS_TEST_ASSERT_MSG_EQ(received.HasDagConfiguration(), true, "The DAG Configuration was lost");
     NS_TEST_ASSERT_MSG_EQ(received.GetRank(), 384, "An option ate part of the base object");
+
+    // The Prefix Information option (RFC 6550 section 6.7.10), the root's
+    // GUA/ULA prefix disseminated for SLAAC (RFC 4862): carried alongside
+    // every other option already on this DIO.
+    NS_TEST_ASSERT_MSG_EQ(dio.HasPrefixInfo(), false, "There is no Prefix Information option yet");
+    dio.SetPrefixInfo(Ipv6Address("2001:1::"), 64, true, true, 86400, 14400);
+    NS_TEST_ASSERT_MSG_EQ(dio.GetSerializedSize(), 84, "The Prefix Information option adds 28 bytes");
+
+    packet = Create<Packet>();
+    packet->AddHeader(dio);
+    packet->RemoveHeader(received);
+
+    NS_TEST_ASSERT_MSG_EQ(received.HasPrefixInfo(), true, "The Prefix Information option was lost");
+    NS_TEST_ASSERT_MSG_EQ(received.GetPrefix(), Ipv6Address("2001:1::"), "Wrong prefix");
+    NS_TEST_ASSERT_MSG_EQ(received.GetPrefixLength(), 64, "Wrong prefix length");
+    NS_TEST_ASSERT_MSG_EQ(received.GetPrefixOnLink(), true, "Wrong 'L' flag");
+    NS_TEST_ASSERT_MSG_EQ(received.GetPrefixAutonomous(), true, "Wrong 'A' flag");
+    NS_TEST_ASSERT_MSG_EQ(received.GetPrefixValidLifetime(), 86400, "Wrong Valid Lifetime");
+    NS_TEST_ASSERT_MSG_EQ(received.GetPrefixPreferredLifetime(), 14400, "Wrong Preferred Lifetime");
+    NS_TEST_ASSERT_MSG_EQ(received.HasLql(), true, "An earlier option was lost");
+    NS_TEST_ASSERT_MSG_EQ(received.GetRank(), 384, "An option ate part of the base object");
+
+    // The 'L'/'A' flags share a byte with 6 reserved bits: clearing both must
+    // not leak into the rest of the option.
+    RplDioHeader noFlags;
+    noFlags.SetPrefixInfo(Ipv6Address("fd00::"), 48, false, false, 0, 0);
+    packet = Create<Packet>();
+    packet->AddHeader(noFlags);
+    packet->RemoveHeader(received);
+    NS_TEST_ASSERT_MSG_EQ(received.GetPrefixOnLink(), false, "The 'L' flag leaked");
+    NS_TEST_ASSERT_MSG_EQ(received.GetPrefixAutonomous(), false, "The 'A' flag leaked");
+    NS_TEST_ASSERT_MSG_EQ(received.GetPrefix(), Ipv6Address("fd00::"), "Wrong ULA prefix");
 }
 
 /**
@@ -658,19 +690,20 @@ RplDodagFormationTestCase::DoRun()
     internetv6.Install(nodes);
 
     Ipv6AddressHelper ipv6;
-    ipv6.SetBase(Ipv6Address("2001:1::"), Ipv6Prefix(64));
-    Ipv6InterfaceContainer interfaces = ipv6.Assign(devices);
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
 
     for (uint32_t i = 0; i < nodes.GetN(); i++)
     {
         interfaces.SetForwarding(i, true);
     }
 
-    rplHelper.SetRoot(nodes.Get(0));
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
     rplHelper.AssignStreams(nodes, 1);
 
     // Imin is 4.096 s and the Trickle interval doubles every time, so the
-    // second hop needs a couple of minutes to settle.
+    // second hop needs a couple of minutes to settle. DAD (RFC 4862) adds
+    // about a second on top of that, both for the root's own SLAAC address
+    // and, once the DIO carrying it arrives, each other node's.
     Simulator::Stop(Seconds(200));
     Simulator::Run();
 
@@ -678,9 +711,9 @@ RplDodagFormationTestCase::DoRun()
     Ptr<RplRoutingProtocol> middle = nodes.Get(1)->GetObject<RplRoutingProtocol>();
     Ptr<RplRoutingProtocol> leaf = nodes.Get(2)->GetObject<RplRoutingProtocol>();
 
-    Ipv6Address dodagId = interfaces.GetAddress(0, 1);
-    Ipv6Address middleAddress = interfaces.GetAddress(1, 1);
-    Ipv6Address leafAddress = interfaces.GetAddress(2, 1);
+    Ipv6Address dodagId = root->GetGlobalAddress();
+    Ipv6Address middleAddress = middle->GetGlobalAddress();
+    Ipv6Address leafAddress = leaf->GetGlobalAddress();
 
     NS_TEST_ASSERT_MSG_EQ(root->IsRoot(), true, "Node 0 is not the root");
     NS_TEST_ASSERT_MSG_EQ(root->IsJoined(), true, "The root is not in its own DODAG");
@@ -876,8 +909,7 @@ RplMrhofSelectionTestCase::DoRun()
     internetv6.Install(nodes);
 
     Ipv6AddressHelper ipv6;
-    ipv6.SetBase(Ipv6Address("2001:1::"), Ipv6Prefix(64));
-    Ipv6InterfaceContainer interfaces = ipv6.Assign(devices);
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
     for (uint32_t i = 0; i < nodes.GetN(); i++)
     {
         interfaces.SetForwarding(i, true);
@@ -1023,8 +1055,7 @@ RplSourceRoutingProcessTestCase::DoRun()
     internetv6.Install(nodes);
 
     Ipv6AddressHelper ipv6;
-    ipv6.SetBase(Ipv6Address("2001:1::"), Ipv6Prefix(64));
-    ipv6.Assign(devices);
+    ipv6.AssignWithoutAddress(devices);
 
     // Nothing here needs simulated time to pass, only DoInitialize() to have
     // run, which is what registers RplIpv6ExtensionSourceRouting.
@@ -1152,11 +1183,18 @@ RplSourceRoutingProcessTestCase::DoRun()
     // exists: this is the regression test for the bug where a relay hop both
     // resent the packet on its own and let the original fall through to
     // local delivery too, corrupting whatever was listening on this node.
+    // fe80::4 was never heard from, but on a node with a single RPL
+    // interface RouteToNeighbour() finds a route anyway (see its own
+    // comment on InterfaceForNeighbour()'s single-interface fallback): the
+    // root, not this hop, already decided fe80::4 is one radio hop away, so
+    // this is a normal relay, not the RFC 6554 section 4.2 on-link failure
+    // (that is covered separately below, on a node with no RPL interface at
+    // all to send through).
     {
         RplSourceRoutingHeader srh;
         srh.SetNextHeader(59);
         srh.SetSegmentsLeft(1);
-        srh.SetAddresses({Ipv6Address("fe80::4")}); // heard from nobody: no route
+        srh.SetAddresses({Ipv6Address("fe80::4")});
 
         Ptr<Packet> packet = Create<Packet>();
         packet->AddHeader(srh);
@@ -1182,6 +1220,108 @@ RplSourceRoutingProcessTestCase::DoRun()
         NS_TEST_ASSERT_MSG_EQ(stopProcessing,
                               true,
                               "A relay hop did not stop the caller's receive loop");
+    }
+
+    // RFC 6554 section 4.2's on-link failure: neither RouteToNeighbour() nor
+    // the routing lookup can find a way to reach the next hop. A node with
+    // no RPL interface at all is what actually triggers this (see the
+    // comment in RplIpv6ExtensionSourceRouting::Process() on why a started
+    // interface's fallback absorbs every other case): a second node here,
+    // with no NetDevice installed at all, so RplRoutingProtocol's
+    // DoInitialize() still registers the extension but starts no interface.
+    {
+        NodeContainer isolated;
+        isolated.Create(1);
+        RplHelper isolatedRplHelper;
+        InternetStackHelper isolatedInternetv6;
+        isolatedInternetv6.SetRoutingHelper(isolatedRplHelper);
+        isolatedInternetv6.Install(isolated);
+
+        Simulator::Stop(Seconds(0));
+        Simulator::Run();
+
+        Ptr<Ipv6ExtensionRoutingDemux> isolatedDemux =
+            isolated.Get(0)->GetObject<Ipv6ExtensionRoutingDemux>();
+        Ptr<Ipv6ExtensionRouting> isolatedExtension =
+            isolatedDemux->GetExtensionRouting(RplIpv6ExtensionSourceRouting::TYPE_ROUTING);
+        NS_TEST_ASSERT_MSG_EQ(isolatedExtension != nullptr,
+                              true,
+                              "RplIpv6ExtensionSourceRouting was not registered on a node with "
+                              "no interface");
+
+        RplSourceRoutingHeader srh;
+        srh.SetNextHeader(59);
+        srh.SetSegmentsLeft(1);
+        srh.SetAddresses({Ipv6Address("fe80::4")});
+
+        Ptr<Packet> packet = Create<Packet>();
+        packet->AddHeader(srh);
+
+        Ipv6Header ipv6Header;
+        ipv6Header.SetSource(Ipv6Address("fe80::3"));
+        ipv6Header.SetDestination(Ipv6Address("fe80::9"));
+        ipv6Header.SetHopLimit(64);
+
+        bool stopProcessing = false;
+        bool isDropped = false;
+        Ipv6L3Protocol::DropReason dropReason;
+        isolatedExtension->Process(packet,
+                                   0,
+                                   ipv6Header,
+                                   Ipv6Address("fe80::9"),
+                                   nullptr,
+                                   stopProcessing,
+                                   isDropped,
+                                   dropReason);
+
+        NS_TEST_ASSERT_MSG_EQ(isDropped, true, "An on-link failure was not dropped");
+        NS_TEST_ASSERT_MSG_EQ(stopProcessing,
+                              true,
+                              "Processing was not stopped for an on-link failure");
+        NS_TEST_ASSERT_MSG_EQ(dropReason,
+                              Ipv6L3Protocol::DROP_NO_ROUTE,
+                              "Wrong drop reason for an on-link failure");
+    }
+
+    // A routing loop (RFC 6554 section 4.2): this router's own link-local
+    // address appears twice in the Routing Header, other than the entry
+    // Segments Left points at, with a different address in between. The
+    // root's non-storing path computation (ComputeSourceRoute()) never
+    // produces this on its own; it takes a stale or tampered header.
+    {
+        RplSourceRoutingHeader srh;
+        srh.SetNextHeader(59);
+        srh.SetSegmentsLeft(1);
+        srh.SetAddresses(
+            {linkLocal, Ipv6Address("fe80::5"), linkLocal, Ipv6Address("fe80::6")});
+
+        Ptr<Packet> packet = Create<Packet>();
+        packet->AddHeader(srh);
+
+        Ipv6Header ipv6Header;
+        ipv6Header.SetSource(Ipv6Address("fe80::3"));
+        ipv6Header.SetDestination(linkLocal);
+        ipv6Header.SetHopLimit(64);
+
+        bool stopProcessing = false;
+        bool isDropped = false;
+        Ipv6L3Protocol::DropReason dropReason;
+        extension->Process(packet,
+                           0,
+                           ipv6Header,
+                           linkLocal,
+                           nullptr,
+                           stopProcessing,
+                           isDropped,
+                           dropReason);
+
+        NS_TEST_ASSERT_MSG_EQ(isDropped, true, "A routing loop was not dropped");
+        NS_TEST_ASSERT_MSG_EQ(stopProcessing,
+                              true,
+                              "Processing was not stopped for a routing loop");
+        NS_TEST_ASSERT_MSG_EQ(dropReason,
+                              Ipv6L3Protocol::DROP_ROUTE_ERROR,
+                              "Wrong drop reason for a routing loop");
     }
 
     // Segments Left already zero: this node is the real destination, so
@@ -1323,22 +1463,22 @@ RplNoPathDaoTestCase::DoRun()
     internetv6.Install(nodes);
 
     Ipv6AddressHelper ipv6;
-    ipv6.SetBase(Ipv6Address("2001:1::"), Ipv6Prefix(64));
-    Ipv6InterfaceContainer interfaces = ipv6.Assign(devices);
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
     for (uint32_t i = 0; i < nodes.GetN(); i++)
     {
         interfaces.SetForwarding(i, true);
     }
 
-    rplHelper.SetRoot(nodes.Get(0));
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
     rplHelper.AssignStreams(nodes, 1);
 
     Simulator::Stop(Seconds(60));
     Simulator::Run();
 
     Ptr<RplRoutingProtocol> root = nodes.Get(0)->GetObject<RplRoutingProtocol>();
-    Ipv6Address childAddress = interfaces.GetAddress(1, 1);
-    Ipv6Address rootAddress = interfaces.GetAddress(0, 1);
+    Ptr<RplRoutingProtocol> child = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    Ipv6Address childAddress = child->GetGlobalAddress();
+    Ipv6Address rootAddress = root->GetGlobalAddress();
     NS_TEST_ASSERT_MSG_EQ(root->GetTopologySize(), 1, "The root did not learn the child's DAO");
 
     std::vector<Ipv6Address> hops;
@@ -1451,14 +1591,13 @@ RplDaoAckRetryTestCase::DoRun()
     internetv6.Install(nodes);
 
     Ipv6AddressHelper ipv6;
-    ipv6.SetBase(Ipv6Address("2001:1::"), Ipv6Prefix(64));
-    Ipv6InterfaceContainer interfaces = ipv6.Assign(devices);
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
     for (uint32_t i = 0; i < nodes.GetN(); i++)
     {
         interfaces.SetForwarding(i, true);
     }
 
-    rplHelper.SetRoot(nodes.Get(0));
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
     rplHelper.AssignStreams(nodes, 1);
 
     Ptr<Node> rootNode = nodes.Get(0);
@@ -1487,9 +1626,9 @@ RplDaoAckRetryTestCase::DoRun()
     // whether or not the previous one was acknowledged, so the window below
     // has to end well inside one DaoInterval to see only one such cycle. With
     // the streams AssignStreams() fixes above, the periodic DAO and its two
-    // retries land at 4.71, 5.71 and 6.71 s after the blacklist, and the next
-    // periodic DAO at 8.71 s; 5.5 s comfortably separates the two.
-    Simulator::Stop(Seconds(5.5));
+    // retries land at 3.71, 4.71 and 5.71 s after the blacklist, and the next
+    // periodic DAO at 7.71 s; 6.2 s comfortably separates the two.
+    Simulator::Stop(Seconds(6.2));
     Simulator::Run();
 
     // 1 (initial, already counted) + 1 (periodic, unacknowledged) +
@@ -1601,14 +1740,16 @@ RplPacketInfoProcessTestCase::DoRun()
     internetv6.Install(nodes);
 
     Ipv6AddressHelper ipv6;
-    ipv6.SetBase(Ipv6Address("2001:1::"), Ipv6Prefix(64));
-    ipv6.Assign(devices);
+    ipv6.AssignWithoutAddress(devices);
 
-    rplHelper.SetRoot(nodes.Get(0));
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
 
-    // Only needs DoInitialize() to have run, which is what registers
-    // RplIpv6OptionRpl and puts the root at a fixed, known rank.
-    Simulator::Stop(Seconds(0));
+    // The root only settles at a fixed, known rank once its own SLAAC
+    // address has cleared DAD (RFC 4862's DadTimeout defaults to 1 s) and
+    // HandleDadSuccess() starts the DODAG; RplIpv6OptionRpl is registered
+    // earlier, at DoInitialize(), but there is nothing to gain from
+    // separating the two waits here.
+    Simulator::Stop(Seconds(2));
     Simulator::Run();
 
     Ptr<Node> node = nodes.Get(0);

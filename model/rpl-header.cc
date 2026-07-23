@@ -92,7 +92,14 @@ RplDioHeader::RplDioHeader()
       m_hasMetricContainer(false),
       m_pathEtx(0),
       m_hasLql(false),
-      m_lql(0)
+      m_lql(0),
+      m_hasPrefixInfo(false),
+      m_prefix(Ipv6Address::GetAny()),
+      m_prefixLength(0),
+      m_prefixOnLink(false),
+      m_prefixAutonomous(false),
+      m_prefixValidLifetime(0),
+      m_prefixPreferredLifetime(0)
 {
 }
 
@@ -133,6 +140,10 @@ RplDioHeader::Print(std::ostream& os) const
     {
         os << " LQL " << +m_lql;
     }
+    if (m_hasPrefixInfo)
+    {
+        os << " prefix " << m_prefix << "/" << +m_prefixLength;
+    }
 }
 
 uint32_t
@@ -140,7 +151,8 @@ RplDioHeader::GetSerializedSize() const
 {
     return 24 + (m_hasDagConf ? DAG_CONF_OPTION_SIZE : 0) +
            (m_hasMetricContainer ? METRIC_CONTAINER_OPTION_SIZE : 0) +
-           (m_hasLql ? LQL_OPTION_SIZE : 0);
+           (m_hasLql ? LQL_OPTION_SIZE : 0) +
+           (m_hasPrefixInfo ? PREFIX_INFO_OPTION_SIZE : 0);
 }
 
 void
@@ -207,6 +219,21 @@ RplDioHeader::Serialize(Buffer::Iterator start) const
         // multi-hop histogram, so Counter is always 1.
         start.WriteU8(static_cast<uint8_t>((m_lql << 4) | 0x1));
     }
+
+    if (m_hasPrefixInfo)
+    {
+        start.WriteU8(RPL_OPTION_PREFIX_INFO);
+        start.WriteU8(PREFIX_INFO_OPTION_LENGTH);
+        start.WriteU8(m_prefixLength);
+        uint8_t prefixFlags = (m_prefixOnLink ? PREFIX_INFO_L_FLAG : 0) |
+                              (m_prefixAutonomous ? PREFIX_INFO_A_FLAG : 0);
+        start.WriteU8(prefixFlags); // Reserved1 in the low 6 bits, always 0
+        start.WriteHtonU32(m_prefixValidLifetime);
+        start.WriteHtonU32(m_prefixPreferredLifetime);
+        uint8_t prefixBuf[16];
+        m_prefix.Serialize(prefixBuf);
+        start.Write(prefixBuf, 16);
+    }
 }
 
 uint32_t
@@ -236,6 +263,7 @@ RplDioHeader::Deserialize(Buffer::Iterator start)
     m_hasDagConf = false;
     m_hasMetricContainer = false;
     m_hasLql = false;
+    m_hasPrefixInfo = false;
     while (!i.IsEnd())
     {
         uint8_t type = i.ReadU8();
@@ -299,6 +327,19 @@ RplDioHeader::Deserialize(Buffer::Iterator start)
                 // mcType, Res+P+C+O+R, A+Prec, objLength -- already consumed).
                 i.Next(METRIC_CONTAINER_OPTION_LENGTH - 4);
             }
+        }
+        else if (type == RPL_OPTION_PREFIX_INFO && length == PREFIX_INFO_OPTION_LENGTH)
+        {
+            m_hasPrefixInfo = true;
+            m_prefixLength = i.ReadU8();
+            uint8_t prefixFlags = i.ReadU8();
+            m_prefixOnLink = (prefixFlags & PREFIX_INFO_L_FLAG) != 0;
+            m_prefixAutonomous = (prefixFlags & PREFIX_INFO_A_FLAG) != 0;
+            m_prefixValidLifetime = i.ReadNtohU32();
+            m_prefixPreferredLifetime = i.ReadNtohU32();
+            uint8_t prefixBuf[16];
+            i.Read(prefixBuf, 16);
+            m_prefix = Ipv6Address::Deserialize(prefixBuf);
         }
         else
         {
@@ -521,6 +562,65 @@ uint8_t
 RplDioHeader::GetLql() const
 {
     return m_lql;
+}
+
+bool
+RplDioHeader::HasPrefixInfo() const
+{
+    return m_hasPrefixInfo;
+}
+
+void
+RplDioHeader::SetPrefixInfo(Ipv6Address prefix,
+                            uint8_t prefixLength,
+                            bool onLink,
+                            bool autonomous,
+                            uint32_t validLifetime,
+                            uint32_t preferredLifetime)
+{
+    m_hasPrefixInfo = true;
+    m_prefix = prefix;
+    m_prefixLength = prefixLength;
+    m_prefixOnLink = onLink;
+    m_prefixAutonomous = autonomous;
+    m_prefixValidLifetime = validLifetime;
+    m_prefixPreferredLifetime = preferredLifetime;
+}
+
+Ipv6Address
+RplDioHeader::GetPrefix() const
+{
+    return m_prefix;
+}
+
+uint8_t
+RplDioHeader::GetPrefixLength() const
+{
+    return m_prefixLength;
+}
+
+bool
+RplDioHeader::GetPrefixOnLink() const
+{
+    return m_prefixOnLink;
+}
+
+bool
+RplDioHeader::GetPrefixAutonomous() const
+{
+    return m_prefixAutonomous;
+}
+
+uint32_t
+RplDioHeader::GetPrefixValidLifetime() const
+{
+    return m_prefixValidLifetime;
+}
+
+uint32_t
+RplDioHeader::GetPrefixPreferredLifetime() const
+{
+    return m_prefixPreferredLifetime;
 }
 
 NS_OBJECT_ENSURE_REGISTERED(RplDaoHeader);

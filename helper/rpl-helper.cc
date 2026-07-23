@@ -10,6 +10,7 @@
 #include "ns3/log.h"
 #include "ns3/node.h"
 #include "ns3/rpl-routing-protocol.h"
+#include "ns3/uinteger.h"
 
 namespace ns3
 {
@@ -47,10 +48,12 @@ RplHelper::Set(std::string name, const AttributeValue& value)
 }
 
 void
-RplHelper::SetRoot(Ptr<Node> node) const
+RplHelper::SetRoot(Ptr<Node> node, Ipv6Address prefix, uint8_t prefixLength) const
 {
     Ptr<rpl::RplRoutingProtocol> rpl = node->GetObject<rpl::RplRoutingProtocol>();
     NS_ASSERT_MSG(rpl, "RPL is not installed on node " << node->GetId());
+    rpl->SetAttribute("RootPrefix", Ipv6AddressValue(prefix));
+    rpl->SetAttribute("RootPrefixLength", UintegerValue(prefixLength));
     rpl->SetAsRoot();
 }
 

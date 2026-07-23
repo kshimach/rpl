@@ -211,7 +211,21 @@ RplRoutingProtocol::GetTypeId()
                           "Lifetime of the downward route a node advertises, in lifetime units.",
                           UintegerValue(RPL_DEFAULT_LIFETIME),
                           MakeUintegerAccessor(&RplRoutingProtocol::m_pathLifetime),
-                          MakeUintegerChecker<uint8_t>(1, RPL_INFINITE_LIFETIME));
+                          MakeUintegerChecker<uint8_t>(1, RPL_INFINITE_LIFETIME))
+            .AddAttribute("RootPrefix",
+                          "The DODAG root's own GUA or ULA prefix, disseminated to every other "
+                          "node via the DIO Prefix Information option (RFC 6550 section 6.7.10) "
+                          "for SLAAC (RFC 4862). Root only; ignored on every other node, which "
+                          "gets the prefix from the DIO it joins on instead. Required on the "
+                          "root -- SetAsRoot() asserts it is set.",
+                          Ipv6AddressValue(Ipv6Address::GetAny()),
+                          MakeIpv6AddressAccessor(&RplRoutingProtocol::m_rootPrefix),
+                          MakeIpv6AddressChecker())
+            .AddAttribute("RootPrefixLength",
+                          "Prefix length, in bits, of RootPrefix.",
+                          UintegerValue(64),
+                          MakeUintegerAccessor(&RplRoutingProtocol::m_rootPrefixLength),
+                          MakeUintegerChecker<uint8_t>(1, 128));
     return tid;
 }
 
@@ -238,6 +252,13 @@ RplRoutingProtocol::RplRoutingProtocol()
       m_dioIntervalMin(MilliSeconds(1 << RPL_DIO_INTERVAL_MIN)),
       m_dioIntervalDoublings(RPL_DIO_INTERVAL_DOUBLINGS),
       m_dioRedundancy(RPL_DIO_REDUNDANCY),
+      m_hasPrefixInfo(false),
+      m_prefix(Ipv6Address::GetAny()),
+      m_prefixLength(0),
+      m_prefixOnLink(false),
+      m_prefixAutonomous(false),
+      m_prefixValidLifetime(0),
+      m_prefixPreferredLifetime(0),
       m_preferredParent(Ipv6Address::GetAny()),
       m_daoInterval(Seconds(60)),
       m_daoAckTimeout(Seconds(5)),
@@ -249,7 +270,9 @@ RplRoutingProtocol::RplRoutingProtocol()
       m_daoRetriesLeft(0),
       m_daoAckPending(false),
       m_daoEvent(Timer::CANCEL_ON_DESTROY),
-      m_daoRetryEvent(Timer::CANCEL_ON_DESTROY)
+      m_daoRetryEvent(Timer::CANCEL_ON_DESTROY),
+      m_rootPrefix(Ipv6Address::GetAny()),
+      m_rootPrefixLength(64)
 {
     NS_LOG_FUNCTION(this);
     m_jitter = CreateObject<UniformRandomVariable>();
@@ -307,6 +330,14 @@ RplRoutingProtocol::DoInitialize()
         optionDemux->Insert(packetInfoOption);
     }
 
+    // The only way, short of polling, to learn that a SLAAC address has
+    // cleared Duplicate Address Detection and stopped being TENTATIVE (RFC
+    // 4862): connected once here, for every node, since it drives both the
+    // root's own address (below) and every other node's (JoinDodag()).
+    m_ipv6->GetIcmpv6()->TraceConnectWithoutContext(
+        "DadSuccess",
+        MakeCallback(&RplRoutingProtocol::HandleDadSuccess, this));
+
     // Interface 0 is the loopback; RPL never runs there.
     for (uint32_t i = 1; i < m_ipv6->GetNInterfaces(); i++)
     {
@@ -321,14 +352,24 @@ RplRoutingProtocol::DoInitialize()
     if (m_isRoot)
     {
         // RFC 6550, section 8.2.2.2: the root is at MinHopRankIncrease and the
-        // DODAGID is one of its own global addresses.
-        m_dodagId = GetGlobalAddress();
-        NS_ASSERT_MSG(!m_dodagId.IsAny(), "The DODAG root needs a global address");
-        m_joined = true;
-        m_grounded = true;
-        m_rank = m_minHopRankIncrease;
-        m_dioTrickle.Start();
-        NS_LOG_INFO("Root of DODAG " << m_dodagId << " at rank " << m_rank);
+        // DODAGID is one of its own global addresses. Unlike every other
+        // node, the root is not handed a prefix by a DIO -- it owns one
+        // (RootPrefix) and builds its own address from it the same way SLAAC
+        // would (Ipv6Address::MakeAutoconfiguredAddress(), the same
+        // derivation Ipv6L3Protocol::AddAutoconfiguredAddress() uses), so a
+        // node's global address always follows the same "prefix + this
+        // interface's identifier" rule regardless of who assigned it.
+        // AddAddress() triggers DAD asynchronously (Ipv6Interface::
+        // AddAddress()), so the DODAG is not actually started here --
+        // HandleDadSuccess() does that once the address is confirmed unique.
+        NS_ASSERT_MSG(!m_rootPrefix.IsAny(), "The DODAG root needs its RootPrefix attribute set");
+        Address macAddress = m_ipv6->GetNetDevice(1)->GetAddress();
+        Ipv6Address candidate = Ipv6Address::MakeAutoconfiguredAddress(macAddress, m_rootPrefix);
+        Ipv6InterfaceAddress rootAddress(candidate, Ipv6Prefix(m_rootPrefixLength));
+        rootAddress.SetScope(Ipv6InterfaceAddress::GLOBAL);
+        m_ipv6->AddAddress(1, rootAddress);
+        NS_LOG_INFO("Root building its own address " << candidate << " from RootPrefix "
+                                                      << m_rootPrefix);
     }
     else
     {
@@ -468,13 +509,73 @@ RplRoutingProtocol::GetGlobalAddress() const
         for (uint32_t j = 0; j < m_ipv6->GetNAddresses(i); j++)
         {
             Ipv6InterfaceAddress iaddr = m_ipv6->GetAddress(i, j);
-            if (iaddr.GetScope() == Ipv6InterfaceAddress::GLOBAL)
+            // TENTATIVE means Duplicate Address Detection has not finished
+            // yet (RFC 4862): the address is not actually usable, so callers
+            // that trust this getter (SendDao(), the root's own DoInitialize())
+            // must not be handed one still in flight.
+            if (iaddr.GetScope() == Ipv6InterfaceAddress::GLOBAL &&
+                iaddr.GetState() != Ipv6InterfaceAddress::TENTATIVE)
             {
                 return iaddr.GetAddress();
             }
         }
     }
     return Ipv6Address::GetAny();
+}
+
+void
+RplRoutingProtocol::HandleDadSuccess(const Ipv6Address& address)
+{
+    NS_LOG_FUNCTION(this << address);
+
+    if (address.IsLinkLocal())
+    {
+        // Every interface goes through DAD once for its link-local address
+        // regardless of RootPrefix/the DIO's Prefix Information option; not
+        // interesting here.
+        return;
+    }
+
+    if (m_isRoot)
+    {
+        if (m_joined)
+        {
+            // The DODAG is already running: a later re-run of DAD (e.g. on a
+            // route flap) must not restart it.
+            return;
+        }
+
+        // RFC 6550, section 8.2.2.2: the root is at MinHopRankIncrease and
+        // the DODAGID is one of its own global addresses. This fires once
+        // DAD has actually confirmed the address DoInitialize() asked for is
+        // unique, which is what starting the DODAG on an address that might
+        // still get pulled out from under it would risk.
+        m_dodagId = address;
+        m_joined = true;
+        m_grounded = true;
+        m_rank = m_minHopRankIncrease;
+
+        // Every DIO this root sends carries the Prefix Information option
+        // (RFC 6550 section 6.7.10) so every other node can SLAAC an address
+        // on RootPrefix (see SendDio(), JoinDodag()).
+        m_hasPrefixInfo = true;
+        m_prefix = m_rootPrefix;
+        m_prefixLength = m_rootPrefixLength;
+        m_prefixOnLink = true;
+        m_prefixAutonomous = true;
+        m_prefixValidLifetime = RPL_PREFIX_VALID_LIFETIME;
+        m_prefixPreferredLifetime = RPL_PREFIX_PREFERRED_LIFETIME;
+
+        m_dioTrickle.Start();
+        NS_LOG_INFO("Root of DODAG " << m_dodagId << " at rank " << m_rank);
+        return;
+    }
+
+    // Non-root: nothing to do. AddAutoconfiguredAddress() (JoinDodag())
+    // inserts the address with State_e::TENTATIVE_OPTIMISTIC (RFC 4429),
+    // which GetGlobalAddress() already treats as usable -- this node did not
+    // need to wait for this trace to fire before advertising or sending a
+    // DAO on it.
 }
 
 void
@@ -693,6 +794,19 @@ RplRoutingProtocol::SendDio(Ipv6Address dst, uint32_t interface)
         dio.SetLql(preferred != m_parents.end() ? preferred->second.lql : RPL_LQL_UNDETERMINED);
     }
 
+    if (m_hasPrefixInfo)
+    {
+        // Carried by every DIO, not just the root's, the same reason as the
+        // DODAG Configuration option above: a node joining deep in the
+        // DODAG still needs to learn the prefix to SLAAC an address on.
+        dio.SetPrefixInfo(m_prefix,
+                          m_prefixLength,
+                          m_prefixOnLink,
+                          m_prefixAutonomous,
+                          m_prefixValidLifetime,
+                          m_prefixPreferredLifetime);
+    }
+
     Ptr<Packet> packet = Create<Packet>();
     packet->AddHeader(dio);
 
@@ -772,7 +886,7 @@ RplRoutingProtocol::HandleDio(const RplDioHeader& dio,
 
     if (!m_joined)
     {
-        JoinDodag(dio);
+        JoinDodag(dio, interface);
     }
     else if (dio.GetInstanceId() != m_instanceId || dio.GetDodagId() != m_dodagId)
     {
@@ -788,7 +902,7 @@ RplRoutingProtocol::HandleDio(const RplDioHeader& dio,
         {
             NS_LOG_INFO("DODAG " << m_dodagId << " moved to version " << +dio.GetVersionNumber());
             LeaveDodag();
-            JoinDodag(dio);
+            JoinDodag(dio, interface);
         }
         else
         {
@@ -820,9 +934,9 @@ RplRoutingProtocol::HandleDio(const RplDioHeader& dio,
 }
 
 void
-RplRoutingProtocol::JoinDodag(const RplDioHeader& dio)
+RplRoutingProtocol::JoinDodag(const RplDioHeader& dio, uint32_t interface)
 {
-    NS_LOG_FUNCTION(this);
+    NS_LOG_FUNCTION(this << interface);
 
     m_joined = true;
     m_instanceId = dio.GetInstanceId();
@@ -847,6 +961,35 @@ RplRoutingProtocol::JoinDodag(const RplDioHeader& dio)
         {
             NS_LOG_WARN("DODAG " << m_dodagId << " asks for objective code point " << m_ocp
                                  << ", but only OF0 and MRHOF are implemented");
+        }
+    }
+
+    if (dio.HasPrefixInfo())
+    {
+        m_hasPrefixInfo = true;
+        m_prefix = dio.GetPrefix();
+        m_prefixLength = dio.GetPrefixLength();
+        m_prefixOnLink = dio.GetPrefixOnLink();
+        m_prefixAutonomous = dio.GetPrefixAutonomous();
+        m_prefixValidLifetime = dio.GetPrefixValidLifetime();
+        m_prefixPreferredLifetime = dio.GetPrefixPreferredLifetime();
+
+        if (m_prefixAutonomous)
+        {
+            // The standard SLAAC entry point (RFC 4862): builds the address
+            // the same way GlobalAddressOf()/LinkLocalOf() already assume
+            // every node's addresses are related (one interface identifier,
+            // shared with the link-local address) and starts Duplicate
+            // Address Detection on it asynchronously --
+            // HandleDadSuccess() is what learns it is ready to use.
+            uint8_t flags = (m_prefixOnLink ? Icmpv6OptionPrefixInformation::ONLINK : 0) |
+                            Icmpv6OptionPrefixInformation::AUTADDRCONF;
+            m_ipv6->AddAutoconfiguredAddress(interface,
+                                             m_prefix,
+                                             Ipv6Prefix(m_prefixLength),
+                                             flags,
+                                             m_prefixValidLifetime,
+                                             m_prefixPreferredLifetime);
         }
     }
 

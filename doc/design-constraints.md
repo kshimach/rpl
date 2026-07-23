@@ -881,3 +881,176 @@ Metric Container を載せて往復させ、両方が壊れずに残ることを
 ことを確認する。ETX のときと同様、`rpl-test` は `liblr-wpan` を
 リンクしないため、実際の RSSI タグからの LQL 導出は単体テストの対象外
 — 14.2 節の実行結果が唯一の end-to-end 検証である。
+
+## 15. RFC 6550/6551/6553/6554 準拠監査、アドレス自動設定 (SLAAC/DAD)
+    への移行、および RFC 6554 の重大ギャップ修正
+
+RFC 6550 (RPL)、RFC 6551 (Routing Metrics)、RFC 6553 (RPI)、RFC 6554
+(SRH) の原文を rfc-editor.org から取得し、本実装と突き合わせて監査した。
+DIO/DAO/DAO-ACK/DIS のワイヤフォーマットと基本処理、DAG Metric Container
+上の ETX/LQL (13, 14 節)、DODAG Configuration option、Target/Transit
+Information option、non-storing mode の DAO、Rank 計算とループ回避、RPI
+(12 節)、SRH のワイヤフォーマットとホップ処理は準拠済みと確認した。
+10 節に記録済みの lollipop 比較未実装・RH3 アドレス圧縮未実装・RPI の
+確認済みループを実際には止められない、の 3 件は優先度が低いため今回も
+対象外、現状維持とした。今回対応したのは次の 2 件:
+
+1. RFC 6550 6.7.10 節の Prefix Information option が未実装で、root の
+   GUA/ULA プレフィックスを DIO で配布する経路自体が存在しなかった
+   (アドレスは `Ipv6AddressHelper` による全ノード一括の静的固定割当)。
+2. RFC 6554 4.2 節の、中継時の on-link 検証と SRH ループ検出が未実装
+   だった。
+
+### 15.1 Prefix Information Option の実装
+
+`RplDioHeader` に `RPL_OPTION_PREFIX_INFO` (定義済みだったが未使用) の
+Serialize/Deserialize を追加した。フィールドは RFC 6550 6.7.10 節の図
+そのまま: Type(1) + Length(1) + PrefixLength(1) + Flags(1, 上位 2 bit が
+L/A) + ValidLifetime(4) + PreferredLifetime(4) + Prefix(16) の計 28
+バイト。RFC 4861 (Neighbor Discovery の PIO) には同じ並びに加えて
+Reserved2 (4 バイト) があり計 32 バイトになるが、RFC 6550 の PIO には
+それが無い。最初の実装ではここを混同して `PREFIX_INFO_OPTION_SIZE = 32`
+としてしまい、`GetSerializedSize()` は 32 バイトを返すのに
+`Serialize()` は 28 バイトしか書かないというサイズ不整合を起こし、
+`rpl-6lowpan-simple` の実行中に別ノードの `Deserialize()` が
+`NS_ASSERT failed, cond="m_current + delta <= m_dataEnd"` でバッファ
+範囲外に落ちた。RFC 本文の ASCII art 図を直接引用させて確認し直し、
+28 に修正して解消した。
+
+### 15.2 root 自身のアドレス生成と DODAG 起動の非同期化
+
+`RplRoutingProtocol` に `RootPrefix`/`RootPrefixLength` 属性を追加し、
+`RplHelper::SetRoot()` のシグネチャを `SetRoot(node, prefix,
+prefixLength = 64)` に変更した。root は `DoInitialize()` で
+`Ipv6Address::MakeAutoconfiguredAddress()` (`AddAutoconfiguredAddress()`
+が内部で使うのと同じ導出) で `RootPrefix` から自分の EUI-64 ベースの
+アドレスを組み立て、`Ipv6L3Protocol::AddAddress()` で追加する。
+`AddAddress()` は Duplicate Address Detection (RFC 4862) を自動的に
+スケジュールする (`Icmpv6L4Protocol` の `DAD` 属性、既定 true) ため、
+DODAG の起動 (`m_joined = true`、Trickle 起動、DODAGID の確定) は
+`DoInitialize()` では行わず、`Icmpv6L4Protocol` の `"DadSuccess"`
+TraceSource (`TracedCallback<const Ipv6Address&>`) に接続した
+`HandleDadSuccess()` に移した。DAD が実際にアドレスの一意性を確認して
+初めて、その上に DODAG を組み立てる設計である。
+
+トレース接続時、`HandleDadSuccess(Ipv6Address address)` (値渡し) で
+繋ごうとすると `Incompatible types` で `NS_FATAL` になった。
+`TracedCallback` のシグネチャに合わせ `const Ipv6Address&` (参照渡り)
+にする必要がある。
+
+### 15.3 非 root ノードの SLAAC トリガーと PIO の転送
+
+`JoinDodag()` で、受信した DIO が Prefix Information option を持ち A
+フラグが立っていれば、`Ipv6L3Protocol::AddAutoconfiguredAddress()`
+(標準の SLAAC エントリポイント) を呼ぶ。以後、この Prefix Information
+option は自分が送信する DIO にもそのまま乗せて転送する
+(`SendDio()`) — DODAG Configuration option と同じ「root が決め、
+全ノードが継承して転送する」パターンである。
+
+### 15.4 `GetGlobalAddress()` と TENTATIVE_OPTIMISTIC: 当初の設計が
+     前提から誤っていた点
+
+`GetGlobalAddress()` は当初 `iaddr.GetState() != TENTATIVE` の条件で
+DAD 未完了のアドレスを除外する設計にしていた。ところが ns-3 コアの
+`Ipv6InterfaceAddress` はデフォルトで `TENTATIVE_OPTIMISTIC` (RFC 4429
+の Optimistic DAD) 状態を持ち、`AddAutoconfiguredAddress()` が作る
+アドレスもこの状態のまま `AddAddress()` に渡る。`TENTATIVE` と
+`TENTATIVE_OPTIMISTIC` は別の enum 値であり、上記の条件は後者を
+除外しない。つまりこの実装は最初から (`GetGlobalAddress()` を
+書いた時点から) DAD の完了を待たず、アドレス追加と同時に即座に
+そのアドレスを使い始めていたことになる — ns-3 の SLAAC 実装自体が
+「DAD 完了前から使ってよい」という楽観的 DAD の意味論で作られている
+ためで、これは ns-3 コア側の一貫した設計であり、本実装のバグではない。
+
+この事実に気づかず、非 root ノードにも root と同様
+「`HandleDadSuccess()` が発火するまで最初の DAO 送信を待つべき」
+という誤った前提で `SendDao()` の再試行を `HandleDadSuccess()` から
+nudge する実装を一度追加した。結果、`RplDaoAckRetryTestCase` で
+DAO 到着数が期待値 4 に対し実測 6 になった。原因を
+`NS_LOG="RplRoutingProtocol=level_all"` のログで追跡したところ、
+最初の DAO は (アドレスが `TENTATIVE_OPTIMISTIC` の時点で) 既に
+成功して ACK まで受け取っていたにもかかわらず、1 秒後の
+`DadTimeout` 到達時に nudge が無条件で再送をトリガーし、それが
+ちょうど回線遮断後だったため ACK されず、リトライ・次回定期 DAO の
+系列を丸ごと 1 サイクル分余分に生んでいた。nudge は完全に不要
+だったと判明し、削除した。root 側の `HandleDadSuccess()` ゲート
+(DODAG 起動を実際の DAD 完了まで待つ) は、root が名乗る DODAGID
+という「一度確定したら全ノードに伝わる」性質上、より保守的な
+設計として意図的に維持している (アドレスは使えても、まだ確定して
+いないかもしれないものを DODAG の identity にはしない)。
+
+### 15.5 `Ipv6AddressHelper::AssignWithoutAddress()` が必要だった理由
+
+アドレス静的割当を完全に削除する過程で、`Ipv6AddressHelper::Assign()`
+の呼び出し自体も削除したところ、全ノードで
+`NS_ASSERT failed, cond="m_ptr", msg="Attempted to dereference zero
+pointer"` が `DoInitialize()` 開始直後に起きた。`Assign()` は
+アドレスを割り当てるだけでなく `Ipv6::AddInterface(device)` を呼んで
+`Ipv6Interface` オブジェクト自体を作る役目も兼ねており、これを
+省くとインターフェースが存在せず `m_ipv6->GetNetDevice(1)` 等が
+軒並み落ちる。ns-3 コアに既にある `AssignWithoutAddress(devices)`
+(インターフェース作成・アップ・トラフィックコントロール設定は行うが
+グローバルアドレスの割当だけ省く) に切り替えて解消した。
+
+### 15.6 RFC 6554 4.2 節: on-link 検証と ICMPv6 エラー送信
+
+`RplIpv6ExtensionSourceRouting::Process()` で `RouteToNeighbour()` と
+`RouteOutput()` が両方とも経路を返せなかった場合に、RFC 6554 4.2 節の
+"a router MUST drop the datagram and SHOULD send an ICMPv6 Destination
+Unreachable message with Code 7" に従い、
+`Icmpv6L4Protocol::SendErrorDestinationUnreachable(malformedPacket,
+srcAddress, RPL_ICMPV6_SRH_ERROR)` (`RPL_ICMPV6_SRH_ERROR = 7`、
+`rpl-conf.h` に追加。ns-3 コアに Code 7 の名前付き定数は無い) を送る
+よう変更した。
+
+テストを書く過程で、`RouteToNeighbour()` が使う
+`InterfaceForNeighbour()` に「一度も聞いたことのない隣接アドレスでも、
+単一 RPL インターフェースのノードなら唯一の答えとしてそのインター
+フェースを返す」というフォールバックが既にあることに気づいた
+(コード自身のコメントに明記されている、本実装側の既存の意図的な
+設計で、今回変更していない)。つまり単一インターフェースのノード
+(LLN では通常のケース) では `RouteToNeighbour()` は事実上必ず経路を
+返し、この on-link エラー経路は「対象のネクストホップが未知」では
+発火しない。実際に発火するのは RPL インターフェースを 1 つも持たない
+ノード (`m_ifcToSocket` が空) のときだけで、単体テストも
+(`RplSourceRoutingProcessTestCase`) NetDevice を一切持たないノードを
+別途用意してこの経路を検証している。
+
+### 15.7 RFC 6554 4.2 節: SRH ループ検出
+
+同じく `Process()` に、Routing Header の Address[] を Segments Left が
+指すエントリを除いて走査し、「このノードに割り当てられたアドレスが
+2 回以上、間に一致しないアドレスを 1 つ以上挟んで出現する」パターンを
+検出する処理を追加した。検出したら
+`icmpv6->SendErrorParameterError(malformedPacket, srcAddress,
+Icmpv6Header::ICMPV6_MALFORMED_HEADER, offset + 2)` でエラーを送り
+`Ipv6L3Protocol::DROP_ROUTE_ERROR` としてドロップする。root の
+non-storing 経路計算 (`ComputeSourceRoute()`) はこの形の経路を単独では
+作らないため、想定される発火条件は経路が古くなった (親が変わった後)、
+または改ざんされた場合に限られる。
+
+### 15.8 テストと example の SLAAC 前提への全面書き換え
+
+ユーザー指示により、静的割当は SLAAC に完全置換し、`rpl-test-suite.cc`
+と `rpl-6lowpan-simple.cc` も全面的に書き換えた。`interfaces.GetAddress
+(i, 1)` でグローバルアドレスを取得していた箇所は使えなくなるため、
+`RplRoutingProtocol::GetGlobalAddress()` を private から public に
+公開し、各テストは対応するノードの `RplRoutingProtocol` から直接
+取得する形に変更した。DAD 分の遅延 (既定 `DadTimeout` = 1 秒) が
+新たに乗るため、`RplPacketInfoProcessTestCase` (root の rank が
+確定するのを待つ必要がある) 等、いくつかのテストの `Simulator::Stop()`
+の秒数を実測値に基づいて調整した。`RplDaoAckRetryTestCase` は
+`NS_LOG` でイベントのタイムスタンプを実際に採取し、DAO-ACK のリトライ
+系列がどこに来るかを確認したうえで待ち時間と期待値を合わせている
+(15.4 節の nudge 削除後の系列)。
+
+### 15.9 検証結果
+
+`./ns3 run "test-runner --suite=rpl --verbose"` で全ケース PASS
+(既存ケースの書き換え分に加え、Prefix Information option の
+シリアライズ往復、on-link 検証、SRH ループ検出の新規ケースを含む)。
+`rpl-6lowpan-simple --mrhof --lql` で、root にのみ `RootPrefix`
+(`2001:1::/64`) を設定した状態から 3 ノードの DODAG が形成され、
+各ノードが DIO の Prefix Information option 経由の SLAAC で
+`2001:1::ff:fe00:N` 形式のアドレスを得て、最終ノードから root への
+ping が 5/5 (0% packet loss) で通ることを確認した。

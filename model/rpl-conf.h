@@ -125,8 +125,21 @@ constexpr uint8_t RPL_FRESHNESS_TARGET = 4;
 constexpr uint8_t RPL_DEFAULT_LIFETIME = 30;
 constexpr uint16_t RPL_DEFAULT_LIFETIME_UNIT = 60;
 
+/// Defaults for the Prefix Information option (RFC 6550 section 6.7.10),
+/// matching the common Router Advertisement defaults (e.g. radvd's).
+constexpr uint32_t RPL_PREFIX_VALID_LIFETIME = 86400;     //!< 1 day
+constexpr uint32_t RPL_PREFIX_PREFERRED_LIFETIME = 14400; //!< 4 hours
+
 /// All-RPL-nodes link-local multicast address (RFC 6550, section 6).
 constexpr const char* RPL_ALL_NODES_MULTICAST = "ff02::1a";
+
+/// ICMPv6 Destination Unreachable code for a Source Route Header naming a
+/// next hop this router cannot forward to, either because it is not on-link
+/// (RFC 6554 section 4.2) or because the header names this router's own
+/// address twice with something else in between, a routing loop (also
+/// section 4.2). ns-3 core has no named constant for this RFC 6554-defined
+/// code.
+constexpr uint8_t RPL_ICMPV6_SRH_ERROR = 7;
 
 } // namespace rpl
 } // namespace ns3
