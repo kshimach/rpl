@@ -1170,7 +1170,18 @@ RplRoutingProtocol::RouteToNeighbour(Ipv6Address neighbour, Ipv6Address dst) con
 
     Ptr<Ipv6Route> route = Create<Ipv6Route>();
     route->SetDestination(dst);
-    route->SetGateway(neighbour);
+    // The gateway is what Ipv6Interface::Send() resolves over Neighbour
+    // Discovery and hands to the link layer; only a link-local address is
+    // guaranteed to resolve over one radio hop the way every other neighbour
+    // lookup in this class expects. neighbour is dst's own global address
+    // when this is the final hop of a source route
+    // (RplIpv6ExtensionSourceRouting::Process()), so it is converted here
+    // rather than at that call site: NDP resolution failing (or, worse,
+    // Ipv6Interface::Send() treating a global destination that is not this
+    // node's own as if it were, since neither check is scoped to "one radio
+    // hop away") is exactly the kind of failure RouteOutput()'s own comment
+    // warns a global address invites in this LLN.
+    route->SetGateway(neighbour.IsLinkLocal() ? neighbour : LinkLocalOf(neighbour));
     route->SetOutputDevice(m_ipv6->GetNetDevice(interface));
     route->SetSource(m_ipv6->SourceAddressSelection(interface, dst));
     return route;
@@ -1617,10 +1628,28 @@ RplRoutingProtocol::PrepareOutgoingPacket(Ptr<Packet> packet, Ipv6Header& header
         std::vector<Ipv6Address> hops;
         if (ComputeSourceRoute(dst, hops) && hops.size() > 1)
         {
+            std::vector<Ipv6Address> addresses(hops.begin() + 1, hops.end());
+            // The last address is the packet's real final destination. Every
+            // other entry is only ever a next-hop identifier and is fine as
+            // link-local, but this one also becomes the IPv6 header's
+            // Destination once segmentsLeft reaches 0
+            // (RplIpv6ExtensionSourceRouting::Process()), and from there
+            // Icmpv6L4Protocol::HandleEchoRequest() (and any other ICMPv6/UDP
+            // responder) echoes it straight back as the reply's source
+            // address. A link-local source is scoped to one hop
+            // (Ipv6L3Protocol::IpForward() drops it outright further on), so
+            // a link-local final hop silently breaks every reply that has to
+            // cross more than one hop back to the root. Using the global
+            // address here keeps the reply's source address, and so its
+            // onward routing, working; RouteToNeighbour() (used below and by
+            // RplIpv6ExtensionSourceRouting::Process()) resolves a neighbour
+            // by its interface identifier alone, so it still finds the right
+            // interface for a global address.
+            addresses.back() = dst;
             RplSourceRoutingHeader srh;
             srh.SetNextHeader(innerNextHeader);
             srh.SetSegmentsLeft(static_cast<uint8_t>(hops.size() - 1));
-            srh.SetAddresses(std::vector<Ipv6Address>(hops.begin() + 1, hops.end()));
+            srh.SetAddresses(addresses);
 
             packet->AddHeader(srh);
             header.SetDestination(hops.front());

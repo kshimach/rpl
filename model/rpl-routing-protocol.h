@@ -224,6 +224,26 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      */
     int64_t AssignStreams(int64_t stream);
 
+    /**
+     * @brief Build a route handing a packet straight to a one-hop neighbour.
+     *
+     * Public so RplIpv6ExtensionSourceRouting::Process() can use it to relay
+     * a source-routed packet to the next hop the Routing Header names,
+     * without going through RouteOutput(): RouteOutput() deliberately never
+     * treats a global address as on-link (a DODAG shares one prefix across
+     * many hops, see RouteOutput()'s own comment), which is the right call
+     * for traffic in general but wrong here, since the root already
+     * confirmed this exact hop is one radio hop away when it built the
+     * header. The neighbour is identified by its interface identifier alone
+     * (the low 64 bits), so this works whether the caller names it by its
+     * link-local or global address -- both resolve to the same interface.
+     *
+     * @param neighbour the address of the neighbour to send to
+     * @param dst the destination to put in the route
+     * @return the route, nullptr if the neighbour is on no known interface
+     */
+    Ptr<Ipv6Route> RouteToNeighbour(Ipv6Address neighbour, Ipv6Address dst) const;
+
   protected:
     void DoInitialize() override;
     void DoDispose() override;
@@ -497,14 +517,6 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      * @return the interface index, 0 if it cannot be told
      */
     uint32_t InterfaceForNeighbour(Ipv6Address neighbour) const;
-
-    /**
-     * @brief Build a route handing a packet straight to a one-hop neighbour.
-     * @param neighbour the address of the neighbour to send to
-     * @param dst the destination to put in the route
-     * @return the route, nullptr if the neighbour is on no known interface
-     */
-    Ptr<Ipv6Route> RouteToNeighbour(Ipv6Address neighbour, Ipv6Address dst) const;
 
     /**
      * @brief Send an already-built RPL message body on every RPL interface.

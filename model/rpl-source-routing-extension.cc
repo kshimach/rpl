@@ -7,6 +7,7 @@
 #include "rpl-source-routing-extension.h"
 
 #include "rpl-header.h"
+#include "rpl-routing-protocol.h"
 
 #include "ns3/icmpv6-header.h"
 #include "ns3/icmpv6-l4-protocol.h"
@@ -167,10 +168,25 @@ RplIpv6ExtensionSourceRouting::Process(Ptr<Packet>& packet,
     // new destination rather than handed further up the receive path.
     Ptr<Ipv6L3Protocol> ipv6 = GetNode()->GetObject<Ipv6L3Protocol>();
     Ptr<Ipv6RoutingProtocol> ipv6rp = ipv6->GetRoutingProtocol();
-    Socket::SocketErrno err;
     NS_ASSERT(ipv6rp);
 
-    Ptr<Ipv6Route> rtentry = ipv6rp->RouteOutput(prefix, ipv6header, nullptr, err);
+    // nextAddress is a next hop the root already confirmed is one radio hop
+    // away when it built this header (see PrepareOutgoingPacket()'s comment
+    // on why the final entry is a global address rather than link-local).
+    // RouteOutput() would refuse a global destination as "not on-link"
+    // (RplRoutingProtocol::RouteOutput()'s own comment explains why that is
+    // the right call for traffic in general), so this goes straight to
+    // RouteToNeighbour() instead of through the ordinary routing lookup.
+    Ptr<Ipv6Route> rtentry;
+    if (Ptr<rpl::RplRoutingProtocol> rpl = DynamicCast<rpl::RplRoutingProtocol>(ipv6rp))
+    {
+        rtentry = rpl->RouteToNeighbour(nextAddress, ipv6header.GetDestination());
+    }
+    if (!rtentry)
+    {
+        Socket::SocketErrno err;
+        rtentry = ipv6rp->RouteOutput(prefix, ipv6header, nullptr, err);
+    }
     if (rtentry)
     {
         ipv6->SendRealOut(rtentry, prefix, ipv6header);

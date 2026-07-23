@@ -792,7 +792,16 @@ RplDodagFormationTestCase::DoRun()
     NS_TEST_ASSERT_MSG_EQ(srh.GetNextHeader(), 17, "The inner protocol was not carried forward");
     NS_TEST_ASSERT_MSG_EQ(srh.GetSegmentsLeft(), 1, "Wrong number of segments left");
     NS_TEST_ASSERT_MSG_EQ(srh.GetAddresses().size(), 1, "Wrong number of addresses");
-    NS_TEST_ASSERT_MSG_EQ(srh.GetAddress(0), leafLinkLocal, "Wrong final address");
+    // The final entry is the global address, not the link-local one
+    // ComputeSourceRoute() returns: a link-local final hop becomes the wire
+    // destination once segmentsLeft reaches 0
+    // (RplIpv6ExtensionSourceRouting::Process()), which the reply an
+    // application sends back echoes as its own source address
+    // (Icmpv6L4Protocol::HandleEchoRequest() and friends), and a link-local
+    // source address is scoped to one hop -- it gets silently dropped by
+    // Ipv6L3Protocol::IpForward() on any hop after that on the way back to
+    // the root.
+    NS_TEST_ASSERT_MSG_EQ(srh.GetAddress(0), leafAddress, "Wrong final address");
 
     // Node 1 is one hop away, so its packet gets no Routing Header, only the
     // RPL Option, and the wire destination stays node 1's own address.

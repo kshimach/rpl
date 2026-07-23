@@ -373,6 +373,71 @@ RFC 6550 section 11.2 は「2 回連続で rank 不整合を検知したら確�
 既存コードに任せられる。SRH と両方付く場合は HBH が外側 (RFC 8200 の
 推奨順序通り)。
 
+### 12.5 root 発信の SRH: 応答がスコープ違反で握り潰されるバグ
+
+- **症状**: root が非 root ノードへ ping 等の ICMPv6 リクエストを能動的に
+  送る (今回のケースでは `SequentialPinger`、root から各ノードへ 1 台ずつ
+  ping する検証シナリオ) と、2 ホップ以上先のノードでは Echo Request は
+  正しく届くのに、その応答 (Echo Reply) が root に一切戻ってこない。1
+  ホップ先 (root の直接の子) だけは機能する。
+- **原因**: `ComputeSourceRoute()` が返す `hops` は、最終目的地自身を含めて
+  全アドレスをリンクローカルで構築する (12 節冒頭のクラスコメント通り、
+  「downward の経路は 1 radio hop ずつしか跨がないので全部リンクローカルで
+  済む」という設計)。`PrepareOutgoingPacket()` がこれをそのまま
+  `RplSourceRoutingHeader` のアドレス列にしていたため、SRH の最後の
+  エントリ (= 最終目的地) もリンクローカルアドレスになり、
+  `RplIpv6ExtensionSourceRouting::Process()` の `segmentsLeft` が 0 になった
+  瞬間、IPv6 ヘッダの宛先はそのリンクローカルアドレスのまま最終ノードに
+  届く。ns-3 コアの `Icmpv6L4Protocol::HandleEchoRequest()` は「受信した
+  パケットの宛先アドレスをそのまま応答の送信元にする」実装のため、
+  Echo Reply の送信元がリンクローカルアドレスになる。RFC 4291 のスコープ
+  規則により、リンクローカル送信元のパケットは 1 hop しか運べず、
+  `Ipv6L3Protocol::IpForward()` がこれを検知して黙って破棄する
+  (中継ノードを 1 つでも経由すると即死) ため、2 ホップ以上先からの応答が
+  一切戻らなかった。
+- **これまで気付かなかった理由**: 既存の検証 (`rpl-6lowpan-simple.cc` 含む)
+  は全て「leaf が root へ ping する」方向のみ。この場合 Echo Request は
+  upward (SRH 不使用、preferred parent 経由) で、Echo Reply は root 発信の
+  downward (SRH 使用) だが、その送信元は常に root 自身の正しいグローバル
+  アドレスなので、このバグは踏まない。root が能動的に送信元になる
+  ケースは今回初めてテストした。
+- **試みて失敗した修正**: SRH の最終エントリだけを目的地のグローバル
+  アドレスに差し替え、`RplIpv6ExtensionSourceRouting::Process()` が
+  `RouteOutput()` の代わりに新設の public `RplRoutingProtocol::
+  RouteToNeighbour()` を直接呼ぶようにして、`RouteOutput()` の
+  「グローバル宛先は on-link とみなさない」制約 (13 節下、`RouteOutput()`
+  自身のコメント) を SRH のコンテキストだけ迂回させる案を最初に実装した。
+  3 ノードの既存テストは全て通ったが、10 ノードのランダムトポロジで
+  別の重大な副作用が判明した: `RouteToNeighbour()` が返す `Ipv6Route` の
+  Gateway にグローバルアドレスをそのまま入れると (`SetGateway(neighbour)`
+  の `neighbour` がグローバルアドレスになるケース)、`Ipv6L3Protocol::
+  SendRealOut()` -> `Ipv6Interface::Send()` に渡った際の近隣探索
+  (Neighbour Discovery) やローカル配送判定がこの LLN 環境で正しく機能せず、
+  DODAG のランクが際限なく増大していく不安定化を引き起こした
+  (ping を一切送らない状態でも再現)。
+- **最終的な修正**: SRH の最終エントリをグローバルアドレスにする変更は
+  維持しつつ (`PrepareOutgoingPacket()`)、`RouteToNeighbour()` 自身に
+  `neighbour.IsLinkLocal() ? neighbour : LinkLocalOf(neighbour)` を追加し、
+  **Gateway (実際に無線で送る相手) は必ずリンクローカルアドレスに正規化**
+  する形にした。これにより:
+  - パケットの実際の次ホップ解決は、このモジュールの他の近隣探索と全く
+    同じ「リンクローカルアドレス、1 radio hop」という前提のまま安定して
+    動く (ランクの不安定化は解消)。
+  - IPv6 ヘッダの宛先自体 (`Ipv6header.SetDestination(nextAddress)`) は
+    グローバルアドレスのまま最終ノードまで届くので、そのノードが生成する
+    応答の送信元もグローバルアドレスになり、上り方向の転送がスコープ規則
+    に違反しなくなる。
+  10 ノードのランダムトポロジで root からの ping が 9/9 (100%) 到達する
+  ことと、`rpl-test` の全既存ケースが変わらず通ることを確認済み。
+- **既知の残課題 (未修正、次回対応)**: このバグとは独立に、25 ノード以上の
+  規模のランダムトポロジでは、ping を一切送らない状態でも DODAG のランク
+  が時間とともに際限なく増大していく別の不安定化が観測された。OF0
+  (RFC 6552) はヒステリシスを持たないため、輻輳した無線環境で一時的に
+  親を見失うたびに `SelectPreferredParent()` が親を選び直し、それを
+  繰り返すたびにランクが積み上がっていく (13.5 節の MRHOF ヒステリシス
+  のような歯止めが OF0 には無い) ことが疑わしいが未検証。10 ノード規模
+  までは再現しない。
+
 ## 13. RFC 6551 / RFC 6719 (ETX / MRHOF) の実装
 
 これまで OF0 (RFC 6552、ホップ数のみ) しか実装しておらず、ETX は
