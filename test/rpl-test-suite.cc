@@ -515,15 +515,17 @@ RplSourceRoutingHeaderTestCase::DoRun()
 
     NS_TEST_ASSERT_MSG_EQ(srh.GetTypeRouting(), RPL_RH_TYPE_SRH, "Wrong Routing Type");
 
-    // Eight bytes of RH3 and one uncompressed address per entry.
-    NS_TEST_ASSERT_MSG_EQ(srh.GetSerializedSize(), 8 + 2 * 16, "Unexpected header size");
+    // Both addresses are link-local, so both get compressed: CmprI=8 elides
+    // fe80:: from the first (there is one non-last entry), CmprE=8 elides it
+    // from the last -- eight bytes of RH3 plus 8 bytes per entry.
+    NS_TEST_ASSERT_MSG_EQ(srh.GetSerializedSize(), 8 + 8 + 8, "Unexpected header size");
 
     Ptr<Packet> packet = Create<Packet>();
     packet->AddHeader(srh);
-    NS_TEST_ASSERT_MSG_EQ(packet->GetSize(), 8 + 2 * 16, "Unexpected packet size");
+    NS_TEST_ASSERT_MSG_EQ(packet->GetSize(), 8 + 8 + 8, "Unexpected packet size");
 
     RplSourceRoutingHeader received;
-    NS_TEST_ASSERT_MSG_EQ(packet->RemoveHeader(received), 8 + 2 * 16, "Unexpected deserialized size");
+    NS_TEST_ASSERT_MSG_EQ(packet->RemoveHeader(received), 8 + 8 + 8, "Unexpected deserialized size");
     NS_TEST_ASSERT_MSG_EQ(received.GetNextHeader(), 17, "Wrong next header");
     NS_TEST_ASSERT_MSG_EQ(received.GetTypeRouting(), RPL_RH_TYPE_SRH, "Wrong Routing Type");
     NS_TEST_ASSERT_MSG_EQ(received.GetSegmentsLeft(), 2, "Wrong number of segments left");
@@ -531,6 +533,89 @@ RplSourceRoutingHeaderTestCase::DoRun()
     NS_TEST_ASSERT_MSG_EQ(received.GetAddress(0), addresses[0], "Wrong first address");
     NS_TEST_ASSERT_MSG_EQ(received.GetAddress(1), addresses[1], "Wrong second address");
     NS_TEST_ASSERT_MSG_EQ(packet->GetSize(), 0, "The header did not consume the whole packet");
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief Check RH3 address compression (RFC 6554 section 3): an entry is
+ *        elided against fe80:: exactly when it is link-local, in the mixed
+ *        shape RplRoutingProtocol::PrepareOutgoingPacket() actually
+ *        produces (every hop but the last link-local, the last one global),
+ *        and in the fully-uncompressible shape of a path to a multicast or
+ *        otherwise non-link-local intermediate hop.
+ */
+class RplSourceRoutingCompressionTestCase : public TestCase
+{
+  public:
+    RplSourceRoutingCompressionTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplSourceRoutingCompressionTestCase::RplSourceRoutingCompressionTestCase()
+    : TestCase("Source routing header address compression")
+{
+}
+
+void
+RplSourceRoutingCompressionTestCase::DoRun()
+{
+    // Two link-local relay hops, then the global final destination: exactly
+    // the shape PrepareOutgoingPacket() builds. CmprI=8 (both relay entries
+    // are link-local), CmprE=0 (the last one is global, never compressed).
+    {
+        std::vector<Ipv6Address> addresses = {Ipv6Address("fe80::2"),
+                                              Ipv6Address("fe80::3"),
+                                              Ipv6Address("2001:1::ff:fe00:4")};
+        RplSourceRoutingHeader srh;
+        srh.SetNextHeader(17);
+        srh.SetSegmentsLeft(3);
+        srh.SetAddresses(addresses);
+
+        NS_TEST_ASSERT_MSG_EQ(srh.GetSerializedSize(),
+                              8 + 8 + 8 + 16,
+                              "Unexpected size for two compressed relay hops and an "
+                              "uncompressed final destination");
+
+        Ptr<Packet> packet = Create<Packet>();
+        packet->AddHeader(srh);
+
+        RplSourceRoutingHeader received;
+        NS_TEST_ASSERT_MSG_EQ(packet->RemoveHeader(received),
+                              8 + 8 + 8 + 16,
+                              "Unexpected deserialized size");
+        NS_TEST_ASSERT_MSG_EQ(received.GetAddresses().size(), 3, "Wrong number of addresses");
+        NS_TEST_ASSERT_MSG_EQ(received.GetAddress(0), addresses[0], "Wrong first relay hop");
+        NS_TEST_ASSERT_MSG_EQ(received.GetAddress(1), addresses[1], "Wrong second relay hop");
+        NS_TEST_ASSERT_MSG_EQ(received.GetAddress(2),
+                              addresses[2],
+                              "Wrong final destination, or its global prefix was corrupted "
+                              "by treating it as elided");
+    }
+
+    // A single, global-only address (as ComputeSourceRoute() produces for a
+    // direct grandchild): CmprI does not apply (no non-last entry), CmprE=0.
+    {
+        RplSourceRoutingHeader srh;
+        srh.SetNextHeader(17);
+        srh.SetSegmentsLeft(1);
+        srh.SetAddresses({Ipv6Address("2001:1::ff:fe00:9")});
+
+        NS_TEST_ASSERT_MSG_EQ(srh.GetSerializedSize(),
+                              8 + 16,
+                              "A lone global address must not be compressed");
+
+        Ptr<Packet> packet = Create<Packet>();
+        packet->AddHeader(srh);
+        RplSourceRoutingHeader received;
+        packet->RemoveHeader(received);
+        NS_TEST_ASSERT_MSG_EQ(received.GetAddress(0),
+                              Ipv6Address("2001:1::ff:fe00:9"),
+                              "Wrong address after a round trip with no compression");
+    }
 }
 
 /**
@@ -1358,7 +1443,9 @@ RplSourceRoutingProcessTestCase::DoRun()
                               false,
                               "A fully-arrived packet stopped the rest of the receive chain");
         NS_TEST_ASSERT_MSG_EQ(nextHeader, 58, "The inner next header was not reported");
-        NS_TEST_ASSERT_MSG_EQ(processed, 8 + 16, "Wrong number of bytes reported consumed");
+        // fe80::4 is link-local and the lone (so CmprE-governed) address:
+        // compressed to 8 bytes rather than carried in full.
+        NS_TEST_ASSERT_MSG_EQ(processed, 8 + 8, "Wrong number of bytes reported consumed");
     }
 
     Simulator::Destroy();
@@ -1880,6 +1967,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplDioUnknownMetricTypeTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDaoHeaderTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplSourceRoutingHeaderTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplSourceRoutingCompressionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplSourceRoutingProcessTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplTrickleTimerTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDodagFormationTestCase, TestCase::Duration::QUICK);

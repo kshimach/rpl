@@ -1043,34 +1043,67 @@ RplSourceRoutingHeader::Print(std::ostream& os) const
     }
 }
 
+uint8_t
+RplSourceRoutingHeader::Cmpri() const
+{
+    if (m_addresses.size() < 2)
+    {
+        return 0;
+    }
+    for (size_t index = 0; index + 1 < m_addresses.size(); index++)
+    {
+        if (!m_addresses[index].IsLinkLocal())
+        {
+            return 0;
+        }
+    }
+    return 8;
+}
+
+uint8_t
+RplSourceRoutingHeader::Cmpre() const
+{
+    return (!m_addresses.empty() && m_addresses.back().IsLinkLocal()) ? 8 : 0;
+}
+
 uint32_t
 RplSourceRoutingHeader::GetSerializedSize() const
 {
     // Next Header, Hdr Ext Len, Routing Type and Segments Left, then CmprI,
-    // CmprE, Pad and the reserved bits, then the uncompressed addresses.
-    return 8 + 16 * m_addresses.size();
+    // CmprE, Pad and the reserved bits, then the addresses, each entry but
+    // the last (16 - CmprI) octets and the last (16 - CmprE) (see the class
+    // docs for why CmprI/CmprE only ever come out as 0 or 8 here, which is
+    // also why this is always a multiple of 8 on its own, no Pad needed).
+    if (m_addresses.empty())
+    {
+        return 8;
+    }
+    return 8 + (m_addresses.size() - 1) * (16 - Cmpri()) + (16 - Cmpre());
 }
 
 void
 RplSourceRoutingHeader::Serialize(Buffer::Iterator start) const
 {
     Buffer::Iterator i = start;
+    uint8_t cmprI = Cmpri();
+    uint8_t cmprE = Cmpre();
 
     i.WriteU8(GetNextHeader());
     // Hdr Ext Len counts 8-byte units after the first eight bytes.
-    i.WriteU8(static_cast<uint8_t>(2 * m_addresses.size()));
+    i.WriteU8(static_cast<uint8_t>((GetSerializedSize() - 8) / 8));
     i.WriteU8(GetTypeRouting());
     i.WriteU8(GetSegmentsLeft());
 
-    i.WriteU8(0); // CmprI and CmprE, both zero: no compression
-    i.WriteU8(0); // Pad and the top of the reserved field
+    i.WriteU8(static_cast<uint8_t>((cmprI << 4) | cmprE));
+    i.WriteU8(0); // Pad (always 0 here) and the top of the reserved field
     i.WriteU16(0);
 
     uint8_t buf[16];
-    for (const auto& address : m_addresses)
+    for (size_t index = 0; index < m_addresses.size(); index++)
     {
-        address.Serialize(buf);
-        i.Write(buf, 16);
+        uint8_t elided = (index + 1 == m_addresses.size()) ? cmprE : cmprI;
+        m_addresses[index].Serialize(buf);
+        i.Write(buf + elided, 16 - elided);
     }
 }
 
@@ -1080,23 +1113,50 @@ RplSourceRoutingHeader::Deserialize(Buffer::Iterator start)
     Buffer::Iterator i = start;
 
     SetNextHeader(i.ReadU8());
-    uint8_t extensionLength = i.ReadU8();
+    uint8_t hdrExtLen = i.ReadU8();
     SetTypeRouting(i.ReadU8());
     SetSegmentsLeft(i.ReadU8());
 
-    i.ReadU8(); // CmprI and CmprE, assumed zero: no compression support
-    i.ReadU8(); // Pad and the top of the reserved field
-    i.ReadU16();
+    uint8_t cmprByte = i.ReadU8();
+    uint8_t cmprI = cmprByte >> 4;
+    uint8_t cmprE = cmprByte & 0x0f;
+    uint8_t pad = i.ReadU8() >> 4; // top nibble is Pad, the rest is reserved
+    i.ReadU16();                  // the rest of the reserved field
 
     m_addresses.clear();
-    uint8_t buf[16];
-    for (uint8_t index = 0; index < extensionLength / 2; index++)
+
+    // RFC 6554 section 4.2's n, adapted to bytes already past the fixed
+    // 8-octet part: this header's payload, after Pad, holds (n-1) entries
+    // of (16-CmprI) octets and one of (16-CmprE).
+    uint32_t addressBytes = uint32_t(hdrExtLen + 1) * 8 - 8;
+    addressBytes = (addressBytes > pad) ? addressBytes - pad : 0;
+    if (addressBytes >= uint32_t(16 - cmprE))
     {
-        i.Read(buf, 16);
-        m_addresses.push_back(Ipv6Address::Deserialize(buf));
+        uint32_t n = (addressBytes - (16 - cmprE)) / (16 - cmprI) + 1;
+        // fe80::/64 is the only prefix this implementation ever elides (see
+        // the class docs); clamped to 8 octets so a header claiming to
+        // elide more than that -- which this implementation never sends,
+        // but a malformed or hand-built one might -- cannot read past the
+        // constant.
+        static const uint8_t linkLocalPrefix[8] = {0xfe, 0x80, 0, 0, 0, 0, 0, 0};
+        for (uint32_t index = 0; index < n; index++)
+        {
+            uint8_t elided = (index + 1 == n) ? cmprE : cmprI;
+            uint8_t fromConstant = std::min<uint8_t>(elided, 8);
+            uint8_t buf[16] = {0};
+            std::copy(linkLocalPrefix, linkLocalPrefix + fromConstant, buf);
+            i.Read(buf + elided, 16 - elided);
+            m_addresses.push_back(Ipv6Address::Deserialize(buf));
+        }
     }
 
-    return GetSerializedSize();
+    // The wire's own Hdr Ext Len is authoritative for how many bytes this
+    // header occupies, independent of what GetSerializedSize() would
+    // recompute from the addresses just reconstructed above: a header this
+    // implementation did not itself produce need not round-trip through
+    // Cmpri()/Cmpre() the same way (e.g. a CmprI other than 0 or 8, which
+    // this implementation never sends but a hand-built packet might).
+    return uint32_t(hdrExtLen + 1) * 8;
 }
 
 void

@@ -184,9 +184,10 @@
   RFC 6551/6719 (ETX/MRHOF) も 13 節の通り、RFC 6551 の LQL メトリックも
   14 節の通り実装済み (1 DIO への ETX/LQL 同時搭載も対応)。
   storing mode (MOP=2) は方針により対象外。RH3 アドレス圧縮
-  (CmprI/CmprE) 未実装、6LoWPAN NHC 圧縮も Routing Header では効かない
-  (11 節)。RPI の確認済みループ (RFC 6550 section 11.2 の「2 回連続で
-  不整合」) は実際にはパケットを止められない、既知の制約あり (12.2 節)。
+  (CmprI/CmprE) は 16 節の通り実装済み。6LoWPAN NHC 圧縮は Routing
+  Header では効かない (11 節、RH3 自体の圧縮とは別の話)。RPI の
+  確認済みループ (RFC 6550 section 11.2 の「2 回連続で不整合」) は
+  実際にはパケットを止められない、既知の制約あり (12.2 節)。
 
 ## 11. ns-3 コアで見つかった既存バグ、および本実装側のバグ
 
@@ -1054,3 +1055,99 @@ non-storing 経路計算 (`ComputeSourceRoute()`) はこの形の経路を単独
 各ノードが DIO の Prefix Information option 経由の SLAAC で
 `2001:1::ff:fe00:N` 形式のアドレスを得て、最終ノードから root への
 ping が 5/5 (0% packet loss) で通ることを確認した。
+
+## 16. RFC 6554 RH3 アドレス圧縮 (CmprI/CmprE) の実装
+
+15 節の監査で対象外とした低優先度項目のうち、RH3 アドレス圧縮を実装した。
+それまでの `RplSourceRoutingHeader` は CmprI/CmprE/Pad を常に 0 で送り、
+すべてのアドレスを 16 バイト非圧縮で運んでいた。
+
+### 16.1 圧縮復元に外部コンテキストが要らないと分かった経緯
+
+RFC 6554 の圧縮は、一般には「処理時点でのパケットの IPv6 宛先アドレス」
+から省略したプレフィックスバイトを復元する仕組みで、これは
+`Header::Serialize(Buffer::Iterator)`/`Deserialize(Buffer::Iterator)` が
+そもそも受け取れない外部コンテキストに依存する。実装前にこの点をユーザー
+に確認し、一度は「Get/Set 系 API に参照アドレス引数を追加する」方針で
+合意した。
+
+しかし `RplRoutingProtocol::ComputeSourceRoute()`/
+`PrepareOutgoingPacket()` を読み直したところ、本実装のアドレス配列には
+常に成り立つ不変条件があるとわかった: 末尾より前のエントリ (中継ホップ)
+は `ComputeSourceRoute()` が `LinkLocalOf()` で構築するため常にリンク
+ローカル、末尾のエントリだけが実宛先で、`PrepareOutgoingPacket()` が
+`addresses.back() = dst` で上書きする時点で `dst` は非リンクローカル
+(グローバル) と確定している。中継処理
+(`RplIpv6ExtensionSourceRouting::Process()`) がエントリを書き換える
+ときも、書き込まれる値は常にその中継ノード自身のリンクローカル
+アドレスで、この不変条件は経路全体を通じて崩れない。
+
+リンクローカルの上位 8 バイトは `fe80:0000:0000:0000` という
+実装非依存の固定値 (`Ipv6Address::IsLinkLocal()` が
+`CombinePrefix(Ipv6Prefix(64)) == "fe80::0"` で判定するのと同じ、
+`RplRoutingProtocol::LinkLocalOf()` の `linkLocalPrefix` とも同一)。
+よって「そのエントリがリンクローカルなら fe80:: プレフィックスを省略、
+そうでなければ (グローバル/マルチキャスト) 圧縮しない」という、
+エントリの値だけを見て決める方式が、外部コンテキストなしに常に
+正しく成立する。RFC の一般的な「処理時点の宛先アドレスからプレフィックス
+を復元する」規則とも矛盾しない: 本実装で圧縮対象になるエントリを処理する
+瞬間の実際の宛先アドレスは、常にそのエントリ自身と同じ fe80:: プレフィ
+ックスを持つので、別の RFC 6554 実装がこのモジュールの送るパケットを
+読んでも同じように正しく復元できる。この発見により、結局 Get/Set API の
+シグネチャ変更は不要になった。
+
+### 16.2 CmprI/CmprE の決め方、Pad が常に 0 になる理由
+
+- CmprI (末尾より前のエントリ全体に適用): `addresses[0..n-2]` が全て
+  リンクローカルなら 8、そうでなければ 0
+- CmprE (末尾エントリだけに適用): `addresses[n-1]` がリンクローカル
+  なら 8、そうでなければ 0
+
+実運用 (`PrepareOutgoingPacket()` が作る配列) では常に CmprI=8,
+CmprE=0 になる。CmprI/CmprE は 0 か 8 の 2 値しか使わないため、
+ヘッダーサイズは `8 + (n-1)*(16-CmprI) + (16-CmprE)` で必ず 8 の倍数
+になり (16-0=16, 16-8=8 はどちらも 8 の倍数)、Pad は常に 0 で済む。
+`RplSourceRoutingHeader::Cmpri()`/`Cmpre()` (private) は `m_addresses`
+の現在値から都度計算するだけで、内部状態としてキャッシュしない。これに
+より `SetAddress()` (中継時の書き換え) は無変更のまま、次に
+`Serialize()` されるときに新しい値へ自動的に追従する。実際、中継が
+最後から 2 番目のホップを処理するとき、末尾エントリは (それまでの
+グローバルな実宛先から) この中継ノード自身のリンクローカルアドレスへ
+上書きされるため、その次の 1 ホップだけ CmprE=8 に切り替わり、末尾の
+16 バイトも追加で圧縮される — 狙って作った副次効果ではなく、
+「都度計算」という設計から自然に出てくる正しい挙動。
+
+### 16.3 Deserialize の防御的実装
+
+本実装が自分自身では決して送らない CmprI/CmprE 値 (0 と 8 以外、
+4 bit フィールドなので最大 15) を持つ手作りパケットが来ても範囲外
+読み出しをしないよう、fe80:: 定数からのコピーは 8 バイトでクランプし、
+残りは 0 埋めする。また `Deserialize()` の戻り値 (呼び出し元の
+`Packet::RemoveHeader()` がパケットから何バイト取り除くかはこの
+戻り値だけで決まり、ローカルな `Buffer::Iterator` の最終位置は見ない)
+は、復元したアドレスから `GetSerializedSize()` を再計算した値ではなく、
+ワイヤ上の `Hdr Ext Len` から直接 `(hdrExtLen + 1) * 8` として求める。
+理由: 本実装が送らない CmprI (0/8 以外) を含むヘッダーを復元すると、
+再構築されたアドレスの上位バイトが偶然 fe80:: と一致しないことがあり
+(例えば CmprI=4 なら上位 4 バイトだけ fe80:: 定数から埋め、残り 4
+バイトはワイヤ上の任意の値になる)、その場合 `IsLinkLocal()` が偽に
+なって `Cmpri()`/`Cmpre()` の再計算結果が元の値と食い違う。ワイヤの
+`Hdr Ext Len` を直接信頼すれば、この食い違いを気にする必要がない。
+
+### 16.4 テスト
+
+`RplSourceRoutingHeaderTestCase` (両アドレスともリンクローカル、
+CmprI=8/CmprE=8) の期待サイズを `8+2*16` から `8+8+8` に更新。新設の
+`RplSourceRoutingCompressionTestCase` で、実運用と同じ形
+(リンクローカルな中継ホップ 2 つ + グローバルな最終宛先、CmprI=8/
+CmprE=0) と、単独のグローバルアドレス (直接の孫ノード向け、圧縮
+なし) の両方でサイズ計算とラウンドトリップの一致を確認。
+`RplSourceRoutingProcessTestCase` の「Segments Left already zero」
+ケース (`{fe80::4}` 単体、CmprE=8) の期待消費バイト数を `8+16` から
+`8+8` に更新。`RplDodagFormationTestCase` の下り方向パケットの
+アサーション (`leafAddress` がグローバルなので CmprE=0、`8+16` の
+まま) は無変更で PASS することを確認した — 実運用のグローバル最終
+宛先は圧縮されないことの回帰確認になっている。
+`rpl-6lowpan-simple --mrhof --lql` で DODAG 形成 + ping 5/5
+(0% packet loss) が従来通り通ることを確認 (圧縮は
+`RplIpv6ExtensionSourceRouting::Process()` から見て完全に透過的)。

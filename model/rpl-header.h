@@ -634,14 +634,38 @@ class RplDaoAckHeader : public Header
  * @brief The source routing header of RFC 6554, which carries the downward
  *        route the root computed for a packet.
  *
- * The wire format is the RH3 of RFC 6554 with CmprI, CmprE and Pad always
- * zero, i.e. every address is carried in full rather than compressed against
- * a common prefix; compressing addresses, which is what makes an RH3 cheap in
- * a real LLN, is not implemented. This is a genuine IPv6 extension header,
- * inserted at the node that originates the packet by
- * Ipv6RoutingProtocol::PrepareOutgoingPacket() and processed hop by hop by
- * RplIpv6ExtensionSourceRouting, the way RFC 6554 prescribes: nothing about
- * the downward path is carried out of band.
+ * The wire format is the RH3 of RFC 6554, with CmprI and CmprE (the number
+ * of shared prefix octets elided from, respectively, every address but the
+ * last, and the last address) chosen per header, address by address: an
+ * address is compressed exactly when it is link-local, eliding its
+ * (implementation-independent, RFC 4291) fe80::/64 prefix; anything else
+ * (a global address, e.g. the real final destination -- see
+ * RplRoutingProtocol::PrepareOutgoingPacket()'s own comment on why that one
+ * address is deliberately global rather than link-local) is carried in
+ * full. Every entry but the last is always link-local in this
+ * implementation (RplRoutingProtocol::ComputeSourceRoute() only ever
+ * collects link-local next-hop identifiers, and
+ * RplIpv6ExtensionSourceRouting::Process() only ever rewrites a visited
+ * entry with the relaying router's own link-local address), so this
+ * compresses every hop but the last in practice. Since a compressed entry
+ * always elides a whole, fixed, 8-octet prefix, CmprI and CmprE only ever
+ * take the values 0 or 8, and the header's size is always a multiple of 8
+ * octets on its own, so Pad is always 0.
+ *
+ * Because the elided prefix is this fixed constant rather than something
+ * carried on the wire, decompression needs no other context (in particular
+ * not the enclosing IPv6 header's Destination Address, which the general
+ * RFC 6554 mechanism uses and Serialize()/Deserialize() have no access to
+ * anyway) -- it is still what RFC 6554-compliant decompression would
+ * recover: at the point in RplIpv6ExtensionSourceRouting::Process() where
+ * any compressed entry is read, the packet's actual Destination Address is
+ * always link-local with the same elided prefix, so a generic RFC 6554
+ * implementation reading these packets would decompress them the same way.
+ *
+ * This is a genuine IPv6 extension header, inserted at the node that
+ * originates the packet by Ipv6RoutingProtocol::PrepareOutgoingPacket() and
+ * processed hop by hop by RplIpv6ExtensionSourceRouting, the way RFC 6554
+ * prescribes: nothing about the downward path is carried out of band.
  */
 class RplSourceRoutingHeader : public Ipv6ExtensionRoutingHeader
 {
@@ -692,6 +716,22 @@ class RplSourceRoutingHeader : public Ipv6ExtensionRoutingHeader
     Ipv6Address GetAddress(uint8_t index) const;
 
   private:
+    /**
+     * @brief The CmprI this header would serialize as: how many octets are
+     *        elided from every address but the last.
+     * @return 8 if there is at least one non-last address and all of them
+     *         are link-local, 0 otherwise
+     */
+    uint8_t Cmpri() const;
+
+    /**
+     * @brief The CmprE this header would serialize as: how many octets are
+     *        elided from the last address.
+     * @return 8 if the last address is link-local, 0 otherwise (including
+     *         when there is no address at all)
+     */
+    uint8_t Cmpre() const;
+
     std::vector<Ipv6Address> m_addresses; //!< addresses of RFC 6554 section 3, in order
 };
 
