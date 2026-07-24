@@ -1850,7 +1850,13 @@ RplRoutingProtocol::RouteInput(Ptr<const Packet> p,
     if (iif < 0 || !m_ipv6->IsForwarding(static_cast<uint32_t>(iif)))
     {
         NS_LOG_LOGIC("Forwarding is disabled on the input interface");
-        ecb(p, header, Socket::ERROR_NOROUTETOHOST);
+        // Ipv6ListRouting hands its members a null error callback (it calls the
+        // real one itself once every member has declined), so guard before
+        // invoking, the way the built-in protocols do.
+        if (!ecb.IsNull())
+        {
+            ecb(p, header, Socket::ERROR_NOROUTETOHOST);
+        }
         return false;
     }
 
@@ -1870,7 +1876,10 @@ RplRoutingProtocol::RouteInput(Ptr<const Packet> p,
     }
 
     NS_LOG_LOGIC("No forwarding route for " << dst);
-    ecb(p, header, Socket::ERROR_NOROUTETOHOST);
+    if (!ecb.IsNull())
+    {
+        ecb(p, header, Socket::ERROR_NOROUTETOHOST);
+    }
     return false;
 }
 
