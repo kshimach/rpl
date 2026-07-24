@@ -234,8 +234,14 @@ RplIpv6ExtensionSourceRouting::Process(Ptr<Packet>& packet,
     // (RplRoutingProtocol::RouteOutput()'s own comment explains why that is
     // the right call for traffic in general), so this goes straight to
     // RouteToNeighbour() instead of through the ordinary routing lookup.
+    // Fetch RPL as an aggregate on the node rather than casting
+    // GetRoutingProtocol(): when RPL is composed with other protocols the
+    // node's routing protocol is an Ipv6ListRouting, and casting that to
+    // RplRoutingProtocol would fail, skipping RouteToNeighbour() and letting
+    // the fallback RouteOutput() send the final, globally addressed hop up
+    // toward the root as "not on-link" instead of to the on-link neighbour.
     Ptr<Ipv6Route> rtentry;
-    if (Ptr<rpl::RplRoutingProtocol> rpl = DynamicCast<rpl::RplRoutingProtocol>(ipv6rp))
+    if (Ptr<rpl::RplRoutingProtocol> rpl = GetNode()->GetObject<rpl::RplRoutingProtocol>())
     {
         rtentry = rpl->RouteToNeighbour(nextAddress, ipv6header.GetDestination());
     }
