@@ -1502,6 +1502,88 @@ RplSourceRoutingProcessTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief Check that RplRoutingProtocol::PrepareOutgoingPacket() leaves a
+ *        packet untouched when the route it is given does not actually
+ *        leave on an interface RPL runs on -- e.g. RPL composed with
+ *        another routing protocol under Ipv6ListRouting, which offers this
+ *        hook to every member regardless of whose route is in use.
+ */
+class RplPrepareOutgoingPacketNonRplInterfaceTestCase : public TestCase
+{
+  public:
+    RplPrepareOutgoingPacketNonRplInterfaceTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplPrepareOutgoingPacketNonRplInterfaceTestCase::RplPrepareOutgoingPacketNonRplInterfaceTestCase()
+    : TestCase("PrepareOutgoingPacket ignores a route leaving on a non-RPL interface")
+{
+}
+
+void
+RplPrepareOutgoingPacketNonRplInterfaceTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(1);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.AssignWithoutAddress(devices);
+
+    // Nothing here needs simulated time to pass, only DoInitialize() to have
+    // run, which is what registers RplRoutingProtocol on the interface.
+    Simulator::Stop(Seconds(0));
+    Simulator::Run();
+
+    Ptr<Node> node = nodes.Get(0);
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+
+    // A device this node's Ipv6 has no interface index for at all -- attached
+    // to a different node entirely -- stands in for "an interface RPL does
+    // not run on": Ipv6::GetInterfaceForDevice() returns -1 for it exactly
+    // the way it would for a second, non-RPL interface on this same node.
+    Ptr<Node> otherNode = CreateObject<Node>();
+    NetDeviceContainer otherDevice = simpleNetDevice.Install(otherNode, channel);
+
+    Ptr<Ipv6Route> route = Create<Ipv6Route>();
+    route->SetOutputDevice(otherDevice.Get(0));
+
+    Ipv6Header header;
+    header.SetDestination(Ipv6Address("2001:db8::1")); // global: not the
+                                                        // multicast/link-local
+                                                        // early return
+    header.SetNextHeader(59);                          // No Next Header
+
+    Ptr<Packet> packet = Create<Packet>();
+    uint32_t originalSize = packet->GetSize();
+
+    rpl->PrepareOutgoingPacket(packet, header, route);
+
+    NS_TEST_ASSERT_MSG_EQ(
+        packet->GetSize(),
+        originalSize,
+        "A packet leaving on a non-RPL interface must not gain an RPL Option");
+    NS_TEST_ASSERT_MSG_EQ(header.GetNextHeader(),
+                          59,
+                          "Next Header must not be rewritten for a non-RPL interface");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Check the RSSI -> Link Quality Level mapping (RFC 6551 section 4.6):
  *        the built-in default table, and that SetRssiToLqlMapping()
  *        genuinely replaces it rather than merely supplementing it.
@@ -2025,6 +2107,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplSourceRoutingHeaderTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplSourceRoutingCompressionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplSourceRoutingProcessTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplPrepareOutgoingPacketNonRplInterfaceTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplTrickleTimerTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDodagFormationTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplMrhofSelectionTestCase, TestCase::Duration::QUICK);

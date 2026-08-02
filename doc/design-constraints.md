@@ -437,6 +437,35 @@ Ipv6Header& ipv6Header, bool& isDropped)`) には無い。`isDropped` はある�
 既存コードに任せられる。SRH と両方付く場合は HBH が外側 (RFC 8200 の
 推奨順序通り)。
 
+引数の `route` (呼び出し元が `RouteOutput()` で得たもの) は当初参照して
+いなかった。単一の RPL インターフェースしか持たないノードでは実害が
+無いが、`Ipv6ListRouting::PrepareOutgoingPacket()` (ns-3 コア側、
+`Ipv6RoutingProtocol::PrepareOutgoingPacket()` フック自体を追加した
+コミットとは別に、`Ipv6ListRouting` にこのフックの転送を追加した変更)
+は「どのメンバーの route が使われているか」に関係なく登録されている
+全メンバーにこのフックを配る設計であるため、RPL が他のルーティング
+プロトコルと list routing で共存し、かつノードが RPL の管轄しない
+インターフェース
+(例えば別の有線/無線ネットワーク) も持つ構成では、そちらへ出て行く
+グローバル宛のパケットにまで無条件に SRH/RPI を付けてしまっていた。
+RPL Option (RFC 6553) は Option Type の上位 2 bit が「認識できなければ
+ICMP を送信元 unicast へ送りパケット全体を破棄」を意味する値であるため、
+RPL を理解しない受信側に渡ると、そのパケットは丸ごと落ちる。
+
+対処: `route->GetOutputDevice()` を `m_ipv6->GetInterfaceForDevice()` で
+インターフェース番号に変換し、それが `m_ifcToSocket` (RPL が実際に
+`StartInterface()` したインターフェースの集合) に含まれていなければ
+即座に何もせず戻る。`PrepareOutgoingPacket()` の呼び出し元
+(`Ipv6L3Protocol::Send()` の 3 箇所全て) は `route`/`newRoute` の
+non-null をどれも確認済みの上で呼んでいるため、null チェックはしていない。
+
+回帰テストとして `RplPrepareOutgoingPacketNonRplInterfaceTestCase` を
+追加: このノードの `Ipv6` に一切登録されていない (別ノードに属する)
+デバイスを `route` の出力先に仕立て、`PrepareOutgoingPacket()` を呼んでも
+パケットサイズと Next Header がどちらも無変更のままであることを確認する
+(`GetInterfaceForDevice()` が -1 を返すケースは、同じノード上の 2 つ目の
+非 RPL インターフェースがあった場合と同じ経路を通る)。
+
 ### 12.5 root 発信の SRH: 応答がスコープ違反で握り潰されるバグ
 
 - **症状**: root が非 root ノードへ ping 等の ICMPv6 リクエストを能動的に

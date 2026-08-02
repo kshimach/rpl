@@ -1760,6 +1760,22 @@ RplRoutingProtocol::PrepareOutgoingPacket(Ptr<Packet> packet, Ipv6Header& header
         return;
     }
 
+    // route is whatever RouteOutput() (this node's own, or Ipv6ListRouting
+    // fanning this hook out to every member protocol when RPL is composed
+    // with another one -- see Ipv6ListRouting::PrepareOutgoingPacket())
+    // resolved for this packet. If it does not actually leave on an
+    // interface RPL runs on, this packet is not RPL's to touch: neither the
+    // Routing Header nor the RPL Option belong on wire the packet takes some
+    // other way out, and the RPL Option in particular has its Option Type's
+    // "unrecognized option" bits set to discard the whole packet, which a
+    // receiver that never runs RPL has no way to make sense of.
+    int32_t outInterface = m_ipv6->GetInterfaceForDevice(route->GetOutputDevice());
+    if (outInterface < 0 || m_ifcToSocket.find(static_cast<uint32_t>(outInterface)) ==
+                                m_ifcToSocket.end())
+    {
+        return;
+    }
+
     uint8_t innerNextHeader = header.GetNextHeader();
     bool hasRoutingHeader = false;
 
