@@ -11,6 +11,7 @@
 #define RPL_PACKET_INFO_OPTION_H
 
 #include "ns3/ipv6-option.h"
+#include "ns3/nstime.h"
 
 namespace ns3
 {
@@ -33,7 +34,15 @@ namespace rpl
  * checked, and once more inside LocalDeliver(). Process() only acts on the
  * first of the two, tracked by the packet's Uid rather than anything carried
  * on the packet itself, since nothing guarantees the second call sees the
- * same packet object once this node forwards it onward.
+ * same packet object once this node forwards it onward. The Uid alone is not
+ * enough to tell that pair apart from a genuinely later packet, though:
+ * fragments and copies taken along RPL's own forwarding path (e.g.
+ * RplIpv6ExtensionSourceRouting::Process()'s CreateFragment()-based rebuild)
+ * keep the original packet's Uid, so a packet that loops back to a node it
+ * already crossed carries the same Uid it had the first time. The two
+ * Receive()/LocalDeliver() calls for one packet happen back to back in the
+ * same simulation event, so pairing the Uid with Simulator::Now() tells that
+ * case apart from a real repeat: same Uid, later time, processed again.
  *
  * @internal
  * A confirmed rank inconsistency, RFC 6550 section 11.2's second one in a
@@ -85,6 +94,11 @@ class RplIpv6OptionRpl : public Ipv6Option
   private:
     Ptr<Node> m_node;            //!< the node this option processor runs on
     uint64_t m_lastProcessedUid; //!< Uid of the last packet actually processed
+    Time m_lastProcessedTime;    //!< simulation time of m_lastProcessedUid, so a
+                                  //!< later packet reusing that Uid (e.g. the same
+                                  //!< packet object come back around a loop) is not
+                                  //!< mistaken for the same Receive()/LocalDeliver()
+                                  //!< pair and skipped
     bool m_rankErrorSignaled;    //!< true once an inconsistency was flagged, until a
                                   //!< consistent packet is seen again
 };

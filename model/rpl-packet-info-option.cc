@@ -11,6 +11,7 @@
 
 #include "ns3/log.h"
 #include "ns3/node.h"
+#include "ns3/simulator.h"
 
 namespace ns3
 {
@@ -34,6 +35,7 @@ RplIpv6OptionRpl::GetTypeId()
 
 RplIpv6OptionRpl::RplIpv6OptionRpl()
     : m_lastProcessedUid(0),
+      m_lastProcessedTime(Time::Min()),
       m_rankErrorSignaled(false)
 {
 }
@@ -69,15 +71,23 @@ RplIpv6OptionRpl::Process(Ptr<Packet> packet,
     // apart, since nothing guarantees it survives this node handing the
     // packet onward if it turns out to need forwarding instead. The packet's
     // own Uid, compared against the last one this node actually acted on,
-    // does: it is stable across both calls of the same Receive(), and this
-    // object is per node, so a Uid that happens to reappear at another node
-    // (or a later, unrelated packet at this one) never collides with what
-    // this node itself last handled.
-    if (packet->GetUid() == m_lastProcessedUid)
+    // does -- except a Uid alone cannot tell that pair apart from a packet
+    // that genuinely loops back to this node later: RPL's own forwarding
+    // (RplIpv6ExtensionSourceRouting::Process()'s CreateFragment()-based
+    // rebuild) keeps the original Uid across every hop, so a looped-back
+    // packet reintroduces a Uid this node already saw. The Receive()/
+    // LocalDeliver() pair for one packet always falls in the same simulation
+    // event, so requiring the time to match too, not just the Uid, still
+    // catches that pair while letting a same-Uid packet arriving at a later
+    // time (a loop) through -- which is exactly the case RFC 6550 section
+    // 11.2's rank-inconsistency check exists to catch.
+    Time now = Simulator::Now();
+    if (packet->GetUid() == m_lastProcessedUid && now == m_lastProcessedTime)
     {
         return RplPacketInfoHeader().GetSerializedSize();
     }
     m_lastProcessedUid = packet->GetUid();
+    m_lastProcessedTime = now;
 
     Ptr<RplRoutingProtocol> rpl = m_node->GetObject<RplRoutingProtocol>();
     if (!rpl)
