@@ -123,10 +123,16 @@ RplIpv6ExtensionSourceRouting::Process(Ptr<Packet>& packet,
     if (segmentsLeft > nbAddress)
     {
         NS_LOG_LOGIC("Malformed header. Drop!");
+        // RFC 4443 section 3.4: Pointer is the octet offset within the
+        // invoking packet, i.e. malformedPacket -- IPv6 header included --
+        // not within packet/offset, which are relative to the start of the
+        // extension header chain that follows it. offset + 3 alone (the
+        // Segments Left field, 3 bytes into this Routing Header) would point
+        // 40 bytes too early, into the IPv6 header itself.
         icmpv6->SendErrorParameterError(malformedPacket,
                                         srcAddress,
                                         Icmpv6Header::ICMPV6_MALFORMED_HEADER,
-                                        offset + 3);
+                                        ipv6Header.GetSerializedSize() + offset + 3);
         dropReason = Ipv6L3Protocol::DROP_MALFORMED_HEADER;
         isDropped = true;
         stopProcessing = true;
@@ -183,10 +189,13 @@ RplIpv6ExtensionSourceRouting::Process(Ptr<Packet>& packet,
                 if (sawLocalAddress && sawOtherSinceLocalAddress)
                 {
                     NS_LOG_LOGIC("Routing loop: this router's address appears twice. Drop!");
+                    // Same Pointer adjustment as the Segments Left check
+                    // above: offset is relative to malformedPacket's IPv6
+                    // payload, not its start.
                     icmpv6->SendErrorParameterError(malformedPacket,
                                                     srcAddress,
                                                     Icmpv6Header::ICMPV6_MALFORMED_HEADER,
-                                                    offset + 2);
+                                                    ipv6Header.GetSerializedSize() + offset + 2);
                     dropReason = Ipv6L3Protocol::DROP_ROUTE_ERROR;
                     isDropped = true;
                     stopProcessing = true;

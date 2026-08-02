@@ -1048,11 +1048,12 @@ srcAddress, RPL_ICMPV6_SRH_ERROR)` (`RPL_ICMPV6_SRH_ERROR = 7`、
 2 回以上、間に一致しないアドレスを 1 つ以上挟んで出現する」パターンを
 検出する処理を追加した。検出したら
 `icmpv6->SendErrorParameterError(malformedPacket, srcAddress,
-Icmpv6Header::ICMPV6_MALFORMED_HEADER, offset + 2)` でエラーを送り
-`Ipv6L3Protocol::DROP_ROUTE_ERROR` としてドロップする。root の
-non-storing 経路計算 (`ComputeSourceRoute()`) はこの形の経路を単独では
-作らないため、想定される発火条件は経路が古くなった (親が変わった後)、
-または改ざんされた場合に限られる。
+Icmpv6Header::ICMPV6_MALFORMED_HEADER, ipv6Header.GetSerializedSize() +
+offset + 2)` でエラーを送り `Ipv6L3Protocol::DROP_ROUTE_ERROR` として
+ドロップする (Pointer の計算については 16.6 参照)。root の non-storing
+経路計算 (`ComputeSourceRoute()`) はこの形の経路を単独では作らないため、
+想定される発火条件は経路が古くなった (親が変わった後)、または改ざん
+された場合に限られる。
 
 ### 15.8 テストと example の SLAAC 前提への全面書き換え
 
