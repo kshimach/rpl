@@ -221,6 +221,15 @@ RplIpv6ExtensionSourceRouting::Process(Ptr<Packet>& packet,
     ipv6header.SetHopLimit(hopLimit - 1);
     p->AddHeader(routingHeader);
     prefix->AddAtEnd(p);
+    // The header just rewritten does not necessarily reserialize to the same
+    // size: Cmpri()/Cmpre() (RplSourceRoutingHeader's RFC 6554 CmprI/CmprE
+    // compression) is recomputed from the address list's current contents
+    // every time, so writing destAddress into this slot can change how much
+    // of it compresses away. prefix now holds everything that follows the
+    // IPv6 header (whatever preceded the Routing Header, unchanged, plus the
+    // just-rebuilt Routing Header and the payload behind it), so its size is
+    // the new Payload Length.
+    ipv6header.SetPayloadLength(prefix->GetSize());
 
     // Short-circuit: the packet was addressed to us, so it is re-sent to the
     // new destination rather than handed further up the receive path.

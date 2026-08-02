@@ -1158,7 +1158,24 @@ CmprE=0 になる。CmprI/CmprE は 0 か 8 の 2 値しか使わないため、
 なって `Cmpri()`/`Cmpre()` の再計算結果が元の値と食い違う。ワイヤの
 `Hdr Ext Len` を直接信頼すれば、この食い違いを気にする必要がない。
 
-### 16.4 テスト
+### 16.4 転送のたびに Payload Length を再計算する必要がある
+
+16.2 節で述べた「最後から 2 番目のホップだけ末尾エントリの CmprE が
+8 に切り替わり、末尾の 16 バイトも追加で圧縮される」という挙動は、
+その通りヘッダーのシリアライズサイズをホップごとに変える。
+`RplIpv6ExtensionSourceRouting::Process()` は `routingHeader.SetAddress()`
+で書き換えた後 `p->AddHeader(routingHeader)` で再シリアライズするが、
+当初はここで IPv6 header 側の Payload Length を据え置いたまま
+`SendRealOut()` していた。CmprE が 0→8 に切り替わるホップでは実際の
+ペイロードが 8 バイト短くなるため、ワイヤ上の Payload Length が実サイズ
+より大きいまま送出される。6LoWPAN の IPHC がこのフィールド自体を圧縮で
+落として送受信の両側で毎回計算し直すため実害が (この構成では) 隠れて
+いたが、pcap を直接読む場合や 6LoWPAN を介さない素の IPv6 リンクでは
+壊れたまま出る。`SetAddress()` 直後、`prefix` (HbH 等の前置き + 更新後
+SRH + 後続ペイロード、つまり IPv6 header の直後から先頭全体) が確定した
+時点で `ipv6header.SetPayloadLength(prefix->GetSize())` を呼ぶよう修正。
+
+### 16.5 テスト
 
 `RplSourceRoutingHeaderTestCase` (両アドレスともリンクローカル、
 CmprI=8/CmprE=8) の期待サイズを `8+2*16` から `8+8+8` に更新。新設の
