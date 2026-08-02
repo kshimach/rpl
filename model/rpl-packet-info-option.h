@@ -45,20 +45,24 @@ namespace rpl
  * case apart from a real repeat: same Uid, later time, processed again.
  *
  * @internal
- * A confirmed rank inconsistency, RFC 6550 section 11.2's second one in a
- * row, is traced as dropped (isDropped is set) but not actually stopped:
- * unlike Ipv6Extension::Process(), Ipv6Option::Process() has no
- * stopProcessing output, and Ipv6Extension::ProcessOptions() never derives
- * one from an option's isDropped, so the packet is still delivered or
- * forwarded regardless. What this implementation can enforce is the
- * repair-triggering side of RFC 6550 section 11.2: the 'R' flag gets set and
- * RplRoutingProtocol::NotifyRankInconsistency() resets the Trickle timer, so
- * an up to date DIO goes out sooner. Actually discarding the packet would
- * need either a core change to Ipv6Option::Process()'s signature, or
- * destroying enough of the packet here to make delivery fail on its own,
- * which risks the same kind of crash a malformed packet causes elsewhere in
- * ns-3, for a case, a confirmed loop, that is already rare in a working
- * network.
+ * A confirmed rank inconsistency -- RFC 6550 section 11.2.2.2: a second
+ * inconsistency detected along the path of the *same packet*, tracked by
+ * that packet's own Rank-Error ('R') bit, not by anything this node
+ * remembers between packets (every packet starts at R=0, since section
+ * 11.2 requires "A host or RPL leaf node MUST set the 'R' bit to 0") -- is
+ * traced as dropped (isDropped is set) but not actually stopped: unlike
+ * Ipv6Extension::Process(), Ipv6Option::Process() has no stopProcessing
+ * output, and Ipv6Extension::ProcessOptions() never derives one from an
+ * option's isDropped, so the packet is still delivered or forwarded
+ * regardless. What this implementation can enforce is the repair-triggering
+ * side of RFC 6550 section 11.2.2.2's confirmed case:
+ * RplRoutingProtocol::NotifyRankInconsistency() resets the Trickle timer
+ * ("the Trickle timer MUST be reset"), so an up to date DIO goes out sooner.
+ * Actually discarding the packet would need either a core change to
+ * Ipv6Option::Process()'s signature, or destroying enough of the packet here
+ * to make delivery fail on its own, which risks the same kind of crash a
+ * malformed packet causes elsewhere in ns-3, for a case, a confirmed loop,
+ * that is already rare in a working network.
  * @endinternal
  */
 class RplIpv6OptionRpl : public Ipv6Option
@@ -99,8 +103,6 @@ class RplIpv6OptionRpl : public Ipv6Option
                                   //!< packet object come back around a loop) is not
                                   //!< mistaken for the same Receive()/LocalDeliver()
                                   //!< pair and skipped
-    bool m_rankErrorSignaled;    //!< true once an inconsistency was flagged, until a
-                                  //!< consistent packet is seen again
 };
 
 } // namespace rpl

@@ -35,8 +35,7 @@ RplIpv6OptionRpl::GetTypeId()
 
 RplIpv6OptionRpl::RplIpv6OptionRpl()
     : m_lastProcessedUid(0),
-      m_lastProcessedTime(Time::Min()),
-      m_rankErrorSignaled(false)
+      m_lastProcessedTime(Time::Min())
 {
 }
 
@@ -114,37 +113,43 @@ RplIpv6OptionRpl::Process(Ptr<Packet> packet,
 
     if (inconsistent)
     {
-        if (m_rankErrorSignaled)
+        // RFC 6550 section 11.2.2.2, verbatim: "One inconsistency along the
+        // path is not considered a critical error and the packet may
+        // continue. However, a second detection along the path of the same
+        // packet should not occur and the packet MUST be dropped. This
+        // process is controlled by the Rank-Error bit associated with the
+        // packet. When an inconsistency is detected on a packet, if the
+        // Rank-Error bit was not set, then the Rank-Error bit is set. If it
+        // was set the packet MUST be discarded and the Trickle timer MUST be
+        // reset." The state that decides "confirmed" is carried on the
+        // packet itself (its Rank-Error bit as received, RFC 6550 section
+        // 11.2's "A host or RPL leaf node MUST set the 'R' bit to 0" is what
+        // guarantees every packet starts at 0), not anything this node
+        // remembers between packets.
+        if (rpi.GetRankError())
         {
-            // RFC 6550 section 11.2: a second inconsistency in a row is
-            // treated as a confirmed loop rather than a transient one, and
             // ns3::Ipv6Extension::Process() would drop the packet outright
             // here. ns3::Ipv6Option::Process() has no equivalent of that
             // stopProcessing output, only isDropped, which
             // Ipv6Extension::ProcessOptions() never turns into one either:
             // setting it below only traces the packet as dropped, and does
             // not stop it from still being delivered or forwarded. See
-            // design-constraints.md for the full account; the rank error is
-            // still flagged, and Trickle still reset, which is what gets a
-            // corrected DIO out to whoever is on the stale route sooner.
-            NS_LOG_WARN("Rank inconsistency confirmed for the second packet in a row ("
+            // design-constraints.md for the full account; the Trickle reset
+            // this confirmed case triggers is what gets a corrected DIO out
+            // to whoever is on the stale route sooner.
+            NS_LOG_WARN("Rank inconsistency confirmed (Rank-Error bit already set on arrival) ("
                         << (down ? "down" : "up") << ", sender rank " << senderRank
                         << ", own rank " << ownRank << ")");
             isDropped = true;
+            rpl->NotifyRankInconsistency();
         }
         else
         {
             NS_LOG_LOGIC("Rank inconsistency flagged (" << (down ? "down" : "up")
                                                          << ", sender rank " << senderRank
                                                          << ", own rank " << ownRank << ")");
-            m_rankErrorSignaled = true;
-            rpl->NotifyRankInconsistency();
+            rpi.SetRankError(true);
         }
-        rpi.SetRankError(true);
-    }
-    else
-    {
-        m_rankErrorSignaled = false;
     }
 
     rpi.SetSenderRank(ownRank);

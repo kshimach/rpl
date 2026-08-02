@@ -1950,14 +1950,22 @@ RplPacketInfoProcessTestCase::DoRun()
                               "The 'R' flag was not set on the first inconsistency");
     }
 
-    // A second inconsistency right after the first is RFC 6550 section
-    // 11.2's confirmed loop: traced as dropped, even though
-    // Ipv6Option::Process() has no way to actually stop the packet here (see
-    // design-constraints.md).
+    // A packet that arrives with the Rank-Error bit already set -- flagged
+    // by an earlier hop, per RFC 6550 section 11.2's "A host or RPL leaf
+    // node MUST set the 'R' bit to 0", every packet starts at R=0, so this
+    // can only be a hop further back on the same packet's path -- and hits
+    // another inconsistency here is section 11.2.2.2's confirmed loop:
+    // traced as dropped, even though Ipv6Option::Process() has no way to
+    // actually stop the packet here (see design-constraints.md). What
+    // decides "confirmed" is the bit carried on the packet, not anything
+    // this node remembers between packets, so this is a fresh packet built
+    // with the bit already on rather than a second call reusing the one
+    // above.
     {
         RplPacketInfoHeader rpi;
         rpi.SetDown(false);
         rpi.SetSenderRank(ownRank);
+        rpi.SetRankError(true);
 
         Ptr<Packet> packet = Create<Packet>();
         packet->AddHeader(rpi);
