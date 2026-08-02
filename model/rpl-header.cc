@@ -9,6 +9,7 @@
 #include "ns3/log.h"
 
 #include <algorithm>
+#include <limits>
 
 namespace ns3
 {
@@ -419,6 +420,11 @@ RplDioHeader::GetGrounded() const
 void
 RplDioHeader::SetMop(uint8_t mop)
 {
+    // The Mode of Operation is three bits of the DIO's G/MOP/Prf octet (RFC
+    // 6550 section 6.3.1); anything wider is silently masked away by
+    // Serialize(), turning e.g. 8 into 0, an entirely different mode.
+    NS_ASSERT_MSG(mop <= (RPL_DIO_MOP_MASK >> RPL_DIO_MOP_SHIFT),
+                  "Mode of operation " << +mop << " does not fit the DIO's three-bit MOP field");
     m_mop = mop;
 }
 
@@ -431,6 +437,10 @@ RplDioHeader::GetMop() const
 void
 RplDioHeader::SetPreference(uint8_t preference)
 {
+    // Likewise three bits of the same octet, DAGPreference (RFC 6550
+    // section 6.3.1).
+    NS_ASSERT_MSG(preference <= RPL_DIO_PREFERENCE_MASK,
+                  "Preference " << +preference << " does not fit the DIO's three-bit Prf field");
     m_preference = preference;
 }
 
@@ -1122,6 +1132,14 @@ RplSourceRoutingHeader::Serialize(Buffer::Iterator start) const
     uint8_t cmprI = Cmpri();
     uint8_t cmprE = Cmpre();
 
+    // Hdr Ext Len is eight bits (RFC 8200 section 4.4), so a longer header
+    // than this cannot say how long it is: the cast below would wrap and the
+    // receiver would reconstruct a different, shorter address list without
+    // anything on the wire saying so. @see SetAddresses().
+    NS_ASSERT_MSG(GetSerializedSize() <= MAX_SERIALIZED_SIZE,
+                  "A Routing Header of " << GetSerializedSize()
+                                         << " bytes does not fit an 8-bit Hdr Ext Len");
+
     i.WriteU8(GetNextHeader());
     // Hdr Ext Len counts 8-byte units after the first eight bytes.
     i.WriteU8(static_cast<uint8_t>((GetSerializedSize() - 8) / 8));
@@ -1159,10 +1177,29 @@ RplSourceRoutingHeader::Deserialize(Buffer::Iterator start)
 
     m_addresses.clear();
 
+    // Hdr Ext Len is whatever the sender wrote, and everything below reads
+    // against it. Buffer::Iterator does no bounds checking of its own in an
+    // optimized build (@see RplDioHeader::Deserialize()'s note on the same
+    // hazard), so a header claiming more eight-octet units than the packet
+    // actually carries -- which this implementation never sends, but a
+    // truncated or hand-built one does -- would read past the buffer's end,
+    // once per address it thinks is there. Clamp the claim to what is
+    // really left instead, and report that same clamped total as the size
+    // consumed so the caller does not trim more of the packet than existed.
+    uint32_t declaredSize = uint32_t(hdrExtLen + 1) * 8;
+    uint32_t availableSize = 8 + i.GetRemainingSize();
+    if (declaredSize > availableSize)
+    {
+        NS_LOG_WARN("Truncated RPL Source Routing Header (Hdr Ext Len "
+                    << +hdrExtLen << " claims " << declaredSize << " bytes, only " << availableSize
+                    << " are present)");
+        declaredSize = availableSize;
+    }
+
     // RFC 6554 section 4.2's n, adapted to bytes already past the fixed
     // 8-octet part: this header's payload, after Pad, holds (n-1) entries
     // of (16-CmprI) octets and one of (16-CmprE).
-    uint32_t addressBytes = uint32_t(hdrExtLen + 1) * 8 - 8;
+    uint32_t addressBytes = declaredSize - 8;
     addressBytes = (addressBytes > pad) ? addressBytes - pad : 0;
     if (addressBytes >= uint32_t(16 - cmprE))
     {
@@ -1184,13 +1221,14 @@ RplSourceRoutingHeader::Deserialize(Buffer::Iterator start)
         }
     }
 
-    // The wire's own Hdr Ext Len is authoritative for how many bytes this
-    // header occupies, independent of what GetSerializedSize() would
-    // recompute from the addresses just reconstructed above: a header this
-    // implementation did not itself produce need not round-trip through
-    // Cmpri()/Cmpre() the same way (e.g. a CmprI other than 0 or 8, which
-    // this implementation never sends but a hand-built packet might).
-    return uint32_t(hdrExtLen + 1) * 8;
+    // The wire's own Hdr Ext Len, clamped above to what the packet really
+    // holds, is authoritative for how many bytes this header occupies,
+    // independent of what GetSerializedSize() would recompute from the
+    // addresses just reconstructed: a header this implementation did not
+    // itself produce need not round-trip through Cmpri()/Cmpre() the same
+    // way (e.g. a CmprI other than 0 or 8, which this implementation never
+    // sends but a hand-built packet might).
+    return declaredSize;
 }
 
 void
@@ -1222,10 +1260,11 @@ NS_OBJECT_ENSURE_REGISTERED(RplPacketInfoHeader);
 RplPacketInfoHeader::RplPacketInfoHeader()
     : m_flags(0),
       m_instanceId(RPL_DEFAULT_INSTANCE),
-      m_senderRank(0)
+      m_senderRank(0),
+      m_malformed(false)
 {
     SetType(RPL_HBH_OPTION_TYPE);
-    SetLength(4); // Flags, RPLInstanceID, SenderRank
+    SetLength(RPI_BASE_LENGTH); // Flags, RPLInstanceID, SenderRank
 }
 
 TypeId
@@ -1254,7 +1293,12 @@ RplPacketInfoHeader::Print(std::ostream& os) const
 uint32_t
 RplPacketInfoHeader::GetSerializedSize() const
 {
-    return GetLength() + 2;
+    // Derived from what is actually held rather than from the Opt Data Len
+    // field on its own: the two must not be able to disagree, or a forged
+    // length would decide how many bytes Serialize() is given while
+    // Serialize() itself only ever writes the base octets, leaving the rest
+    // of that space filled with whatever the buffer happened to hold.
+    return RPI_BASE_SIZE + m_subTlvs.size();
 }
 
 void
@@ -1263,10 +1307,14 @@ RplPacketInfoHeader::Serialize(Buffer::Iterator start) const
     Buffer::Iterator i = start;
 
     i.WriteU8(GetType());
-    i.WriteU8(GetLength());
+    i.WriteU8(static_cast<uint8_t>(RPI_BASE_LENGTH + m_subTlvs.size()));
     i.WriteU8(m_flags);
     i.WriteU8(m_instanceId);
     i.WriteHtonU16(m_senderRank);
+    if (!m_subTlvs.empty())
+    {
+        i.Write(m_subTlvs.data(), m_subTlvs.size());
+    }
 }
 
 uint32_t
@@ -1275,12 +1323,72 @@ RplPacketInfoHeader::Deserialize(Buffer::Iterator start)
     Buffer::Iterator i = start;
 
     SetType(i.ReadU8());
-    SetLength(i.ReadU8());
+    uint8_t length = i.ReadU8();
+
+    m_subTlvs.clear();
+    m_malformed = false;
+
+    // length is RFC 6553 section 3's Opt Data Len, straight off the wire.
+    // Everything below reads against it, and the enclosing Hop-by-Hop
+    // header's option walk (ns3::Ipv6Extension::ProcessOptions()) advances
+    // by whatever this option reports it consumed, so a length that either
+    // cannot hold the mandatory base octets or claims bytes the packet does
+    // not carry has to stop here rather than be acted on:
+    //
+    //   - Buffer::Iterator does no bounds checking of its own in an
+    //     optimized build (PeekU8()'s range check is an NS_ASSERT, compiled
+    //     out there), so reading the base octets of an option cut short
+    //     would read past the buffer's end.
+    //   - Reporting a length the packet does not have back to
+    //     ProcessOptions() makes it walk past the real end of the option
+    //     list, and, since Ipv6Option::Process()'s return value is a
+    //     uint8_t, an Opt Data Len of 254 reports 256, i.e. 0, which never
+    //     advances that walk at all.
+    //
+    // Two octets is all that was really read, so that is what is reported;
+    // m_malformed is what tells RplIpv6OptionRpl::Process() to drop the
+    // packet rather than let a partly-parsed option through.
+    if (length < RPI_BASE_LENGTH || i.GetRemainingSize() < length ||
+        uint32_t(length) + 2 > std::numeric_limits<uint8_t>::max())
+    {
+        NS_LOG_WARN("Malformed RPL Option: Opt Data Len " << +length << " with "
+                                                          << i.GetRemainingSize()
+                                                          << " bytes left in the packet");
+        m_malformed = true;
+        SetLength(RPI_BASE_LENGTH);
+        m_flags = 0;
+        m_instanceId = RPL_DEFAULT_INSTANCE;
+        m_senderRank = 0;
+        return 2;
+    }
+
+    SetLength(length);
     m_flags = i.ReadU8();
     m_instanceId = i.ReadU8();
     m_senderRank = i.ReadNtohU16();
 
+    // RFC 6553 section 3: whatever follows the base octets is a sub-TLV,
+    // none of which this implementation defines. Carried verbatim so
+    // Serialize() can put it back unchanged for the next hop.
+    if (length > RPI_BASE_LENGTH)
+    {
+        m_subTlvs.resize(length - RPI_BASE_LENGTH);
+        i.Read(m_subTlvs.data(), m_subTlvs.size());
+    }
+
     return GetSerializedSize();
+}
+
+bool
+RplPacketInfoHeader::IsMalformed() const
+{
+    return m_malformed;
+}
+
+const std::vector<uint8_t>&
+RplPacketInfoHeader::GetSubTlvs() const
+{
+    return m_subTlvs;
 }
 
 void

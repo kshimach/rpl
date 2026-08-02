@@ -678,6 +678,12 @@ class RplSourceRoutingHeader : public Ipv6ExtensionRoutingHeader
 
     RplSourceRoutingHeader();
 
+    /// The largest this header can be on the wire: RFC 8200 section 4.4's
+    /// Hdr Ext Len counts eight-octet units past the first eight, in eight
+    /// bits, so (255 + 1) * 8. A path long enough to need more than this
+    /// cannot be expressed as one Routing Header at all.
+    static constexpr uint32_t MAX_SERIALIZED_SIZE = 2048;
+
     TypeId GetInstanceTypeId() const override;
     void Print(std::ostream& os) const override;
     uint32_t GetSerializedSize() const override;
@@ -690,6 +696,12 @@ class RplSourceRoutingHeader : public Ipv6ExtensionRoutingHeader
      * The last address is the packet's real final destination; the IPv6
      * header carries the address of the first hop instead, which is why it is
      * not repeated here.
+     *
+     * The resulting header has to fit MAX_SERIALIZED_SIZE, which how much of
+     * each address compresses away decides (@see Cmpri()): between 127
+     * addresses if none of them do and 255 if they all do. Serialize()
+     * asserts on a list that does not fit; callers building one from a path
+     * of their own should check GetSerializedSize() first.
      *
      * @param addresses the addresses to visit, in order
      */
@@ -758,6 +770,14 @@ class RplSourceRoutingHeader : public Ipv6ExtensionRoutingHeader
 class RplPacketInfoHeader : public Ipv6OptionHeader
 {
   public:
+    /// Opt Data Len of an option carrying nothing but the mandatory base
+    /// octets of RFC 6553 section 3: Flags, RPLInstanceID and SenderRank.
+    static constexpr uint8_t RPI_BASE_LENGTH = 4;
+
+    /// What an option of RPI_BASE_LENGTH occupies on the wire, Option Type
+    /// and Opt Data Len included.
+    static constexpr uint8_t RPI_BASE_SIZE = RPI_BASE_LENGTH + 2;
+
     /**
      * @brief Get the type ID.
      * @return the object TypeId
@@ -828,10 +848,41 @@ class RplPacketInfoHeader : public Ipv6OptionHeader
      */
     uint16_t GetSenderRank() const;
 
+    /**
+     * @brief Whether the last Deserialize() found the option unusable.
+     *
+     * RFC 6553 section 3's Opt Data Len is whatever the sender wrote: it can
+     * be shorter than the four mandatory base octets, or claim more bytes
+     * than the packet actually carries. Neither can be parsed, and neither
+     * can be trusted to say how far the enclosing Hop-by-Hop header's option
+     * walk should advance, so Deserialize() reports only the two octets it
+     * really read and raises this instead. @see RplIpv6OptionRpl::Process(),
+     * which turns it into a drop.
+     *
+     * @return true if the option as received could not be parsed
+     */
+    bool IsMalformed() const;
+
+    /**
+     * @brief The bytes past the four mandatory base octets, if any.
+     *
+     * RFC 6553 section 3: "A RPL device MUST skip over any unrecognized
+     * sub-TLVs and attempt to process any additional sub-TLVs that may
+     * appear after." This implementation defines no sub-TLV of its own, so
+     * they are kept verbatim and written back out unchanged by Serialize()
+     * rather than interpreted -- a router that dropped them would be
+     * rewriting an option it does not understand.
+     *
+     * @return the sub-TLV bytes, empty for the plain four-octet option
+     */
+    const std::vector<uint8_t>& GetSubTlvs() const;
+
   private:
-    uint8_t m_flags;      //!< O, R and F flags in the top three bits
-    uint8_t m_instanceId; //!< RPLInstanceID
+    uint8_t m_flags;       //!< O, R and F flags in the top three bits
+    uint8_t m_instanceId;  //!< RPLInstanceID
     uint16_t m_senderRank; //!< rank of the router that last touched this field
+    std::vector<uint8_t> m_subTlvs; //!< opaque bytes past the four base octets
+    bool m_malformed;               //!< set by Deserialize() on an unparseable option
 };
 
 } // namespace rpl

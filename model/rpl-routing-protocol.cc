@@ -1807,17 +1807,34 @@ RplRoutingProtocol::PrepareOutgoingPacket(Ptr<Packet> packet, Ipv6Header& header
             addresses.back() = dst;
             RplSourceRoutingHeader srh;
             srh.SetNextHeader(innerNextHeader);
-            srh.SetSegmentsLeft(static_cast<uint8_t>(hops.size() - 1));
             srh.SetAddresses(addresses);
 
-            packet->AddHeader(srh);
-            header.SetDestination(hops.front());
-            innerNextHeader = Ipv6Header::IPV6_EXT_ROUTING;
-            hasRoutingHeader = true;
+            // Both Segments Left and Hdr Ext Len are eight-bit fields (RFC
+            // 8200 section 4.4), so a path this long cannot be written down
+            // as one Routing Header, and writing one anyway would wrap the
+            // length silently. A DODAG deep enough to hit this is not
+            // something this implementation can source route through at
+            // all, so the packet goes out with only the RPL Option and is
+            // dropped by the first hop that finds no route -- which is at
+            // least a visible failure rather than a corrupted header.
+            if (addresses.size() > std::numeric_limits<uint8_t>::max() ||
+                srh.GetSerializedSize() > RplSourceRoutingHeader::MAX_SERIALIZED_SIZE)
+            {
+                NS_LOG_WARN("The path to " << dst << " needs " << addresses.size()
+                                           << " addresses, too many for one Routing Header");
+            }
+            else
+            {
+                srh.SetSegmentsLeft(static_cast<uint8_t>(hops.size() - 1));
+                packet->AddHeader(srh);
+                header.SetDestination(hops.front());
+                innerNextHeader = Ipv6Header::IPV6_EXT_ROUTING;
+                hasRoutingHeader = true;
 
-            NS_LOG_LOGIC("Attached a Routing Header for "
-                        << dst << " with " << (hops.size() - 1) << " address(es), first hop "
-                        << hops.front());
+                NS_LOG_LOGIC("Attached a Routing Header for "
+                            << dst << " with " << (hops.size() - 1) << " address(es), first hop "
+                            << hops.front());
+            }
         }
     }
 

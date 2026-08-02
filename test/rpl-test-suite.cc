@@ -276,6 +276,211 @@ RplDioHeaderTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief Check every DIO field at the extremes of the width RFC 6550
+ *        section 6.3 gives it, including the ones packed into shared
+ *        octets, where an off-by-one shift or a missing mask only shows up
+ *        at the top of the range.
+ */
+class RplDioBoundaryTestCase : public TestCase
+{
+  public:
+    RplDioBoundaryTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplDioBoundaryTestCase::RplDioBoundaryTestCase()
+    : TestCase("DIO field boundary values")
+{
+}
+
+void
+RplDioBoundaryTestCase::DoRun()
+{
+    // The G/MOP/Prf octet: Grounded is one bit, the Mode of Operation
+    // three, DAGPreference the remaining three. Every combination of the
+    // two three-bit fields, with Grounded both ways, has to come back
+    // exactly as it went in.
+    for (uint8_t mop = 0; mop <= 7; mop++)
+    {
+        for (uint8_t preference = 0; preference <= 7; preference++)
+        {
+            for (bool grounded : {false, true})
+            {
+                RplDioHeader dio;
+                dio.SetMop(mop);
+                dio.SetPreference(preference);
+                dio.SetGrounded(grounded);
+
+                Ptr<Packet> packet = Create<Packet>();
+                packet->AddHeader(dio);
+                RplDioHeader received;
+                packet->RemoveHeader(received);
+
+                NS_TEST_ASSERT_MSG_EQ(+received.GetMop(),
+                                      +mop,
+                                      "MOP " << +mop << " did not survive alongside preference "
+                                             << +preference);
+                NS_TEST_ASSERT_MSG_EQ(+received.GetPreference(),
+                                      +preference,
+                                      "Preference " << +preference << " did not survive alongside "
+                                                    << "MOP " << +mop);
+                NS_TEST_ASSERT_MSG_EQ(received.GetGrounded(),
+                                      grounded,
+                                      "The Grounded flag did not survive alongside MOP "
+                                          << +mop << " preference " << +preference);
+            }
+        }
+    }
+
+    // Rank is 16 bits, with 0xffff reserved as INFINITE_RANK (RFC 6550
+    // section 17). The eight-bit fields around it take their whole range.
+    for (uint16_t rank : {uint16_t(0), uint16_t(1), RPL_MIN_HOPRANKINC, RPL_INFINITE_RANK})
+    {
+        for (uint8_t byteField : {uint8_t(0), uint8_t(255)})
+        {
+            RplDioHeader dio;
+            dio.SetRank(rank);
+            dio.SetInstanceId(byteField);
+            dio.SetVersionNumber(byteField);
+            dio.SetDtsn(byteField);
+
+            Ptr<Packet> packet = Create<Packet>();
+            packet->AddHeader(dio);
+            RplDioHeader received;
+            packet->RemoveHeader(received);
+
+            NS_TEST_ASSERT_MSG_EQ(received.GetRank(), rank, "Rank " << rank << " did not survive");
+            NS_TEST_ASSERT_MSG_EQ(+received.GetInstanceId(),
+                                  +byteField,
+                                  "RPLInstanceID " << +byteField << " did not survive");
+            NS_TEST_ASSERT_MSG_EQ(+received.GetVersionNumber(),
+                                  +byteField,
+                                  "Version number " << +byteField << " did not survive");
+            NS_TEST_ASSERT_MSG_EQ(+received.GetDtsn(),
+                                  +byteField,
+                                  "DTSN " << +byteField << " did not survive");
+        }
+    }
+
+    // The DODAG Configuration option (RFC 6550 section 6.7.6) at both ends
+    // of every field it holds.
+    {
+        RplDioHeader dio;
+        dio.SetDagConfiguration(0, 0, 0, 0, 0, 0, 0, 0);
+        Ptr<Packet> packet = Create<Packet>();
+        packet->AddHeader(dio);
+        RplDioHeader received;
+        packet->RemoveHeader(received);
+        NS_TEST_ASSERT_MSG_EQ(received.HasDagConfiguration(), true, "The all-zero option was lost");
+        NS_TEST_ASSERT_MSG_EQ(+received.GetIntervalDoublings(), 0, "Wrong DIOIntervalDoublings");
+        NS_TEST_ASSERT_MSG_EQ(+received.GetIntervalMin(), 0, "Wrong DIOIntervalMin");
+        NS_TEST_ASSERT_MSG_EQ(+received.GetRedundancy(), 0, "Wrong DIORedundancyConstant");
+        NS_TEST_ASSERT_MSG_EQ(received.GetMaxRankIncrease(), 0, "Wrong MaxRankIncrease");
+        NS_TEST_ASSERT_MSG_EQ(received.GetMinHopRankIncrease(), 0, "Wrong MinHopRankIncrease");
+        NS_TEST_ASSERT_MSG_EQ(received.GetOcp(), 0, "Wrong objective code point");
+        NS_TEST_ASSERT_MSG_EQ(+received.GetDefaultLifetime(), 0, "Wrong default lifetime");
+        NS_TEST_ASSERT_MSG_EQ(received.GetLifetimeUnit(), 0, "Wrong lifetime unit");
+
+        RplDioHeader saturated;
+        saturated.SetDagConfiguration(255, 255, 255, 0xffff, 0xffff, 0xffff, 255, 0xffff);
+        packet = Create<Packet>();
+        packet->AddHeader(saturated);
+        packet->RemoveHeader(received);
+        NS_TEST_ASSERT_MSG_EQ(+received.GetIntervalDoublings(), 255, "Wrong DIOIntervalDoublings");
+        NS_TEST_ASSERT_MSG_EQ(+received.GetIntervalMin(), 255, "Wrong DIOIntervalMin");
+        NS_TEST_ASSERT_MSG_EQ(+received.GetRedundancy(), 255, "Wrong DIORedundancyConstant");
+        NS_TEST_ASSERT_MSG_EQ(received.GetMaxRankIncrease(), 0xffff, "Wrong MaxRankIncrease");
+        NS_TEST_ASSERT_MSG_EQ(received.GetMinHopRankIncrease(), 0xffff, "Wrong MinHopRankIncrease");
+        NS_TEST_ASSERT_MSG_EQ(received.GetOcp(), 0xffff, "Wrong objective code point");
+        NS_TEST_ASSERT_MSG_EQ(+received.GetDefaultLifetime(), 255, "Wrong default lifetime");
+        NS_TEST_ASSERT_MSG_EQ(received.GetLifetimeUnit(), 0xffff, "Wrong lifetime unit");
+    }
+
+    // The ETX metric container, both extremes of its 16-bit fixed-point
+    // value (RFC 6551 section 4.3).
+    for (uint16_t pathEtx : {uint16_t(0), uint16_t(0xffff)})
+    {
+        RplDioHeader dio;
+        dio.SetMetricContainer(pathEtx);
+        Ptr<Packet> packet = Create<Packet>();
+        packet->AddHeader(dio);
+        RplDioHeader received;
+        packet->RemoveHeader(received);
+        NS_TEST_ASSERT_MSG_EQ(received.HasMetricContainer(), true, "The metric container was lost");
+        NS_TEST_ASSERT_MSG_EQ(received.GetPathEtx(), pathEtx, "Wrong path ETX");
+    }
+
+    // LQL is a four-bit Val sub-field (RFC 6551 section 4.6) of which only
+    // 0 to 7 are defined, so the whole defined range has to survive and
+    // anything above it must be clamped rather than truncated on the shift.
+    for (uint8_t lql = 0; lql <= RPL_LQL_WORST; lql++)
+    {
+        RplDioHeader dio;
+        dio.SetLql(lql);
+        Ptr<Packet> packet = Create<Packet>();
+        packet->AddHeader(dio);
+        RplDioHeader received;
+        packet->RemoveHeader(received);
+        NS_TEST_ASSERT_MSG_EQ(received.HasLql(), true, "The LQL option was lost");
+        NS_TEST_ASSERT_MSG_EQ(+received.GetLql(), +lql, "LQL " << +lql << " did not survive");
+    }
+
+    for (uint8_t lql : {uint8_t(8), uint8_t(15), uint8_t(255)})
+    {
+        RplDioHeader dio;
+        dio.SetLql(lql);
+        NS_TEST_ASSERT_MSG_EQ(+dio.GetLql(),
+                              +RPL_LQL_WORST,
+                              "LQL " << +lql << " was not clamped to the worst defined value");
+    }
+
+    // The Prefix Information option (RFC 6550 section 6.7.10): both flags
+    // in every combination, the ends of the prefix length, and both
+    // lifetimes at their extremes.
+    for (bool onLink : {false, true})
+    {
+        for (bool autonomous : {false, true})
+        {
+            for (uint8_t prefixLength : {uint8_t(0), uint8_t(64), uint8_t(128)})
+            {
+                RplDioHeader dio;
+                dio.SetPrefixInfo(Ipv6Address("2001:db8::"),
+                                  prefixLength,
+                                  onLink,
+                                  autonomous,
+                                  onLink ? 0xffffffff : 0,
+                                  autonomous ? 0xffffffff : 0);
+
+                Ptr<Packet> packet = Create<Packet>();
+                packet->AddHeader(dio);
+                RplDioHeader received;
+                packet->RemoveHeader(received);
+
+                NS_TEST_ASSERT_MSG_EQ(received.HasPrefixInfo(), true, "The option was lost");
+                NS_TEST_ASSERT_MSG_EQ(received.GetPrefixOnLink(), onLink, "Wrong 'L' flag");
+                NS_TEST_ASSERT_MSG_EQ(received.GetPrefixAutonomous(),
+                                      autonomous,
+                                      "Wrong 'A' flag");
+                NS_TEST_ASSERT_MSG_EQ(+received.GetPrefixLength(),
+                                      +prefixLength,
+                                      "Wrong prefix length");
+                NS_TEST_ASSERT_MSG_EQ(received.GetPrefixValidLifetime(),
+                                      onLink ? 0xffffffff : 0,
+                                      "Wrong Valid Lifetime");
+                NS_TEST_ASSERT_MSG_EQ(received.GetPrefixPreferredLifetime(),
+                                      autonomous ? 0xffffffff : 0,
+                                      "Wrong Preferred Lifetime");
+            }
+        }
+    }
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Check that a DIO carrying an option this implementation does not know
  *        is still parsed, i.e. the unknown option is skipped rather than
  *        derailing the rest of the message.
@@ -451,6 +656,163 @@ RplDioUnknownMetricTypeTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief Walk the remaining shapes an option list can take on the wire
+ *        (RFC 6550 section 6.7): padding, an option cut off before its
+ *        Length octet, a known option type carrying the wrong Length, and a
+ *        metric container whose object body is not the size the type calls
+ *        for.
+ *
+ * All of these have to leave the base object intact and either skip the
+ * option or stop cleanly, never mistake part of one option for another.
+ */
+class RplDioOptionEdgeTestCase : public TestCase
+{
+  public:
+    RplDioOptionEdgeTestCase();
+
+  private:
+    void DoRun() override;
+
+    /**
+     * @brief Build a DIO with a known rank and DODAGID, with the given
+     *        bytes appended as its option list.
+     *
+     * @param options the raw option bytes to append
+     * @param length how many bytes of options
+     * @return the DIO as it comes back off the wire
+     */
+    RplDioHeader RoundTrip(const uint8_t* options, uint32_t length);
+};
+
+RplDioOptionEdgeTestCase::RplDioOptionEdgeTestCase()
+    : TestCase("DIO option list edge cases")
+{
+}
+
+RplDioHeader
+RplDioOptionEdgeTestCase::RoundTrip(const uint8_t* options, uint32_t length)
+{
+    RplDioHeader dio;
+    dio.SetRank(256);
+    dio.SetDodagId(Ipv6Address("2001:1::1"));
+
+    Ptr<Packet> packet = Create<Packet>();
+    packet->AddHeader(dio);
+    if (length > 0)
+    {
+        packet->AddAtEnd(Create<Packet>(options, length));
+    }
+
+    RplDioHeader received;
+    packet->RemoveHeader(received);
+    return received;
+}
+
+void
+RplDioOptionEdgeTestCase::DoRun()
+{
+    // Pad1 (RFC 6550 section 6.7.2) is a lone zero octet with no Length of
+    // its own; a run of them must be skipped one at a time.
+    {
+        const uint8_t pad1[4] = {RPL_OPTION_PAD1,
+                                 RPL_OPTION_PAD1,
+                                 RPL_OPTION_PAD1,
+                                 RPL_OPTION_PAD1};
+        RplDioHeader received = RoundTrip(pad1, sizeof(pad1));
+        NS_TEST_ASSERT_MSG_EQ(received.GetRank(), 256, "Padding ate part of the base object");
+        NS_TEST_ASSERT_MSG_EQ(received.HasDagConfiguration(), false, "Padding became an option");
+    }
+
+    // PadN (section 6.7.3): a Length and that many zero octets.
+    {
+        const uint8_t padN[6] = {RPL_OPTION_PADN, 4, 0, 0, 0, 0};
+        RplDioHeader received = RoundTrip(padN, sizeof(padN));
+        NS_TEST_ASSERT_MSG_EQ(received.GetRank(), 256, "PadN ate part of the base object");
+        NS_TEST_ASSERT_MSG_EQ(received.GetDodagId(),
+                              Ipv6Address("2001:1::1"),
+                              "PadN corrupted the DODAGID");
+    }
+
+    // An option type with no Length octet behind it at all: the list ends
+    // mid-option and there is nothing to skip by.
+    {
+        const uint8_t stub[1] = {RPL_OPTION_DAG_CONF};
+        RplDioHeader received = RoundTrip(stub, sizeof(stub));
+        NS_TEST_ASSERT_MSG_EQ(received.GetRank(), 256, "A one-byte option ate the base object");
+        NS_TEST_ASSERT_MSG_EQ(received.HasDagConfiguration(),
+                              false,
+                              "An option with no Length octet was parsed as if complete");
+    }
+
+    // A known option type whose Length is not the one that type has: the
+    // implementation only understands the fixed size it emits, so this is
+    // skipped as if it were an unknown option, and whatever follows still
+    // parses.
+    for (uint8_t wrongLength : {uint8_t(0), uint8_t(13), uint8_t(15)})
+    {
+        std::vector<uint8_t> options;
+        options.push_back(RPL_OPTION_DAG_CONF);
+        options.push_back(wrongLength);
+        options.insert(options.end(), wrongLength, 0);
+
+        // A real ETX metric container right after it, to prove the walk
+        // resumed at the right offset rather than somewhere inside the
+        // option just skipped.
+        const uint8_t etx[8] =
+            {RPL_OPTION_DAG_METRIC_CONTAINER, 6, RPL_DAG_MC_ETX, 0, 0, 2, 0x01, 0x40};
+        options.insert(options.end(), etx, etx + sizeof(etx));
+
+        RplDioHeader received = RoundTrip(options.data(), options.size());
+        NS_TEST_ASSERT_MSG_EQ(received.HasDagConfiguration(),
+                              false,
+                              "A DAG Configuration option of length " << +wrongLength
+                                                                       << " was parsed anyway");
+        NS_TEST_ASSERT_MSG_EQ(received.HasMetricContainer(),
+                              true,
+                              "The option after a length-" << +wrongLength
+                                                            << " one was never reached");
+        NS_TEST_ASSERT_MSG_EQ(received.GetPathEtx(), 320, "The following option was misparsed");
+    }
+
+    // A metric container of the right option length whose ETX object body
+    // is not the two octets an ETX object is: not a value this
+    // implementation can read, so the metric is not adopted.
+    {
+        const uint8_t badBody[8] =
+            {RPL_OPTION_DAG_METRIC_CONTAINER, 6, RPL_DAG_MC_ETX, 0, 0, 4, 0x01, 0x40};
+        RplDioHeader received = RoundTrip(badBody, sizeof(badBody));
+        NS_TEST_ASSERT_MSG_EQ(received.HasMetricContainer(),
+                              false,
+                              "An ETX object of the wrong body length was adopted");
+        NS_TEST_ASSERT_MSG_EQ(received.GetRank(), 256, "It also ate part of the base object");
+    }
+
+    // The LQL sub-object's Counter nibble (RFC 6551 section 4.6) is not one
+    // this implementation reads: whatever it says, the Val nibble above it
+    // is what comes out.
+    {
+        const uint8_t counter[8] =
+            {RPL_OPTION_DAG_METRIC_CONTAINER, 6, RPL_DAG_MC_LQL, 0, 0, 2, 0, 0x3f};
+        RplDioHeader received = RoundTrip(counter, sizeof(counter));
+        NS_TEST_ASSERT_MSG_EQ(received.HasLql(), true, "The LQL option was lost");
+        NS_TEST_ASSERT_MSG_EQ(+received.GetLql(), 3, "The Counter nibble leaked into the Val");
+    }
+
+    // An empty option list, i.e. a DIO that is only its base object.
+    {
+        RplDioHeader received = RoundTrip(nullptr, 0);
+        NS_TEST_ASSERT_MSG_EQ(received.HasDagConfiguration(), false, "An option appeared");
+        NS_TEST_ASSERT_MSG_EQ(received.HasMetricContainer(), false, "An option appeared");
+        NS_TEST_ASSERT_MSG_EQ(received.HasLql(), false, "An option appeared");
+        NS_TEST_ASSERT_MSG_EQ(received.HasPrefixInfo(), false, "An option appeared");
+        NS_TEST_ASSERT_MSG_EQ(received.GetRank(), 256, "Wrong rank");
+    }
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Check that a DAO and a DAO-ACK survive a round trip.
  */
 class RplDaoHeaderTestCase : public TestCase
@@ -527,6 +889,191 @@ RplDaoHeaderTestCase::DoRun()
     NS_TEST_ASSERT_MSG_EQ(receivedAck.GetSequence(), 77, "Wrong DAO sequence");
     NS_TEST_ASSERT_MSG_EQ(receivedAck.GetStatus(), 0, "Wrong status");
     NS_TEST_ASSERT_MSG_EQ(receivedAck.GetDodagId(), Ipv6Address("2001:1::1"), "Wrong DODAGID");
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief Check the DAO and DAO-ACK at their field boundaries, and against
+ *        the option lists a peer could send that this implementation never
+ *        does: no Target, no Transit Information, a truncated option, an
+ *        unknown one.
+ *
+ * A DAO with no Target is the case that matters most: RplRoutingProtocol::
+ * HandleDao() decides what to do from GetTarget(), so it has to come back
+ * as the unspecified address rather than as whatever the previous parse, or
+ * the constructor, happened to leave behind.
+ */
+class RplDaoBoundaryTestCase : public TestCase
+{
+  public:
+    RplDaoBoundaryTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplDaoBoundaryTestCase::RplDaoBoundaryTestCase()
+    : TestCase("DAO and DAO-ACK boundary values and option list edge cases")
+{
+}
+
+void
+RplDaoBoundaryTestCase::DoRun()
+{
+    // Path lifetime 0 is a No-Path (RFC 6550 section 6.4.3) and 0xff is the
+    // infinite lifetime; the sequence numbers and prefix length take their
+    // whole range.
+    for (uint8_t pathLifetime : {uint8_t(0), uint8_t(1), RPL_INFINITE_LIFETIME})
+    {
+        for (uint8_t sequence : {uint8_t(0), uint8_t(255)})
+        {
+            for (uint8_t prefixLength : {uint8_t(0), uint8_t(64), uint8_t(128)})
+            {
+                RplDaoHeader dao;
+                dao.SetSequence(sequence);
+                dao.SetTarget(Ipv6Address("2001:1::5"), prefixLength);
+                dao.SetTransitInformation(Ipv6Address("2001:1::4"), sequence, pathLifetime);
+
+                Ptr<Packet> packet = Create<Packet>();
+                packet->AddHeader(dao);
+                RplDaoHeader received;
+                packet->RemoveHeader(received);
+
+                NS_TEST_ASSERT_MSG_EQ(+received.GetSequence(),
+                                      +sequence,
+                                      "DAO sequence " << +sequence << " did not survive");
+                NS_TEST_ASSERT_MSG_EQ(+received.GetPathSequence(),
+                                      +sequence,
+                                      "Path sequence " << +sequence << " did not survive");
+                NS_TEST_ASSERT_MSG_EQ(+received.GetPathLifetime(),
+                                      +pathLifetime,
+                                      "Path lifetime " << +pathLifetime << " did not survive");
+                NS_TEST_ASSERT_MSG_EQ(+received.GetTargetPrefixLength(),
+                                      +prefixLength,
+                                      "Target prefix length " << +prefixLength
+                                                              << " did not survive");
+            }
+        }
+    }
+
+    // A DAO whose option list is empty: neither a Target nor a Transit
+    // Information option. RFC 6550 section 6.4 allows the base object on
+    // its own; nothing usable can be read out of it.
+    {
+        const uint8_t bare[4] = {0, 0, 0, 42};
+        Ptr<Packet> packet = Create<Packet>(bare, sizeof(bare));
+        RplDaoHeader received;
+        packet->RemoveHeader(received);
+        NS_TEST_ASSERT_MSG_EQ(received.GetTarget(),
+                              Ipv6Address::GetAny(),
+                              "A DAO with no Target option reported one anyway");
+        NS_TEST_ASSERT_MSG_EQ(received.GetParent(),
+                              Ipv6Address::GetAny(),
+                              "A DAO with no Transit Information option reported a parent");
+        NS_TEST_ASSERT_MSG_EQ(+received.GetSequence(), 42, "Wrong DAO sequence");
+        NS_TEST_ASSERT_MSG_EQ(received.GetDodagId(),
+                              Ipv6Address::GetAny(),
+                              "The 'D' flag was clear but a DODAGID was read");
+    }
+
+    // Reusing a header object must not let the previous parse's Target or
+    // parent show through the next one.
+    {
+        RplDaoHeader full;
+        full.SetTarget(Ipv6Address("2001:1::5"));
+        full.SetTransitInformation(Ipv6Address("2001:1::4"), 1, 30);
+        Ptr<Packet> packet = Create<Packet>();
+        packet->AddHeader(full);
+
+        RplDaoHeader received;
+        packet->RemoveHeader(received);
+        NS_TEST_ASSERT_MSG_EQ(received.GetTarget(), Ipv6Address("2001:1::5"), "Wrong target");
+
+        const uint8_t bare[4] = {0, 0, 0, 1};
+        Ptr<Packet> barePacket = Create<Packet>(bare, sizeof(bare));
+        barePacket->RemoveHeader(received);
+        NS_TEST_ASSERT_MSG_EQ(received.GetTarget(),
+                              Ipv6Address::GetAny(),
+                              "The previous DAO's target leaked into the next parse");
+        NS_TEST_ASSERT_MSG_EQ(received.GetParent(),
+                              Ipv6Address::GetAny(),
+                              "The previous DAO's parent leaked into the next parse");
+    }
+
+    // The same option-length guard the DIO parser has: an option whose
+    // declared Length claims more bytes than are left must stop the walk
+    // rather than read past the buffer's end. The real options before it
+    // still have to come out intact.
+    {
+        RplDaoHeader dao;
+        dao.SetTarget(Ipv6Address("2001:1::5"));
+        dao.SetTransitInformation(Ipv6Address("2001:1::4"), 1, 30);
+        Ptr<Packet> packet = Create<Packet>();
+        packet->AddHeader(dao);
+
+        const uint8_t truncated[4] = {RPL_OPTION_TARGET, 18, 0, 0};
+        packet->AddAtEnd(Create<Packet>(truncated, sizeof(truncated)));
+
+        RplDaoHeader received;
+        packet->RemoveHeader(received);
+        NS_TEST_ASSERT_MSG_EQ(received.GetTarget(),
+                              Ipv6Address("2001:1::5"),
+                              "A truncated trailing option overwrote the real target");
+        NS_TEST_ASSERT_MSG_EQ(received.GetParent(),
+                              Ipv6Address("2001:1::4"),
+                              "A truncated trailing option overwrote the real parent");
+    }
+
+    // An option this implementation does not know, sitting between the two
+    // it does: skipped by its own Length, with the Transit Information
+    // behind it still found.
+    {
+        RplDaoHeader targetOnly;
+        targetOnly.SetTarget(Ipv6Address("2001:1::7"));
+        targetOnly.SetTransitInformation(Ipv6Address("2001:1::6"), 2, 30);
+        Ptr<Packet> packet = Create<Packet>();
+        packet->AddHeader(targetOnly);
+
+        const uint8_t unknown[6] = {RPL_OPTION_TARGET_DESC, 4, 0xde, 0xad, 0xbe, 0xef};
+        packet->AddAtEnd(Create<Packet>(unknown, sizeof(unknown)));
+
+        RplDaoHeader received;
+        packet->RemoveHeader(received);
+        NS_TEST_ASSERT_MSG_EQ(received.GetTarget(), Ipv6Address("2001:1::7"), "Wrong target");
+        NS_TEST_ASSERT_MSG_EQ(received.GetParent(), Ipv6Address("2001:1::6"), "Wrong parent");
+    }
+
+    // The DAO-ACK's 'D' flag decides whether the DODAGID is on the wire at
+    // all (RFC 6550 section 6.5), so the header is 4 or 20 octets.
+    {
+        RplDaoAckHeader compact;
+        compact.SetInstanceId(255);
+        compact.SetSequence(255);
+        compact.SetStatus(255);
+        NS_TEST_ASSERT_MSG_EQ(compact.GetSerializedSize(),
+                              4,
+                              "A DAO-ACK with no DODAGID is four octets");
+
+        Ptr<Packet> packet = Create<Packet>();
+        packet->AddHeader(compact);
+        RplDaoAckHeader received;
+        NS_TEST_ASSERT_MSG_EQ(packet->RemoveHeader(received), 4, "Unexpected deserialized size");
+        NS_TEST_ASSERT_MSG_EQ(+received.GetInstanceId(), 255, "Wrong RPLInstanceID");
+        NS_TEST_ASSERT_MSG_EQ(+received.GetSequence(), 255, "Wrong DAO sequence");
+        NS_TEST_ASSERT_MSG_EQ(+received.GetStatus(), 255, "Wrong status");
+        NS_TEST_ASSERT_MSG_EQ(received.GetDodagId(),
+                              Ipv6Address::GetAny(),
+                              "A DODAGID was read out of a four-octet DAO-ACK");
+
+        // And back the other way: a DODAGID set on the same object has to
+        // make the header grow again.
+        received.SetDodagId(Ipv6Address("2001:1::1"));
+        NS_TEST_ASSERT_MSG_EQ(received.GetSerializedSize(),
+                              20,
+                              "Setting a DODAGID did not grow the DAO-ACK");
+    }
 }
 
 /**
@@ -669,6 +1216,218 @@ RplSourceRoutingCompressionTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief Check the RFC 6554 Routing Header at the edges of its wire format:
+ *        an empty address list, the longest list an eight-bit Hdr Ext Len
+ *        can describe in either compression regime, and the extremes of
+ *        Segments Left.
+ */
+class RplSourceRoutingBoundaryTestCase : public TestCase
+{
+  public:
+    RplSourceRoutingBoundaryTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplSourceRoutingBoundaryTestCase::RplSourceRoutingBoundaryTestCase()
+    : TestCase("Source routing header boundary sizes")
+{
+}
+
+void
+RplSourceRoutingBoundaryTestCase::DoRun()
+{
+    // No addresses at all: the fixed eight octets and nothing else. Never
+    // sent by this implementation (PrepareOutgoingPacket() only attaches a
+    // Routing Header for a path of more than one hop), but a header of this
+    // shape is well formed and must round trip.
+    {
+        RplSourceRoutingHeader srh;
+        srh.SetNextHeader(59);
+        srh.SetSegmentsLeft(0);
+        srh.SetAddresses({});
+        NS_TEST_ASSERT_MSG_EQ(srh.GetSerializedSize(), 8, "An empty RH3 is eight octets");
+
+        Ptr<Packet> packet = Create<Packet>();
+        packet->AddHeader(srh);
+        RplSourceRoutingHeader received;
+        NS_TEST_ASSERT_MSG_EQ(packet->RemoveHeader(received), 8, "Unexpected deserialized size");
+        NS_TEST_ASSERT_MSG_EQ(received.GetAddresses().size(), 0, "An address appeared from nowhere");
+        NS_TEST_ASSERT_MSG_EQ(received.GetSegmentsLeft(), 0, "Wrong number of segments left");
+    }
+
+    // 127 global addresses: (127 - 1) * 16 + 16 + 8 = 2040 octets, Hdr Ext
+    // Len 254. One more would not fit the eight-bit field at all.
+    {
+        std::vector<Ipv6Address> addresses(127, Ipv6Address("2001:1::ff:fe00:1"));
+        RplSourceRoutingHeader srh;
+        srh.SetNextHeader(59);
+        srh.SetSegmentsLeft(127);
+        srh.SetAddresses(addresses);
+        NS_TEST_ASSERT_MSG_EQ(srh.GetSerializedSize(),
+                              2040,
+                              "Wrong size for the longest uncompressed address list");
+        NS_TEST_ASSERT_MSG_LT_OR_EQ(srh.GetSerializedSize(),
+                                    RplSourceRoutingHeader::MAX_SERIALIZED_SIZE,
+                                    "The longest uncompressed list does not fit Hdr Ext Len");
+
+        Ptr<Packet> packet = Create<Packet>();
+        packet->AddHeader(srh);
+        RplSourceRoutingHeader received;
+        NS_TEST_ASSERT_MSG_EQ(packet->RemoveHeader(received), 2040, "Unexpected deserialized size");
+        NS_TEST_ASSERT_MSG_EQ(received.GetAddresses().size(), 127, "Wrong number of addresses");
+        NS_TEST_ASSERT_MSG_EQ(received.GetAddress(126),
+                              Ipv6Address("2001:1::ff:fe00:1"),
+                              "The last of 127 addresses was lost");
+    }
+
+    // Rewriting one entry can change how much of the list compresses, and
+    // so the size of the whole header: this is why a hop that relays a
+    // source routed packet has to recompute the IPv6 Payload Length from
+    // the rebuilt header rather than carry the one it arrived with
+    // (RplIpv6ExtensionSourceRouting::Process()).
+    {
+        RplSourceRoutingHeader srh;
+        srh.SetNextHeader(59);
+        srh.SetSegmentsLeft(3);
+        srh.SetAddresses({Ipv6Address("fe80::2"),
+                          Ipv6Address("fe80::3"),
+                          Ipv6Address("2001:1::ff:fe00:4")});
+        // CmprI = 8 (both relay hops are link-local), CmprE = 0.
+        NS_TEST_ASSERT_MSG_EQ(srh.GetSerializedSize(), 8 + 8 + 8 + 16, "Unexpected initial size");
+
+        // What a relay hop does: the slot it was addressed under takes the
+        // packet's current destination, a global address here, which stops
+        // the non-last entries from all being link-local and so turns
+        // CmprI off.
+        srh.SetAddress(0, Ipv6Address("2001:1::ff:fe00:1"));
+        NS_TEST_ASSERT_MSG_EQ(srh.GetSerializedSize(),
+                              8 + 16 + 16 + 16,
+                              "Rewriting an entry did not change the compressed size");
+
+        Ptr<Packet> packet = Create<Packet>();
+        packet->AddHeader(srh);
+        RplSourceRoutingHeader received;
+        NS_TEST_ASSERT_MSG_EQ(packet->RemoveHeader(received),
+                              8 + 16 + 16 + 16,
+                              "The rewritten header did not round trip at its new size");
+        NS_TEST_ASSERT_MSG_EQ(received.GetAddress(0),
+                              Ipv6Address("2001:1::ff:fe00:1"),
+                              "The rewritten entry was lost");
+        NS_TEST_ASSERT_MSG_EQ(received.GetAddress(1),
+                              Ipv6Address("fe80::3"),
+                              "An entry that was not rewritten changed");
+    }
+
+    // 255 link-local addresses: every entry compresses to eight octets, so
+    // 255 * 8 + 8 = 2048, Hdr Ext Len 255, the largest RH3 there is.
+    {
+        std::vector<Ipv6Address> addresses(255, Ipv6Address("fe80::1"));
+        RplSourceRoutingHeader srh;
+        srh.SetNextHeader(59);
+        srh.SetSegmentsLeft(255);
+        srh.SetAddresses(addresses);
+        NS_TEST_ASSERT_MSG_EQ(srh.GetSerializedSize(),
+                              RplSourceRoutingHeader::MAX_SERIALIZED_SIZE,
+                              "Wrong size for the longest compressed address list");
+
+        Ptr<Packet> packet = Create<Packet>();
+        packet->AddHeader(srh);
+        RplSourceRoutingHeader received;
+        NS_TEST_ASSERT_MSG_EQ(packet->RemoveHeader(received), 2048, "Unexpected deserialized size");
+        NS_TEST_ASSERT_MSG_EQ(received.GetAddresses().size(), 255, "Wrong number of addresses");
+        NS_TEST_ASSERT_MSG_EQ(received.GetSegmentsLeft(), 255, "Wrong number of segments left");
+        NS_TEST_ASSERT_MSG_EQ(received.GetAddress(254),
+                              Ipv6Address("fe80::1"),
+                              "The last of 255 compressed addresses was lost");
+    }
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief Check that a Routing Header whose Hdr Ext Len claims more octets
+ *        than the packet actually carries is clamped to what is really
+ *        there rather than read past the end of the buffer.
+ *
+ * RFC 8200 section 4.4's Hdr Ext Len is written by the sender, so a
+ * truncated or hand-built header can claim any length at all. ns-3's
+ * Buffer::Iterator only range-checks under NS_ASSERT, which an optimized
+ * build compiles out, so the parser has to do the checking itself.
+ */
+class RplSourceRoutingTruncatedTestCase : public TestCase
+{
+  public:
+    RplSourceRoutingTruncatedTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplSourceRoutingTruncatedTestCase::RplSourceRoutingTruncatedTestCase()
+    : TestCase("Source routing header with a Hdr Ext Len past the end of the packet")
+{
+}
+
+void
+RplSourceRoutingTruncatedTestCase::DoRun()
+{
+    // Eight octets of RH3 and nothing else, claiming 30 more eight-octet
+    // units (248 octets of addresses) follow.
+    {
+        uint8_t raw[8] = {59, 30, RPL_RH_TYPE_SRH, 1, 0x00, 0, 0, 0};
+        Ptr<Packet> packet = Create<Packet>(raw, sizeof(raw));
+
+        RplSourceRoutingHeader received;
+        NS_TEST_ASSERT_MSG_EQ(packet->RemoveHeader(received),
+                              8,
+                              "A Hdr Ext Len past the end of the packet was not clamped");
+        NS_TEST_ASSERT_MSG_EQ(received.GetAddresses().size(),
+                              0,
+                              "Addresses were reconstructed out of bytes that are not there");
+        NS_TEST_ASSERT_MSG_EQ(packet->GetSize(), 0, "More was consumed than the packet held");
+    }
+
+    // Partially truncated: room for one uncompressed address, but the
+    // header claims two.
+    {
+        uint8_t raw[24] = {59, 2, RPL_RH_TYPE_SRH, 2, 0x00, 0, 0, 0};
+        Ipv6Address("2001:1::5").Serialize(raw + 8);
+        // Only 24 of the 40 octets a Hdr Ext Len of 2 would need.
+        Ptr<Packet> packet = Create<Packet>(raw, sizeof(raw));
+
+        RplSourceRoutingHeader received;
+        NS_TEST_ASSERT_MSG_EQ(packet->RemoveHeader(received),
+                              24,
+                              "The size consumed was not clamped to the packet");
+        NS_TEST_ASSERT_MSG_EQ(received.GetAddresses().size(),
+                              1,
+                              "Wrong number of addresses recovered from a truncated header");
+        NS_TEST_ASSERT_MSG_EQ(received.GetAddress(0),
+                              Ipv6Address("2001:1::5"),
+                              "The one address that was really there was misparsed");
+    }
+
+    // A Hdr Ext Len of 0, i.e. the eight fixed octets and no address, with
+    // Segments Left claiming otherwise: nothing to read, and the
+    // inconsistency is Process()'s to reject, not Deserialize()'s.
+    {
+        uint8_t raw[8] = {59, 0, RPL_RH_TYPE_SRH, 4, 0x00, 0, 0, 0};
+        Ptr<Packet> packet = Create<Packet>(raw, sizeof(raw));
+
+        RplSourceRoutingHeader received;
+        NS_TEST_ASSERT_MSG_EQ(packet->RemoveHeader(received), 8, "Unexpected deserialized size");
+        NS_TEST_ASSERT_MSG_EQ(received.GetAddresses().size(), 0, "An address appeared from nowhere");
+        NS_TEST_ASSERT_MSG_EQ(received.GetSegmentsLeft(), 4, "Segments Left was not read");
+    }
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Check the Trickle timer of RFC 6206: the interval doubles up to Imax,
  *        every transmission falls in [I/2, I), a reset goes back to Imin and
  *        the redundancy constant suppresses a redundant transmission.
@@ -768,6 +1527,57 @@ RplTrickleTimerTestCase::DoRun()
 
     NS_TEST_ASSERT_MSG_EQ(m_transmissions.size(), 0, "The redundancy constant did not suppress");
     suppressed.Stop();
+    Simulator::Destroy();
+
+    // A timer that was never started ignores a reset: Reset() reschedules,
+    // and rescheduling one that is not running would start it behind the
+    // caller's back.
+    RplTrickleTimer idle;
+    idle.SetParameters(Seconds(1), 2, 0);
+    idle.SetFunction(MakeCallback(&RplTrickleTimerTestCase::Transmit, this));
+    idle.AssignStreams(1);
+    idle.Reset();
+    NS_TEST_ASSERT_MSG_EQ(idle.IsRunning(), false, "A reset started a timer that was not running");
+
+    m_transmissions.clear();
+    Simulator::Stop(Seconds(5));
+    Simulator::Run();
+    NS_TEST_ASSERT_MSG_EQ(m_transmissions.size(), 0, "A timer that was never started transmitted");
+    Simulator::Destroy();
+
+    // Zero doublings: Imax equals Imin, so the interval never grows and
+    // every interval is one second long. Stopping at 10 s, on an interval
+    // boundary, makes the count exact.
+    m_transmissions.clear();
+    RplTrickleTimer flat;
+    flat.SetParameters(Seconds(1), 0, 0);
+    flat.SetFunction(MakeCallback(&RplTrickleTimerTestCase::Transmit, this));
+    flat.AssignStreams(1);
+
+    Simulator::Schedule(Seconds(0), &RplTrickleTimer::Start, &flat);
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(flat.GetInterval(), Seconds(1), "Imax should equal Imin at 0 doublings");
+    NS_TEST_ASSERT_MSG_EQ(m_transmissions.size(),
+                          10,
+                          "One transmission per one-second interval was expected");
+
+    // A reset while already at Imin changes nothing, and in particular must
+    // not reschedule the transmission that is already pending for this
+    // interval into an extra one.
+    size_t before = m_transmissions.size();
+    flat.Reset();
+    NS_TEST_ASSERT_MSG_EQ(flat.GetInterval(), Seconds(1), "A reset at Imin moved the interval");
+    // One more interval: Simulator::Stop() takes a delay from now, not an
+    // absolute time.
+    Simulator::Stop(Seconds(1));
+    Simulator::Run();
+    NS_TEST_ASSERT_MSG_EQ(m_transmissions.size(),
+                          before + 1,
+                          "A reset at Imin produced an extra transmission");
+
+    flat.Stop();
     Simulator::Destroy();
 }
 
@@ -1138,6 +1948,287 @@ RplMrhofSelectionTestCase::DoRun()
                           "A large enough improvement should switch the preferred parent");
     NS_TEST_ASSERT_MSG_EQ(leaf->GetPathEtx(), 128, "Wrong path cost via peerB");
     NS_TEST_ASSERT_MSG_EQ(leaf->GetRank(), 256, "Wrong MRHOF rank via peerB");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief Check which DIOs RplRoutingProtocol::HandleDio() acts on and which
+ *        it turns away: a mode of operation it does not implement, another
+ *        RPL instance or DODAG, a stale DODAG version, and the infinite
+ *        rank RFC 6550 section 8.2.2.5 uses to poison a sub-DODAG.
+ *
+ * Driven the same way RplMrhofSelectionTestCase is: one node under test,
+ * fed hand-built DIOs sourced from a second real node that need not run RPL
+ * itself.
+ */
+class RplDioRejectionTestCase : public TestCase
+{
+  public:
+    RplDioRejectionTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplDioRejectionTestCase::RplDioRejectionTestCase()
+    : TestCase("DIOs HandleDio() must turn away")
+{
+}
+
+void
+RplDioRejectionTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2); // 0 = node under test, 1 = the peer sending the DIOs
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+    rplHelper.AssignStreams(nodes, 1);
+
+    Ptr<RplRoutingProtocol> node = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ipv6Address dodagId("2001:1::1");
+    Ipv6Address otherDodagId("2001:2::1");
+    Ipv6Address nodeLinkLocal =
+        nodes.Get(0)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address peerLinkLocal =
+        nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    auto buildDio = [](Ipv6Address id, uint8_t version, uint16_t rank, uint8_t mop) {
+        RplDioHeader dio;
+        dio.SetInstanceId(RPL_DEFAULT_INSTANCE);
+        dio.SetVersionNumber(version);
+        dio.SetRank(rank);
+        dio.SetMop(mop);
+        dio.SetDodagId(id);
+        dio.SetDagConfiguration(RPL_DIO_INTERVAL_DOUBLINGS,
+                                RPL_DIO_INTERVAL_MIN,
+                                RPL_DIO_REDUNDANCY,
+                                RPL_MAX_RANKINC,
+                                RPL_MIN_HOPRANKINC,
+                                RPL_OCP_OF0,
+                                RPL_DEFAULT_LIFETIME,
+                                RPL_DEFAULT_LIFETIME_UNIT);
+        return dio;
+    };
+
+    auto send = [&](const RplDioHeader& dio) {
+        Simulator::Schedule(Seconds(0),
+                            &SendRawRplMessage<RplDioHeader>,
+                            nodes.Get(1),
+                            1,
+                            dio,
+                            static_cast<uint8_t>(RPL_CODE_DIO),
+                            peerLinkLocal,
+                            nodeLinkLocal);
+        Simulator::Stop(MilliSeconds(10));
+        Simulator::Run();
+    };
+
+    // Storing mode: not implemented here, so nothing about this DIO may be
+    // acted on, not even to join the DODAG it advertises.
+    send(buildDio(dodagId, 1, RPL_MIN_HOPRANKINC, RPL_MOP_STORING_NO_MULTICAST));
+    NS_TEST_ASSERT_MSG_EQ(node->IsJoined(),
+                          false,
+                          "A DIO advertising storing mode was joined anyway");
+
+    // Likewise a mode of operation with no downward routes at all.
+    send(buildDio(dodagId, 1, RPL_MIN_HOPRANKINC, RPL_MOP_NO_DOWNWARD_ROUTES));
+    NS_TEST_ASSERT_MSG_EQ(node->IsJoined(), false, "A DIO with MOP 0 was joined anyway");
+
+    // An infinite rank poisons a sub-DODAG (RFC 6550 section 8.2.2.5): a
+    // node that has not joined anything has nothing to poison, and must not
+    // treat it as an invitation either.
+    send(buildDio(dodagId, 1, RPL_INFINITE_RANK, RPL_MOP_NON_STORING));
+    NS_TEST_ASSERT_MSG_EQ(node->IsJoined(),
+                          false,
+                          "A DIO advertising an infinite rank was joined");
+
+    // A well-formed non-storing DIO: this one is joined.
+    send(buildDio(dodagId, 5, RPL_MIN_HOPRANKINC, RPL_MOP_NON_STORING));
+    NS_TEST_ASSERT_MSG_EQ(node->IsJoined(), true, "A valid DIO did not bootstrap a DODAG");
+    NS_TEST_ASSERT_MSG_EQ(node->GetDodagId(), dodagId, "Joined the wrong DODAG");
+    NS_TEST_ASSERT_MSG_EQ(node->GetPreferredParent(), peerLinkLocal, "Wrong preferred parent");
+    NS_TEST_ASSERT_MSG_EQ(node->GetRank(), 2 * RPL_MIN_HOPRANKINC, "Wrong rank one hop out");
+
+    // Another DODAG entirely, advertising a better rank: ignored, since
+    // this node already belongs to one.
+    send(buildDio(otherDodagId, 9, 1, RPL_MOP_NON_STORING));
+    NS_TEST_ASSERT_MSG_EQ(node->GetDodagId(), dodagId, "A DIO for another DODAG was adopted");
+    NS_TEST_ASSERT_MSG_EQ(node->GetRank(), 2 * RPL_MIN_HOPRANKINC, "Its rank was adopted too");
+
+    // A stale version of the DODAG this node is in: ignored.
+    send(buildDio(dodagId, 4, 1, RPL_MOP_NON_STORING));
+    NS_TEST_ASSERT_MSG_EQ(node->GetRank(),
+                          2 * RPL_MIN_HOPRANKINC,
+                          "A DIO for a stale DODAG version changed the rank");
+
+    // A newer version: the node leaves and rejoins on it.
+    send(buildDio(dodagId, 6, RPL_MIN_HOPRANKINC, RPL_MOP_NON_STORING));
+    NS_TEST_ASSERT_MSG_EQ(node->IsJoined(), true, "The node did not rejoin on the new version");
+    NS_TEST_ASSERT_MSG_EQ(node->GetDodagId(), dodagId, "The DODAG changed on a version bump");
+    NS_TEST_ASSERT_MSG_EQ(node->GetPreferredParent(),
+                          peerLinkLocal,
+                          "The parent was not picked up again after the version bump");
+
+    // The only parent poisons itself: with nothing left to attach to, the
+    // node leaves the DODAG and goes back to soliciting.
+    send(buildDio(dodagId, 6, RPL_INFINITE_RANK, RPL_MOP_NON_STORING));
+    NS_TEST_ASSERT_MSG_EQ(node->GetPreferredParent(),
+                          Ipv6Address::GetAny(),
+                          "A poisoned parent stayed selected");
+    NS_TEST_ASSERT_MSG_EQ(node->GetRank(), RPL_INFINITE_RANK, "The rank was not invalidated");
+    NS_TEST_ASSERT_MSG_EQ(node->IsJoined(), false, "The node stayed in a DODAG it cannot reach");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief Check what the root's downward path computation does with a
+ *        topology that does not lead anywhere: an entry whose reported
+ *        parents form a cycle, one whose lifetime has run out, and a
+ *        destination it never heard of at all.
+ *
+ * The DAOs that build these are hand-made (@see SendRawRplMessage): a node
+ * running this implementation only ever reports its real preferred parent,
+ * so none of these shapes can arise from one.
+ */
+class RplComputeSourceRouteFailureTestCase : public TestCase
+{
+  public:
+    RplComputeSourceRouteFailureTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplComputeSourceRouteFailureTestCase::RplComputeSourceRouteFailureTestCase()
+    : TestCase("Downward path computation over an unusable topology")
+{
+}
+
+void
+RplComputeSourceRouteFailureTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(60));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> root = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ipv6Address rootAddress = root->GetGlobalAddress();
+    Ptr<RplRoutingProtocol> child = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    Ipv6Address childAddress = child->GetGlobalAddress();
+    NS_TEST_ASSERT_MSG_EQ(root->GetTopologySize(), 1, "The root did not learn the child's DAO");
+
+    std::vector<Ipv6Address> hops;
+
+    // A destination no DAO ever mentioned.
+    NS_TEST_ASSERT_MSG_EQ(root->ComputeSourceRoute(Ipv6Address("2001:1::dead"), hops),
+                          false,
+                          "The root invented a path to a node it never heard of");
+    NS_TEST_ASSERT_MSG_EQ(hops.size(), 0, "A failed path computation left hops behind");
+
+    // Two nodes reporting each other as their parent: the walk up the
+    // parents never reaches the root, and must terminate rather than spin.
+    Ipv6Address cycleA("2001:1::ff:fe00:aa");
+    Ipv6Address cycleB("2001:1::ff:fe00:bb");
+
+    auto sendDao = [&](Ipv6Address target, Ipv6Address parent, uint8_t lifetime) {
+        RplDaoHeader dao;
+        dao.SetInstanceId(RPL_DEFAULT_INSTANCE);
+        dao.SetSequence(1);
+        dao.SetTarget(target);
+        dao.SetTransitInformation(parent, 1, lifetime);
+        Simulator::Schedule(Seconds(0),
+                            &SendRawRplMessage<RplDaoHeader>,
+                            nodes.Get(1),
+                            1,
+                            dao,
+                            static_cast<uint8_t>(RPL_CODE_DAO),
+                            childAddress,
+                            rootAddress);
+        Simulator::Stop(MilliSeconds(10));
+        Simulator::Run();
+    };
+
+    sendDao(cycleA, cycleB, RPL_DEFAULT_LIFETIME);
+    sendDao(cycleB, cycleA, RPL_DEFAULT_LIFETIME);
+    NS_TEST_ASSERT_MSG_EQ(root->GetTopologySize(), 3, "The hand-built DAOs were not recorded");
+
+    NS_TEST_ASSERT_MSG_EQ(root->ComputeSourceRoute(cycleA, hops),
+                          false,
+                          "A cycle in the reported parents produced a path anyway");
+    NS_TEST_ASSERT_MSG_EQ(hops.size(), 0, "A failed path computation left hops behind");
+
+    // A parent chain that simply stops at a node the root has no entry for.
+    Ipv6Address orphan("2001:1::ff:fe00:cc");
+    sendDao(orphan, Ipv6Address("2001:1::ff:fe00:dd"), RPL_DEFAULT_LIFETIME);
+    NS_TEST_ASSERT_MSG_EQ(root->ComputeSourceRoute(orphan, hops),
+                          false,
+                          "A parent chain that never reaches the root produced a path");
+
+    // The real child is still reachable throughout: none of the broken
+    // entries above may take the working one down with them.
+    NS_TEST_ASSERT_MSG_EQ(root->ComputeSourceRoute(childAddress, hops),
+                          true,
+                          "The one usable entry was lost among the broken ones");
+    NS_TEST_ASSERT_MSG_EQ(hops.size(), 1, "A direct child is one hop: itself");
+
+    // An entry whose lifetime has run out is no longer a path, even before
+    // anything purges it from the table. PathLifetime 1 with the default
+    // lifetime unit of 60 s expires a minute out.
+    Ipv6Address expiring("2001:1::ff:fe00:ee");
+    sendDao(expiring, rootAddress, 1);
+    NS_TEST_ASSERT_MSG_EQ(root->ComputeSourceRoute(expiring, hops),
+                          true,
+                          "A freshly advertised entry was not usable");
+
+    Simulator::Stop(Seconds(61));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(root->ComputeSourceRoute(expiring, hops),
+                          false,
+                          "An expired entry was still used to build a path");
 
     Simulator::Destroy();
 }
@@ -1921,6 +3012,235 @@ RplPacketInfoHeaderTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief Check that the RPL Option carries sub-TLVs through unchanged.
+ *
+ * RFC 6553 section 3: "The RPL Option Data Length is variable", and "A RPL
+ * device MUST skip over any unrecognized sub-TLVs and attempt to process any
+ * additional sub-TLVs that may appear after." This implementation defines no
+ * sub-TLV of its own, so the whole of that requirement is: read past them,
+ * do not eat them, and put them back on the wire byte for byte.
+ */
+class RplPacketInfoSubTlvTestCase : public TestCase
+{
+  public:
+    RplPacketInfoSubTlvTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplPacketInfoSubTlvTestCase::RplPacketInfoSubTlvTestCase()
+    : TestCase("RPL Option sub-TLVs survive parsing and reserialization")
+{
+}
+
+void
+RplPacketInfoSubTlvTestCase::DoRun()
+{
+    // Option Type, Opt Data Len 8 (the four base octets plus a four-octet
+    // sub-TLV), flags, RPLInstanceID, SenderRank, then the sub-TLV.
+    const uint8_t raw[10] =
+        {RPL_HBH_OPTION_TYPE, 8, RPL_HDR_OPT_DOWN, 7, 0x01, 0x80, 0xde, 0xad, 0xbe, 0xef};
+    Ptr<Packet> packet = Create<Packet>(raw, sizeof(raw));
+
+    RplPacketInfoHeader received;
+    NS_TEST_ASSERT_MSG_EQ(packet->RemoveHeader(received),
+                          10,
+                          "A sub-TLV-carrying option did not report its full length");
+    NS_TEST_ASSERT_MSG_EQ(received.IsMalformed(), false, "A well-formed option was rejected");
+    NS_TEST_ASSERT_MSG_EQ(received.GetDown(), true, "The 'O' flag was lost");
+    NS_TEST_ASSERT_MSG_EQ(received.GetInstanceId(), 7, "Wrong RPLInstanceID");
+    NS_TEST_ASSERT_MSG_EQ(received.GetSenderRank(), 384, "Wrong SenderRank");
+    NS_TEST_ASSERT_MSG_EQ(received.GetSubTlvs().size(), 4, "Wrong number of sub-TLV bytes kept");
+    NS_TEST_ASSERT_MSG_EQ(received.GetSerializedSize(),
+                          10,
+                          "GetSerializedSize() does not account for the sub-TLV");
+
+    // Back onto a packet: the sub-TLV has to come out exactly as it went in.
+    Ptr<Packet> rebuilt = Create<Packet>();
+    rebuilt->AddHeader(received);
+    NS_TEST_ASSERT_MSG_EQ(rebuilt->GetSize(), 10, "The reserialized option changed size");
+
+    uint8_t out[10] = {0};
+    rebuilt->CopyData(out, sizeof(out));
+    for (uint32_t i = 0; i < sizeof(raw); i++)
+    {
+        NS_TEST_ASSERT_MSG_EQ(+out[i],
+                              +raw[i],
+                              "Byte " << i << " of the option changed across a round trip");
+    }
+
+    // The plain four-octet option has no sub-TLV at all.
+    RplPacketInfoHeader plain;
+    plain.SetSenderRank(128);
+    NS_TEST_ASSERT_MSG_EQ(plain.GetSubTlvs().size(), 0, "A bare option invented a sub-TLV");
+    NS_TEST_ASSERT_MSG_EQ(plain.GetSerializedSize(),
+                          RplPacketInfoHeader::RPI_BASE_SIZE,
+                          "A bare option is six octets");
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief Check that an RPL Option whose Opt Data Len cannot be trusted is
+ *        rejected rather than acted on.
+ *
+ * RFC 6553 section 3's Opt Data Len is whatever the sender wrote. Too short
+ * for the four mandatory base octets, or longer than the packet actually
+ * carries, and there is nothing to parse; either way the value must not be
+ * reported back to ns3::Ipv6Extension::ProcessOptions(), which advances its
+ * walk of the option list by exactly that much -- and, since
+ * Ipv6Option::Process() returns a uint8_t, an Opt Data Len of 254 reports
+ * 256, i.e. 0, which advances it not at all.
+ */
+class RplPacketInfoMalformedTestCase : public TestCase
+{
+  public:
+    RplPacketInfoMalformedTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplPacketInfoMalformedTestCase::RplPacketInfoMalformedTestCase()
+    : TestCase("RPL Option with an untrustworthy Opt Data Len")
+{
+}
+
+void
+RplPacketInfoMalformedTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(1);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.AssignWithoutAddress(devices);
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+
+    Simulator::Stop(Seconds(2));
+    Simulator::Run();
+
+    Ptr<Ipv6OptionDemux> demux = nodes.Get(0)->GetObject<Ipv6OptionDemux>();
+    Ptr<Ipv6Option> option = demux->GetOption(RPL_HBH_OPTION_TYPE);
+    NS_TEST_ASSERT_MSG_EQ(option != nullptr, true, "RplIpv6OptionRpl was not registered");
+
+    Ipv6Header ipv6Header;
+    ipv6Header.SetSource(Ipv6Address("fe80::9"));
+    ipv6Header.SetDestination(Ipv6Address("2001:1::ff:fe00:1"));
+    ipv6Header.SetHopLimit(64);
+
+    // Six octets are all that is really present in each of these, whatever
+    // the length field claims: 0-3 cannot hold the base octets at all, and
+    // 5 upwards claims bytes past the end of the packet. 254 is the one
+    // that used to report 0 and stall ProcessOptions()' walk outright.
+    for (uint8_t declared : {0, 1, 2, 3, 5, 10, 100, 253, 254, 255})
+    {
+        uint8_t raw[6] = {RPL_HBH_OPTION_TYPE, declared, 0, 0, 0xff, 0xff};
+        Ptr<Packet> packet = Create<Packet>(raw, sizeof(raw));
+
+        RplPacketInfoHeader parsed;
+        NS_TEST_ASSERT_MSG_EQ(packet->PeekHeader(parsed),
+                              2,
+                              "Opt Data Len " << +declared
+                                              << " was parsed as if the bytes were there");
+        NS_TEST_ASSERT_MSG_EQ(parsed.IsMalformed(),
+                              true,
+                              "Opt Data Len " << +declared << " was not flagged as malformed");
+
+        bool isDropped = false;
+        uint8_t processed = option->Process(packet, 0, ipv6Header, isDropped);
+        NS_TEST_ASSERT_MSG_EQ(isDropped,
+                              true,
+                              "Opt Data Len " << +declared << " was not dropped");
+        NS_TEST_ASSERT_MSG_EQ(+processed,
+                              2,
+                              "Opt Data Len " << +declared
+                                              << " reported more consumed than was read");
+        NS_TEST_ASSERT_MSG_GT(+processed,
+                              0,
+                              "Opt Data Len " << +declared
+                                              << " reported no progress, stalling the option walk");
+        NS_TEST_ASSERT_MSG_EQ(packet->GetSize(),
+                              sizeof(raw),
+                              "Opt Data Len " << +declared << " grew the packet");
+    }
+
+    // The other side of the boundary: an Opt Data Len of 4 with the bytes
+    // actually present is the ordinary option and must be processed.
+    {
+        uint8_t raw[6] = {RPL_HBH_OPTION_TYPE, 4, 0, 0, 0x02, 0x00};
+        Ptr<Packet> packet = Create<Packet>(raw, sizeof(raw));
+
+        RplPacketInfoHeader parsed;
+        NS_TEST_ASSERT_MSG_EQ(packet->PeekHeader(parsed), 6, "A bare option was not parsed");
+        NS_TEST_ASSERT_MSG_EQ(parsed.IsMalformed(), false, "A bare option was called malformed");
+
+        bool isDropped = false;
+        uint8_t processed = option->Process(packet, 0, ipv6Header, isDropped);
+        NS_TEST_ASSERT_MSG_EQ(isDropped, false, "A well-formed option was dropped");
+        NS_TEST_ASSERT_MSG_EQ(+processed, 6, "Wrong number of bytes reported consumed");
+    }
+
+    // 253 is the longest Opt Data Len ns-3 can report back through
+    // Ipv6Option::Process()' eight-bit return value (253 + 2 = 255): with
+    // the bytes really there it parses, one octet more and it cannot.
+    {
+        std::vector<uint8_t> raw(255, 0xa5);
+        raw[0] = RPL_HBH_OPTION_TYPE;
+        raw[1] = 253;
+        raw[2] = 0;
+        raw[3] = 0;
+        raw[4] = 0x01;
+        raw[5] = 0x00;
+        Ptr<Packet> packet = Create<Packet>(raw.data(), raw.size());
+
+        RplPacketInfoHeader parsed;
+        NS_TEST_ASSERT_MSG_EQ(packet->PeekHeader(parsed),
+                              255,
+                              "The longest representable option was not parsed");
+        NS_TEST_ASSERT_MSG_EQ(parsed.IsMalformed(), false, "It was called malformed");
+        NS_TEST_ASSERT_MSG_EQ(parsed.GetSubTlvs().size(), 249, "Wrong sub-TLV length");
+
+        bool isDropped = false;
+        uint8_t processed = option->Process(packet, 0, ipv6Header, isDropped);
+        NS_TEST_ASSERT_MSG_EQ(isDropped, false, "The longest representable option was dropped");
+        NS_TEST_ASSERT_MSG_EQ(+processed, 255, "Wrong number of bytes reported consumed");
+    }
+
+    {
+        std::vector<uint8_t> raw(256, 0xa5);
+        raw[0] = RPL_HBH_OPTION_TYPE;
+        raw[1] = 254;
+        raw[2] = 0;
+        raw[3] = 0;
+        raw[4] = 0x01;
+        raw[5] = 0x00;
+        Ptr<Packet> packet = Create<Packet>(raw.data(), raw.size());
+
+        RplPacketInfoHeader parsed;
+        NS_TEST_ASSERT_MSG_EQ(packet->PeekHeader(parsed),
+                              2,
+                              "An option ns-3 cannot report the length of was parsed anyway");
+        NS_TEST_ASSERT_MSG_EQ(parsed.IsMalformed(), true, "It was not flagged as malformed");
+    }
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Check RplIpv6OptionRpl::Process(): the rank consistency check in
  *        both directions, the once-then-confirmed inconsistency sequence of
  *        RFC 6550 section 11.2, and that processing the same packet twice
@@ -2057,27 +3377,99 @@ RplPacketInfoProcessTestCase::DoRun()
         NS_TEST_ASSERT_MSG_EQ(isDropped, true, "A confirmed inconsistency was not traced as dropped");
     }
 
-    // Ipv6L3Protocol::Receive() walks the Hop-by-Hop chain twice for a
-    // locally-destined packet; the second call must be a no-op rather than
-    // re-checking the SenderRank this same call already rewrote to this
-    // node's own.
+    // The same check the other way round (RFC 6550 section 11.2): a packet
+    // moving down should come from a sender closer to the root, i.e. of
+    // lower rank. Both sides of the boundary, plus the boundary itself --
+    // an equal rank is an inconsistency in either direction, since a hop
+    // has to change the distance to the root one way or the other.
+    struct
+    {
+        bool down;             //!< the 'O' flag under test
+        int senderRankOffset;  //!< the sender's rank, relative to this node's
+        bool expectRankError;  //!< whether the 'R' flag should come back set
+        const char* what;      //!< what the case is, for the failure message
+    } directionCases[] = {
+        {false, +1, false, "a sender one step further from the root, moving up"},
+        {false, 0, true, "a sender of equal rank, moving up"},
+        {false, -1, true, "a sender closer to the root, moving up"},
+        {true, -1, false, "a sender one step closer to the root, moving down"},
+        {true, 0, true, "a sender of equal rank, moving down"},
+        {true, +1, true, "a sender further from the root, moving down"},
+    };
+
+    for (const auto& testCase : directionCases)
     {
         RplPacketInfoHeader rpi;
-        rpi.SetDown(false);
-        rpi.SetSenderRank(ownRank + RPL_MIN_HOPRANKINC);
+        rpi.SetDown(testCase.down);
+        rpi.SetSenderRank(
+            static_cast<uint16_t>(ownRank + testCase.senderRankOffset * RPL_MIN_HOPRANKINC));
 
         Ptr<Packet> packet = Create<Packet>();
         packet->AddHeader(rpi);
 
         bool isDropped = false;
         option->Process(packet, 0, ipv6Header, isDropped);
+        NS_TEST_ASSERT_MSG_EQ(isDropped,
+                              false,
+                              "A first inconsistency was treated as confirmed for "
+                                  << testCase.what);
+
+        RplPacketInfoHeader received;
+        packet->RemoveHeader(received);
+        NS_TEST_ASSERT_MSG_EQ(received.GetRankError(),
+                              testCase.expectRankError,
+                              "Wrong 'R' flag for " << testCase.what);
+        NS_TEST_ASSERT_MSG_EQ(received.GetDown(),
+                              testCase.down,
+                              "The 'O' flag was rewritten for " << testCase.what);
+        NS_TEST_ASSERT_MSG_EQ(received.GetSenderRank(),
+                              ownRank,
+                              "SenderRank was not rewritten for " << testCase.what);
+    }
+
+    // Ipv6L3Protocol::Receive() walks the Hop-by-Hop chain twice for a
+    // locally-destined packet; the second call must be a no-op rather than
+    // re-checking the SenderRank this same call already rewrote to this
+    // node's own.
+    Ptr<Packet> repeated = Create<Packet>();
+    {
+        RplPacketInfoHeader rpi;
+        rpi.SetDown(false);
+        rpi.SetSenderRank(ownRank + RPL_MIN_HOPRANKINC);
+        repeated->AddHeader(rpi);
+
+        bool isDropped = false;
+        option->Process(repeated, 0, ipv6Header, isDropped);
         NS_TEST_ASSERT_MSG_EQ(isDropped, false, "The first call of the pair was dropped");
 
-        uint8_t processedAgain = option->Process(packet, 0, ipv6Header, isDropped);
+        uint8_t processedAgain = option->Process(repeated, 0, ipv6Header, isDropped);
         NS_TEST_ASSERT_MSG_EQ(isDropped, false, "The second call of the pair acted on the packet");
         NS_TEST_ASSERT_MSG_EQ(processedAgain,
                               6,
                               "Wrong number of bytes reported consumed on the repeat call");
+    }
+
+    // That suppression is keyed on the Uid *and* the time, not the Uid
+    // alone: RPL's own forwarding keeps a packet's Uid across every hop
+    // (RplIpv6ExtensionSourceRouting::Process() rebuilds it with
+    // CreateFragment()), so the same Uid coming back at a later time is a
+    // loop -- exactly what the rank check exists to catch -- and must be
+    // checked rather than waved through as the second half of a
+    // Receive()/LocalDeliver() pair. The packet above already carries this
+    // node's own rank, so a genuine recheck finds it inconsistent.
+    {
+        Simulator::Stop(Seconds(1));
+        Simulator::Run();
+
+        bool isDropped = false;
+        option->Process(repeated, 0, ipv6Header, isDropped);
+
+        RplPacketInfoHeader received;
+        repeated->RemoveHeader(received);
+        NS_TEST_ASSERT_MSG_EQ(received.GetRankError(),
+                              true,
+                              "The same packet arriving later was suppressed as a duplicate "
+                              "instead of being checked as the loop it is");
     }
 
     Simulator::Destroy();
@@ -2100,21 +3492,30 @@ RplTestSuite::RplTestSuite()
 {
     AddTestCase(new RplDisHeaderTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDioHeaderTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplDioBoundaryTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDioUnknownOptionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDioTruncatedOptionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDioUnknownMetricTypeTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplDioOptionEdgeTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDaoHeaderTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplDaoBoundaryTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplSourceRoutingHeaderTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplSourceRoutingCompressionTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplSourceRoutingBoundaryTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplSourceRoutingTruncatedTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplSourceRoutingProcessTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplPrepareOutgoingPacketNonRplInterfaceTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplTrickleTimerTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDodagFormationTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplDioRejectionTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplComputeSourceRouteFailureTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplMrhofSelectionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplLqlMappingTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplNoPathDaoTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDaoAckRetryTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplPacketInfoHeaderTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplPacketInfoSubTlvTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplPacketInfoMalformedTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplPacketInfoProcessTestCase, TestCase::Duration::QUICK);
 }
 

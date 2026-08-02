@@ -64,6 +64,37 @@ RplIpv6OptionRpl::Process(Ptr<Packet> packet,
 {
     NS_LOG_FUNCTION(this << packet << +offset << ipv6Header << isDropped);
 
+    // Packet has no way to patch bytes in place, so the option is read out
+    // through a fragment covering everything from here to the end of the
+    // packet, updated, and spliced back onto the untouched prefix.
+    Ptr<Packet> tail = packet->CreateFragment(offset, packet->GetSize() - offset);
+    RplPacketInfoHeader rpi;
+    tail->RemoveHeader(rpi);
+
+    // How far the caller's option walk advances past this option. Parsed
+    // before any of the early returns below rather than assumed to be the
+    // bare six octets: an option carrying sub-TLVs (RFC 6553 section 3) is
+    // longer than that, and reporting six for one of those would have the
+    // caller read the first sub-TLV as if it were the next option.
+    uint8_t optionSize = static_cast<uint8_t>(rpi.GetSerializedSize());
+
+    if (rpi.IsMalformed())
+    {
+        // The Opt Data Len this option arrived with is unusable, so nothing
+        // in it can be checked or rewritten (@see
+        // RplPacketInfoHeader::Deserialize() for what makes one unusable).
+        // RFC 6553 section 3 has the two high order bits of the Option Type
+        // set to '01', which per RFC 8200 section 4.2 means a receiver that
+        // cannot process the option discards the packet; the same is the
+        // only safe answer for one it can recognise but not parse. Only the
+        // Option Type and Opt Data Len octets were really read, so that is
+        // what the caller is told it may skip -- and it stops walking the
+        // option list at all once isDropped is set.
+        NS_LOG_WARN("Dropping a packet whose RPL Option could not be parsed");
+        isDropped = true;
+        return 2;
+    }
+
     // Ipv6L3Protocol::Receive() walks the Hop-by-Hop chain once itself and,
     // for a packet addressed to this node, a second time inside
     // LocalDeliver(); a packet tag would not reliably tell the two calls
@@ -83,7 +114,7 @@ RplIpv6OptionRpl::Process(Ptr<Packet> packet,
     Time now = Simulator::Now();
     if (packet->GetUid() == m_lastProcessedUid && now == m_lastProcessedTime)
     {
-        return RplPacketInfoHeader().GetSerializedSize();
+        return optionSize;
     }
     m_lastProcessedUid = packet->GetUid();
     m_lastProcessedTime = now;
@@ -91,15 +122,8 @@ RplIpv6OptionRpl::Process(Ptr<Packet> packet,
     Ptr<RplRoutingProtocol> rpl = m_node->GetObject<RplRoutingProtocol>();
     if (!rpl)
     {
-        return RplPacketInfoHeader().GetSerializedSize();
+        return optionSize;
     }
-
-    // Packet has no way to patch bytes in place, so the option is read out
-    // through a fragment covering everything from here to the end of the
-    // packet, updated, and spliced back onto the untouched prefix.
-    Ptr<Packet> tail = packet->CreateFragment(offset, packet->GetSize() - offset);
-    RplPacketInfoHeader rpi;
-    tail->RemoveHeader(rpi);
 
     bool down = rpi.GetDown();
     uint16_t senderRank = rpi.GetSenderRank();
@@ -158,7 +182,7 @@ RplIpv6OptionRpl::Process(Ptr<Packet> packet,
     packet->RemoveAtEnd(packet->GetSize() - offset);
     packet->AddAtEnd(tail);
 
-    return rpi.GetSerializedSize();
+    return optionSize;
 }
 
 } // namespace rpl

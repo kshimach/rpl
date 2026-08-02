@@ -1310,3 +1310,127 @@ Configuration option (type 4, 本物の Length 14) を、Length はそのまま�
 本体を 4 バイトで打ち切ったパケットを渡し、`HasDagConfiguration()` が
 `false` のまま (壊れた本体が完全なものとして読まれていない) であることを
 確認する。
+
+## 18. RFC 6553 の Opt Data Len を検証していなかった (パケット増幅、オプション走査の停止、sub-TLV 破壊)
+
+17 節と同じ「相手が書いた長さフィールドを信用する」問題が、RPL Option
+(RPI) 側にも三通りの形で残っていた。RFC 6553 section 3 の Opt Data Len は
+基本 4 オクテット (Flags / RPLInstanceID / SenderRank) の後ろに sub-TLV を
+置ける可変長フィールドで、同節は "The RPL Option Data Length is variable"
+および "A RPL device MUST skip over any unrecognized sub-TLVs and attempt to
+process any additional sub-TLVs that may appear after" と規定している。
+`RplPacketInfoHeader` はこれを 4 固定と決め打ちしており、
+
+- `GetSerializedSize()` が `GetLength() + 2` を返す一方 `Serialize()` は
+  常に 6 バイトしか書かない。両者の差は `Packet::AddHeader()` が確保した
+  まま埋められない領域になる。
+- `Deserialize()` は残バイト数を見ずに常に 6 バイト読み、読めた量とは
+  無関係に `GetLength() + 2` を返す。
+- `RplIpv6OptionRpl::Process()` はその値をそのまま
+  `ns3::Ipv6Extension::ProcessOptions()` に返す。
+
+結果、実測で次の三点が起きていた (`scratch` の使い捨てプローブで確認):
+
+1. **パケット増幅**: 6 バイトしかないパケットに Opt Data Len 254 と
+   書いておくと、`Process()` を通った後のパケットが 256 バイトに膨らむ。
+   長さフィールドひとつで受信側にメモリを確保させられる。
+2. **オプション走査の停止**: `Ipv6Option::Process()` の戻り値は
+   `uint8_t`。Opt Data Len 254 は 256 を返そうとして 0 になり、
+   `ProcessOptions()` の `processedSize += optionLength` が進まない。
+   同関数のループ条件は `while (length > processedSize && !isDropped)` で、
+   `isDropped` も立たないため無限ループになる。
+3. **sub-TLV 破壊**: Opt Data Len 8 (基本 4 + sub-TLV 4) のオプションを
+   中継すると、`Serialize()` が書かない後半 4 バイトがゼロで上書きされ、
+   `de ad be ef` が `00 00 00 00` になって次ホップへ出ていく。RFC 6553 が
+   要求する「理解できない sub-TLV は読み飛ばす」の逆。
+
+対処:
+
+- `RplPacketInfoHeader` に `m_subTlvs` (基本 4 オクテットより後ろの生
+  バイト列) を持たせ、`Deserialize()` で保存、`Serialize()` で書き戻す。
+  `GetSerializedSize()` は長さフィールドではなく `m_subTlvs` の実サイズ
+  から導出するので、両者が食い違いようがない。
+- `Deserialize()` は Opt Data Len が (a) 4 未満 (基本フィールドが入らない)、
+  (b) パケットの残量を超える、(c) `+2` が `uint8_t` に収まらない (ns-3 の
+  `Ipv6Option::Process()` の戻り値幅の制約。RFC 上は正当な長さだが、この
+  実装基盤では走査位置を正しく伝えられない) のいずれかなら、実際に読めた
+  2 バイトだけを返し `m_malformed` を立てる。
+- `RplIpv6OptionRpl::Process()` は `m_malformed` を見て `isDropped` を立て
+  2 を返す。RFC 6553 は Option Type の上位 2 ビットを '01' と定めており、
+  RFC 8200 section 4.2 によりオプションを処理できない受信者はパケットを
+  破棄する — 認識はできるが解析できない場合も同じ扱いが唯一安全な答え。
+  `isDropped` が立てば `ProcessOptions()` のループもそこで止まる。
+- あわせて、重複排除 (12.2 節) と `rpl == nullptr` の早期 return が返して
+  いた固定値 6 を、実際にパースしたオプション長に変更した。sub-TLV 付きの
+  オプションで 6 を返すと、呼び出し側が最初の sub-TLV を次のオプションの
+  Option Type として読んでしまう。
+
+回帰テストは `RplPacketInfoSubTlvTestCase` (sub-TLV がバイト単位で往復
+すること、`GetSerializedSize()` が sub-TLV を含むこと) と
+`RplPacketInfoMalformedTestCase` (Opt Data Len 0/1/2/3/5/10/100/253/254/255
+が全て drop され、戻り値が 2 で 0 にならないこと、パケットが増えないこと、
+境界の 4 と 253 は逆に正常に処理されること)。
+
+## 19. RFC 6554 の Hdr Ext Len を検証していなかった (境界外読み出し)
+
+17 節・18 節と同型の三例目。`RplSourceRoutingHeader::Deserialize()` は
+`hdrExtLen` (RFC 8200 section 4.4 の Hdr Ext Len、送信側が書く値) から
+アドレス領域の長さを計算し、そこから読み出すアドレス個数 n を求めて n 回
+読んでいたが、パケットに実際そのバイト数があるかは確認していなかった。
+8 バイトしかないパケットに Hdr Ext Len 30 (= 248 バイトのアドレス領域) と
+書いたものを渡すと、デバッグビルドでは `Buffer::Iterator` の `NS_ASSERT`
+で `NS_FATAL` 終了、最適化ビルドではそのアサートが消えるため範囲外メモリ
+がアドレスとして読まれる。戻り値 `(hdrExtLen + 1) * 8` も同様に実体より
+大きくなり、`Packet::RemoveHeader()` がパケットより多くを削ろうとする。
+
+対処: 8 バイトの固定部を読んだ直後に `i.GetRemainingSize()` を見て、
+宣言サイズが実サイズを超えていれば実サイズに切り詰める。切り詰めた値を
+アドレス領域の計算にも戻り値にも使うので、n の導出も `RemoveHeader()` の
+削除量も実体を超えない。
+
+回帰テストは `RplSourceRoutingTruncatedTestCase`: Hdr Ext Len 30 で 8
+バイトしかないもの (アドレス 0 個、8 バイト消費)、Hdr Ext Len 2 で 24
+バイトしかないもの (アドレス 1 個だけ復元、24 バイト消費)、Hdr Ext Len 0
+で Segments Left だけが矛盾しているもの (それは `Process()` 側で弾く責務)
+の三種。
+
+## 20. Hdr Ext Len に収まらない長さの Routing Header をサイレントに壊していた
+
+19 節の裏返し。`RplSourceRoutingHeader::Serialize()` は
+`static_cast<uint8_t>((GetSerializedSize() - 8) / 8)` で Hdr Ext Len を
+書くが、この値が 255 を超えるとラップする。非圧縮アドレス 128 個
+(2056 バイト) で Hdr Ext Len は 256 → 0 になり、往復させるとアドレス 0 個
+のヘッダとして復元される。ワイヤ上にはどこにも「壊れている」と書いていない。
+
+RFC 6554 の RH3 一つで表現できる上限は圧縮の効き方で決まる: 全て非圧縮
+なら 127 個 (2040 バイト、Hdr Ext Len 254)、全て link-local で 8 バイトに
+圧縮されるなら 255 個 (2048 バイト、Hdr Ext Len 255)。
+
+対処: 上限を `RplSourceRoutingHeader::MAX_SERIALIZED_SIZE` (2048) として
+公開し、`Serialize()` に `NS_ASSERT_MSG` を置く。さらに
+`RplRoutingProtocol::PrepareOutgoingPacket()` は Routing Header を組み立てた
+後に `GetSerializedSize()` と Segments Left の幅を確認し、収まらない経路
+なら Routing Header を付けずに (RPL Option だけ付けて) 送る + `NS_LOG_WARN`。
+壊れたヘッダを出すより、最初のホップで経路なしとして落ちる方が可視である
+という判断。実運用のトポロジで 127 ホップを超えることはないので、これは
+防御であって想定経路ではない。
+
+境界テストは `RplSourceRoutingBoundaryTestCase`: アドレス 0 個、非圧縮
+127 個 (2040 バイト)、圧縮 255 個 (2048 バイト) がいずれも正しく往復する
+こと。同テストには、エントリを一つ書き換えると CmprI が変わってヘッダ長
+自体が変わること (16.4 節の Payload Length 再計算が必要な理由そのもの) の
+確認も含めた。
+
+## 21. DIO の 3 ビットフィールドに範囲外の値を渡せた
+
+`RplDioHeader::SetMop()` / `SetPreference()` は値をそのまま保持し、
+`Serialize()` が `(m_mop << RPL_DIO_MOP_SHIFT) & RPL_DIO_MOP_MASK` で
+マスクしていた。MOP は RFC 6550 section 6.3.1 の G/MOP/Prf オクテット内の
+3 ビットなので、`SetMop(8)` はマスクの結果 0 (= MOP_NO_DOWNWARD_ROUTES)
+になる。8 と 0 は全く別のモードで、しかも呼び出し側には何も伝わらない。
+`SetLql()` が既に clamp していたのに対し、こちらは無防備だった。
+
+対処: 両方に `NS_ASSERT_MSG` を追加 (3 ビットに収まること)。受信側は
+マスク済みの値しか読まないので、これは自ノードの設定ミスを早期に見つける
+ためのもの。境界テスト `RplDioBoundaryTestCase` は MOP 0-7 × Prf 0-7 ×
+Grounded の全組み合わせが往復することを確認する。
