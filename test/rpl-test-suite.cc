@@ -326,6 +326,53 @@ RplDioUnknownOptionTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief Check that an option whose declared Length claims more bytes than
+ *        are actually left in the packet is treated as truncated rather
+ *        than read past the buffer's end.
+ */
+class RplDioTruncatedOptionTestCase : public TestCase
+{
+  public:
+    RplDioTruncatedOptionTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplDioTruncatedOptionTestCase::RplDioTruncatedOptionTestCase()
+    : TestCase("DIO with an option whose declared Length exceeds the packet")
+{
+}
+
+void
+RplDioTruncatedOptionTestCase::DoRun()
+{
+    RplDioHeader dio;
+    dio.SetRank(256);
+    dio.SetDodagId(Ipv6Address("2001:1::1"));
+
+    Ptr<Packet> packet = Create<Packet>();
+    packet->AddHeader(dio);
+
+    // A DAG Configuration option (type 4, real Length 14) that claims its
+    // real Length but is cut off after 4 of the 14 body bytes: the option
+    // parser must not walk past the end of what actually follows.
+    uint8_t truncated[] = {RPL_OPTION_DAG_CONF, 14, 0, 0, 0, 0};
+    Ptr<Packet> trailer = Create<Packet>(truncated, sizeof(truncated));
+    packet->AddAtEnd(trailer);
+
+    RplDioHeader received;
+    packet->RemoveHeader(received);
+
+    NS_TEST_ASSERT_MSG_EQ(received.HasDagConfiguration(),
+                          false,
+                          "A truncated option must not be parsed as if it were complete");
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Check that a DAG Metric Container option carrying a Routing
  *        Metric/Constraint object type this implementation does not know
  *        is skipped using the option's own validated size, not the
@@ -1964,6 +2011,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplDisHeaderTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDioHeaderTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDioUnknownOptionTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplDioTruncatedOptionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDioUnknownMetricTypeTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDaoHeaderTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplSourceRoutingHeaderTestCase, TestCase::Duration::QUICK);

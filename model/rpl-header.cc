@@ -278,6 +278,23 @@ RplDioHeader::Deserialize(Buffer::Iterator start)
         }
         uint8_t length = i.ReadU8();
 
+        // length is the attacker-controlled Option Length field: every branch
+        // below trusts it (directly, or indirectly via the *_OPTION_LENGTH
+        // equality checks) to read that many bytes. Buffer::Iterator has no
+        // bounds checking of its own in an optimized build (PeekU8()'s range
+        // check is an NS_ASSERT, compiled out there), so a declared length
+        // longer than what is actually left in a truncated or malformed
+        // packet would read (and, for the option types below, use as field
+        // values) memory past the buffer's end instead of stopping cleanly
+        // the way a debug build's assertion failure would.
+        if (i.GetRemainingSize() < length)
+        {
+            NS_LOG_WARN("Truncated RPL option "
+                        << +type << " (declared length " << +length << ", only "
+                        << i.GetRemainingSize() << " bytes remain), stopping");
+            break;
+        }
+
         if (type == RPL_OPTION_DAG_CONF && length == DAG_CONF_OPTION_LENGTH)
         {
             m_hasDagConf = true;
@@ -761,6 +778,23 @@ RplDaoHeader::Deserialize(Buffer::Iterator start)
             break;
         }
         uint8_t length = i.ReadU8();
+
+        // length is the attacker-controlled Option Length field: every branch
+        // below trusts it (directly, or indirectly via the *_OPTION_LENGTH
+        // equality checks) to read that many bytes. Buffer::Iterator has no
+        // bounds checking of its own in an optimized build (PeekU8()'s range
+        // check is an NS_ASSERT, compiled out there), so a declared length
+        // longer than what is actually left in a truncated or malformed
+        // packet would read (and, for the option types below, use as field
+        // values) memory past the buffer's end instead of stopping cleanly
+        // the way a debug build's assertion failure would.
+        if (i.GetRemainingSize() < length)
+        {
+            NS_LOG_WARN("Truncated RPL option "
+                        << +type << " (declared length " << +length << ", only "
+                        << i.GetRemainingSize() << " bytes remain), stopping");
+            break;
+        }
 
         if (type == RPL_OPTION_TARGET && length == TARGET_OPTION_LENGTH)
         {

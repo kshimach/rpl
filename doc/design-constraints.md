@@ -1192,3 +1192,52 @@ CmprE=0) と、単独のグローバルアドレス (直接の孫ノード向け
 `rpl-6lowpan-simple --mrhof --lql` で DODAG 形成 + ping 5/5
 (0% packet loss) が従来通り通ることを確認 (圧縮は
 `RplIpv6ExtensionSourceRouting::Process()` から見て完全に透過的)。
+
+### 16.6 ICMPv6 Parameter Problem の Pointer が IPv6 header 分ずれていた
+
+`Process()` の 2 箇所 (15.7 の SRH ループ検出、および Segments Left が
+アドレス数を超える「malformed header」判定) は `SendErrorParameterError()`
+の `ptr` 引数に `offset + N` (`offset` は `packet`/`p` と同じ、拡張ヘッダー
+チェーンの先頭、つまり IPv6 header の直後からの相対位置) を渡していた。
+RFC 4443 section 3.4 の Pointer は「invoking packet 内でのオクテット
+オフセット」で、ここでの invoking packet は `malformedPacket`
+(`packet->Copy(); malformedPacket->AddHeader(ipv6Header);` で作られる、
+IPv6 header を前置きした完全なパケット)。`offset` はその IPv6 header
+の分だけ短く、`ipv6-l3-protocol.cc` の同種の呼び出し (`Receive()` の
+Unknown Next Header 処理) は `ip.GetSerializedSize() + nextHeaderPosition`
+と明示的に加算しているのに対し、ここではそれが欠けていて Pointer が
+40 (IPv6 header の固定長) だけ手前を指していた。両呼び出しに
+`ipv6Header.GetSerializedSize()` を足して修正。ICMPv6 Parameter Problem
+は経路上のデバッグ用の診断情報であり、ドロップ自体の判定・処理には
+関わらないため、実害は「間違った位置を指すエラーメッセージが飛ぶ」
+ことに留まる。
+
+## 17. DIO/DAO オプション読み出しが宣言サイズだけを見ていた (境界外読み出し)
+
+`RplDioHeader`/`RplDaoHeader` の `Deserialize()` はオプションを
+`while (!i.IsEnd())` で走査し、`type`/`length` (Type/Length フィールド、
+共に相手が送ってきた値をそのまま信用する) を読んだ後、各オプション種別
+ごとに `length == 対応する *_OPTION_LENGTH` かどうかだけを確認して本体を
+読んでいた。`length` が本物と一致してさえいれば、パケットが実際にそれだけ
+残っているかは一度も検証していない — 送信側が正直な `length` を書いた
+まま、その後ろが実際には切り詰められている (伝送中に壊れた、あるいは
+偽装された) パケットが来ると、`Buffer::Iterator::ReadU8()` 等が
+バッファの終端を越えて読む。`PeekU8()` 自身の範囲チェックは
+`NS_ASSERT_MSG` で、デバッグビルドでは検知して落ちるが、最適化ビルドでは
+コンパイルごと消える (ns-3 の `NS_ASSERT` 系マクロの通常の挙動) ため、
+そこでは範囲外メモリがそのまま読まれ、一部はオプションのフィールド値
+としてそのまま使われる。
+
+対処: `length` を読んだ直後、DIO/DAO 両方の `Deserialize()` に
+`i.GetRemainingSize() < length` のガードを追加し、満たなければそこで
+走査を打ち切る (以降のオプションは全て未知として扱う、既存の
+「途中で `IsEnd()` になったら打ち切る」経路と同じ扱い)。`length` バイト
+分の存在を一度確認すれば、それ以降の各分岐 (DAG Configuration、DAG
+Metric Container、Prefix Information、Target、Transit、未知オプションの
+`i.Next(length)`) は全て安全になる。
+
+回帰テストとして `RplDioTruncatedOptionTestCase` を追加: DAG
+Configuration option (type 4, 本物の Length 14) を、Length はそのままに
+本体を 4 バイトで打ち切ったパケットを渡し、`HasDagConfiguration()` が
+`false` のまま (壊れた本体が完全なものとして読まれていない) であることを
+確認する。
