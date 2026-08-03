@@ -3358,6 +3358,284 @@ RplNoPathDaoSentOnParentLossTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief Check that a node poisoned by its only parent (RFC 6550 section
+ *        8.2.2.5, an infinite rank) also withdraws itself, the same as one
+ *        that loses its parent to silence.
+ *
+ * HandleDio() has its own m_parents.erase(from), separate from the
+ * staleness sweep RplNoPathDaoSentOnParentLossTestCase exercises, so this
+ * is not the same code path even though both end up at
+ * SelectPreferredParent()'s best.IsAny() case. The link itself is very
+ * much alive here (that is how the poisoning DIO arrived at all), so
+ * unlike an interface going down (StopInterface(), which closes the
+ * socket before it ever gets a chance to withdraw anything, and has
+ * nothing left to send on by the time it would) there is no reason the
+ * withdrawal should not get through.
+ */
+class RplNoPathDaoSentOnPoisonTestCase : public TestCase
+{
+  public:
+    RplNoPathDaoSentOnPoisonTestCase();
+
+  private:
+    void DoRun() override;
+
+    /**
+     * @brief Record a DAO's target and path lifetime.
+     * @param socket the monitoring socket
+     */
+    void RecordDao(Ptr<Socket> socket);
+
+    std::vector<std::pair<Ipv6Address, uint8_t>> m_daos; //!< (target, path lifetime) of every DAO seen
+};
+
+RplNoPathDaoSentOnPoisonTestCase::RplNoPathDaoSentOnPoisonTestCase()
+    : TestCase("A node withdraws itself with a No-Path DAO when poisoned")
+{
+}
+
+void
+RplNoPathDaoSentOnPoisonTestCase::RecordDao(Ptr<Socket> socket)
+{
+    Address sender;
+    Ptr<Packet> packet = socket->RecvFrom(sender);
+    if (!packet)
+    {
+        return;
+    }
+
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ipv6Header);
+    Icmpv6Header icmpv6Header;
+    packet->RemoveHeader(icmpv6Header);
+
+    if (icmpv6Header.GetType() == ICMPV6_RPL && icmpv6Header.GetCode() == RPL_CODE_DAO)
+    {
+        RplDaoHeader dao;
+        packet->RemoveHeader(dao);
+        m_daos.emplace_back(dao.GetTarget(), dao.GetPathLifetime());
+    }
+}
+
+void
+RplNoPathDaoSentOnPoisonTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Ptr<Node> rootNode = nodes.Get(0);
+    Ptr<Socket> monitor = Socket::CreateSocket(rootNode, Ipv6RawSocketFactory::GetTypeId());
+    monitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    monitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    monitor->BindToNetDevice(rootNode->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+    monitor->SetRecvCallback(MakeCallback(&RplNoPathDaoSentOnPoisonTestCase::RecordDao, this));
+
+    Ptr<RplRoutingProtocol> root = rootNode->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> child = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(child->IsJoined(), true, "The child never joined the DODAG");
+    Ipv6Address childAddress = child->GetGlobalAddress();
+    NS_TEST_ASSERT_MSG_EQ(root->GetTopologySize(), 1, "The root never heard the child's first DAO");
+
+    Ipv6Address rootLinkLocal =
+        rootNode->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address childLinkLocal =
+        nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    // A DIO advertising an infinite rank, from the root's own link-local
+    // address -- the child's one and only parent -- but hand-built rather
+    // than anything the real root would ever send: RplRoutingProtocol
+    // never poisons its own sub-DODAG this way, so this is standing in for
+    // a different implementation, or a compromised node, doing so.
+    RplDioHeader poison;
+    poison.SetInstanceId(RPL_DEFAULT_INSTANCE);
+    poison.SetVersionNumber(0); // the root's version at DoInitialize(), never bumped here
+    poison.SetRank(RPL_INFINITE_RANK);
+    poison.SetMop(RPL_MOP_NON_STORING);
+    poison.SetDodagId(root->GetDodagId());
+
+    Simulator::Schedule(Seconds(0),
+                        &SendRawRplMessage<RplDioHeader>,
+                        rootNode,
+                        1,
+                        poison,
+                        static_cast<uint8_t>(RPL_CODE_DIO),
+                        rootLinkLocal,
+                        childLinkLocal);
+    Simulator::Stop(Seconds(1));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(child->IsJoined(), false, "The child stayed joined despite the poison");
+    NS_TEST_ASSERT_MSG_EQ(child->GetPreferredParent(),
+                          Ipv6Address::GetAny(),
+                          "The poisoned parent stayed selected");
+
+    bool withdrew = std::any_of(m_daos.begin(), m_daos.end(), [&](const auto& dao) {
+        return dao.first == childAddress && dao.second == 0;
+    });
+    NS_TEST_ASSERT_MSG_EQ(withdrew,
+                          true,
+                          "No No-Path DAO for the child's own address arrived at the root after "
+                          "being poisoned, even though the link it would have travelled on was "
+                          "never taken down");
+
+    monitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief SCRATCH PROBE, not a permanent test: check what happens three
+ *        hops out when the middle node of a line loses its own parent.
+ */
+class RplNoPathDaoThreeHopProbeTestCase : public TestCase
+{
+  public:
+    RplNoPathDaoThreeHopProbeTestCase();
+
+  private:
+    void DoRun() override;
+    void RecordDao(Ptr<Socket> socket);
+    std::vector<std::pair<Ipv6Address, uint8_t>> m_daos;
+};
+
+RplNoPathDaoThreeHopProbeTestCase::RplNoPathDaoThreeHopProbeTestCase()
+    : TestCase("PROBE: three-hop line, middle node loses its parent")
+{
+}
+
+void
+RplNoPathDaoThreeHopProbeTestCase::RecordDao(Ptr<Socket> socket)
+{
+    Address sender;
+    Ptr<Packet> packet = socket->RecvFrom(sender);
+    if (!packet)
+    {
+        return;
+    }
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ipv6Header);
+    Icmpv6Header icmpv6Header;
+    packet->RemoveHeader(icmpv6Header);
+    if (icmpv6Header.GetType() == ICMPV6_RPL && icmpv6Header.GetCode() == RPL_CODE_DAO)
+    {
+        RplDaoHeader dao;
+        packet->RemoveHeader(dao);
+        m_daos.emplace_back(dao.GetTarget(), dao.GetPathLifetime());
+        std::cerr << "  [probe] DAO target=" << dao.GetTarget()
+                  << " pathLifetime=" << +dao.GetPathLifetime() << " at " << Simulator::Now()
+                  << std::endl;
+    }
+}
+
+void
+RplNoPathDaoThreeHopProbeTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(3); // 0 = root, 1 = middle, 2 = leaf
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    // Line topology: the two ends cannot hear each other.
+    Ptr<SimpleNetDevice> first = DynamicCast<SimpleNetDevice>(devices.Get(0));
+    Ptr<SimpleNetDevice> last = DynamicCast<SimpleNetDevice>(devices.Get(2));
+    channel->BlackList(first, last);
+    channel->BlackList(last, first);
+
+    RplHelper rplHelper;
+    rplHelper.Set("DioIntervalMin", TimeValue(MilliSeconds(256)));
+    rplHelper.Set("DioIntervalDoublings", UintegerValue(2));
+    rplHelper.Set("DisInterval", TimeValue(Seconds(2)));
+
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Ptr<Node> rootNode = nodes.Get(0);
+    Ptr<Socket> monitor = Socket::CreateSocket(rootNode, Ipv6RawSocketFactory::GetTypeId());
+    monitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    monitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    monitor->BindToNetDevice(rootNode->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+    monitor->SetRecvCallback(MakeCallback(&RplNoPathDaoThreeHopProbeTestCase::RecordDao, this));
+
+    Ptr<RplRoutingProtocol> root = rootNode->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> middle = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> leaf = nodes.Get(2)->GetObject<RplRoutingProtocol>();
+
+    Simulator::Stop(Seconds(15));
+    Simulator::Run();
+
+    std::cerr << "  [probe] after join: middle joined=" << middle->IsJoined()
+              << " leaf joined=" << leaf->IsJoined()
+              << " root topology size=" << root->GetTopologySize() << std::endl;
+    Ipv6Address middleAddress = middle->GetGlobalAddress();
+    Ipv6Address leafAddress = leaf->GetGlobalAddress();
+
+    Ptr<SimpleNetDevice> rootDevice = DynamicCast<SimpleNetDevice>(devices.Get(0));
+    Ptr<SimpleNetDevice> middleDevice = DynamicCast<SimpleNetDevice>(devices.Get(1));
+    std::cerr << "  [probe] blacklisting root->middle" << std::endl;
+    channel->BlackList(rootDevice, middleDevice);
+
+    Simulator::Stop(Seconds(20));
+    Simulator::Run();
+
+    std::cerr << "  [probe] after cutoff: middle joined=" << middle->IsJoined()
+              << " leaf joined=" << leaf->IsJoined()
+              << " root topology size=" << root->GetTopologySize() << std::endl;
+
+    bool middleWithdrew = std::any_of(m_daos.begin(), m_daos.end(), [&](const auto& dao) {
+        return dao.first == middleAddress && dao.second == 0;
+    });
+    bool leafWithdrew = std::any_of(m_daos.begin(), m_daos.end(), [&](const auto& dao) {
+        return dao.first == leafAddress && dao.second == 0;
+    });
+    std::cerr << "  [probe] middle withdrew=" << middleWithdrew
+              << " leaf withdrew=" << leafWithdrew << std::endl;
+
+    monitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Check that an unacknowledged DAO is retried DaoRetries times at
  *        DaoAckTimeout, then given up on until the next periodic DAO.
  *
@@ -4657,6 +4935,10 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplLqlMappingTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplNoPathDaoTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplNoPathDaoSentOnParentLossTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplNoPathDaoSentOnPoisonTestCase, TestCase::Duration::QUICK);
+    // RplNoPathDaoThreeHopProbeTestCase intentionally not registered: it is
+    // a scratch probe that reproduces an unrelated pre-existing crash
+    // (see design-constraints.md), not a passing regression test.
     AddTestCase(new RplDaoAckRetryTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplPacketInfoHeaderTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplPacketInfoSubTlvTestCase, TestCase::Duration::QUICK);

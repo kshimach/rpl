@@ -898,6 +898,16 @@ RplRoutingProtocol::HandleDio(const RplDioHeader& dio,
     {
         // RFC 6550, section 8.2.2.5: an infinite rank poisons the sub-DODAG.
         NS_LOG_LOGIC("Neighbour " << from << " is advertising an infinite rank");
+        // Withdraw before erasing, the same reason and the same order as
+        // the staleness sweep in SelectPreferredParent(): once from is
+        // gone from m_parents, RouteOutput() has nothing left to resolve
+        // a route through, even though the link itself -- this DIO just
+        // arrived on it -- is very much still there to send the
+        // withdrawal over.
+        if (m_joined && from == m_preferredParent)
+        {
+            SendNoPathDao(from);
+        }
         m_parents.erase(from);
         if (SelectPreferredParent())
         {

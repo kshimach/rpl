@@ -1634,3 +1634,92 @@ Path Lifetime 0 かつ Target が子のアドレスと一致する DAO を受信
 こと、およびその結果 root の `GetTopologySize()` が 0 になることを
 確認する。既存の `RplNoPathDaoTestCase` (手作りメッセージによる
 受信側のみの検証) と役割を分けている。
+
+### 23.3 動作検証: poison 経路でも撤回できていなかった
+
+23 節の実装を、単体テストとは別に NS_LOG (`RplRoutingProtocol=level_all
+|prefix_all`) でワイヤ上の動きを直接確認する形で検証した。stale 経路
+(`SelectPreferredParent()` の掃除ループ) は狙い通り動作していた:
+`erase()` 直前に `SendNoPathDao()` が発火し、`RouteOutput()` が
+`Routing 2001:1::200:ff:fe00:1 via the preferred parent
+fe80::200:ff:fe00:1` とルートを解決、root 側も
+`Received a DAO from 2001:1::200:ff:fe00:2: ... lifetime 0` /
+`No-Path for 2001:1::200:ff:fe00:2, dropping it from the topology` と
+正しく処理していた。
+
+ただしこの過程で、23.1 の設計時には気付いていなかった**もう一つの
+削除経路**が残っていたことが分かった: `HandleDio()` の infinite rank
+分岐 (RFC 6550 section 8.2.2.5、親が sub-DODAG を poison するケース)
+も `m_parents.erase(from)` を呼んでから `SelectPreferredParent()` を
+呼ぶ構造になっており、stale 経路と全く同じ理由 (`m_parents` から
+既に消えたエントリを `RouteViaPreferredParent()` が解決できない) で
+撤回が送れていなかった。回帰テスト
+`RplNoPathDaoSentOnPoisonTestCase` (root の link-local アドレスを
+騙って infinite rank の DIO を子に送る、`SendRawRplMessage()` による
+手作りメッセージ) で再現を確認したうえで、`HandleDio()` 側にも
+stale 経路と同じ「`erase()` の前に、対象が `m_preferredParent` なら
+`SendNoPathDao()` を呼ぶ」ガードを追加した。
+
+`StopInterface()` (インターフェースが down した場合の親削除) にも
+同型の構造があるが、こちらは対処していない: `m_ifcToSocket.erase()`
+でソケット自体を閉じてから親を削除するため、その時点で撤回を試みても
+そもそも送信する手段がない (単一インターフェース前提のこの実装では、
+別のインターフェース経由で迂回させる余地もない)。実際に NS_LOG でも
+`StopInterface` の呼び出し後は `SendNoPathDao` が一切発火しないことを
+確認済みだが、これは「送れないので送らない」という妥当な帰結であり、
+バグではない。
+
+## 24. (未修正) 親を失った直後、旧子からの DIO を無条件に信頼して
+       ルーティングループに陥る
+
+23.3 の動作検証中、3 ノードのライントポロジ (root - middle - leaf) で
+middle が親 (root) を stale 判定で失うシナリオを追加で試したところ、
+23 節の実装とは無関係に、既存のコードに起因するルーティングループと
+それによるクラッシュ (`PacketMetadata::AddBig()` の
+`NS_ASSERT(m_used != prev && m_used != next)`, ns-3 コア側) を発見した。
+`SendNoPathDao()` の呼び出しを 3 箇所とも一時的に無効化しても同じ時刻
+(シミュレーション内 +18.294233496s) に全く同じ箇所でクラッシュすること
+を確認済みで、23 節の変更が原因ではない、独立した既存の設計ギャップ。
+
+**再現条件**: leaf は middle 経由で root にぶら下がっている
+(leaf の rank は 384、middle は 256)。root -> middle の DIO だけを
+blacklist すると、middle は staleness 検知で root を失い
+`LeaveDodag()` する (`m_joined = false`)。ところが leaf はまだ
+middle からの DIO を受信できているため (root <-> middle のリンクの
+片方向だけが切れている想定)、leaf 自身の staleness 検知が働くまでの
+数秒間、通常どおり middle 宛に DIO を送り続ける。
+
+**原因**: `HandleDio()` の
+
+```cpp
+if (!m_joined)
+{
+    JoinDodag(dio, interface);
+}
+```
+
+は、DIO の送信元がどんな rank を名乗っていようと無条件に信頼する。
+通常は「初めて DODAG に参加する」場面を想定した分岐だが、
+「ついさっき同じ DODAG から離脱した」ノードがここを通ることもあり、
+その場合 `m_dodagId`/`m_instanceId` は `LeaveDodag()` でクリアされず
+そのまま残っている (意図的な設計、10 節にある lollipop 比較の話とは
+別)。leaf が送ってくる DIO はたまたま同じ instance/DODAGID (leaf 自身は
+まだ旧トポロジのつもりで送っている) で、rank 384 を名乗っている。
+`JoinDodag()` はこれを鵜呑みにして受け入れ、続く
+`SelectPreferredParent()` で leaf が唯一の候補としてそのまま
+`m_preferredParent` になる。
+
+結果、middle は「leaf が親」、leaf は「middle が親」という状態が同時に
+成立する。両者ともお互いを preferred parent としてルーティングし合う
+ため、root 宛 (または他の任意の宛先) のパケットが middle <-> leaf 間を
+Hop Limit が尽きるまで往復し、`PacketMetadata` の内部リスト操作
+(`AddBig()`) がその過程で不整合な状態に陥って `NS_ASSERT` に落ちる。
+
+**対応状況**: 未修正。原因は特定できたが、修正には設計判断が要る:
+DIO の rank を無条件に信頼する `JoinDodag()` の呼び出しに、何らかの
+足切り (例えば「離脱直前の rank より十分低いことを要求する」) を
+入れるとしても、境界の取り方次第で正当な再接続 (別の経路での
+救済) まで弾いてしまう恐れがあり、単純な閾値では済まない。
+再現手順 (`RplNoPathDaoThreeHopProbeTestCase`、
+`test/rpl-test-suite.cc` に実装だけ残し `AddTestCase()` には
+意図的に未登録) は残してあるので、対処する際はそこから始められる。
