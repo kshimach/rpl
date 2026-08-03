@@ -1754,3 +1754,132 @@ No-Path DAO が root に届いていることを確認する。poisoning を
 いない)。leaf の唯一の上流は middle で、その middle は既に離脱して
 いるため転送できないため。これは 23.1 に書いたベストエフォート方針
 どおりで、root 側は `PurgeTopology()` が PathLifetime 満了で回収する。
+
+## 25. RFC 準拠監査 (第二次): Trickle / OF0 / MRHOF / DTSN / MaxRankIncrease
+
+15 節の監査は RFC 6550/6551/6553/6554 のワイヤフォーマットと基本処理を
+対象としており、Trickle アルゴリズム本体 (RFC 6206)、目的関数の数値規定
+(RFC 6552 OF0 / RFC 6719 MRHOF)、および RFC 6550 のうち rank 制約と
+DTSN まわりは対象外だった。今回そこを原文と突き合わせた結果を記録する。
+**いずれも今回は修正しておらず、既知の乖離として残している。**
+
+### 25.1 準拠を確認できたもの
+
+- **RFC 6206 (Trickle) の 6 ルール**: `RplTrickleTimer` は 4.2 節の 6
+  ルールすべてに準拠。開始時 I=Imin (規定は [Imin, Imax] の範囲内なら
+  可)、インターバル開始で c=0 かつ t ∈ [I/2, I)、consistent で c++、
+  時刻 t で c<k なら送信、満了で I を倍にして Imax でクランプ、
+  Reset は I>Imin のときのみ (I==Imin なら何もしない) まで一致。
+  k=0 を「抑制無効」に割り当てているのも 6.5 節の RECOMMENDED どおり。
+- **RFC 6550 8.3 節の DIS 応答規定**: マルチキャスト DIS は Trickle
+  リセット、ユニキャスト DIS はリセットせず DIO をユニキャストで返す、
+  その DIO は DODAG Configuration option を含む (MUST) — すべて
+  `HandleDis()`/`SendDio()` で満たしている。
+- **RFC 6719 の推奨定数**: `MAX_LINK_METRIC` 512、`MAX_PATH_COST`
+  32768、`PARENT_SWITCH_THRESHOLD` 192 は 5 節の ETX 向け推奨値と一致。
+- **RFC 6719 の `ALLOW_FLOATING_ROOT` 0 相当**: floating root になる
+  経路を持たないので、推奨値 0 と等価。
+
+### 25.2 乖離: RFC 6550 8.2.2.4 rule 3 の DAGMaxRankIncrease が未適用 (MUST)
+
+> Let L be the lowest Rank within a DODAG Version that a given node has
+> advertised. Within the same DODAG Version, that node MUST NOT advertise
+> an effective Rank higher than L + DAGMaxRankIncrease. ... If a node's
+> Rank were to be higher than allowed by L + DAGMaxRankIncrease, when it
+> advertises Rank, it MUST advertise its Rank as INFINITE_RANK.
+
+`m_maxRankIncrease` は DIO の DODAG Configuration option から受信して
+保存し (`JoinDodag()`)、自分が送る DIO で再広告もしている
+(`SendDio()`) が、**rank 計算にもループ回避にも一切使われていない**。
+L (その DODAG Version で自分が広告した最小 rank) を追跡する変数自体が
+存在しない。
+
+RPL でこの制約は、ノードが際限なく rank を上げ続ける
+(count-to-infinity) ことを防ぐ独立した防御層にあたる。22.2 節・24 節で
+塞いだループはいずれも「親選択の時点で」防ぐ仕組みであり、この rule 3
+は「広告する rank の側で」歯止めをかけるもので、役割が重なっていない。
+
+### 25.3 乖離: RFC 6550 9.6 節の DTSN 処理が未実装 (MUST 2 件)
+
+> 1. If a node hears one of its DAO parents increment its DTSN, the node
+>    MUST schedule a DAO message transmission ...
+> 2. In Non-Storing mode, if a node hears one of its DAO parents
+>    increment its DTSN, the node MUST increment its own DTSN.
+
+`Parent::dtsn` に受信値を記録しているだけで (`HandleDio()`)、増加の
+検出も、それを受けた DAO 再送も、自身の `m_dtsn` のインクリメントも
+実装していない。`m_dtsn` は 0 のまま一度も動かない。
+
+閉じた世界 (この実装のノードだけの DODAG) では、誰も DTSN を上げない
+ので相互に整合しており実害は出ない。他実装と混在した場合、root が
+DTSN を上げて sub-DODAG 全体の DAO 更新をトリガーしても、本実装の
+ノードは反応しない。非 storing mode では DTSN の increment が
+sub-DODAG 全体へ伝播する設計なので、本実装のノードがいる枝から先は
+更新が止まる。
+
+### 25.4 乖離: RFC 6552 の step_of_rank が既定値と異なる (範囲内、MUST 違反ではない)
+
+OF0 の rank 計算は `rank_increase = (Rf*Sp + Sr) * MinHopRankIncrease`
+で、6.3 節が `DEFAULT_STEP_OF_RANK: 3`、`DEFAULT_RANK_FACTOR: 1`、
+`DEFAULT_RANK_STRETCH: 0` を定めている。既定値どおりなら
+`rank_increase = 3 * MinHopRankIncrease`。
+
+`RankViaParent()` は `parent.rank + m_minHopRankIncrease`、すなわち
+Sp=1 相当。6.3 節の `MINIMUM_STEP_OF_RANK: 1` 以上
+`MAXIMUM_STEP_OF_RANK: 9` 以下という範囲は満たしており、step_of_rank
+の算出方法自体が実装依存 ("the exact method for computing the
+rank_increase is implementation dependent") なので MUST 違反ではない。
+Contiki-NG rpl-lite の OF0 も同じく Sp=1 相当で、本実装の
+「Contiki-NG と数値的に一致させる」方針 (rpl-conf.h 冒頭) とは合って
+いる。
+
+影響は rank の絶対値のスケールで、標準的な既定値を使う実装の 1/3 に
+なる。同一 DODAG に両者が混在すると、本実装のノードのほうが常に
+root に近く見え、親として選ばれやすくなる。DAGMaxRankIncrease との
+相対関係も変わる (25.2 が未実装なので現状は影響しないが、実装した
+場合はここが効いてくる)。
+
+### 25.5 乖離: MRHOF の境界比較が 1 単位ずれている (SHOULD/MAY)
+
+- 5 節 "If the selected metric for a link is greater than
+  MAX_LINK_METRIC, the node SHOULD exclude that link" に対し、実装は
+  `parent.etx >= RPL_MRHOF_MAX_LINK_METRIC` で除外している。ETX が
+  ちょうど 512 (= 4.0) のリンクを、RFC は残し実装は捨てる。
+- 3.2.2 節 rule 3 のヒステリシスは "smaller than cur_min_path_cost by
+  less than PARENT_SWITCH_THRESHOLD" (差が閾値**未満**なら現親を維持)
+  に対し、実装は `currentPathCost <= bestPathCost + THRESHOLD` (差が
+  閾値**以下**で維持)。差がちょうど 192 のとき、RFC は乗り換え、実装は
+  据え置く。
+
+いずれも境界 1 単位の差で、SHOULD/MAY 条項のため違反ではない。
+
+### 25.6 乖離: MRHOF 3.2.2 rule 4 の cur_min_path_cost (MUST、実害なし)
+
+> If ALLOW_FLOATING_ROOT is 0 and no neighbors are discovered, the node
+> does not have a preferred parent and MUST set cur_min_path_cost to
+> MAX_PATH_COST.
+
+`LeaveDodag()` は `m_pathEtx` (cur_min_path_cost 相当) を 0 にして
+いる。MAX_PATH_COST (32768) にすべきところ、逆に最良の値になる。
+
+ただし実害は無い: この値が外に出るのは DIO の Metric Container のみで、
+親を失った状態で送る DIO は 24 節の poisoning DIO だけであり、それは
+rank が INFINITE_RANK なので受信側は 8.2.2.5 節に従って親集合から
+除去する (Metric Container は見ない)。
+
+### 25.7 対応方針
+
+修正の優先度は次のとおりと考えている:
+
+1. **25.3 (DTSN)** — MUST 2 件だが、実装は素直 (親の DTSN 増加を検出
+   して自分の DTSN を上げ、DAO を再スケジュールするだけ)。他実装との
+   相互運用性に直結する。
+2. **25.2 (DAGMaxRankIncrease)** — MUST。L の追跡を足す必要があるが、
+   `SendDio()` で広告する rank にクランプを入れるだけで形にはなる。
+   count-to-infinity への独立した防御層が増える。
+3. **25.6 (cur_min_path_cost)** — MUST だが実害なし。1 行。
+4. **25.5 (境界 1 単位)** — 違反ではない。他実装と厳密に挙動を揃える
+   必要が出たときに。
+5. **25.4 (step_of_rank)** — 方針 (Contiki-NG との一致) と RFC 既定値
+   のどちらを優先するかの判断が要る。変更すると既存テストの期待 rank
+   値がすべて変わる。
