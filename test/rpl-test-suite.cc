@@ -31,6 +31,9 @@
 #include "ns3/test.h"
 #include "ns3/uinteger.h"
 
+#include <algorithm>
+#include <vector>
+
 using namespace ns3;
 using namespace ns3::rpl;
 
@@ -85,6 +88,85 @@ SendRawRplMessage(Ptr<Node> node,
 
     socket->SendTo(packet, 0, Inet6SocketAddress(dst, 0));
     socket->Close();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief Hand a hand-built RPL control message directly to a node's
+ *        Ipv6L3Protocol::Receive(), as if it had just arrived over its
+ *        interface 1 -- bypassing the channel, any blacklist on it, and
+ *        Neighbour Discovery address resolution entirely.
+ *
+ * SendRawRplMessage() drives the same scenario through a real send, which
+ * is the more faithful choice whenever the path between the two nodes is
+ * otherwise ordinary. It stops being the right tool the moment a test also
+ * needs a directed blacklist to stay in effect while the message gets
+ * through anyway (lifting it, even briefly, risks letting an unrelated
+ * message -- e.g. the real root's own reply to whatever the child was
+ * about to retry -- slip through the same gap), or needs the message
+ * delivered from a node that has never exchanged anything with the
+ * recipient before (Neighbour Discovery has nothing cached for that pair
+ * yet, and would have to resolve it first). This is the tool for those
+ * cases: nothing about how the message reaches Receive() is being tested
+ * here, only what the recipient does once it has it.
+ *
+ * @param node the node to deliver to
+ * @param interface the interface the message is delivered on
+ * @param body the RPL message body, e.g. a RplDaoAckHeader
+ * @param code the RPL message code
+ * @param src the source address, both for the ICMPv6 checksum and the IPv6
+ *        header actually carried in
+ * @param dst the destination address, likewise
+ */
+template <typename T>
+static void
+DeliverRawRplMessage(Ptr<Node> node,
+                     uint32_t interface,
+                     const T& body,
+                     uint8_t code,
+                     Ipv6Address src,
+                     Ipv6Address dst)
+{
+    Ptr<Ipv6L3Protocol> ipv6 = node->GetObject<Ipv6L3Protocol>();
+    Ptr<NetDevice> device = ipv6->GetNetDevice(interface);
+
+    Ptr<Packet> packet = Create<Packet>();
+    packet->AddHeader(body);
+
+    Icmpv6Header icmpv6Header;
+    icmpv6Header.SetType(ICMPV6_RPL);
+    icmpv6Header.SetCode(code);
+    icmpv6Header.CalculatePseudoHeaderChecksum(src,
+                                               dst,
+                                               packet->GetSize() + icmpv6Header.GetSerializedSize(),
+                                               Icmpv6L4Protocol::GetStaticProtocolNumber());
+    packet->AddHeader(icmpv6Header);
+
+    Ipv6Header ipv6Header;
+    ipv6Header.SetSource(src);
+    ipv6Header.SetDestination(dst);
+    ipv6Header.SetNextHeader(Icmpv6L4Protocol::GetStaticProtocolNumber());
+    ipv6Header.SetPayloadLength(packet->GetSize());
+    ipv6Header.SetHopLimit(255);
+    packet->AddHeader(ipv6Header);
+
+    // 0x86dd is IPv6's EtherType, the protocol number Ipv6L3Protocol is
+    // itself registered under as a protocol handler
+    // (Node::RegisterProtocolHandler(), see ipv6-l3-protocol.cc). The L2
+    // from/to addresses matter for only one thing past logging -- an
+    // opportunistic Neighbour Discovery cache refresh keyed on "from"
+    // (Ipv6L3Protocol::Receive(), the NdiscCache::LookupInverse() branch) --
+    // which the device's own address standing in for both simply misses
+    // (an empty lookup, not an error): harmless, since nothing this
+    // function delivers needs that cache warm.
+    ipv6->Receive(device,
+                 packet,
+                 0x86dd,
+                 device->GetAddress(),
+                 device->GetAddress(),
+                 NetDevice::PACKET_HOST);
 }
 
 /**
@@ -2103,6 +2185,322 @@ RplDioRejectionTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief Follow a node all the way around the state machine: joined, then
+ *        cut off from its only parent until it gives up on the DODAG, then
+ *        reconnected and joined again.
+ *
+ * The interesting half is the middle one. Every other path into
+ * SelectPreferredParent() is driven by an incoming DIO, so a node whose
+ * only neighbour goes silent has nothing to trigger the staleness check
+ * that is supposed to notice -- unless something the node runs on its own
+ * clock does the triggering. Losing the last parent has to take the node
+ * out of the DODAG (RFC 6550 section 8.2.2.1: a node with no parent has an
+ * infinite rank) and back to soliciting, rather than leave it advertising
+ * a rank it can no longer reach the root with.
+ */
+class RplParentLossRejoinTestCase : public TestCase
+{
+  public:
+    RplParentLossRejoinTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplParentLossRejoinTestCase::RplParentLossRejoinTestCase()
+    : TestCase("Losing the last parent and rejoining")
+{
+}
+
+void
+RplParentLossRejoinTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    // A short Imin with two doublings puts Imax at about a second, so the
+    // two missed announcements that make a neighbour stale take a couple of
+    // seconds rather than the best part of an hour.
+    rplHelper.Set("DioIntervalMin", TimeValue(MilliSeconds(256)));
+    rplHelper.Set("DioIntervalDoublings", UintegerValue(2));
+    rplHelper.Set("DisInterval", TimeValue(Seconds(2)));
+
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Ptr<RplRoutingProtocol> root = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> child = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+
+    // Joined: the ordinary sequence, DIS to DIO to parent selection to DAO.
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(child->IsJoined(), true, "The child never joined the DODAG");
+    NS_TEST_ASSERT_MSG_EQ(child->GetRank(), 2 * RPL_MIN_HOPRANKINC, "The child is one hop out");
+    Ipv6Address parent = child->GetPreferredParent();
+    NS_TEST_ASSERT_MSG_NE(parent, Ipv6Address::GetAny(), "The child has no preferred parent");
+    NS_TEST_ASSERT_MSG_EQ(root->GetTopologySize(), 1, "The root never heard the child's DAO");
+
+    // Cut the child off from the root's DIOs. Nothing else is on this link,
+    // so no DIO reaches the child at all from here on.
+    Ptr<SimpleNetDevice> rootDevice = DynamicCast<SimpleNetDevice>(devices.Get(0));
+    Ptr<SimpleNetDevice> childDevice = DynamicCast<SimpleNetDevice>(devices.Get(1));
+    channel->BlackList(rootDevice, childDevice);
+
+    // Well past the two maximum Trickle intervals that make a neighbour
+    // stale, plus room for the child's own Trickle to fire after that.
+    Simulator::Stop(Seconds(15));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(child->GetPreferredParent(),
+                          Ipv6Address::GetAny(),
+                          "A parent that stopped sending DIOs stayed selected");
+    NS_TEST_ASSERT_MSG_EQ(child->GetRank(),
+                          RPL_INFINITE_RANK,
+                          "A node with no parent kept a finite rank");
+    NS_TEST_ASSERT_MSG_EQ(child->IsJoined(),
+                          false,
+                          "A node with no way to the root stayed in the DODAG");
+
+    // Reconnect: the DIS the child is sending again finds the root, and the
+    // whole join sequence runs a second time.
+    channel->UnBlackList(rootDevice, childDevice);
+
+    Simulator::Stop(Seconds(15));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(child->IsJoined(), true, "The child did not rejoin once reconnected");
+    NS_TEST_ASSERT_MSG_EQ(child->GetPreferredParent(),
+                          parent,
+                          "The child rejoined on a different parent than the only one there is");
+    NS_TEST_ASSERT_MSG_EQ(child->GetRank(),
+                          2 * RPL_MIN_HOPRANKINC,
+                          "The rank was not restored on rejoining");
+    NS_TEST_ASSERT_MSG_EQ(child->GetDodagId(),
+                          root->GetDodagId(),
+                          "The child rejoined a different DODAG");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief Take a joined node's interface down and back up, and check it
+ *        unwinds and rebuilds its RPL state around that.
+ *
+ * A different route out of the DODAG than losing a parent to silence
+ * (@see RplParentLossRejoinTestCase): here it is StopInterface() that has
+ * to drop the neighbours reachable through that interface, close the
+ * socket and hand what is left to the parent selection, and
+ * StartInterface() that has to bring the socket and the multicast
+ * subscription back once the interface returns.
+ */
+class RplInterfaceRestartTestCase : public TestCase
+{
+  public:
+    RplInterfaceRestartTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplInterfaceRestartTestCase::RplInterfaceRestartTestCase()
+    : TestCase("An interface going down and coming back up")
+{
+}
+
+void
+RplInterfaceRestartTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    rplHelper.Set("DioIntervalMin", TimeValue(MilliSeconds(256)));
+    rplHelper.Set("DioIntervalDoublings", UintegerValue(2));
+    rplHelper.Set("DisInterval", TimeValue(Seconds(2)));
+
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Ptr<RplRoutingProtocol> child = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    Ptr<Ipv6L3Protocol> childIpv6 = nodes.Get(1)->GetObject<Ipv6L3Protocol>();
+
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(child->IsJoined(), true, "The child never joined the DODAG");
+    Ipv6Address parent = child->GetPreferredParent();
+    NS_TEST_ASSERT_MSG_NE(parent, Ipv6Address::GetAny(), "The child has no preferred parent");
+
+    // Down: the only neighbour was reachable through this interface, so
+    // dropping it leaves no parent and takes the node out of the DODAG.
+    childIpv6->SetDown(1);
+    Simulator::Stop(Seconds(1));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(child->GetPreferredParent(),
+                          Ipv6Address::GetAny(),
+                          "A parent reachable only through a downed interface stayed selected");
+    NS_TEST_ASSERT_MSG_EQ(child->GetRank(),
+                          RPL_INFINITE_RANK,
+                          "A node with no usable interface kept a finite rank");
+    NS_TEST_ASSERT_MSG_EQ(child->IsJoined(),
+                          false,
+                          "A node with no usable interface stayed in the DODAG");
+
+    // Up again: the socket and the all-RPL-nodes subscription come back,
+    // and the ordinary join sequence runs a second time.
+    childIpv6->SetUp(1);
+    Simulator::Stop(Seconds(15));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(child->IsJoined(),
+                          true,
+                          "The child did not rejoin after its interface came back");
+    NS_TEST_ASSERT_MSG_EQ(child->GetRank(),
+                          2 * RPL_MIN_HOPRANKINC,
+                          "The rank was not restored after the interface came back");
+    NS_TEST_ASSERT_MSG_NE(child->GetPreferredParent(),
+                          Ipv6Address::GetAny(),
+                          "No parent was picked up after the interface came back");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief Check that a second Duplicate Address Detection success on the
+ *        root does not restart the DODAG it is already running.
+ *
+ * HandleDadSuccess() is what starts the root's DODAG, on the trace that
+ * fires when its own SLAAC address clears DAD (RFC 4862). That trace can
+ * fire again later -- any further global address on the root goes through
+ * DAD too -- and RFC 6550 section 8.2.2.2 has the DODAGID be one specific
+ * address of the root's, not whichever one most recently finished DAD:
+ * changing it mid-flight would orphan every node that joined on the old
+ * one and invalidate every downward path already computed.
+ */
+class RplRootReaddressTestCase : public TestCase
+{
+  public:
+    RplRootReaddressTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplRootReaddressTestCase::RplRootReaddressTestCase()
+    : TestCase("A second address on the root does not restart the DODAG")
+{
+}
+
+void
+RplRootReaddressTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    rplHelper.Set("DioIntervalMin", TimeValue(MilliSeconds(256)));
+    rplHelper.Set("DioIntervalDoublings", UintegerValue(2));
+
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> root = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> child = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    Ipv6Address dodagId = root->GetDodagId();
+    NS_TEST_ASSERT_MSG_NE(dodagId, Ipv6Address::GetAny(), "The root never started a DODAG");
+    NS_TEST_ASSERT_MSG_EQ(root->GetTopologySize(), 1, "The root never heard the child's DAO");
+    NS_TEST_ASSERT_MSG_EQ(child->GetDodagId(), dodagId, "The child joined another DODAG");
+
+    // A second global address on the root, on an unrelated prefix: it goes
+    // through DAD and fires the same trace the DODAG was started on.
+    Ptr<Ipv6L3Protocol> rootIpv6 = nodes.Get(0)->GetObject<Ipv6L3Protocol>();
+    Ipv6InterfaceAddress extra(Ipv6Address("2001:db8::1"), Ipv6Prefix(64));
+    extra.SetScope(Ipv6InterfaceAddress::GLOBAL);
+    rootIpv6->AddAddress(1, extra);
+
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(root->GetDodagId(),
+                          dodagId,
+                          "A later DAD success moved the DODAGID to the new address");
+    NS_TEST_ASSERT_MSG_EQ(root->GetRank(),
+                          RPL_MIN_HOPRANKINC,
+                          "The root's rank changed on a later DAD success");
+    NS_TEST_ASSERT_MSG_EQ(root->GetTopologySize(),
+                          1,
+                          "The topology learnt from the DAOs was thrown away");
+    NS_TEST_ASSERT_MSG_EQ(child->GetDodagId(),
+                          dodagId,
+                          "The child was moved to a different DODAG under it");
+    NS_TEST_ASSERT_MSG_EQ(child->GetRank(),
+                          2 * RPL_MIN_HOPRANKINC,
+                          "The child's rank changed for a reason of the root's own");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Check what the root's downward path computation does with a
  *        topology that does not lead anywhere: an entry whose reported
  *        parents form a cycle, one whose lifetime has run out, and a
@@ -2953,6 +3351,609 @@ RplDaoAckRetryTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief Check the three answers a DIS can get (RFC 6550 section 8.3): a
+ *        unicast one is answered with a unicast DIO, a multicast one resets
+ *        the Trickle timer instead, and a node that has not joined a DODAG
+ *        answers neither.
+ *
+ * A monitoring raw socket on the soliciting node counts the DIOs; Imin is
+ * long enough that the Trickle timer's own transmissions are easy to tell
+ * apart from an answer, and the multicast case is read off the timing --
+ * a reset puts the next transmission back inside one Imin, where the
+ * grown-up interval would have taken seconds.
+ */
+class RplDisHandlingTestCase : public TestCase
+{
+  public:
+    RplDisHandlingTestCase();
+
+  private:
+    void DoRun() override;
+
+    /**
+     * @brief Record the arrival of a DIO at the monitoring socket.
+     * @param socket the monitoring socket
+     */
+    void RecordDio(Ptr<Socket> socket);
+
+    std::vector<Time> m_dioArrivals; //!< when a DIO reached the monitoring socket
+};
+
+RplDisHandlingTestCase::RplDisHandlingTestCase()
+    : TestCase("DIS answered, ignored, or turned into a Trickle reset")
+{
+}
+
+void
+RplDisHandlingTestCase::RecordDio(Ptr<Socket> socket)
+{
+    Address sender;
+    Ptr<Packet> packet = socket->RecvFrom(sender);
+    if (!packet)
+    {
+        return;
+    }
+
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ipv6Header);
+    Icmpv6Header icmpv6Header;
+    packet->RemoveHeader(icmpv6Header);
+
+    if (icmpv6Header.GetType() == ICMPV6_RPL && icmpv6Header.GetCode() == RPL_CODE_DIO)
+    {
+        m_dioArrivals.push_back(Simulator::Now());
+    }
+}
+
+void
+RplDisHandlingTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(3); // 0 = root, 1 = the soliciting node, 2 = never joins
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    // Node 2 never hears a DIO from anyone -- neither the root's own, nor
+    // one relayed by node 1 once it joins and starts advertising its own
+    // rank -- so it stays outside the DODAG and can stand in for
+    // "solicited but not joined".
+    Ptr<SimpleNetDevice> rootDevice = DynamicCast<SimpleNetDevice>(devices.Get(0));
+    Ptr<SimpleNetDevice> proberDevice = DynamicCast<SimpleNetDevice>(devices.Get(1));
+    Ptr<SimpleNetDevice> outsiderDevice = DynamicCast<SimpleNetDevice>(devices.Get(2));
+    channel->BlackList(rootDevice, outsiderDevice);
+    channel->BlackList(outsiderDevice, rootDevice);
+    channel->BlackList(proberDevice, outsiderDevice);
+    channel->BlackList(outsiderDevice, proberDevice);
+
+    RplHelper rplHelper;
+    // Imin of a second with four doublings: Imax is 16 s, far enough from
+    // Imin that a reset back to Imin is unmistakable in the arrival times.
+    rplHelper.Set("DioIntervalMin", TimeValue(Seconds(1)));
+    rplHelper.Set("DioIntervalDoublings", UintegerValue(4));
+    // Nothing here needs the soliciting node's own periodic DIS.
+    rplHelper.Set("DisInterval", TimeValue(Seconds(1000)));
+
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Ptr<Node> prober = nodes.Get(1);
+    Ptr<Socket> monitor = Socket::CreateSocket(prober, Ipv6RawSocketFactory::GetTypeId());
+    monitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    monitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    monitor->BindToNetDevice(prober->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+    monitor->SetRecvCallback(MakeCallback(&RplDisHandlingTestCase::RecordDio, this));
+
+    // Let the DODAG settle and the root's Trickle interval grow to Imax.
+    Simulator::Stop(Seconds(80));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> root = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> outsider = nodes.Get(2)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(root->IsJoined(), true, "The root never started its DODAG");
+    NS_TEST_ASSERT_MSG_EQ(outsider->IsJoined(),
+                          false,
+                          "The node cut off from the root joined a DODAG anyway");
+
+    Ipv6Address proberLinkLocal =
+        prober->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address rootLinkLocal =
+        nodes.Get(0)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address outsiderLinkLocal =
+        nodes.Get(2)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    // A unicast DIS to the root: answered with a DIO addressed back, well
+    // inside the seconds the grown-up Trickle interval would have taken.
+    m_dioArrivals.clear();
+    RplDisHeader dis;
+    Simulator::Schedule(Seconds(0),
+                        &SendRawRplMessage<RplDisHeader>,
+                        prober,
+                        1,
+                        dis,
+                        static_cast<uint8_t>(RPL_CODE_DIS),
+                        proberLinkLocal,
+                        rootLinkLocal);
+    Simulator::Stop(MilliSeconds(100));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(m_dioArrivals.size(), 1, "A unicast DIS was not answered with one DIO");
+
+    // A unicast DIS to a node that has not joined anything: it has nothing
+    // to advertise, so it stays quiet.
+    m_dioArrivals.clear();
+    Simulator::Schedule(Seconds(0),
+                        &SendRawRplMessage<RplDisHeader>,
+                        prober,
+                        1,
+                        dis,
+                        static_cast<uint8_t>(RPL_CODE_DIS),
+                        proberLinkLocal,
+                        outsiderLinkLocal);
+    Simulator::Stop(MilliSeconds(100));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(m_dioArrivals.size(),
+                          0,
+                          "A node outside any DODAG answered a DIS anyway");
+
+    // A multicast DIS is an inconsistency (RFC 6550 section 8.3): rather
+    // than answer it directly, the root resets its Trickle timer, which
+    // puts the next multicast DIO within one Imin instead of the up to
+    // Imax it was heading for.
+    m_dioArrivals.clear();
+    Simulator::Schedule(Seconds(0),
+                        &SendRawRplMessage<RplDisHeader>,
+                        prober,
+                        1,
+                        dis,
+                        static_cast<uint8_t>(RPL_CODE_DIS),
+                        proberLinkLocal,
+                        Ipv6Address(RPL_ALL_NODES_MULTICAST));
+    Time before = Simulator::Now();
+    Simulator::Stop(Seconds(1));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_GT_OR_EQ(m_dioArrivals.size(),
+                                1,
+                                "A multicast DIS did not reset the root's Trickle timer");
+    NS_TEST_ASSERT_MSG_LT(m_dioArrivals.front() - before,
+                          Seconds(1),
+                          "The DIO after a multicast DIS came no sooner than the un-reset "
+                          "interval would have produced");
+
+    monitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief Check which DAO-ACKs stop a node retrying its DAO and which do
+ *        not: the wrong sequence number, a rejection status, and the one
+ *        that actually matches. Plus the DAO a node that is not the root
+ *        must not act on.
+ *
+ * RFC 6550 section 6.5's DAO-ACK carries back the sequence it answers, so
+ * a node has to check it: acting on an acknowledgement for an earlier DAO
+ * would clear the pending state of the one still in flight and lose the
+ * retry that was meant to get it through.
+ */
+class RplDaoAckSequenceTestCase : public TestCase
+{
+  public:
+    RplDaoAckSequenceTestCase();
+
+  private:
+    void DoRun() override;
+
+    /**
+     * @brief Record a DAO, and the sequence it carries.
+     * @param socket the monitoring socket
+     */
+    void RecordDao(Ptr<Socket> socket);
+
+    std::vector<uint8_t> m_daoSequences; //!< sequence of every DAO seen
+};
+
+RplDaoAckSequenceTestCase::RplDaoAckSequenceTestCase()
+    : TestCase("DAO-ACKs a node must not accept")
+{
+}
+
+void
+RplDaoAckSequenceTestCase::RecordDao(Ptr<Socket> socket)
+{
+    Address sender;
+    Ptr<Packet> packet = socket->RecvFrom(sender);
+    if (!packet)
+    {
+        return;
+    }
+
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ipv6Header);
+    Icmpv6Header icmpv6Header;
+    packet->RemoveHeader(icmpv6Header);
+
+    if (icmpv6Header.GetType() == ICMPV6_RPL && icmpv6Header.GetCode() == RPL_CODE_DAO)
+    {
+        RplDaoHeader dao;
+        packet->RemoveHeader(dao);
+        m_daoSequences.push_back(dao.GetSequence());
+    }
+}
+
+void
+RplDaoAckSequenceTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    rplHelper.Set("DioIntervalMin", TimeValue(MilliSeconds(256)));
+    // The child's very first DAO gets acknowledged for real, before the
+    // blacklist below is even applied, so what that blacklist leaves
+    // unacknowledged is the next one -- the periodic refresh, DaoInterval
+    // later. Long enough that it cannot recur a second time before every
+    // check below is done (SendDao() unconditionally hands the
+    // acknowledgement-tracking state to whatever sequence it just sent, so
+    // a second refresh landing mid-test would silently retarget the
+    // retries this test is watching), short enough that the whole test
+    // still finishes well inside Icmpv6L4Protocol's default 30 s
+    // ReachableTime -- the child's Neighbour Discovery cache entry for the
+    // root, as its gateway, is confirmed once during the join above and
+    // never again once the blacklist is up, and past ReachableTime a
+    // genuinely unreachable entry drops packets before they ever reach the
+    // channel, which would stop the DAOs themselves, not just their
+    // acknowledgement.
+    rplHelper.Set("DaoInterval", TimeValue(Seconds(20)));
+    rplHelper.Set("DaoAckTimeout", TimeValue(Seconds(1)));
+    rplHelper.Set("DaoRetries", UintegerValue(30));
+
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Ptr<Node> rootNode = nodes.Get(0);
+    Ptr<Socket> monitor = Socket::CreateSocket(rootNode, Ipv6RawSocketFactory::GetTypeId());
+    monitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    monitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    monitor->BindToNetDevice(rootNode->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+    monitor->SetRecvCallback(MakeCallback(&RplDaoAckSequenceTestCase::RecordDao, this));
+
+    // Let the child join and send its first DAO normally, so this exercises
+    // a real DAO-ACK sequence being interrupted, not a join that never
+    // happened in the first place. That first DAO gets acknowledged before
+    // the blacklist below takes effect. The bystander is never a candidate
+    // parent (RPL_MOP_NON_STORING is the only mode implemented and every
+    // node here runs it, but the bystander joining the same DODAG one hop
+    // out from the child would only complicate the topology for nothing
+    // this test needs); it just needs a working address of its own,
+    // established here alongside everything else.
+    Simulator::Stop(Seconds(5));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> root = rootNode->GetObject<RplRoutingProtocol>();
+    Ptr<Node> childNode = nodes.Get(1);
+    Ptr<RplRoutingProtocol> child = childNode->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(child->IsJoined(), true, "The child never joined the DODAG");
+    NS_TEST_ASSERT_MSG_GT_OR_EQ(m_daoSequences.size(),
+                                1,
+                                "The child's first DAO did not arrive");
+
+    // A DAO addressed to a node that is not the root, while root-to-child is
+    // still open: non-storing mode has the root, and only the root, keep
+    // the topology (RFC 6550 section 9.2), so this must not be recorded
+    // anywhere on the child.
+    Ipv6Address childAddress = child->GetGlobalAddress();
+    Ipv6Address rootAddress = root->GetGlobalAddress();
+    NS_TEST_ASSERT_MSG_EQ(child->GetTopologySize(), 0, "A non-root node kept a topology");
+    RplDaoHeader stray;
+    stray.SetInstanceId(RPL_DEFAULT_INSTANCE);
+    stray.SetSequence(1);
+    stray.SetTarget(Ipv6Address("2001:1::ff:fe00:99"));
+    stray.SetTransitInformation(rootAddress, 1, RPL_DEFAULT_LIFETIME);
+    Simulator::Schedule(Seconds(0),
+                        &SendRawRplMessage<RplDaoHeader>,
+                        rootNode,
+                        1,
+                        stray,
+                        static_cast<uint8_t>(RPL_CODE_DAO),
+                        rootAddress,
+                        childAddress);
+    Simulator::Stop(Seconds(1));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(child->GetTopologySize(),
+                          0,
+                          "A node that is not the root acted on a DAO");
+
+    // Now cut the root's replies off: the root's own DAO-ACK never reaches
+    // the child from here on, so the only acknowledgements it sees are the
+    // hand-built ones below (sent from the bystander instead, see the note
+    // on sendAck()), and the retry timer keeps the DAO coming.
+    Ptr<SimpleNetDevice> rootDevice = DynamicCast<SimpleNetDevice>(devices.Get(0));
+    Ptr<SimpleNetDevice> childDevice = DynamicCast<SimpleNetDevice>(devices.Get(1));
+    channel->BlackList(rootDevice, childDevice);
+
+    // The next periodic DAO (DaoInterval after the child joined) finds
+    // nothing to acknowledge it: DaoAckTimeout's retries follow.
+    Simulator::Stop(Seconds(20));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_GT_OR_EQ(m_daoSequences.size(),
+                                2,
+                                "The child's DAO was not retried while unacknowledged");
+    uint8_t pending = m_daoSequences.back();
+
+    auto countOf = [this](uint8_t sequence) {
+        return std::count(m_daoSequences.begin(), m_daoSequences.end(), sequence);
+    };
+
+    // RplRoutingProtocol::HandleDaoAck() never checks who a DAO-ACK actually
+    // came from, only its sequence and status, and DeliverRawRplMessage()
+    // hands it straight to the child's Ipv6L3Protocol::Receive() -- no
+    // channel involved, so the blacklist above cannot swallow it, and
+    // nothing about a real send (routing, Neighbour Discovery) has to
+    // succeed first for it to arrive. An earlier version of this test sent
+    // these the same way SendRawRplMessage() does, from the root itself,
+    // which meant lifting that same blacklist for the moment the packet was
+    // on the wire; that just as easily let the root's own genuine,
+    // correctly-sequenced acknowledgement -- sent automatically in response
+    // to whichever retry happened to land inside that same window -- slip
+    // through too, silently ending the very sequence this test exists to
+    // drive by hand.
+    auto sendAck = [&](uint8_t sequence, uint8_t status) {
+        RplDaoAckHeader ack;
+        ack.SetInstanceId(RPL_DEFAULT_INSTANCE);
+        ack.SetDodagId(root->GetDodagId());
+        ack.SetSequence(sequence);
+        ack.SetStatus(status);
+        Simulator::Schedule(Seconds(0),
+                            &DeliverRawRplMessage<RplDaoAckHeader>,
+                            childNode,
+                            1,
+                            ack,
+                            static_cast<uint8_t>(RPL_CODE_DAO_ACK),
+                            rootAddress,
+                            childAddress);
+    };
+
+    // A DAO-ACK for an earlier sequence: not the one in flight, so the
+    // retries have to keep going.
+    long countBefore = countOf(pending);
+    sendAck(static_cast<uint8_t>(pending - 1), 0);
+    Simulator::Stop(Seconds(3));
+    Simulator::Run();
+    NS_TEST_ASSERT_MSG_GT(countOf(pending),
+                          countBefore,
+                          "A DAO-ACK for an earlier sequence stopped the retries");
+
+    // The right sequence, but a rejection status: RFC 6550 section 6.5's
+    // Status is not "accepted", so the DAO is not confirmed either.
+    countBefore = countOf(pending);
+    sendAck(pending, 1);
+    Simulator::Stop(Seconds(3));
+    Simulator::Run();
+    NS_TEST_ASSERT_MSG_GT(countOf(pending),
+                          countBefore,
+                          "A rejected DAO was treated as acknowledged");
+
+    // The matching sequence, accepted: the retries stop.
+    sendAck(pending, 0);
+    Simulator::Stop(Seconds(1));
+    Simulator::Run();
+
+    countBefore = countOf(pending);
+    Simulator::Stop(Seconds(3));
+    Simulator::Run();
+    NS_TEST_ASSERT_MSG_EQ(countOf(pending),
+                          countBefore,
+                          "The DAO kept being retried after it was acknowledged");
+
+    // A duplicate of that same acknowledgement changes nothing.
+    sendAck(pending, 0);
+    Simulator::Stop(Seconds(3));
+    Simulator::Run();
+    NS_TEST_ASSERT_MSG_EQ(countOf(pending),
+                          countBefore,
+                          "A duplicate DAO-ACK restarted something");
+
+    monitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief Check the neighbour freshness rule: a neighbour heard once is a
+ *        candidate parent only while nothing better-established is
+ *        available, and stops being one as soon as another neighbour has
+ *        been heard RPL_FRESHNESS_TARGET times.
+ *
+ * A radio link that delivered exactly one packet may well be a lucky long
+ * shot rather than a usable link, and RFC 6550 leaves how a candidate
+ * becomes a parent to the implementation (section 3.2.5, "the details of
+ * this process are out of scope"). This mirrors Contiki-NG's link
+ * statistics: everything counts until something is established, then only
+ * the established ones do -- otherwise a node deep in a DODAG could never
+ * bootstrap at all.
+ */
+class RplParentFreshnessTestCase : public TestCase
+{
+  public:
+    RplParentFreshnessTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplParentFreshnessTestCase::RplParentFreshnessTestCase()
+    : TestCase("A neighbour heard once loses to one heard often")
+{
+}
+
+void
+RplParentFreshnessTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(3); // 0 = node under test, 1 = the lucky shot, 2 = the steady one
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+    rplHelper.AssignStreams(nodes, 1);
+
+    Ptr<RplRoutingProtocol> node = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ipv6Address dodagId("2001:1::1");
+    Ipv6Address nodeLinkLocal =
+        nodes.Get(0)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address luckyLinkLocal =
+        nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address steadyLinkLocal =
+        nodes.Get(2)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    auto buildDio = [&dodagId](uint16_t rank) {
+        RplDioHeader dio;
+        dio.SetInstanceId(RPL_DEFAULT_INSTANCE);
+        dio.SetVersionNumber(1);
+        dio.SetRank(rank);
+        dio.SetMop(RPL_MOP_NON_STORING);
+        dio.SetDodagId(dodagId);
+        dio.SetDagConfiguration(RPL_DIO_INTERVAL_DOUBLINGS,
+                                RPL_DIO_INTERVAL_MIN,
+                                RPL_DIO_REDUNDANCY,
+                                RPL_MAX_RANKINC,
+                                RPL_MIN_HOPRANKINC,
+                                RPL_OCP_OF0,
+                                RPL_DEFAULT_LIFETIME,
+                                RPL_DEFAULT_LIFETIME_UNIT);
+        return dio;
+    };
+
+    auto send = [&](Ptr<Node> from, Ipv6Address fromAddress, const RplDioHeader& dio) {
+        Simulator::Schedule(Seconds(0),
+                            &SendRawRplMessage<RplDioHeader>,
+                            from,
+                            1,
+                            dio,
+                            static_cast<uint8_t>(RPL_CODE_DIO),
+                            fromAddress,
+                            nodeLinkLocal);
+        Simulator::Stop(MilliSeconds(10));
+        Simulator::Run();
+    };
+
+    // The lucky shot, heard exactly once, at the best rank there is. With
+    // nothing established to compare against, it is taken: a node has to
+    // be able to bootstrap on the first DIO it ever hears.
+    RplDioHeader luckyDio = buildDio(RPL_MIN_HOPRANKINC);
+    send(nodes.Get(1), luckyLinkLocal, luckyDio);
+
+    NS_TEST_ASSERT_MSG_EQ(node->IsJoined(), true, "The first DIO did not bootstrap a DODAG");
+    NS_TEST_ASSERT_MSG_EQ(node->GetPreferredParent(),
+                          luckyLinkLocal,
+                          "The only neighbour there was did not become the parent");
+    NS_TEST_ASSERT_MSG_EQ(node->GetRank(), 2 * RPL_MIN_HOPRANKINC, "Wrong rank via the lucky shot");
+
+    // The steady one, at a worse rank, heard up to one short of the
+    // freshness target: still not established, so the better rank of the
+    // lucky shot keeps winning.
+    //
+    // Its rank is one MinHopRankIncrease worse than the lucky shot's, which
+    // is to say the same as this node's own -- deliberately not two, which
+    // is what a child of this node would advertise and which the loop
+    // avoidance in SelectPreferredParent() refuses outright, freshness or
+    // no freshness. What is under test here is the freshness rule, so the
+    // candidate has to be one that rule alone decides.
+    RplDioHeader steadyDio = buildDio(2 * RPL_MIN_HOPRANKINC);
+    for (uint8_t heard = 1; heard < RPL_FRESHNESS_TARGET; heard++)
+    {
+        send(nodes.Get(2), steadyLinkLocal, steadyDio);
+        NS_TEST_ASSERT_MSG_EQ(node->GetPreferredParent(),
+                              luckyLinkLocal,
+                              "A neighbour heard " << +heard << " times, still short of the "
+                                                   << "freshness target, took over anyway");
+    }
+
+    // The one that reaches the target: from here on the lucky shot, heard
+    // once, is no longer a candidate, and the established neighbour takes
+    // over despite advertising a worse rank.
+    send(nodes.Get(2), steadyLinkLocal, steadyDio);
+
+    NS_TEST_ASSERT_MSG_EQ(node->GetPreferredParent(),
+                          steadyLinkLocal,
+                          "A neighbour heard once kept beating one heard the full "
+                          "freshness target of times");
+    NS_TEST_ASSERT_MSG_EQ(node->GetRank(),
+                          3 * RPL_MIN_HOPRANKINC,
+                          "Wrong rank via the established neighbour");
+    NS_TEST_ASSERT_MSG_EQ(node->IsJoined(),
+                          true,
+                          "Switching to the established neighbour dropped the DODAG");
+
+    // And once the lucky shot is heard often enough to be established
+    // itself, its better rank counts again.
+    for (uint8_t heard = 1; heard < RPL_FRESHNESS_TARGET; heard++)
+    {
+        send(nodes.Get(1), luckyLinkLocal, luckyDio);
+    }
+
+    NS_TEST_ASSERT_MSG_EQ(node->GetPreferredParent(),
+                          luckyLinkLocal,
+                          "A neighbour that became established was not reconsidered");
+    NS_TEST_ASSERT_MSG_EQ(node->GetRank(),
+                          2 * RPL_MIN_HOPRANKINC,
+                          "Wrong rank after moving back up");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Check that the RPL Option (RPI, RFC 6553) survives a serialize and
  *        deserialize round trip, flags included.
  */
@@ -3508,6 +4509,12 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplTrickleTimerTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDodagFormationTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDioRejectionTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplParentLossRejoinTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplInterfaceRestartTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplRootReaddressTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplParentFreshnessTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplDisHandlingTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplDaoAckSequenceTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplComputeSourceRouteFailureTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplMrhofSelectionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplLqlMappingTestCase, TestCase::Duration::QUICK);

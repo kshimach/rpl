@@ -824,6 +824,28 @@ void
 RplRoutingProtocol::DioTrickleFire()
 {
     NS_LOG_FUNCTION(this);
+
+    // A neighbour that has simply gone quiet is only noticed here. Every
+    // other call of SelectPreferredParent() is driven by an incoming DIO
+    // (HandleDio()) or by an interface going down (StopInterface()), so a
+    // node whose neighbours all stop sending has nothing left to run the
+    // staleness check that is meant to catch exactly that: it would keep
+    // its last parent selected indefinitely and go on advertising a rank
+    // it can no longer reach the root with, poisoning everything that
+    // picked it as a parent in turn. The Trickle timer keeps firing
+    // whether or not anything is being heard, which is what makes it the
+    // right clock for this; the check happens before the DIO goes out, so
+    // the DIO carries the rank that comes out of it.
+    // The return value, which everywhere else means "reset the Trickle
+    // timer", is deliberately ignored here. Resetting it from inside its
+    // own transmission event would reschedule the very timer currently
+    // being run, and there is nothing to gain from it either: a reset
+    // exists to bring the next DIO forward, and the next DIO is the one
+    // going out on the line below. If the check above dropped the last
+    // parent, LeaveDodag() has already stopped the timer outright, and
+    // SendDio() below is then a no-op.
+    SelectPreferredParent();
+
     SendDio(Ipv6Address(RPL_ALL_NODES_MULTICAST));
 }
 
@@ -1500,67 +1522,101 @@ RplRoutingProtocol::SelectPreferredParent()
     // neighbour that has since turned out to be stale: keeping it would lock
     // the node onto a bad link, because the fresh neighbours below that rank
     // would all be rejected.
+    //
+    // That exception is deliberately not a free pass, though: relaxing the
+    // bound all the way to INFINITE_RANK would also let back in the
+    // neighbours that derived their own rank from this node's DIOs, i.e.
+    // this node's sub-DODAG, and adopting one of those is a routing loop
+    // (RFC 6550 section 8.2.2.4) -- one that in this implementation cannot
+    // even be broken by the RPL Option's rank check, which can trace a
+    // packet as dropped but not actually stop it (@see
+    // doc/design-constraints.md section 12.1). Any neighbour a full
+    // MinHopRankIncrease worse than this node could be exactly that, since
+    // that is the rank a child of this node computes; the relaxation stops
+    // there. A node with no rank of its own has no sub-DODAG either, so
+    // that case relaxes to everything, as before.
     uint16_t currentRank = m_rank;
     auto preferred = m_parents.find(m_preferredParent);
     if (haveFresh &&
         (preferred == m_parents.end() || preferred->second.freshness < RPL_FRESHNESS_TARGET))
     {
-        currentRank = RPL_INFINITE_RANK;
+        uint32_t childRank = uint32_t(m_rank) + m_minHopRankIncrease;
+        currentRank = (childRank >= RPL_INFINITE_RANK) ? RPL_INFINITE_RANK
+                                                       : static_cast<uint16_t>(childRank);
     }
 
     Ipv6Address best = Ipv6Address::GetAny();
     uint16_t bestRank = RPL_INFINITE_RANK;
     uint32_t bestPathCost = std::numeric_limits<uint32_t>::max();
 
-    for (const auto& [address, parent] : m_parents)
+    // Two passes over the candidates. The first keeps to the established
+    // neighbours; the second, entered only when the first found nothing at
+    // all, drops that restriction.
+    //
+    // Freshness has to be a preference rather than a requirement, because
+    // the two filters below interact badly when it is not: the neighbours
+    // that are established can all still be rejected by the rank check
+    // (they sit below this node, so taking one would be a loop), and a node
+    // that then finds itself with no parent leaves the DODAG, clears its
+    // parent set, and takes whichever DIO happens to arrive first -- quite
+    // possibly one from its own sub-DODAG, which is the very loop the rank
+    // check just refused. A neighbour heard three times is a real
+    // neighbour; provisionally trusting it costs far less than that.
+    bool requireFresh = haveFresh;
+    for (uint8_t pass = 0; pass < 2 && best.IsAny(); pass++)
     {
-        if (haveFresh && parent.freshness < RPL_FRESHNESS_TARGET)
-        {
-            NS_LOG_LOGIC("Neighbour " << address << " has only been heard "
-                                      << +parent.freshness << " times");
-            continue;
-        }
+        requireFresh = haveFresh && pass == 0;
 
-        if (m_joined && currentRank != RPL_INFINITE_RANK && parent.rank >= currentRank)
+        for (const auto& [address, parent] : m_parents)
         {
-            NS_LOG_LOGIC("Neighbour " << address << " is not closer to the root than we are");
-            continue;
-        }
-
-        if (m_ocp == RPL_OCP_MRHOF && parent.etx >= RPL_MRHOF_MAX_LINK_METRIC)
-        {
-            // RFC 6719 section 3.2: a link this bad is not even considered.
-            NS_LOG_LOGIC("Neighbour " << address << " has too high a link ETX");
-            continue;
-        }
-
-        uint32_t pathCost = 0;
-        uint16_t rank = RankViaParent(parent, &pathCost);
-        if (rank == RPL_INFINITE_RANK)
-        {
-            continue;
-        }
-
-        if (m_ocp == RPL_OCP_MRHOF)
-        {
-            if (pathCost >= RPL_MRHOF_MAX_PATH_COST)
+            if (requireFresh && parent.freshness < RPL_FRESHNESS_TARGET)
             {
-                NS_LOG_LOGIC("Neighbour " << address << " has too high a path cost");
+                NS_LOG_LOGIC("Neighbour " << address << " has only been heard "
+                                          << +parent.freshness << " times");
                 continue;
             }
-            // Ties are broken on the address so that the choice is deterministic.
-            if (best.IsAny() || pathCost < bestPathCost ||
-                (pathCost == bestPathCost && address < best))
+
+            if (m_joined && currentRank != RPL_INFINITE_RANK && parent.rank >= currentRank)
+            {
+                NS_LOG_LOGIC("Neighbour " << address << " is not closer to the root than we are");
+                continue;
+            }
+
+            if (m_ocp == RPL_OCP_MRHOF && parent.etx >= RPL_MRHOF_MAX_LINK_METRIC)
+            {
+                // RFC 6719 section 3.2: a link this bad is not even considered.
+                NS_LOG_LOGIC("Neighbour " << address << " has too high a link ETX");
+                continue;
+            }
+
+            uint32_t pathCost = 0;
+            uint16_t rank = RankViaParent(parent, &pathCost);
+            if (rank == RPL_INFINITE_RANK)
+            {
+                continue;
+            }
+
+            if (m_ocp == RPL_OCP_MRHOF)
+            {
+                if (pathCost >= RPL_MRHOF_MAX_PATH_COST)
+                {
+                    NS_LOG_LOGIC("Neighbour " << address << " has too high a path cost");
+                    continue;
+                }
+                // Ties are broken on the address so that the choice is deterministic.
+                if (best.IsAny() || pathCost < bestPathCost ||
+                    (pathCost == bestPathCost && address < best))
+                {
+                    best = address;
+                    bestRank = rank;
+                    bestPathCost = pathCost;
+                }
+            }
+            else if (best.IsAny() || rank < bestRank || (rank == bestRank && address < best))
             {
                 best = address;
                 bestRank = rank;
-                bestPathCost = pathCost;
             }
-        }
-        else if (best.IsAny() || rank < bestRank || (rank == bestRank && address < best))
-        {
-            best = address;
-            bestRank = rank;
         }
     }
 
@@ -1571,11 +1627,14 @@ RplRoutingProtocol::SelectPreferredParent()
         // exceeds PARENT_SWITCH_THRESHOLD, so the node does not flap between
         // parents of near-identical quality. The current parent still has
         // to clear the same freshness and loop-avoidance filters applied to
-        // every other candidate above; otherwise hysteresis could keep a
-        // stale or newly-looped parent selected indefinitely.
+        // every other candidate above -- the freshness one exactly as far
+        // as the pass that produced best applied it, so that hysteresis
+        // neither rejects the current parent on a rule the winner was not
+        // held to, nor keeps a stale or newly-looped parent selected
+        // indefinitely.
         auto current = m_parents.find(m_preferredParent);
         if (current != m_parents.end() &&
-            (!haveFresh || current->second.freshness >= RPL_FRESHNESS_TARGET) &&
+            (!requireFresh || current->second.freshness >= RPL_FRESHNESS_TARGET) &&
             (!m_joined || currentRank == RPL_INFINITE_RANK || current->second.rank < currentRank) &&
             current->second.etx < RPL_MRHOF_MAX_LINK_METRIC)
         {

@@ -1434,3 +1434,124 @@ RFC 6554 の RH3 一つで表現できる上限は圧縮の効き方で決まる
 マスク済みの値しか読まないので、これは自ノードの設定ミスを早期に見つける
 ためのもの。境界テスト `RplDioBoundaryTestCase` は MOP 0-7 × Prf 0-7 ×
 Grounded の全組み合わせが往復することを確認する。
+
+## 22. シーケンス状態遷移の準正常系検証で見つかったバグ2件
+
+正常系・準正常系(境界値)・異常系に加え、「シーケンス」の準正常系
+――正しいメッセージ列が正しくない順序・タイミングで届く場合――を
+状態遷移として検証した。追加したテストケース:
+
+- `RplParentLossRejoinTestCase`: 親が沈黙 → 喪失検知 → DODAG離脱 →
+  再接続 → 再join。
+- `RplInterfaceRestartTestCase`: インターフェースdown → 全状態破棄 →
+  up → 再join。
+- `RplRootReaddressTestCase`: root の2つ目のグローバルアドレスが
+  DAD完了 → `HandleDadSuccess` 再発火が DODAG を再起動しないこと。
+- `RplParentFreshnessTestCase`: 1回しか聞いていない隣人 vs
+  `RPL_FRESHNESS_TARGET` 回聞いた隣人の優先順位切り替え。
+- `RplDioRejectionTestCase`: storing mode / MOP 0 / infinite rank /
+  他DODAG / stale version の DIO 拒否。
+- `RplComputeSourceRouteFailureTestCase`: 循環参照・孤立エントリ・
+  期限切れエントリでの経路計算失敗。
+- `RplDisHandlingTestCase`: unicast DIS への応答、未joinノードの
+  無応答、multicast DIS での Trickle リセット。
+- `RplDaoAckSequenceTestCase`: 不一致シーケンスの無視、reject
+  ステータスの無視、accept での再送停止、重複ackの無害性。
+
+この過程で2件のバグを発見・修正した。
+
+### 22.1 沈黙した親が検知されないまま (孤立したノードが古いランクを流し続ける)
+
+`SelectPreferredParent()` は `HandleDio()` (DIO受信時) と
+`StopInterface()` (インターフェースdown時) からしか呼ばれておらず、
+「隣人が単に何も送らなくなった」場合にそれを検知する経路がなかった。
+`RplTrickleTimer` は受信の有無に関わらず一定間隔で発火し続けるので、
+本来これが staleness チェックの自然なタイミングだったが、
+`DioTrickleFire()` は `SendDio()` を呼ぶだけで
+`SelectPreferredParent()` を一度も呼んでいなかった。
+
+結果: 唯一の親から2回連続でDIOを聞き逃しても(`RPL_FRESHNESS_MAX`相当の
+staleness判定自体は`SelectPreferredParent()`内にあるにも関わらず)、
+それを評価する機会自体が来ないため、ノードは古い親・古いランクを
+DODAG離脱することなく無期限に保持し続け、その古いランクを次のDIOで
+下流に流し続ける — RFC 6550 が想定する「ランクは到達可能性を反映する」
+という前提が崩れる。
+
+対処: `DioTrickleFire()` の冒頭で `SelectPreferredParent()` を呼ぶ。
+戻り値(「リセットが必要か」)は意図的に無視する — 自分自身の送信
+イベントの最中に自分自身のTrickleタイマーをリセットするのは、
+今まさに処理中のタイマーを再スケジュールすることになり無意味なばかりか、
+どのみちこの後 `SendDio()` で最新状態のDIOが出るので、リセットする
+実益もない。回帰テスト: `RplParentLossRejoinTestCase`。
+
+### 22.2 `SelectPreferredParent()` の freshness フィルタが必須条件になっていた (自分の子を親として選び直すループ)
+
+`SelectPreferredParent()` の freshness フィルタ(§5、`RPL_FRESHNESS_MAX`
+関連のコメント参照)は、「確立した隣人がいるなら未確立の隣人は無視する」
+という*優先順位*のつもりで書かれていたが、実装は単純な除外条件
+(`if (haveFresh && parent.freshness < RPL_FRESHNESS_TARGET) continue;`)
+になっていた。ランクによるループ回避チェック(自分より下位のランクを
+持つ隣人=自分の子孫を親候補から除外)と組み合わさると、「ランク的には
+使える唯一の隣人が、たまたずfreshness不足で除外される」状況で
+候補がゼロになり、`SelectPreferredParent()` は
+`LeaveDodag()`(親集合を空にしてDODAGを離脱)を呼んでいた。次に
+たまたま届いたDIOが自分の子孫からのものであっても、離脱直後で
+`m_parents` が空、`currentRank` の再計算に使う `m_rank` も
+`RPL_INFINITE_RANK` にリセットされているため、ループ回避チェックが
+機能せず、そのままそのDIOの送信元を親として採用してしまう —
+自分の子孫を親にする経路ループが発生する。
+
+再現条件は2ノードのマルチテストスイート実行中に実際に起きた:
+`RplParentFreshnessTestCase` を実装・実行したところ、ノード同士が
+互いを親としてループを組み、`RplIpv6ExtensionSourceRouting::Process()`
+のフラグメント処理が(存在しないはずの)ホップ数超過パケットを
+生成し、`PacketMetadata` の内部アサート
+(`m_used != prev && m_used != next`)で `NS_FATAL` 終了した。
+
+対処: 候補選定を2パスにする。1パス目は freshness フィルタを従来通り
+適用し、何か見つかればそれで決定 (優先順位としてのfreshnessが働く)。
+1パス目が何も見つけられなかった場合のみ、2パス目でfreshnessフィルタを
+外して再試行する(それでもランク・ETX等の他の条件は全て適用したまま)。
+ヒステリシス(MRHOF)の現在親チェックも、勝者を出したパスと同じ
+freshness要件で評価するよう対応する変数 `requireFresh` を導入した。
+
+回帰テストは `RplParentFreshnessTestCase` に追加した最終ブロック:
+唯一のランク的に使える隣人が freshness 不足でも、他に候補が無ければ
+それを使ってDODAGに留まる (離脱→ループの経路を通らない)こと、かつ
+RFC 6550 section 8.2.2.4 の「moving Down might create a loop」を踏まえ、
+自分の子になり得る(自分より1 MinHopRankIncrease分ランクが低い)隣人は
+freshnessの有無に関わらず引き続き拒否されることを確認する。
+
+### 22.3 テスト設計上の教訓: ブラックリストしたリンクへの「注入」はチャネル経由では信頼できない
+
+`RplDaoAckSequenceTestCase` の実装過程で、意図的にブロックした
+root→child リンクに対して「正解のACKだけを注入し、本物のrootからの
+自動応答は引き続きブロックしたい」という要求を、
+`SimpleChannel::BlackList()`/`UnBlackList()` の一時解除で実現しようと
+したところ、以下が全て問題になることが分かった:
+
+- 解除している間、本物のroot発の自動応答(同じ受信イベントの中で
+  DAOに対しHandleDao()が生成する正規のDAO-ACK)も一緒に通ってしまい、
+  テストが検証したい「手作りACKの効果」と区別がつかなくなる。
+- 送信元を単純に別ノード(bystander)にすると、そのノードが
+  child経由でDODAGに参加し、独自のDAOシーケンス番号が
+  child→rootの(意図的に開けたままの)経路を使って届いてしまい、
+  監視対象のシーケンス番号と衝突する。
+- bystanderをDODAGから完全に孤立させると、今度はRPLの
+  `RouteOutput()`が「参加していないノードは経路を持たない」ため、
+  子のグローバルアドレス宛の送信ができなくなる(リンクローカル宛に
+  すれば経路自体は解決するが、そもそもリンクローカルの隣人同士でも
+  Neighbor Discoveryの初回解決が必要で、この解決のためのNS/NA交換が
+  ns-3のこのテスト構成では完了しないケースがあった)。
+
+これらは全てチャネル・ルーティング・NDPという「配送手段」側の
+複雑さであり、テストが本来検証したい `HandleDaoAck()` のロジック
+(シーケンス一致・ステータスチェック)そのものとは無関係だった。
+
+対処: `SendRawRplMessage()`(既存、ソケット経由の現実的な送信)とは
+別に `DeliverRawRplMessage()` を追加した。こちらは `Ipv6L3Protocol::
+Receive()`(public)を直接呼び、チャネル・ブラックリスト・NDPを
+完全に迂回して「あたかも今インターフェースに届いたかのように」
+パケットを注入する。配送経路そのものを検証する必要がない箇所
+(このテストのように、相手ノードの受信後ロジックだけを検証したい
+場合)はこちらを使う方針とした。
