@@ -168,8 +168,8 @@
   `RplDaoAckRetryTestCase` で DAO-ACK タイムアウト・リトライ・
   リトライ枯渇 (`SendRawRplMessage()` によるパケット手動生成、および
   root 上の監視用 raw socket による送信回数カウントで検証、private
-  state には触れない) をそれぞれ追加。ただし No-Path DAO 自体を
-  本実装から**送信**する経路はまだ無い (下記参照)。
+  state には触れない) をそれぞれ追加。No-Path DAO の**送信**経路は
+  23 節の通り実装済み。
 - **Low (ドキュメント化のみ完了、未修正)**: DODAG version number
   (`HandleDio()`) と DAO path sequence (`HandleDao()`) は、いずれも
   RFC 6550 section 7.2 の lollipop 比較を実装せず、素の整数比較
@@ -1555,3 +1555,82 @@ Receive()`(public)を直接呼び、チャネル・ブラックリスト・NDP�
 パケットを注入する。配送経路そのものを検証する必要がない箇所
 (このテストのように、相手ノードの受信後ロジックだけを検証したい
 場合)はこちらを使う方針とした。
+
+## 23. No-Path DAO の送信を実装
+
+10 節に記録の通り、`HandleDao()` は No-Path DAO (RFC 6550 section 6.4.3、
+Path Lifetime 0 の DAO) を受信して処理する経路は既にあったが、本実装の
+ノード自身がそれを**送信**する経路が無かった。ノードが親を失って
+DODAG を離脱しても、root 側のトポロジエントリは advertise 済みの
+`PathLifetime` が切れて `PurgeTopology()` が回収するまで残り続ける
+— 実害としては、その間 root が既に無効な経路を `ComputeSourceRoute()`
+で組み立て続ける (相手に届かないパケットを送り出す) ことになる。
+
+### 23.1 実装
+
+`SendNoPathDao(Ipv6Address viaParent)` を新設。`SendDao()` とほぼ同じ
+組み立て (Target = 自ノードのグローバルアドレス、Transit Information
+に `viaParent` のグローバルアドレスと Path Lifetime 0) だが、以下の点で
+異なる:
+
+- DAO-ACK を要求しない (`SetAckRequested()` を呼ばない、デフォルトの
+  false のまま)。リトライ機構 (`m_daoAckPending`/`m_daoRetryEvent`) にも
+  触れない。この時点で送ろうとしている経路そのものが「使えなくなった」
+  と判断したものであることが多く、その同じ経路でリトライしても得る
+  ものが薄い。届かなければ、次の定期リフレッシュ、あるいは root 側の
+  `PurgeTopology()` が最終的な後始末になる。
+- Path Sequence をインクリメントする (`++m_pathSequence`)。RFC 6550
+  section 9.3 rule 1 「新しい情報を持つ DAO は Path Sequence を進める」
+  に従うが、この実装の root 側 (`HandleDao()`) は Path Sequence を
+  比較せず常に最新の DAO で上書きする設計 (10 節) なので、実利は
+  「どの DAO が最新か」を将来の実装や別実装が見分けられるようにする
+  ドキュメント的な意味に留まる。
+
+呼び出し箇所は `SelectPreferredParent()` 内の2箇所:
+
+1. **staleness による親の削除**(冒頭の掃除ループ) — 削除対象が
+   `m_preferredParent` と一致する場合、`m_parents.erase()` する**前**に
+   送信する。
+2. **rank/ETX 起因で候補が全滅した場合**(`best.IsAny()` 分岐、
+   `LeaveDodag()` の直前) — こちらは `m_parents` に `m_preferredParent`
+   のエントリがまだ残っている場合のみ (`m_parents.find(m_preferredParent)
+   != m_parents.end()`) 送信する。
+
+### 23.2 見つかったバグ: staleness 起因のケースでルーティングが失敗する
+
+最初の実装は `best.IsAny()` 分岐のみに `SendNoPathDao(m_preferredParent)`
+を置いていた。テスト (`RplNoPathDaoSentOnParentLossTestCase`、
+`RplParentLossRejoinTestCase` と同じ「root→child のみ blacklist、
+child は stale 判定で親を失う」構成に、root 上の DAO 監視 raw socket を
+追加したもの) を書いたところ、No-Path DAO が root に一切届かないことが
+判明した。
+
+原因: `SendNoPathDao()` は `SendDao()` と同じく `SendRplMessageUnicast()`
+経由で送信するが、これは通常のルーティング (`RouteOutput()` →
+non-root 分岐の `RouteViaPreferredParent()`) を通る。
+`RouteViaPreferredParent()` は `m_parents.find(m_preferredParent)` が
+見つかることを前提にしている。ところが `SelectPreferredParent()` の
+冒頭にある staleness 掃除ループは、stale と判定した隣人を
+`m_parents.erase()` で即座に削除する — `m_preferredParent` という
+*変数*自体はこの時点ではまだ古い値を保持しているが、`m_parents`
+という*マップ*からは既に消えている。`best.IsAny()` 分岐に到達する
+頃には、まさにこの経路 (staleness) で失われたケースについては
+`m_parents` から証拠が消えており、`RouteOutput()` は
+`ERROR_NOROUTETOHOST` で失敗する。ログにも
+`RouteOutput(): [LOGIC] No route to <root>` が残っていた。
+
+対処: staleness 掃除ループの中で、削除対象が `m_preferredParent` の
+場合は `erase()` する前 (`m_parents` にまだエントリがあり、
+`RouteViaPreferredParent()` が機能する状態) に `SendNoPathDao()` を
+呼ぶよう変更。`best.IsAny()` 分岐側の呼び出しは、staleness 経路とは
+別に「rank/ETX 条件だけで弾かれた」ケース (この場合
+`m_preferredParent` は `m_parents` に残ったままなので送信は成功する)
+のための保険として残し、二重送信を避けるため
+`m_parents.find(m_preferredParent) != m_parents.end()` を条件に追加した。
+
+回帰テスト `RplNoPathDaoSentOnParentLossTestCase`
+(`test/rpl-test-suite.cc`) は、root 上の raw socket が実際に
+Path Lifetime 0 かつ Target が子のアドレスと一致する DAO を受信する
+こと、およびその結果 root の `GetTopologySize()` が 0 になることを
+確認する。既存の `RplNoPathDaoTestCase` (手作りメッセージによる
+受信側のみの検証) と役割を分けている。

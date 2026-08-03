@@ -3131,12 +3131,11 @@ RplLqlMappingTestCase::DoRun()
  * @brief Check that a No-Path DAO (RFC 6550 section 6.4.3, path lifetime
  *        zero) removes the target from the root's topology.
  *
- * Nothing in this implementation sends a No-Path DAO yet (see
- * doc/design-constraints.md section 10): a node's downward route is only ever
- * dropped by PurgeTopology() once its lifetime runs out. HandleDao() does
- * know what to do with one, though, e.g. from another implementation sharing
- * the DODAG, so this builds one by hand with SendRawRplMessage() and checks
- * that path.
+ * This exercises HandleDao()'s receiving side on its own, with a hand-built
+ * message (SendRawRplMessage()) standing in for one from another
+ * implementation sharing the DODAG, or one this node sent itself
+ * (SendNoPathDao(), @see RplNoPathDaoSentOnParentLossTestCase) that arrived
+ * out of order relative to the rest of this test's setup.
  */
 class RplNoPathDaoTestCase : public TestCase
 {
@@ -3214,6 +3213,144 @@ RplNoPathDaoTestCase::DoRun()
                           false,
                           "The root can still reach the child after the No-Path");
 
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief Check that a node about to leave the DODAG for lack of a parent
+ *        withdraws itself first: SendNoPathDao(), RFC 6550 section 6.4.3.
+ *
+ * Same setup as RplParentLossRejoinTestCase (a parent that stops sending
+ * DIOs, detected as stale once the Trickle timer notices), but with a raw
+ * socket on the root recording every DAO that arrives so the withdrawal
+ * itself -- not just its effect on the root's topology, which
+ * RplNoPathDaoTestCase already covers from a hand-built message -- can be
+ * confirmed. Only the root-to-child direction is blacklisted, so the
+ * withdrawal, travelling child to root, still gets through.
+ */
+class RplNoPathDaoSentOnParentLossTestCase : public TestCase
+{
+  public:
+    RplNoPathDaoSentOnParentLossTestCase();
+
+  private:
+    void DoRun() override;
+
+    /**
+     * @brief Record a DAO's target and path lifetime.
+     * @param socket the monitoring socket
+     */
+    void RecordDao(Ptr<Socket> socket);
+
+    std::vector<std::pair<Ipv6Address, uint8_t>> m_daos; //!< (target, path lifetime) of every DAO seen
+};
+
+RplNoPathDaoSentOnParentLossTestCase::RplNoPathDaoSentOnParentLossTestCase()
+    : TestCase("A node withdraws itself with a No-Path DAO before leaving the DODAG")
+{
+}
+
+void
+RplNoPathDaoSentOnParentLossTestCase::RecordDao(Ptr<Socket> socket)
+{
+    Address sender;
+    Ptr<Packet> packet = socket->RecvFrom(sender);
+    if (!packet)
+    {
+        return;
+    }
+
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ipv6Header);
+    Icmpv6Header icmpv6Header;
+    packet->RemoveHeader(icmpv6Header);
+
+    if (icmpv6Header.GetType() == ICMPV6_RPL && icmpv6Header.GetCode() == RPL_CODE_DAO)
+    {
+        RplDaoHeader dao;
+        packet->RemoveHeader(dao);
+        m_daos.emplace_back(dao.GetTarget(), dao.GetPathLifetime());
+    }
+}
+
+void
+RplNoPathDaoSentOnParentLossTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    rplHelper.Set("DioIntervalMin", TimeValue(MilliSeconds(256)));
+    rplHelper.Set("DioIntervalDoublings", UintegerValue(2));
+    rplHelper.Set("DisInterval", TimeValue(Seconds(2)));
+
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Ptr<Node> rootNode = nodes.Get(0);
+    Ptr<Socket> monitor = Socket::CreateSocket(rootNode, Ipv6RawSocketFactory::GetTypeId());
+    monitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    monitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    monitor->BindToNetDevice(rootNode->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+    monitor->SetRecvCallback(MakeCallback(&RplNoPathDaoSentOnParentLossTestCase::RecordDao, this));
+
+    Ptr<RplRoutingProtocol> root = rootNode->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> child = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(child->IsJoined(), true, "The child never joined the DODAG");
+    Ipv6Address childAddress = child->GetGlobalAddress();
+    NS_TEST_ASSERT_MSG_EQ(root->GetTopologySize(), 1, "The root never heard the child's first DAO");
+
+    long normalDaos =
+        std::count_if(m_daos.begin(), m_daos.end(), [](const auto& dao) { return dao.second != 0; });
+    NS_TEST_ASSERT_MSG_GT_OR_EQ(normalDaos, 1, "The child's ordinary advertisement never arrived");
+
+    Ptr<SimpleNetDevice> rootDevice = DynamicCast<SimpleNetDevice>(devices.Get(0));
+    Ptr<SimpleNetDevice> childDevice = DynamicCast<SimpleNetDevice>(devices.Get(1));
+    channel->BlackList(rootDevice, childDevice);
+
+    Simulator::Stop(Seconds(15));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(child->IsJoined(),
+                          false,
+                          "The child never noticed its parent had gone quiet");
+
+    bool withdrew = std::any_of(m_daos.begin(), m_daos.end(), [&](const auto& dao) {
+        return dao.first == childAddress && dao.second == 0;
+    });
+    NS_TEST_ASSERT_MSG_EQ(withdrew,
+                          true,
+                          "No No-Path DAO for the child's own address arrived at the root");
+
+    // The root acts on it exactly as it would one from another
+    // implementation (RplNoPathDaoTestCase): the topology entry is gone.
+    NS_TEST_ASSERT_MSG_EQ(root->GetTopologySize(),
+                          0,
+                          "The root's topology still lists the child after its withdrawal");
+
+    monitor->Close();
     Simulator::Destroy();
 }
 
@@ -4519,6 +4656,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplMrhofSelectionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplLqlMappingTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplNoPathDaoTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplNoPathDaoSentOnParentLossTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDaoAckRetryTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplPacketInfoHeaderTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplPacketInfoSubTlvTestCase, TestCase::Duration::QUICK);

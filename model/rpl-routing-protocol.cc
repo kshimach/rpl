@@ -1111,6 +1111,39 @@ RplRoutingProtocol::SendDao()
 }
 
 void
+RplRoutingProtocol::SendNoPathDao(Ipv6Address viaParent)
+{
+    NS_LOG_FUNCTION(this << viaParent);
+
+    Ipv6Address target = GetGlobalAddress();
+    Ipv6Address parent = GlobalAddressOf(viaParent);
+    if (target.IsAny() || parent.IsAny())
+    {
+        NS_LOG_LOGIC("Not withdrawing: no global address for this node or the parent it was "
+                    "last reachable through");
+        return;
+    }
+
+    RplDaoHeader dao;
+    dao.SetInstanceId(m_instanceId);
+    dao.SetDodagId(m_dodagId);
+    dao.SetSequence(++m_daoSequence);
+    dao.SetTarget(target);
+    // Path Lifetime 0, RFC 6550 section 6.4.3: a No-Path. The path sequence
+    // still has to advance, the same as any other DAO with new information
+    // (RFC 6550 section 9.3 rule 1) -- this is what lets the root tell an
+    // in-flight withdrawal apart from a stale, reordered copy of the
+    // advertisement it is withdrawing.
+    dao.SetTransitInformation(parent, ++m_pathSequence, 0);
+
+    Ptr<Packet> packet = Create<Packet>();
+    packet->AddHeader(dao);
+
+    NS_LOG_INFO("Withdrawing " << target << ", last reachable via " << viaParent);
+    SendRplMessageUnicast(packet, RPL_CODE_DAO, m_dodagId);
+}
+
+void
 RplRoutingProtocol::DaoTimerExpire()
 {
     NS_LOG_FUNCTION(this);
@@ -1500,6 +1533,18 @@ RplRoutingProtocol::SelectPreferredParent()
         if (it->second.lastHeard < staleBefore)
         {
             NS_LOG_LOGIC("Dropping the stale neighbour " << it->first);
+            // Withdrawing has to happen here, before erase(), rather than
+            // down at the best.IsAny() case below: RouteOutput() (and so
+            // SendRplMessageUnicast(), which SendNoPathDao() goes through
+            // the same way SendDao() does) resolves a route for a
+            // non-root node purely from m_parents.find(m_preferredParent)
+            // -- with the entry already gone, there would be nothing left
+            // to route the withdrawal through even though the address it
+            // names is still perfectly reachable.
+            if (m_joined && it->first == m_preferredParent)
+            {
+                SendNoPathDao(it->first);
+            }
             it = m_parents.erase(it);
         }
         else
@@ -1666,6 +1711,21 @@ RplRoutingProtocol::SelectPreferredParent()
     if (best.IsAny())
     {
         NS_LOG_INFO("Lost the last parent of DODAG " << m_dodagId << ", soliciting again");
+        // RFC 6550 section 9.8 rule 4 / the general rule a few paragraphs
+        // later ("when a DAO entry times out or is invalidated, a node
+        // SHOULD make a reasonable attempt to report a No-Path"): tried on
+        // a best-effort basis, before LeaveDodag() clears it below. This is
+        // the fallback for the rank/ETX case, where the preferred parent
+        // fell out of contention without ever going stale, so it is still
+        // in m_parents (and so still routable, @see the staleness loop
+        // above, which already handles the more common stale case before
+        // this point, since erasing it there happens after this function
+        // was entered but before best.IsAny() could ever be evaluated).
+        if (m_joined && !m_preferredParent.IsAny() &&
+            m_parents.find(m_preferredParent) != m_parents.end())
+        {
+            SendNoPathDao(m_preferredParent);
+        }
         LeaveDodag();
         m_disTimer.Cancel();
         m_disTimer.Schedule(Seconds(m_jitter->GetValue(0.0, 1.0)));

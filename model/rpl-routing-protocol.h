@@ -469,6 +469,25 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     void SendDao();
 
     /**
+     * @brief Withdraw this node's own advertisement, RFC 6550 section 6.4.3.
+     *
+     * A No-Path DAO -- a DAO whose Transit Information carries a Path
+     * Lifetime of 0 -- tells the root this node's target is no longer
+     * reachable via @p viaParent. Sent as a one-shot, best-effort message:
+     * unlike SendDao(), no DAO-ACK is requested and there is no retry, since
+     * by the time this is worth sending the path it would retry over is
+     * usually the one just found unusable in the first place, and the
+     * periodic refresh (or PurgeTopology() on the root, once the
+     * advertised PathLifetime elapses) is what a lost No-Path ultimately
+     * falls back on.
+     *
+     * @param viaParent the link-local address of the parent this node was
+     *        last advertised as reachable through, i.e. the caller's own
+     *        m_preferredParent read before clearing it
+     */
+    void SendNoPathDao(Ipv6Address viaParent);
+
+    /**
      * @brief Send a DAO now and schedule the next refresh.
      */
     void DaoTimerExpire();
