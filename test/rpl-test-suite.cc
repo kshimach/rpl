@@ -3509,27 +3509,51 @@ RplNoPathDaoSentOnPoisonTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
- * @brief SCRATCH PROBE, not a permanent test: check what happens three
- *        hops out when the middle node of a line loses its own parent.
+ * @brief Check that a node detaching from the middle of a line poisons its
+ *        sub-DODAG on the way out (RFC 6550 section 8.2.2.5) instead of
+ *        going quiet and looping with its own former child.
+ *
+ * Three nodes in a line, root - middle - leaf. Cutting the root's DIOs off
+ * from the middle leaves the middle with no parent, so it detaches. The
+ * leaf, meanwhile, is still perfectly able to hear the middle and has no
+ * reason of its own to stop sending DIOs at it.
+ *
+ * Without the poisoning DIO, the leaf never learns any of that: it keeps
+ * announcing itself, and the middle -- unjoined, so with no rank of its
+ * own left for SelectPreferredParent()'s loop avoidance to compare
+ * against -- takes the first DIO back as its new parent, which is the leaf
+ * that is still pointing at the middle. The two route through each other
+ * and a packet bounces between them until the Hop Limit runs out (in a
+ * debug build, until PacketMetadata's bookkeeping trips an assertion
+ * first). RFC 6550 section 8.2.2.6 is what says the detaching node has to
+ * speak up here, and section 8.2.2.5 what the sub-DODAG does about it:
+ * a former parent advertising INFINITE_RANK "cannot act as a parent any
+ * longer and is removed from the parent set".
  */
-class RplNoPathDaoThreeHopProbeTestCase : public TestCase
+class RplPoisonOnDetachTestCase : public TestCase
 {
   public:
-    RplNoPathDaoThreeHopProbeTestCase();
+    RplPoisonOnDetachTestCase();
 
   private:
     void DoRun() override;
+
+    /**
+     * @brief Record a DAO's target and path lifetime.
+     * @param socket the monitoring socket
+     */
     void RecordDao(Ptr<Socket> socket);
-    std::vector<std::pair<Ipv6Address, uint8_t>> m_daos;
+
+    std::vector<std::pair<Ipv6Address, uint8_t>> m_daos; //!< (target, path lifetime) of every DAO seen
 };
 
-RplNoPathDaoThreeHopProbeTestCase::RplNoPathDaoThreeHopProbeTestCase()
-    : TestCase("PROBE: three-hop line, middle node loses its parent")
+RplPoisonOnDetachTestCase::RplPoisonOnDetachTestCase()
+    : TestCase("A detaching node poisons its sub-DODAG instead of looping with it")
 {
 }
 
 void
-RplNoPathDaoThreeHopProbeTestCase::RecordDao(Ptr<Socket> socket)
+RplPoisonOnDetachTestCase::RecordDao(Ptr<Socket> socket)
 {
     Address sender;
     Ptr<Packet> packet = socket->RecvFrom(sender);
@@ -3546,14 +3570,11 @@ RplNoPathDaoThreeHopProbeTestCase::RecordDao(Ptr<Socket> socket)
         RplDaoHeader dao;
         packet->RemoveHeader(dao);
         m_daos.emplace_back(dao.GetTarget(), dao.GetPathLifetime());
-        std::cerr << "  [probe] DAO target=" << dao.GetTarget()
-                  << " pathLifetime=" << +dao.GetPathLifetime() << " at " << Simulator::Now()
-                  << std::endl;
     }
 }
 
 void
-RplNoPathDaoThreeHopProbeTestCase::DoRun()
+RplPoisonOnDetachTestCase::DoRun()
 {
     NodeContainer nodes;
     nodes.Create(3); // 0 = root, 1 = middle, 2 = leaf
@@ -3592,7 +3613,7 @@ RplNoPathDaoThreeHopProbeTestCase::DoRun()
     monitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
     monitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
     monitor->BindToNetDevice(rootNode->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
-    monitor->SetRecvCallback(MakeCallback(&RplNoPathDaoThreeHopProbeTestCase::RecordDao, this));
+    monitor->SetRecvCallback(MakeCallback(&RplPoisonOnDetachTestCase::RecordDao, this));
 
     Ptr<RplRoutingProtocol> root = rootNode->GetObject<RplRoutingProtocol>();
     Ptr<RplRoutingProtocol> middle = nodes.Get(1)->GetObject<RplRoutingProtocol>();
@@ -3601,32 +3622,59 @@ RplNoPathDaoThreeHopProbeTestCase::DoRun()
     Simulator::Stop(Seconds(15));
     Simulator::Run();
 
-    std::cerr << "  [probe] after join: middle joined=" << middle->IsJoined()
-              << " leaf joined=" << leaf->IsJoined()
-              << " root topology size=" << root->GetTopologySize() << std::endl;
+    NS_TEST_ASSERT_MSG_EQ(middle->IsJoined(), true, "The middle node never joined");
+    NS_TEST_ASSERT_MSG_EQ(leaf->IsJoined(), true, "The leaf never joined");
+    NS_TEST_ASSERT_MSG_EQ(root->GetTopologySize(), 2, "The root did not hear both DAOs");
     Ipv6Address middleAddress = middle->GetGlobalAddress();
-    Ipv6Address leafAddress = leaf->GetGlobalAddress();
+    Ipv6Address middleLinkLocal =
+        nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address leafLinkLocal =
+        nodes.Get(2)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    NS_TEST_ASSERT_MSG_EQ(leaf->GetPreferredParent(),
+                          middleLinkLocal,
+                          "The leaf is not hanging off the middle node");
 
+    // Cut the root's DIOs off from the middle node. The leaf can still hear
+    // the middle perfectly well, and goes on announcing itself to it.
     Ptr<SimpleNetDevice> rootDevice = DynamicCast<SimpleNetDevice>(devices.Get(0));
     Ptr<SimpleNetDevice> middleDevice = DynamicCast<SimpleNetDevice>(devices.Get(1));
-    std::cerr << "  [probe] blacklisting root->middle" << std::endl;
     channel->BlackList(rootDevice, middleDevice);
 
     Simulator::Stop(Seconds(20));
     Simulator::Run();
 
-    std::cerr << "  [probe] after cutoff: middle joined=" << middle->IsJoined()
-              << " leaf joined=" << leaf->IsJoined()
-              << " root topology size=" << root->GetTopologySize() << std::endl;
+    // The middle node has nothing left to reach the root through, so it
+    // detaches -- and so, once the poisoning DIO reaches it, does the leaf,
+    // whose only way up was the middle.
+    NS_TEST_ASSERT_MSG_EQ(middle->IsJoined(),
+                          false,
+                          "The middle node stayed in a DODAG it cannot reach");
+    NS_TEST_ASSERT_MSG_EQ(leaf->IsJoined(),
+                          false,
+                          "The leaf kept a parent that had already detached, which means the "
+                          "poisoning DIO never reached it");
 
+    // The heart of it: neither may end up pointing at the other. Before the
+    // poisoning DIO existed, this is exactly what happened -- the middle
+    // took the leaf as its parent while the leaf still had the middle as
+    // its own, and traffic looped between them.
+    NS_TEST_ASSERT_MSG_NE(middle->GetPreferredParent(),
+                          leafLinkLocal,
+                          "The middle node adopted its own former child as a parent");
+    NS_TEST_ASSERT_MSG_NE(leaf->GetPreferredParent(),
+                          middleLinkLocal,
+                          "The leaf kept the detached middle node as its parent");
+
+    // The middle node was still able to reach the root when it detached, so
+    // its own withdrawal got through. The leaf's cannot: its only route to
+    // the root ran through the middle node, which by then had detached too,
+    // so that entry is left for the root's PurgeTopology() to age out.
     bool middleWithdrew = std::any_of(m_daos.begin(), m_daos.end(), [&](const auto& dao) {
         return dao.first == middleAddress && dao.second == 0;
     });
-    bool leafWithdrew = std::any_of(m_daos.begin(), m_daos.end(), [&](const auto& dao) {
-        return dao.first == leafAddress && dao.second == 0;
-    });
-    std::cerr << "  [probe] middle withdrew=" << middleWithdrew
-              << " leaf withdrew=" << leafWithdrew << std::endl;
+    NS_TEST_ASSERT_MSG_EQ(middleWithdrew,
+                          true,
+                          "The middle node never withdrew itself from the root");
 
     monitor->Close();
     Simulator::Destroy();
@@ -4936,9 +4984,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplNoPathDaoTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplNoPathDaoSentOnParentLossTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplNoPathDaoSentOnPoisonTestCase, TestCase::Duration::QUICK);
-    // RplNoPathDaoThreeHopProbeTestCase intentionally not registered: it is
-    // a scratch probe that reproduces an unrelated pre-existing crash
-    // (see design-constraints.md), not a passing regression test.
+    AddTestCase(new RplPoisonOnDetachTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDaoAckRetryTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplPacketInfoHeaderTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplPacketInfoSubTlvTestCase, TestCase::Duration::QUICK);

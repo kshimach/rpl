@@ -933,7 +933,9 @@ RplRoutingProtocol::HandleDio(const RplDioHeader& dio,
         if (dio.GetVersionNumber() > m_version)
         {
             NS_LOG_INFO("DODAG " << m_dodagId << " moved to version " << +dio.GetVersionNumber());
-            LeaveDodag();
+            // Migrating between DODAG Versions, not detaching: no
+            // poisoning, since the node rejoins in this same event.
+            LeaveDodag(false);
             JoinDodag(dio, interface);
         }
         else
@@ -1033,9 +1035,35 @@ RplRoutingProtocol::JoinDodag(const RplDioHeader& dio, uint32_t interface)
 }
 
 void
-RplRoutingProtocol::LeaveDodag()
+RplRoutingProtocol::LeaveDodag(bool poison)
 {
-    NS_LOG_FUNCTION(this);
+    NS_LOG_FUNCTION(this << poison);
+
+    // RFC 6550 section 8.2.2.5: "A node poisons routes by advertising a
+    // Rank of INFINITE_RANK", and a node that hears that from a parent
+    // "cannot act as a parent any longer and is removed from the parent
+    // set". Section 8.2.2.6 makes it the expected behaviour for exactly
+    // this situation: a node that cannot retain a non-empty parent set
+    // detaches, and SHOULD immediately advertise that.
+    //
+    // Going quiet instead, which is all this used to do, leaves the
+    // sub-DODAG with no way to learn any of it. They keep sending DIOs at
+    // this node, and this node -- unjoined from here on, so with no rank
+    // of its own left for SelectPreferredParent()'s loop avoidance to
+    // compare against -- would take the first one back as its new parent,
+    // including one from a node that derived its own rank from this one.
+    // The two then route through each other and the packet bounces between
+    // them until its Hop Limit runs out.
+    //
+    // The poisoning DIO goes out before m_joined is cleared, since
+    // SendDio() declines to send anything once it is, and carries
+    // INFINITE_RANK because that is what m_rank is set to just below.
+    if (poison && m_joined)
+    {
+        m_rank = RPL_INFINITE_RANK;
+        NS_LOG_INFO("Poisoning the sub-DODAG on the way out of " << m_dodagId);
+        SendDio(Ipv6Address(RPL_ALL_NODES_MULTICAST));
+    }
 
     m_joined = false;
     m_rank = RPL_INFINITE_RANK;
@@ -1736,7 +1764,9 @@ RplRoutingProtocol::SelectPreferredParent()
         {
             SendNoPathDao(m_preferredParent);
         }
-        LeaveDodag();
+        // Detaching for want of a parent: poison on the way out, so the
+        // sub-DODAG stops treating this node as a way to the root.
+        LeaveDodag(true);
         m_disTimer.Cancel();
         m_disTimer.Schedule(Seconds(m_jitter->GetValue(0.0, 1.0)));
         return true;

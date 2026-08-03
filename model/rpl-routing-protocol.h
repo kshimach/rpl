@@ -364,8 +364,16 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
 
     /**
      * @brief Leave the current DODAG and drop every candidate parent.
+     *
+     * @param poison whether to advertise INFINITE_RANK on the way out (RFC
+     *        6550 section 8.2.2.5). True when the node is detaching because
+     *        it can no longer hold a parent, which is what tells its
+     *        sub-DODAG to stop treating it as a way to the root; false when
+     *        it is only stepping between DODAG Versions (section 8.2.2.4
+     *        rule 5), where it rejoins in the same event and its next DIO
+     *        already carries the new version.
      */
-    void LeaveDodag();
+    void LeaveDodag(bool poison);
 
     /**
      * @brief Compute the rank this node would have through a given parent.
