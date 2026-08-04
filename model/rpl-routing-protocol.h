@@ -652,6 +652,18 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     Callback<uint8_t, double> m_rssiToLql; //!< RSSI (dBm) -> LQL (0-7) mapping
     uint16_t m_minHopRankIncrease; //!< MinHopRankIncrease, also the rank of the root
     uint16_t m_maxRankIncrease;    //!< MaxRankIncrease
+
+    /**
+     * @brief L of RFC 6550 section 8.2.2.4 rule 3: the lowest rank this node
+     *        has advertised within the current DODAG Version.
+     *
+     * Reset to RPL_INFINITE_RANK by JoinDodag() (no rank advertised in this
+     * Version yet) and lowered by SelectPreferredParent() whenever the new
+     * rank stays within the bound the rule imposes; a rank that does not is
+     * never folded in, since INFINITE_RANK -- what the node advertises
+     * instead -- "is an exception to this rule".
+     */
+    uint16_t m_lowestRankThisVersion;
     Time m_dioIntervalMin;         //!< Trickle Imin for DIOs
     uint8_t m_dioIntervalDoublings; //!< Trickle doublings for DIOs
     uint8_t m_dioRedundancy;        //!< Trickle redundancy constant for DIOs

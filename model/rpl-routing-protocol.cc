@@ -249,6 +249,7 @@ RplRoutingProtocol::RplRoutingProtocol()
       m_rssiToLql(MakeCallback(&DefaultRssiToLql)),
       m_minHopRankIncrease(RPL_MIN_HOPRANKINC),
       m_maxRankIncrease(RPL_MAX_RANKINC),
+      m_lowestRankThisVersion(RPL_INFINITE_RANK),
       m_dioIntervalMin(MilliSeconds(1 << RPL_DIO_INTERVAL_MIN)),
       m_dioIntervalDoublings(RPL_DIO_INTERVAL_DOUBLINGS),
       m_dioRedundancy(RPL_DIO_REDUNDANCY),
@@ -945,6 +946,18 @@ RplRoutingProtocol::HandleDio(const RplDioHeader& dio,
         }
     }
 
+    // RFC 6550 section 9.6, rules 1 and 2: hearing a DAO parent increment
+    // its DTSN means new downward state exists to refresh. "DAO parent" is
+    // this node's one and only DAO destination in non-storing mode, its
+    // preferred parent, so a DTSN bump from anyone else is not this rule's
+    // concern (it may still just be a fresh neighbour, whose default-
+    // constructed Parent -- dtsn 0 -- would otherwise read as an increment
+    // the first time it is heard from at all).
+    auto existingParent = m_parents.find(from);
+    bool preferredParentBumpedDtsn = existingParent != m_parents.end() &&
+                                     from == m_preferredParent &&
+                                     dio.GetDtsn() > existingParent->second.dtsn;
+
     Parent& parent = m_parents[from];
     parent.address = from;
     parent.interface = interface;
@@ -957,6 +970,21 @@ RplRoutingProtocol::HandleDio(const RplDioHeader& dio,
     if (dio.HasMetricContainer())
     {
         parent.pathEtx = dio.GetPathEtx();
+    }
+
+    if (preferredParentBumpedDtsn)
+    {
+        // Rule 2: in non-storing mode, this node's own DTSN follows its
+        // parent's up.
+        m_dtsn++;
+        // Rule 1: schedule a DAO. RFC 6550 section 9.5's DelayDAO jitter is
+        // the same one a parent switch already uses just below, for the
+        // same reason -- an immediate, unjittered transmission from every
+        // node in the sub-DODAG at once would be exactly the kind of burst
+        // Trickle-style pacing exists to avoid.
+        NS_LOG_INFO("DAO parent " << from << " incremented its DTSN, refreshing this node's DAO");
+        m_daoEvent.Cancel();
+        m_daoEvent.Schedule(Seconds(m_jitter->GetValue(0.0, 1.0)));
     }
 
     m_dioTrickle.ConsistencyHit();
@@ -981,6 +1009,9 @@ RplRoutingProtocol::JoinDodag(const RplDioHeader& dio, uint32_t interface)
     m_preference = dio.GetPreference();
     m_rank = RPL_INFINITE_RANK; // until a parent is picked
     m_pathEtx = 0;
+    // RFC 6550 section 8.2.2.4 rule 3: L starts fresh for every DODAG
+    // Version, this join included.
+    m_lowestRankThisVersion = RPL_INFINITE_RANK;
 
     if (dio.HasDagConfiguration())
     {
@@ -1780,6 +1811,29 @@ RplRoutingProtocol::SelectPreferredParent()
     if (m_ocp == RPL_OCP_MRHOF)
     {
         m_pathEtx = static_cast<uint16_t>(bestPathCost);
+    }
+
+    // RFC 6550 section 8.2.2.4 rule 3: "that node MUST NOT advertise an
+    // effective Rank higher than L + DAGMaxRankIncrease. ... If a node's
+    // Rank were to be higher than allowed ..., when it advertises Rank, it
+    // MUST advertise its Rank as INFINITE_RANK." A guard against
+    // count-to-infinity independent of the loop avoidance already applied
+    // above (during candidate selection) and in HandleDio()'s poisoning
+    // check (once a neighbour's own rank goes infinite): this one catches
+    // a rank that keeps climbing gradually, one valid-looking parent
+    // switch at a time, without any single step tripping either of those.
+    // uint32_t sidesteps m_lowestRankThisVersion + m_maxRankIncrease
+    // overflowing the uint16_t both operands are.
+    if (uint32_t(m_rank) > uint32_t(m_lowestRankThisVersion) + m_maxRankIncrease)
+    {
+        NS_LOG_INFO("Rank " << m_rank << " exceeds L (" << m_lowestRankThisVersion
+                            << ") + DAGMaxRankIncrease (" << m_maxRankIncrease
+                            << ") for this DODAG Version, advertising INFINITE_RANK instead");
+        m_rank = RPL_INFINITE_RANK;
+    }
+    else
+    {
+        m_lowestRankThisVersion = std::min(m_lowestRankThisVersion, m_rank);
     }
 
     if (parentChanged)

@@ -4258,6 +4258,230 @@ RplDaoAckSequenceTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief Check RFC 6550 section 9.6: a node that hears its DAO parent
+ *        increment its DTSN refreshes its own DAO (rule 1) and bumps its
+ *        own DTSN in turn (rule 2, non-storing mode).
+ *
+ * The parent's DTSN bump is a hand-built DIO (SendRawRplMessage()), since
+ * nothing in this implementation increments its own DTSN on its own --
+ * the whole point under test is what a node does on the *receiving* end of
+ * one. Two monitors, both on the root: a raw socket counts DAO arrivals
+ * (rule 1), and a second one, filtered to the child's link-local source
+ * address, reads back the DTSN the child itself puts in its next DIO
+ * (rule 2). Both have to sit on the root, not the child: a node's own
+ * multicast transmissions are never delivered back to a socket on that
+ * same node, so a monitor on the child would only ever see the root's
+ * DIOs, never the child's own.
+ */
+class RplDtsnRefreshTestCase : public TestCase
+{
+  public:
+    RplDtsnRefreshTestCase();
+
+  private:
+    void DoRun() override;
+
+    /**
+     * @brief Record the arrival of a DAO.
+     * @param socket the monitoring socket
+     */
+    void RecordDao(Ptr<Socket> socket);
+
+    /**
+     * @brief Record a DIO's DTSN, if it came from the child.
+     * @param socket the monitoring socket
+     */
+    void RecordDio(Ptr<Socket> socket);
+
+    uint32_t m_daoCount{0};             //!< number of DAOs seen at the root
+    Ipv6Address m_childLinkLocal;       //!< the child's address, to filter DIOs by sender
+    std::vector<uint8_t> m_childDtsns; //!< DTSN of every DIO the child itself sent
+};
+
+RplDtsnRefreshTestCase::RplDtsnRefreshTestCase()
+    : TestCase("A DTSN increment from the DAO parent refreshes the DAO and the DTSN")
+{
+}
+
+void
+RplDtsnRefreshTestCase::RecordDao(Ptr<Socket> socket)
+{
+    Address sender;
+    Ptr<Packet> packet = socket->RecvFrom(sender);
+    if (!packet)
+    {
+        return;
+    }
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ipv6Header);
+    Icmpv6Header icmpv6Header;
+    packet->RemoveHeader(icmpv6Header);
+    if (icmpv6Header.GetType() == ICMPV6_RPL && icmpv6Header.GetCode() == RPL_CODE_DAO)
+    {
+        m_daoCount++;
+    }
+}
+
+void
+RplDtsnRefreshTestCase::RecordDio(Ptr<Socket> socket)
+{
+    Address sender;
+    Ptr<Packet> packet = socket->RecvFrom(sender);
+    if (!packet)
+    {
+        return;
+    }
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ipv6Header);
+    if (ipv6Header.GetSource() != m_childLinkLocal)
+    {
+        // A node's own multicast transmissions are not delivered back to a
+        // socket on that same node, so this monitor never actually sees
+        // the root's own DIOs -- but filtering by source is what makes
+        // that guaranteed rather than incidental.
+        return;
+    }
+    Icmpv6Header icmpv6Header;
+    packet->RemoveHeader(icmpv6Header);
+    if (icmpv6Header.GetType() == ICMPV6_RPL && icmpv6Header.GetCode() == RPL_CODE_DIO)
+    {
+        RplDioHeader dio;
+        packet->RemoveHeader(dio);
+        m_childDtsns.push_back(dio.GetDtsn());
+    }
+}
+
+void
+RplDtsnRefreshTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    rplHelper.Set("DioIntervalMin", TimeValue(MilliSeconds(256)));
+    rplHelper.Set("DioIntervalDoublings", UintegerValue(2));
+
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Ptr<Node> rootNode = nodes.Get(0);
+    Ptr<Node> childNode = nodes.Get(1);
+
+    Ptr<Socket> daoMonitor = Socket::CreateSocket(rootNode, Ipv6RawSocketFactory::GetTypeId());
+    daoMonitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    daoMonitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    daoMonitor->BindToNetDevice(rootNode->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+    daoMonitor->SetRecvCallback(MakeCallback(&RplDtsnRefreshTestCase::RecordDao, this));
+
+    Ptr<RplRoutingProtocol> root = rootNode->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> child = childNode->GetObject<RplRoutingProtocol>();
+
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(child->IsJoined(), true, "The child never joined the DODAG");
+    NS_TEST_ASSERT_MSG_GT_OR_EQ(m_daoCount, 1, "The child's initial DAO never arrived");
+
+    Ipv6Address rootLinkLocal =
+        rootNode->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address childLinkLocal =
+        childNode->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    NS_TEST_ASSERT_MSG_EQ(child->GetPreferredParent(),
+                          rootLinkLocal,
+                          "The child's preferred parent is not the root");
+
+    // The DIO monitor goes on the root, not the child: a node's own
+    // multicast transmissions are never delivered back to a socket on that
+    // same node, so this is set up only once the child's link-local
+    // address (used to filter it to the child's own DIOs, @see
+    // RecordDio()) is known, and only now, after the join settled, so the
+    // first DIO it captures is a real one to read the starting DTSN off
+    // of rather than racing the join sequence.
+    m_childLinkLocal = childLinkLocal;
+    Ptr<Socket> dioMonitor = Socket::CreateSocket(rootNode, Ipv6RawSocketFactory::GetTypeId());
+    dioMonitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    dioMonitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    dioMonitor->BindToNetDevice(rootNode->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+    dioMonitor->SetRecvCallback(MakeCallback(&RplDtsnRefreshTestCase::RecordDio, this));
+
+    // Imax is Imin << doublings = 256ms << 2 = ~1s, but the monitor's setup
+    // and the Trickle timer's current interval are not synchronised: in the
+    // worst case (just missed a transmission near the end of the current
+    // interval) it takes the rest of that interval plus a whole one more
+    // to see the next DIO, up to 2 * Imax. Waited out with margin rather
+    // than exactly, so this is not sensitive to exactly where in the
+    // interval the monitor happened to be set up.
+    Simulator::Stop(Seconds(3));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_GT_OR_EQ(m_childDtsns.size(), 1, "The child never sent a DIO of its own");
+    NS_TEST_ASSERT_MSG_EQ(m_childDtsns.back(), 0, "The child's DTSN did not start at 0");
+
+    uint32_t daoCountBeforeBump = m_daoCount;
+
+    // A hand-built DIO, from the root's own link-local address -- the
+    // child's one and only DAO parent -- with the DTSN incremented from
+    // the 0 every real DIO in this test has carried so far. RplRoutingProtocol
+    // never increments its own DTSN unprompted, so nothing short of this
+    // can put rule 1/2 to the test.
+    RplDioHeader bump;
+    bump.SetInstanceId(RPL_DEFAULT_INSTANCE);
+    bump.SetVersionNumber(0);
+    bump.SetRank(RPL_MIN_HOPRANKINC); // the root's own, fixed rank
+    bump.SetMop(RPL_MOP_NON_STORING);
+    bump.SetDodagId(root->GetDodagId());
+    bump.SetDtsn(1);
+
+    Simulator::Schedule(Seconds(0),
+                        &SendRawRplMessage<RplDioHeader>,
+                        rootNode,
+                        1,
+                        bump,
+                        static_cast<uint8_t>(RPL_CODE_DIO),
+                        rootLinkLocal,
+                        childLinkLocal);
+    Simulator::Stop(Seconds(1));
+    Simulator::Run();
+
+    // Rule 1: a DAO went out to refresh the root's downward state.
+    NS_TEST_ASSERT_MSG_GT(m_daoCount,
+                          daoCountBeforeBump,
+                          "The DTSN bump from the DAO parent did not trigger a DAO");
+
+    // Rule 2: the child's own DTSN followed. Confirmed the same way the
+    // baseline was: reading it back out of the child's next real DIO,
+    // rather than reaching into RplRoutingProtocol's private state.
+    Simulator::Stop(Seconds(5));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(m_childDtsns.back(),
+                          1,
+                          "The child's own DTSN did not follow its DAO parent's increment");
+
+    daoMonitor->Close();
+    dioMonitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Check the neighbour freshness rule: a neighbour heard once is a
  *        candidate parent only while nothing better-established is
  *        available, and stops being one as soon as another neighbour has
@@ -4978,6 +5202,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplParentFreshnessTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDisHandlingTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDaoAckSequenceTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplDtsnRefreshTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplComputeSourceRouteFailureTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplMrhofSelectionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplLqlMappingTestCase, TestCase::Duration::QUICK);

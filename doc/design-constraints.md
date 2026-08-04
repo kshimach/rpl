@@ -1873,13 +1873,82 @@ rank が INFINITE_RANK なので受信側は 8.2.2.5 節に従って親集合か
 
 1. **25.3 (DTSN)** — MUST 2 件だが、実装は素直 (親の DTSN 増加を検出
    して自分の DTSN を上げ、DAO を再スケジュールするだけ)。他実装との
-   相互運用性に直結する。
+   相互運用性に直結する。**26.2 節の通り対応済み。**
 2. **25.2 (DAGMaxRankIncrease)** — MUST。L の追跡を足す必要があるが、
    `SendDio()` で広告する rank にクランプを入れるだけで形にはなる。
-   count-to-infinity への独立した防御層が増える。
+   count-to-infinity への独立した防御層が増える。**26.1 節の通り
+   対応済み。**
 3. **25.6 (cur_min_path_cost)** — MUST だが実害なし。1 行。
 4. **25.5 (境界 1 単位)** — 違反ではない。他実装と厳密に挙動を揃える
    必要が出たときに。
 5. **25.4 (step_of_rank)** — 方針 (Contiki-NG との一致) と RFC 既定値
    のどちらを優先するかの判断が要る。変更すると既存テストの期待 rank
    値がすべて変わる。
+
+## 26. 25.7 の優先度 1・2 (DTSN, DAGMaxRankIncrease) を実装
+
+25 節で見つけた 6 件の乖離のうち、相互運用性に直結する MUST 違反 2 件を
+実装した。
+
+### 26.1 DAGMaxRankIncrease (RFC 6550 section 8.2.2.4 rule 3)
+
+新しいメンバー `m_lowestRankThisVersion` に L (このノードが現在の
+DODAG Version 内で advertise した最小 rank) を追跡させる。
+`JoinDodag()` で `RPL_INFINITE_RANK` にリセットし (このバージョンでは
+まだ何も advertise していない)、`SelectPreferredParent()` が新しい
+rank を確定した直後、`m_rank > L + DAGMaxRankIncrease` なら
+`m_rank` を `RPL_INFINITE_RANK` に置き換える (RFC の文言どおり、
+超過時は INFINITE_RANK を advertise する)。満たす場合のみ L を
+更新する — INFINITE_RANK になった rank 自体は次の L の計算に混ぜない
+(RFC が明示する例外)。
+
+22.2 節・24 節で入れたループ回避 (親候補選定時の rank 比較、poison
+検知) とは独立した防御層になる。あちらは「一足飛びに悪い rank の
+相手を親に選ばない」層、こちらは「じわじわ rank が上がり続ける
+(count-to-infinity)」層で、どちらか一方では防げないケースがある。
+
+### 26.2 DTSN (RFC 6550 section 9.6, rules 1 と 2)
+
+`HandleDio()` で、DIO の送信元が現在の `m_preferredParent` かつ
+既知のエントリ (新規の隣人ではない) かつ DTSN が前回記録した値より
+増えている場合、(a) 自分の `m_dtsn` をインクリメントし (non-storing
+mode の rule 2)、(b) `m_daoEvent` をキャンセルしてジッター付きで
+再スケジュールする (rule 1、DAO 再送のトリガー)。新規の隣人を
+「DTSN が増えた」と誤検知しないよう、`m_parents.find(from)` を
+`parent.dtsn` を上書きする**前**に取っておき、その旧値と比較する
+(デフォルト構築される `Parent::dtsn` は 0 なので、比較無しに
+上書き後の値を見ると初回聴取が常に「増加」と判定されてしまう)。
+
+### 26.3 動作検証で発覚した、無関係な既存クラッシュ (テストコード側)
+
+新規テスト `RplDtsnRefreshTestCase` を書いて動かしたところ、
+毎回確実にクラッシュ (`std::vector::back()` を空の vector に対して
+呼ぶ未定義動作) した。26.1/26.2 の実装のどちらが原因かを疑い、
+`if (false && ...)` で個別に無効化して確認したが、**両方無効化しても
+同じ場所でクラッシュし続けた**。実装側の問題ではなく、テストコード
+自体に原因があると判断し、`m_childDtsns.back()` を呼ぶ箇所を
+`.empty()` チェックで安全にガードしたところ、クラッシュはテスト
+失敗 (`m_childDtsns.size() == 0`) に変わった。
+
+真因はタイミング設計のミス: root 上に "child が送る DIO" を監視する
+ソケットを設置した直後、`Simulator::Stop(Seconds(1))` で 1 秒だけ
+待って最初の DIO を捕捉しようとしていた。コメントには「Imax = Imin
+<< doublings = 256ms << 2 = ~1s だから 1 秒で十分」と書いていたが、
+これは誤り: Trickle タイマーの現在の interval の**どこで**モニターを
+設置したかは無関係にランダムなため、最悪ケースでは「現在の interval
+の残り + まるまる次の interval 一回分」、すなわち最大 `2 * Imax`
+(約 2 秒) 待たないと次の送信に当たらない。1 秒では運が悪いと
+outputs 一度も捕捉できないまま `m_childDtsns` が空のままになり、
+それを想定していない `.back()` が UB を踏んでいた。
+
+対処: 待機時間を 3 秒 (2 * Imax に安全マージンを載せた値) に修正。
+NS_LOG (`Ipv6L3Protocol`/`RplRoutingProtocol` を `level_all`) で
+実際に "root が dioMonitor を設置した直後の 1 秒間、child の
+DioTrickleFire が一度も発火していない" ことを直接確認して原因を
+特定した。8 回連続 PASS で安定性を確認済み。
+
+この節から得られる教訓は `.claude/skills/ns3-debug-pitfalls`
+(ns-3-dev リポジトリのローカルスキル) に追記した:
+Trickle 周期に依存する監視ソケットの待機時間は Imax 一発分ではなく
+2 倍を見る、および「クラッシュを一旦テスト失敗に格下げしてから
+原因を探る」というデバッグ手順そのもの。
