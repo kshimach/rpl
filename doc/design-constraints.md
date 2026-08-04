@@ -170,12 +170,12 @@
   root 上の監視用 raw socket による送信回数カウントで検証、private
   state には触れない) をそれぞれ追加。No-Path DAO の**送信**経路は
   23 節の通り実装済み。
-- **Low (ドキュメント化のみ完了、未修正)**: DODAG version number
-  (`HandleDio()`) と DAO path sequence (`HandleDao()`) は、いずれも
-  RFC 6550 section 7.2 の lollipop 比較を実装せず、素の整数比較
-  (version) または比較なしの無条件上書き (path sequence) になっている。
-  コード側にコメントで明記済み。256 回のバージョン変更・親変更が
-  必要になる程度の実害のため、修正は見送り。
+- **(完了)**: RFC 6550 section 7.2 の lollipop 比較。DODAG version
+  number (`HandleDio()`)、DAO path sequence (`HandleDao()`)、DTSN
+  (`HandleDio()`) の 3 箇所。「256 回のバージョン変更・親変更が必要に
+  なる程度の実害」という当初の見積もりは誤りで、path sequence の方は
+  回り込みと無関係に、23 節で実装した No-Path DAO の追い越しだけで
+  即座に踏める。27 節を参照。
 - **Low (完了)**: Sphinx モデルドキュメント作成
   (`contrib/rpl/doc/rpl.rst`、`utils/create-module.py` の標準構成に
   準拠。本体 doc ビルドへの登録は行っていない — contrib モジュールで
@@ -729,8 +729,8 @@ end-to-end の到達性に影響は無い。ただし直線トポロジのため
   デフォルト値をそのまま使っている (13.1 節)。
 - `PARENT_SET_SIZE` (RFC 6719 の推奨値 3) による候補親数の上限は
   未実装。OF0 も同様に無制限に候補を保持しており、既存の挙動を踏襲。
-- DODAG version number の lollipop 比較が未実装という既存の制限
-  (10 節) は MRHOF 下でも変わらず残る。
+- DODAG version number の lollipop 比較が未実装という当時の制限は
+  27 節で解消済み (MRHOF 固有の話ではない)。
 
 ### 13.8 コードレビューで見つかった問題の修正
 
@@ -989,7 +989,8 @@ Information option、non-storing mode の DAO、Rank 計算とループ回避、
 (12 節)、SRH のワイヤフォーマットとホップ処理は準拠済みと確認した。
 10 節に記録済みの lollipop 比較未実装・RH3 アドレス圧縮未実装・RPI の
 確認済みループを実際には止められない、の 3 件は優先度が低いため今回も
-対象外、現状維持とした。今回対応したのは次の 2 件:
+対象外、現状維持とした (lollipop 比較はこの見積もりが誤っていたことが
+後に判明し、27 節で実装した)。今回対応したのは次の 2 件:
 
 1. RFC 6550 6.7.10 節の Prefix Information option が未実装で、root の
    GUA/ULA プレフィックスを DIO で配布する経路自体が存在しなかった
@@ -2004,3 +2005,184 @@ INFINITE_RANK なので受信側は Metric Container を見る前に親集合か
 一度踏み外した: 最初 child が送る poisoning DIO を child 自身の
 ノードに置いたモニターで捕まえようとして無言のまま (0 件) 失敗し、
 モニターを root 側に置き直して直った。
+
+## 27. RFC 6550 section 7.2 のロリポップ比較が未実装だった (シーケンス番号の回り込み)
+
+RPL のシーケンスカウンタは RFC 6550 section 7.2 が定義する「ロリポップ」
+方式で比較しなければならない。実装はこれを持っておらず、4 箇所すべてが
+素の整数比較か、比較そのものの欠落だった。section 7.2 rule 3 の柱書きは
+
+> When comparing two sequence counters, the following rules MUST be applied
+
+であり、MUST 条項の違反にあたる。10 節に「未対応」として挙げてはいたが、
+影響範囲の見積もりが甘く、実際には後述のとおり恒久的な機能停止を招く。
+
+### 27.1 ロリポップ比較とは何か
+
+section 7.2 の定義:
+
+- 128 以上の値は「線形領域」。再起動直後のブートストラップに使う。
+  推奨初期値は 240 (= 256 - SEQUENCE_WINDOW)。
+- 127 以下の値は「循環領域」。サイズ 128 の RFC 1982 的な循環空間。
+- rule 2: 線形領域のカウンタは 255 の次に **0 へ戻る** (127 の次ではない)。
+  循環領域のカウンタは 127 の次に 0 へ戻る。
+- rule 3.1: 一方が [128..255]、他方が [0..127] のとき、
+  `(256 + B - A) <= SEQUENCE_WINDOW (16)` なら B が大きい。
+- rule 3.2: 同じ領域内なら、差が SEQUENCE_WINDOW 以内であれば RFC 1982
+  的に比較し、超えていれば「比較不能 (desynchronization)」。
+- rule 4: 比較不能な場合は「自身の状態変化が最小になるように」評価する。
+
+つまり `0 > 255` が真になる。素の `>` はここで必ず逆の答えを出す。
+
+実装は `rpl-conf.h` の `RplSequenceCompare()` / `RplSequenceNewer()`。
+RFC が本文中で挙げている 2 つの計算例 (240 対 5 → 240 が大きい、
+250 対 5 → 250 が小さい) をそのまま `RplSequenceCounterTestCase` の
+アサーションにしてある。
+
+rule 3.2 の「absolute magnitude of difference」は、領域を**回って**測るのか
+**跨いで**測るのか本文からは一意に決まらない。跨いで測るとすると rule
+3.2.1 がわざわざ RFC 1982 を参照している意味が無くなる (窓 16 の内側では
+RFC 1982 と素の比較は決して食い違わない) ため、回って測る解釈を採った。
+Contiki-NG の `rpl_lollipop_greater_than()` も同じ解釈。ただし循環するのは
+循環領域だけで、線形領域は rule 2 が「back to zero」と書いているとおり
+255 の次が 128 ではないので、こちらは循環させない。
+
+Contiki-NG との唯一の意図的な差異は境界の扱いで、rule 3.2.1 は
+"less than or equal to SEQUENCE_WINDOW" なので差がちょうど 16 の場合も
+比較可能とした (Contiki-NG は strict `<` で比較不能扱い)。
+
+### 27.2 DODAG Version Number (最も影響が大きい)
+
+`HandleDio()` は `dio.GetVersionNumber() > m_version` で新バージョンを
+判定していた。root がバージョンを 255 から 0 へ回した瞬間、DODAG 内の
+**全ノードが新バージョンを拒否する**。しかも root は戻らないので、
+次の DIO でも、その次でも、以後永久に拒否し続ける — global repair
+(RFC 6550 section 7.1 が DODAGVersionNumber の存在理由として挙げている
+機能そのもの) が恒久的に停止する。
+
+回帰テスト `RplVersionWrapTestCase`。チャネル上に実在の root を置かず、
+すべて手組みの DIO で駆動する構成にした (実 root がいると、その DIO が
+バージョン番号を横から書き換えてテストの意図が崩れる)。修正前は
+`actual=256 limit=512` — バージョン 0 への移行が起きず rank が更新
+されないまま — で失敗する。逆方向 (0 に移行済みのノードへ 255 の DIO)
+が拒否されることも同じテストで確認している。「差があれば何でも受ける」
+という誤った修正で通ってしまわないようにするため。
+
+### 27.3 Path Sequence (比較が存在しなかった)
+
+`HandleDao()` は Path Sequence を `TopologyEntry` に保存するだけで、
+一度も読んでいなかった。到着順がそのまま採用される。RFC 6550 section
+7.1 の Path Sequence の定義は
+
+> An older (lesser) value received from an originating router indicates that
+> the originating router holds stale routing states and the originating
+> router should not be considered anymore as a potential next hop for the
+> target.
+
+であり、section 9.2.1 はカウンタを増やす契機として
+
+> 1. the Path Lifetime is to be updated (e.g., a refresh or a no-Path).
+> 2. the DODAG Parent Address subfield list is to be changed.
+
+の 2 つを MUST として挙げている。親を切り替えるノードはこの両方を
+同時に起こす。しかも 23 節で実装した No-Path DAO は**捨てる側の親を
+経由して**送られ、新しい DAO は**新しい親を経由して**送られるので、
+両者は長さの異なる別経路を上っていく。追い越しは十分に起こりうる。
+
+追い越された No-Path を root が真に受けると `m_topology.erase(target)`
+が走り、そのノードは**トポロジから消える**。次の定期 DAO (既定 60 秒)
+まで下り方向の経路が計算できず、宛先に向かうパケットは全部落ちる。
+23 節で No-Path 送信を実装したことによって新たに踏めるようになった
+経路であり、`SendNoPathDao()` のコメント自身が
+
+> The path sequence still has to advance ... this is what lets the root tell
+> an in-flight withdrawal apart from a stale, reordered copy
+
+と書いていたにもかかわらず、受信側にその比較が無かった。送信側だけ
+実装されていた形になる。
+
+修正では、同じ target の既存エントリに対して
+
+- GREATER → 採用 (新しい情報)
+- EQUAL → 採用 (再送・定期更新。section 9.2.1 の "All DAOs generated at
+  the same time for the same Target MUST be sent with the same Path
+  Sequence" が再送を指し、本実装の定期 DAO も同じ値を繰り返すので、
+  ここを弾くと全ノードの経路が PathLifetime ごとに一度必ず期限切れになる)
+- LESS / NOT_COMPARABLE → 無視 (rule 4)
+
+とした。あわせて、既に期限切れのエントリは比較の前に破棄する。
+`ComputeSourceRoute()` はどのみち期限切れエントリを使わないので、
+残しておいても「死んだ Path Sequence がその target を締め出し続ける」
+副作用しか無い。`PurgeTopology()` は root 自身が送信するときにしか
+走らないため、DAO 受信時にも掃除する意味がある。
+
+なお、stale として無視した DAO にも DAO-ACK は返す。RFC 6550 section
+7.1 は DAOSequence を
+
+> locally significant to the node that issues a DAO message for its own
+> consumption to detect the loss of a DAO message and enable retries
+
+と定義しており、ACK が報告するのは「メッセージが届いたこと」であって
+「経路が入ったこと」ではない。返さなければ送信側は同じ理由で捨てられる
+メッセージを `m_daoRetries` 回再送するだけになる。そもそも送信側は
+その頃には後続の (別 DAOSequence の) DAO の ACK を待っているので、
+この ACK は `HandleDaoAck()` のシーケンス一致検査で弾かれる。
+
+回帰テスト `RplStaleDaoTestCase`。修正前は 3 つのアサーションで失敗する
+(古い Path Sequence の DAO による上書き、古い No-Path による削除、
+その結果の経路消失)。「順序検査を入れたら withdrawal が一切効かなくなった」
+を防ぐため、最新の No-Path がちゃんと経路を落とすことも同じテストで
+確認している。
+
+### 27.4 DTSN
+
+`HandleDio()` の `dio.GetDtsn() > existingParent->second.dtsn`。
+DTSN は section 7.1 が名指しする 3 つのカウンタには含まれないが、
+同じように回り込む 8 bit のシーケンスカウンタであり、素の `>` では
+256 回に 1 回の increment (255 → 0) を取り逃がす。26.2 で実装した
+rule 1/2 が発火しないので、sub-DODAG 全体が DAO を更新せず、root 側の
+下り経路が期限切れになる。
+
+回帰テスト `RplDtsnWrapTestCase`。**チャネル上のどのノードも持っていない
+アドレス**を送信元にした DIO を `DeliverRawRplMessage()` で直接叩き込む
+構成にした。実在の隣人を使うと、その隣人が自分の DTSN を載せた DIO を
+勝手に送り続けるので、検証対象の状態が上書きされてしまう。
+
+初回の DIO は `m_parents` にエントリを作るだけで「前回値」が存在しない
+ため、どちらの比較でも increment とは判定されない。これを利用して
+「親の DTSN = 255、自分の DTSN = 0」という状態を、旧実装にも新実装にも
+同じ手順で作れる。ここが要点で、たとえば 0 → 255 → 0 と 3 回叩くと
+旧実装は 1 回目 (255 > 0)、新実装は 2 回目 (0 > 255) をそれぞれ
+increment と数え、**最終的な DTSN が両方 1 になって区別がつかない**。
+修正前は `actual=0 limit=1` で失敗する。
+
+### 27.5 Path Lifetime 0xFF が無限を意味することを見ていなかった
+
+同じ `HandleDao()` の別件。RFC 6550 section 6.7.8:
+
+> Path Lifetime: 8-bit unsigned integer. The length of time in Lifetime
+> Units (obtained from the Configuration option) that the prefix is valid
+> for route determination. ... A value of all one bits (0xFF) represents
+> infinity. A value of all zero bits (0x00) indicates a loss of
+> reachability.
+
+0x00 側 (No-Path) は 23 節で扱っていたが、0xFF 側は単なる乗数として
+`Simulator::Now() + Seconds(255 * m_lifetimeUnit)` を計算していた。
+「無限」を要求したのに、既定の lifetime unit (60 秒) では 255 分で
+経路が消える。`RPL_INFINITE_LIFETIME = 0xFF` という定数は
+`rpl-conf.h` に存在し、`PathLifetime` 属性の上限チェッカにも
+使われていた (`MakeUintegerChecker<uint8_t>(1, RPL_INFINITE_LIFETIME)`)
+ので、設定可能かつ意味のある値として意図されていたことは明らかで、
+受信側だけが対応していなかった。
+
+修正は `Time::Max()` を入れるだけ。回帰テスト
+`RplInfiniteLifetimeDaoTestCase` は 255 lifetime unit を十分に超えた
+時刻まで進めて経路が残っていることを確認する。
+
+### 27.6 テストランナーの挙動に関する注記
+
+ns-3 の test-runner は、スイート内のあるテストケースが失敗すると
+**そこで打ち切って以降のケースを実行しない**。新規テストを複数まとめて
+追加して「1 件しか落ちていない」ように見えるときは、実際には後続が
+走っていないだけの可能性がある。各バグの実在確認は、対象テストを
+登録順で先頭側へ一時的に移動して 1 件ずつ行った。

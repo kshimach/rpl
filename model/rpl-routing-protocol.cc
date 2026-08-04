@@ -929,9 +929,18 @@ RplRoutingProtocol::HandleDio(const RplDioHeader& dio,
     }
     else if (dio.GetVersionNumber() != m_version)
     {
-        // Note that the lollipop comparison of RFC 6550 section 7.2 is not
-        // implemented, so a version number wrapping around is not detected.
-        if (dio.GetVersionNumber() > m_version)
+        // The DODAGVersionNumber is a lollipop counter (RFC 6550 section
+        // 7.1), so which of two Versions is the newer one is decided by the
+        // comparison of section 7.2 rule 3, not by a plain `>`. The two
+        // disagree exactly at the wrap: rule 2 has the counter go from 255
+        // "back to zero", which `>` reads as a 255-step decrease. Since the
+        // root never goes back to an older Version, that misreading is not
+        // something the next DIO puts right -- every node would reject every
+        // Version from the wrap onwards, and global repair would stop working
+        // permanently. Rule 4 covers the counters that cannot be ordered at
+        // all: not migrating is the answer that "minimize[s] the resulting
+        // changes to its own state".
+        if (RplSequenceNewer(dio.GetVersionNumber(), m_version))
         {
             NS_LOG_INFO("DODAG " << m_dodagId << " moved to version " << +dio.GetVersionNumber());
             // Migrating between DODAG Versions, not detaching: no
@@ -953,10 +962,18 @@ RplRoutingProtocol::HandleDio(const RplDioHeader& dio,
     // concern (it may still just be a fresh neighbour, whose default-
     // constructed Parent -- dtsn 0 -- would otherwise read as an increment
     // the first time it is heard from at all).
+    //
+    // "Increment" is the lollipop one of RFC 6550 section 7.2, the same as
+    // the DODAG Version above: the DTSN is not among the three counters
+    // section 7.1 names, but it is an 8-bit RPL sequence counter that wraps
+    // like them, and read with a plain `>` the wrap from 255 to 0 is the one
+    // increment in every 256 that goes unnoticed -- leaving the whole
+    // sub-DODAG never told to refresh, and its downward routes to expire at
+    // the root.
     auto existingParent = m_parents.find(from);
     bool preferredParentBumpedDtsn = existingParent != m_parents.end() &&
                                      from == m_preferredParent &&
-                                     dio.GetDtsn() > existingParent->second.dtsn;
+                                     RplSequenceNewer(dio.GetDtsn(), existingParent->second.dtsn);
 
     Parent& parent = m_parents[from];
     parent.address = from;
@@ -1297,7 +1314,55 @@ RplRoutingProtocol::HandleDao(const RplDaoHeader& dao, Ipv6Address from)
         return;
     }
 
-    if (dao.GetPathLifetime() == 0)
+    // An entry whose lifetime has already run out has no say in what may
+    // supersede it: ComputeSourceRoute() refuses to build a path over one
+    // regardless, so leaving it standing here would only let a long-dead
+    // Path Sequence lock its target out of the topology. Purged on the spot
+    // rather than left to PurgeTopology(), which only runs when the root
+    // itself has traffic to route.
+    auto existing = m_topology.find(target);
+    if (existing != m_topology.end() && existing->second.expire <= Simulator::Now())
+    {
+        m_topology.erase(existing);
+        existing = m_topology.end();
+    }
+
+    // RFC 6550 section 7.1 on the Path Sequence: "An older (lesser) value
+    // received from an originating router indicates that the originating
+    // router holds stale routing states and the originating router should not
+    // be considered anymore as a potential next hop for the target." Section
+    // 9.2.1 has the counter advance on exactly the two events that produce
+    // the race -- "the Path Lifetime is to be updated (e.g., a refresh or a
+    // no-Path)" and "the DODAG Parent Address subfield list is to be changed"
+    // -- and a node that switches parent does both at once: it withdraws
+    // through the parent it is leaving and re-advertises through the new one,
+    // so the two DAOs climb disjoint paths and can arrive in either order.
+    // Acting on the withdrawal after the re-advertisement has overtaken it
+    // drops the target from the topology altogether, black-holing everything
+    // headed its way until its next periodic refresh.
+    //
+    // An equal Path Sequence is not stale: section 9.2.1's "All DAOs
+    // generated at the same time for the same Target MUST be sent with the
+    // same Path Sequence" covers the retransmissions DaoRetry() sends, and
+    // this implementation's periodic refresh repeats the sequence it last
+    // advertised, so refusing equality would expire every route in the DODAG
+    // exactly once per PathLifetime. One that cannot be ordered at all is,
+    // per section 7.2 rule 4: leaving the entry alone is what "minimize[s]
+    // the resulting changes to its own state".
+    RplSequenceOrder order = existing == m_topology.end()
+                                 ? RplSequenceOrder::GREATER
+                                 : RplSequenceCompare(dao.GetPathSequence(),
+                                                      existing->second.pathSequence);
+    bool stale =
+        order == RplSequenceOrder::LESS || order == RplSequenceOrder::NOT_COMPARABLE;
+
+    if (stale)
+    {
+        NS_LOG_INFO("Ignoring a DAO for " << target << " with Path Sequence "
+                                          << +dao.GetPathSequence() << ", superseded by "
+                                          << +existing->second.pathSequence);
+    }
+    else if (dao.GetPathLifetime() == 0)
     {
         // A No-Path, RFC 6550 section 6.4.3: the target has moved away.
         NS_LOG_INFO("No-Path for " << target << ", dropping it from the topology");
@@ -1305,19 +1370,31 @@ RplRoutingProtocol::HandleDao(const RplDaoHeader& dao, Ipv6Address from)
     }
     else
     {
-        // The path sequence is stored but, like the DODAG version number in
-        // HandleDio(), never compared: this always accepts the latest DAO
-        // that arrived rather than the one with the highest (lollipop, RFC
-        // 6550 section 7.2) sequence, so a DAO reordered by the network could
-        // overwrite a newer entry with a stale one until the next DAO sets it
-        // straight again.
         TopologyEntry& entry = m_topology[target];
         entry.parent = dao.GetParent();
         entry.pathSequence = dao.GetPathSequence();
-        entry.expire = Simulator::Now() + Seconds(dao.GetPathLifetime() * m_lifetimeUnit);
+        // RFC 6550 section 6.7.8: the Path Lifetime is "The length of time in
+        // Lifetime Units ... that the prefix is valid for route
+        // determination", except that "A value of all one bits (0xFF)
+        // represents infinity". Multiplied out like any other value, that
+        // largest of all lifetimes would instead be a merely long one, and
+        // the route the sender asked to have kept indefinitely would be
+        // dropped 255 lifetime units in.
+        entry.expire = dao.GetPathLifetime() == RPL_INFINITE_LIFETIME
+                           ? Time::Max()
+                           : Simulator::Now() + Seconds(dao.GetPathLifetime() * m_lifetimeUnit);
         NS_LOG_INFO("Topology: " << target << " sits under " << entry.parent);
     }
 
+    // Acknowledged even when it was ignored as stale above. RFC 6550 section
+    // 7.1 has the DAOSequence a DAO-ACK carries be "locally significant to
+    // the node that issues a DAO message for its own consumption to detect
+    // the loss of a DAO message and enable retries": what it reports is that
+    // the message arrived, not what the root did with it. Withholding it
+    // would only have the sender retransmit, m_daoRetries times over, a
+    // message the root discards on the same grounds every time -- and the
+    // sender is by then waiting on the DAO-ACK of the newer DAO that
+    // superseded this one, under a DAOSequence this reply does not match.
     if (dao.GetAckRequested())
     {
         RplDaoAckHeader daoAck;

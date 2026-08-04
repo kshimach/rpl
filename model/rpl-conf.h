@@ -81,6 +81,122 @@ constexpr uint8_t RPL_DAO_D_FLAG = 0x40; //!< DODAGID present
 constexpr uint16_t RPL_INFINITE_RANK = 0xFFFF;
 constexpr uint8_t RPL_INFINITE_LIFETIME = 0xFF;
 
+/// Lollipop sequence counters (RFC 6550, section 7.2). Values of 128 and
+/// greater form a linear region used to bootstrap the counter after a
+/// restart; values of 127 and below form a circular region of size 128.
+constexpr uint8_t RPL_SEQUENCE_WINDOW = 16;         //!< SEQUENCE_WINDOW, 2^4
+constexpr uint8_t RPL_SEQUENCE_LINEAR_REGION = 128; //!< first value of the linear region
+constexpr uint8_t RPL_SEQUENCE_CIRCULAR_SIZE = 128; //!< size of the circular region
+
+/// How two lollipop sequence counters relate (RFC 6550, section 7.2, rule 3).
+enum class RplSequenceOrder
+{
+    LESS,           //!< the first counter is the older one
+    EQUAL,          //!< the two counters are the same
+    GREATER,        //!< the first counter is the newer one
+    NOT_COMPARABLE, //!< too far apart to order: a desynchronisation
+};
+
+/**
+ * @brief Order two lollipop sequence counters, RFC 6550 section 7.2 rule 3.
+ *
+ * Rule 3 opens with "When comparing two sequence counters, the following
+ * rules MUST be applied", and the rules disagree with a plain integer
+ * comparison on exactly the wrap-around the lollipop encoding exists to
+ * express: 0 follows 255, so it is the newer of the two, and a `>` reads
+ * that as a 255-step decrease instead.
+ *
+ * @internal
+ * Two readings of rule 3.2 are possible, since it measures "the absolute
+ * magnitude of difference between the two sequence counters" without saying
+ * whether the measurement goes around the region or across it. Taken across,
+ * rule 3.2.1's reference to RFC 1982 would be redundant -- inside a window of
+ * 16, RFC 1982 and a plain comparison never disagree -- so this takes it as
+ * going around, which is also what Contiki-NG's rpl_lollipop_greater_than()
+ * does. That only applies to the circular region: rule 2 has a counter in the
+ * linear region wrap "back to zero", i.e. into the circular region, so 255 is
+ * never one step short of 128 and the linear region is not circular.
+ *
+ * The one deliberate difference from Contiki-NG is the boundary: rule 3.2.1
+ * is "less than or equal to SEQUENCE_WINDOW", where Contiki-NG's comparison
+ * is strict, so counters exactly SEQUENCE_WINDOW apart are ordered here and
+ * incomparable there.
+ * @endinternal
+ *
+ * @param a the first counter
+ * @param b the second counter
+ * @return how a relates to b
+ */
+inline RplSequenceOrder
+RplSequenceCompare(uint8_t a, uint8_t b)
+{
+    if (a == b)
+    {
+        return RplSequenceOrder::EQUAL;
+    }
+
+    const bool aLinear = a >= RPL_SEQUENCE_LINEAR_REGION;
+    const bool bLinear = b >= RPL_SEQUENCE_LINEAR_REGION;
+
+    if (aLinear != bLinear)
+    {
+        // Rule 3.1, with A the counter in [128..255] and B the one in
+        // [0..127]: "If (256 + B - A) is less than or equal to
+        // SEQUENCE_WINDOW, then B is greater than A".
+        const uint16_t linear = aLinear ? a : b;
+        const uint16_t circular = aLinear ? b : a;
+        const bool circularIsGreater = (256 + circular - linear) <= RPL_SEQUENCE_WINDOW;
+        if (circularIsGreater)
+        {
+            return aLinear ? RplSequenceOrder::LESS : RplSequenceOrder::GREATER;
+        }
+        return aLinear ? RplSequenceOrder::GREATER : RplSequenceOrder::LESS;
+    }
+
+    if (aLinear)
+    {
+        // Rule 3.2 in the linear region, which does not wrap within itself.
+        const uint16_t magnitude = (a > b) ? (a - b) : (b - a);
+        if (magnitude > RPL_SEQUENCE_WINDOW)
+        {
+            return RplSequenceOrder::NOT_COMPARABLE;
+        }
+        return (a > b) ? RplSequenceOrder::GREATER : RplSequenceOrder::LESS;
+    }
+
+    // Rule 3.2 in the circular region: how far b has to advance to reach a.
+    const uint8_t forward = static_cast<uint8_t>(a - b) % RPL_SEQUENCE_CIRCULAR_SIZE;
+    if (forward <= RPL_SEQUENCE_WINDOW)
+    {
+        return RplSequenceOrder::GREATER;
+    }
+    if (RPL_SEQUENCE_CIRCULAR_SIZE - forward <= RPL_SEQUENCE_WINDOW)
+    {
+        return RplSequenceOrder::LESS;
+    }
+    return RplSequenceOrder::NOT_COMPARABLE;
+}
+
+/**
+ * @brief Whether a lollipop sequence counter carries newer information than
+ *        the one already held.
+ *
+ * RFC 6550 section 7.2 rule 4 on the counters that cannot be ordered at all:
+ * failing any record of which one incremented most recently, "the node should
+ * consider the comparison as if it has evaluated in such a way so as to
+ * minimize the resulting changes to its own state" -- so an incomparable
+ * counter is not newer, and nothing is updated on the strength of it.
+ *
+ * @param candidate the counter that just arrived
+ * @param held the counter already recorded
+ * @return true if the arriving counter supersedes the recorded one
+ */
+inline bool
+RplSequenceNewer(uint8_t candidate, uint8_t held)
+{
+    return RplSequenceCompare(candidate, held) == RplSequenceOrder::GREATER;
+}
+
 /// Routing Header type 3 (RFC 6554).
 constexpr uint8_t RPL_RH_TYPE_SRH = 3;
 

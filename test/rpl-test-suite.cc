@@ -5313,6 +5313,683 @@ RplPacketInfoProcessTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief Check that a DAO parent's DTSN wrapping past its maximum still
+ *        reads as the increment it is.
+ *
+ * RFC 6550 section 9.6 rule 2: "If a node hears one of its DAO parents
+ * increment its DTSN, the node MUST increment its own DTSN." The DTSN is not
+ * one of the three counters section 7.1 names, but it is an 8-bit RPL
+ * sequence counter that wraps the same way, and read with a plain `>` the
+ * wrap from 255 to 0 is the one increment in every 256 that is missed --
+ * along with the DAO refresh rule 1 asks for, throughout the sub-DODAG at
+ * once, leaving the root's downward routes to expire.
+ *
+ * The DIOs come from an address no node on the channel owns, handed straight
+ * to the node under test. That is what makes the two steps below the only
+ * DTSNs its DAO parent is ever heard with: a real neighbour would keep
+ * transmitting its own DTSN in between and overwrite the state under test.
+ */
+class RplDtsnWrapTestCase : public TestCase
+{
+  public:
+    RplDtsnWrapTestCase();
+
+  private:
+    void DoRun() override;
+
+    /**
+     * @brief Record a DIO's DTSN, if it came from the node under test.
+     * @param socket the monitoring socket
+     */
+    void RecordDio(Ptr<Socket> socket);
+
+    Ipv6Address m_nodeLinkLocal;   //!< the node under test, to filter DIOs by sender
+    std::vector<uint8_t> m_dtsns; //!< DTSN of every DIO the node under test sent
+};
+
+RplDtsnWrapTestCase::RplDtsnWrapTestCase()
+    : TestCase("A DAO parent's DTSN wrapping past its maximum")
+{
+}
+
+void
+RplDtsnWrapTestCase::RecordDio(Ptr<Socket> socket)
+{
+    Address sender;
+    Ptr<Packet> packet = socket->RecvFrom(sender);
+    if (!packet)
+    {
+        return;
+    }
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ipv6Header);
+    if (ipv6Header.GetSource() != m_nodeLinkLocal)
+    {
+        return;
+    }
+    Icmpv6Header icmpv6Header;
+    packet->RemoveHeader(icmpv6Header);
+    if (icmpv6Header.GetType() == ICMPV6_RPL && icmpv6Header.GetCode() == RPL_CODE_DIO)
+    {
+        RplDioHeader dio;
+        packet->RemoveHeader(dio);
+        m_dtsns.push_back(dio.GetDtsn());
+    }
+}
+
+void
+RplDtsnWrapTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2); // 0 = node under test, 1 = the DIO monitor
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+    rplHelper.AssignStreams(nodes, 1);
+
+    Ptr<Node> node = nodes.Get(0);
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+
+    Simulator::Stop(Seconds(2));
+    Simulator::Run();
+
+    m_nodeLinkLocal = node->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    // The monitor goes on the other node: a node's own multicast is never
+    // delivered back to a socket on that same node, so nothing on the node
+    // under test could read the DIOs it sends itself.
+    Ptr<Socket> dioMonitor = Socket::CreateSocket(nodes.Get(1), Ipv6RawSocketFactory::GetTypeId());
+    dioMonitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    dioMonitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    dioMonitor->BindToNetDevice(nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+    dioMonitor->SetRecvCallback(MakeCallback(&RplDtsnWrapTestCase::RecordDio, this));
+
+    // An address on this link that belongs to no node.
+    Ipv6Address phantom("fe80::200:ff:fe00:99");
+    Ipv6Address dodagId("2001:1::1");
+
+    auto buildDio = [&dodagId](uint8_t dtsn) {
+        RplDioHeader dio;
+        dio.SetInstanceId(RPL_DEFAULT_INSTANCE);
+        dio.SetVersionNumber(0);
+        dio.SetRank(RPL_MIN_HOPRANKINC);
+        dio.SetMop(RPL_MOP_NON_STORING);
+        dio.SetDodagId(dodagId);
+        dio.SetDtsn(dtsn);
+        // Imin 2^8 ms = 256 ms with two doublings, so the node under test
+        // emits DIOs of its own often enough to be read below, and its DAO
+        // parent is not dropped as stale (2 * Imax = ~2 s) before then.
+        dio.SetDagConfiguration(2,
+                                8,
+                                RPL_DIO_REDUNDANCY,
+                                RPL_MAX_RANKINC,
+                                RPL_MIN_HOPRANKINC,
+                                RPL_OCP_OF0,
+                                RPL_DEFAULT_LIFETIME,
+                                RPL_DEFAULT_LIFETIME_UNIT);
+        return dio;
+    };
+
+    // The first DIO from a neighbour only creates its Parent record; there is
+    // no previous DTSN to have incremented past, so this one cannot be read
+    // as a bump under any comparison. That is what leaves 255 recorded as the
+    // DAO parent's DTSN with the node's own still at 0, and makes the step
+    // below the only thing that can move it.
+    DeliverRawRplMessage(node,
+                         1,
+                         buildDio(255),
+                         static_cast<uint8_t>(RPL_CODE_DIO),
+                         phantom,
+                         m_nodeLinkLocal);
+    Simulator::Stop(MilliSeconds(10));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoined(), true, "The injected DIO did not bootstrap a DODAG");
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetPreferredParent(),
+                          phantom,
+                          "The only neighbour there was did not become the DAO parent");
+
+    // The wrap: RFC 6550 section 7.2 rule 3.1 with A = 255 and B = 0 gives
+    // (256 + 0 - 255) = 1, at most SEQUENCE_WINDOW, so 0 is greater than 255.
+    DeliverRawRplMessage(node,
+                         1,
+                         buildDio(0),
+                         static_cast<uint8_t>(RPL_CODE_DIO),
+                         phantom,
+                         m_nodeLinkLocal);
+
+    // Long enough for several of the node's own DIOs at Imin 256 ms, and
+    // short of the ~2 s of silence that would have it drop the phantom as
+    // stale and leave the DODAG.
+    Simulator::Stop(MilliSeconds(1500));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_GT_OR_EQ(m_dtsns.size(), 1, "The node under test never sent a DIO");
+    // Widened out of uint8_t, which the test macros would otherwise render as
+    // the character of that code point in the failure message.
+    NS_TEST_ASSERT_MSG_EQ(static_cast<uint32_t>(m_dtsns.back()),
+                          1,
+                          "The node did not follow its DAO parent's DTSN across the wrap, so "
+                          "neither it nor its sub-DODAG would have refreshed their DAOs");
+
+    dioMonitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief Check the lollipop comparison of RFC 6550 section 7.2 against the
+ *        worked examples the RFC states for it.
+ *
+ * Section 7.2 rule 3 opens with "When comparing two sequence counters, the
+ * following rules MUST be applied", so this is not a detail an implementation
+ * gets to pick a simpler rule for: a plain integer comparison disagrees with
+ * it on exactly the wrap-around cases the lollipop encoding exists to get
+ * right.
+ */
+class RplSequenceCounterTestCase : public TestCase
+{
+  public:
+    RplSequenceCounterTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplSequenceCounterTestCase::RplSequenceCounterTestCase()
+    : TestCase("Lollipop sequence counter comparison")
+{
+}
+
+void
+RplSequenceCounterTestCase::DoRun()
+{
+    // Compared by name rather than by value: RplSequenceOrder is an enum
+    // class, which the test macros cannot stream into a failure message, and
+    // "LESS, expected GREATER" says more there than "0, expected 2" would.
+    auto order = [](uint8_t a, uint8_t b) {
+        switch (RplSequenceCompare(a, b))
+        {
+        case RplSequenceOrder::LESS:
+            return std::string("LESS");
+        case RplSequenceOrder::EQUAL:
+            return std::string("EQUAL");
+        case RplSequenceOrder::GREATER:
+            return std::string("GREATER");
+        case RplSequenceOrder::NOT_COMPARABLE:
+            return std::string("NOT_COMPARABLE");
+        }
+        return std::string("UNKNOWN");
+    };
+
+    // The two examples RFC 6550 section 7.2 rule 3.1 spells out itself.
+    // "if A is 240, and B is 5, then (256 + 5 - 240) is 21. 21 is greater
+    // than SEQUENCE_WINDOW (16); thus, 240 is greater than 5."
+    NS_TEST_ASSERT_MSG_EQ(order(240, 5),
+                          "GREATER",
+                          "240 should be greater than 5 (the RFC's own example)");
+    NS_TEST_ASSERT_MSG_EQ(order(5, 240),
+                          "LESS",
+                          "the comparison should be antisymmetric");
+
+    // "if A is 250 and B is 5, then (256 + 5 - 250) is 11. 11 is less than
+    // SEQUENCE_WINDOW (16); thus, 250 is less than 5."
+    NS_TEST_ASSERT_MSG_EQ(order(250, 5),
+                          "LESS",
+                          "250 should be less than 5 (the RFC's own example)");
+    NS_TEST_ASSERT_MSG_EQ(order(5, 250),
+                          "GREATER",
+                          "the comparison should be antisymmetric");
+
+    // Rule 2: "When a sequence counter increment would cause the sequence
+    // counter to increment beyond its maximum value, the sequence counter
+    // MUST wrap back to zero." A counter in the linear region tops out at
+    // 255 and wraps to 0, which the comparison then has to read as an
+    // increment, not a 255-step drop.
+    NS_TEST_ASSERT_MSG_EQ(order(0, 255),
+                          "GREATER",
+                          "the wrap from the linear region into the circular one was not "
+                          "recognised as an increment");
+    NS_TEST_ASSERT_MSG_EQ(order(255, 0),
+                          "LESS",
+                          "a counter that has not wrapped yet was taken for the newer one");
+
+    NS_TEST_ASSERT_MSG_EQ(RplSequenceNewer(0, 255),
+                          true,
+                          "RplSequenceNewer() disagrees with RplSequenceCompare() on the wrap");
+    NS_TEST_ASSERT_MSG_EQ(RplSequenceNewer(255, 0),
+                          false,
+                          "RplSequenceNewer() accepted the pre-wrap value as newer");
+
+    // Rule 2 again: a counter that is already in the circular region wraps
+    // at 127, not at 255.
+    NS_TEST_ASSERT_MSG_EQ(order(0, 127),
+                          "GREATER",
+                          "the wrap inside the circular region was not recognised");
+
+    // Rule 3.2: inside one region, RFC 1982 ordering applies while the two
+    // are within SEQUENCE_WINDOW of each other.
+    NS_TEST_ASSERT_MSG_EQ(order(11, 10),
+                          "GREATER",
+                          "an ordinary increment in the circular region compared wrong");
+    NS_TEST_ASSERT_MSG_EQ(order(10, 10),
+                          "EQUAL",
+                          "a counter did not compare equal to itself");
+    NS_TEST_ASSERT_MSG_EQ(order(241, 240),
+                          "GREATER",
+                          "an ordinary increment in the linear region compared wrong");
+
+    // Rule 3.2.2: "If the absolute magnitude of difference of the two
+    // sequence counters is greater than SEQUENCE_WINDOW, then a
+    // desynchronization has occurred and the two sequence numbers are not
+    // comparable."
+    NS_TEST_ASSERT_MSG_EQ(order(100, 10),
+                          "NOT_COMPARABLE",
+                          "two counters a desynchronisation apart compared anyway");
+    NS_TEST_ASSERT_MSG_EQ(order(240, 200),
+                          "NOT_COMPARABLE",
+                          "two counters a desynchronisation apart compared anyway");
+
+    // Exactly SEQUENCE_WINDOW apart is still comparable: rule 3.2.1 is
+    // "less than or equal to SEQUENCE_WINDOW".
+    NS_TEST_ASSERT_MSG_EQ(order(26, 10),
+                          "GREATER",
+                          "a difference of exactly SEQUENCE_WINDOW was called incomparable");
+
+    // Rule 4: a node "should consider the comparison as if it has evaluated
+    // in such a way so as to minimize the resulting changes to its own
+    // state", i.e. an incomparable counter is not newer.
+    NS_TEST_ASSERT_MSG_EQ(RplSequenceNewer(100, 10),
+                          false,
+                          "an incomparable counter was treated as newer, changing state on "
+                          "information that cannot be ordered");
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief Check that a DODAG Version Number wrapping past its maximum is read
+ *        as the increment it is, and that a genuinely older one is still
+ *        rejected.
+ *
+ * RFC 6550 section 7.1: the DODAGVersionNumber "is monotonically incremented
+ * by the root each time the root decides to form a new Version of the DODAG
+ * in order to revalidate the integrity and allow a global repair to occur".
+ * Section 7.2 rule 2 has that counter wrap back to zero once it passes 255.
+ * A plain `>` comparison reads that wrap as a 255-step decrease and rejects
+ * the new Version -- and since the root never goes back, every node in the
+ * DODAG rejects every DIO from then on: global repair stops working for good,
+ * not just for one round.
+ *
+ * Driven entirely from hand-built DIOs of a DODAG that has no real root on
+ * the channel, so that nothing else transmits a Version number to race the
+ * one under test.
+ */
+class RplVersionWrapTestCase : public TestCase
+{
+  public:
+    RplVersionWrapTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplVersionWrapTestCase::RplVersionWrapTestCase()
+    : TestCase("A DODAG Version Number wrapping past its maximum")
+{
+}
+
+void
+RplVersionWrapTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2); // 0 = node under test, 1 = the only neighbour it ever hears
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+    rplHelper.AssignStreams(nodes, 1);
+
+    Ptr<RplRoutingProtocol> node = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ipv6Address dodagId("2001:1::1");
+    Ipv6Address nodeLinkLocal =
+        nodes.Get(0)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address neighbourLinkLocal =
+        nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    auto buildDio = [&dodagId](uint8_t version, uint16_t rank) {
+        RplDioHeader dio;
+        dio.SetInstanceId(RPL_DEFAULT_INSTANCE);
+        dio.SetVersionNumber(version);
+        dio.SetRank(rank);
+        dio.SetMop(RPL_MOP_NON_STORING);
+        dio.SetDodagId(dodagId);
+        dio.SetDagConfiguration(RPL_DIO_INTERVAL_DOUBLINGS,
+                                RPL_DIO_INTERVAL_MIN,
+                                RPL_DIO_REDUNDANCY,
+                                RPL_MAX_RANKINC,
+                                RPL_MIN_HOPRANKINC,
+                                RPL_OCP_OF0,
+                                RPL_DEFAULT_LIFETIME,
+                                RPL_DEFAULT_LIFETIME_UNIT);
+        return dio;
+    };
+
+    auto send = [&](const RplDioHeader& dio) {
+        Simulator::Schedule(Seconds(0),
+                            &SendRawRplMessage<RplDioHeader>,
+                            nodes.Get(1),
+                            1,
+                            dio,
+                            static_cast<uint8_t>(RPL_CODE_DIO),
+                            neighbourLinkLocal,
+                            nodeLinkLocal);
+        Simulator::Stop(MilliSeconds(10));
+        Simulator::Run();
+    };
+
+    // Join at the top of the linear region, one increment short of the wrap.
+    // The rank advertised is what tells the Versions apart below: on
+    // migrating, the node drops its parent set and recomputes its own rank
+    // from whatever DIO carried it into the new Version.
+    send(buildDio(255, RPL_MIN_HOPRANKINC));
+    NS_TEST_ASSERT_MSG_EQ(node->IsJoined(), true, "The first DIO did not bootstrap a DODAG");
+    NS_TEST_ASSERT_MSG_EQ(node->GetRank(),
+                          2 * RPL_MIN_HOPRANKINC,
+                          "Wrong rank on joining DODAG Version 255");
+
+    // The wrap. RFC 6550 section 7.2 rule 3.1: with A = 255 and B = 0,
+    // (256 + 0 - 255) is 1, which is at most SEQUENCE_WINDOW (16), so 0 is
+    // greater than 255 -- a new DODAG Version, and the node has to migrate
+    // into it.
+    send(buildDio(0, 3 * RPL_MIN_HOPRANKINC));
+    NS_TEST_ASSERT_MSG_EQ(node->GetRank(),
+                          4 * RPL_MIN_HOPRANKINC,
+                          "The node did not migrate into the DODAG Version the counter wrapped "
+                          "into, so a global repair after the wrap would never reach it");
+
+    // And the other direction still has to be refused, or the fix would just
+    // be "accept anything that differs": with A = 255 and B = 0 again, 255
+    // is the lesser of the two, so a DIO still advertising it is stale.
+    send(buildDio(255, RPL_MIN_HOPRANKINC));
+    NS_TEST_ASSERT_MSG_EQ(node->GetRank(),
+                          4 * RPL_MIN_HOPRANKINC,
+                          "The node migrated backwards into the DODAG Version it had already "
+                          "left");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief Check that the root orders DAOs for one target by their Path
+ *        Sequence, so a stale one -- a No-Path in particular -- cannot undo a
+ *        newer one that overtook it.
+ *
+ * RFC 6550 section 7.1 on the Path Sequence: "An older (lesser) value
+ * received from an originating router indicates that the originating router
+ * holds stale routing states and the originating router should not be
+ * considered anymore as a potential next hop for the target." Section 9.2.1
+ * makes the counter advance on exactly the two events that produce the race:
+ * "the Path Lifetime is to be updated (e.g., a refresh or a no-Path)" and
+ * "the DODAG Parent Address subfield list is to be changed".
+ *
+ * The race is not hypothetical in this implementation: a node that loses its
+ * preferred parent withdraws through that same parent (SendNoPathDao()) and
+ * then advertises through the new one, so the two DAOs travel up disjoint
+ * paths of unrelated length and can arrive in either order.
+ */
+class RplStaleDaoTestCase : public TestCase
+{
+  public:
+    RplStaleDaoTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplStaleDaoTestCase::RplStaleDaoTestCase()
+    : TestCase("A DAO overtaken by a newer one for the same target")
+{
+}
+
+void
+RplStaleDaoTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(60));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> root = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ipv6Address rootAddress = root->GetGlobalAddress();
+    Ptr<RplRoutingProtocol> child = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    Ipv6Address childAddress = child->GetGlobalAddress();
+    NS_TEST_ASSERT_MSG_EQ(root->GetTopologySize(), 1, "The root did not learn the child's DAO");
+
+    auto sendDao = [&](Ipv6Address target,
+                       Ipv6Address parent,
+                       uint8_t pathSequence,
+                       uint8_t lifetime) {
+        RplDaoHeader dao;
+        dao.SetInstanceId(RPL_DEFAULT_INSTANCE);
+        dao.SetSequence(pathSequence);
+        dao.SetTarget(target);
+        dao.SetTransitInformation(parent, pathSequence, lifetime);
+        Simulator::Schedule(Seconds(0),
+                            &SendRawRplMessage<RplDaoHeader>,
+                            nodes.Get(1),
+                            1,
+                            dao,
+                            static_cast<uint8_t>(RPL_CODE_DAO),
+                            childAddress,
+                            rootAddress);
+        Simulator::Stop(MilliSeconds(10));
+        Simulator::Run();
+    };
+
+    // A target sitting under the real child, so the parent chain the root
+    // walks actually reaches it and a route can be computed.
+    Ipv6Address target("2001:1::ff:fe00:aa");
+    // ...and a parent that leads nowhere, which is what the stale DAOs below
+    // claim instead: if one of them is taken, the route computation stops
+    // finding a path, which is what makes the difference observable.
+    Ipv6Address nowhere("2001:1::ff:fe00:bb");
+    std::vector<Ipv6Address> hops;
+
+    sendDao(target, childAddress, 20, RPL_DEFAULT_LIFETIME);
+    NS_TEST_ASSERT_MSG_EQ(root->GetTopologySize(), 2, "The first DAO was not recorded");
+    NS_TEST_ASSERT_MSG_EQ(root->ComputeSourceRoute(target, hops),
+                          true,
+                          "A freshly advertised target was not routable");
+
+    // A DAO the network reordered: it left before the one above (lower Path
+    // Sequence) but arrived after it. Taking it would move the target under
+    // a parent it has already left.
+    sendDao(target, nowhere, 19, RPL_DEFAULT_LIFETIME);
+    NS_TEST_ASSERT_MSG_EQ(root->ComputeSourceRoute(target, hops),
+                          true,
+                          "A DAO with an older Path Sequence overwrote the newer entry it was "
+                          "overtaken by");
+
+    // The same for a No-Path, which is the case that actually happens here:
+    // it is sent through the parent being abandoned, so it travels a
+    // different and possibly slower path than the DAO that replaced it.
+    // Acting on it drops the target from the topology altogether, leaving it
+    // unreachable until its next periodic refresh.
+    sendDao(target, nowhere, 19, 0);
+    NS_TEST_ASSERT_MSG_EQ(root->GetTopologySize(),
+                          2,
+                          "A No-Path with an older Path Sequence withdrew a route that had "
+                          "already been re-advertised through a different parent");
+    NS_TEST_ASSERT_MSG_EQ(root->ComputeSourceRoute(target, hops),
+                          true,
+                          "A stale No-Path left the target unroutable");
+
+    // A No-Path that really is the newest word on the target still has to
+    // take it down, or the ordering check would just be a way to ignore
+    // withdrawals.
+    sendDao(target, childAddress, 21, 0);
+    NS_TEST_ASSERT_MSG_EQ(root->GetTopologySize(),
+                          1,
+                          "An up-to-date No-Path did not withdraw the route");
+    NS_TEST_ASSERT_MSG_EQ(root->ComputeSourceRoute(target, hops),
+                          false,
+                          "A withdrawn target was still routable");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief Check that a Path Lifetime of 0xFF means the route never expires.
+ *
+ * RFC 6550 section 6.7.8 on the Transit Information option's Path Lifetime:
+ * "The length of time in Lifetime Units (obtained from the Configuration
+ * option) that the prefix is valid for route determination. ... A value of
+ * all one bits (0xFF) represents infinity." Read as a plain multiplier
+ * instead, 0xFF is the *shortest* lifetime a node can ask for beyond the
+ * ordinary range rather than an unlimited one, and the root drops the route
+ * 255 lifetime units in.
+ */
+class RplInfiniteLifetimeDaoTestCase : public TestCase
+{
+  public:
+    RplInfiniteLifetimeDaoTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplInfiniteLifetimeDaoTestCase::RplInfiniteLifetimeDaoTestCase()
+    : TestCase("A DAO asking for an infinite path lifetime")
+{
+}
+
+void
+RplInfiniteLifetimeDaoTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(60));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> root = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ipv6Address rootAddress = root->GetGlobalAddress();
+    Ptr<RplRoutingProtocol> child = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    Ipv6Address childAddress = child->GetGlobalAddress();
+
+    Ipv6Address target("2001:1::ff:fe00:aa");
+    RplDaoHeader dao;
+    dao.SetInstanceId(RPL_DEFAULT_INSTANCE);
+    dao.SetSequence(1);
+    dao.SetTarget(target);
+    dao.SetTransitInformation(childAddress, 1, RPL_INFINITE_LIFETIME);
+    Simulator::Schedule(Seconds(0),
+                        &SendRawRplMessage<RplDaoHeader>,
+                        nodes.Get(1),
+                        1,
+                        dao,
+                        static_cast<uint8_t>(RPL_CODE_DAO),
+                        childAddress,
+                        rootAddress);
+    Simulator::Stop(MilliSeconds(10));
+    Simulator::Run();
+
+    std::vector<Ipv6Address> hops;
+    NS_TEST_ASSERT_MSG_EQ(root->ComputeSourceRoute(target, hops),
+                          true,
+                          "A freshly advertised target was not routable");
+
+    // Well past the 255 lifetime units a plain multiplication would have
+    // given the entry, and past the point where the periodic purge in
+    // RouteOutput() would have had every chance to run.
+    Simulator::Stop(Seconds(RPL_INFINITE_LIFETIME * RPL_DEFAULT_LIFETIME_UNIT + 600));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(root->ComputeSourceRoute(target, hops),
+                          true,
+                          "A route advertised with the infinite path lifetime expired anyway");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief The RPL test suite.
  */
 class RplTestSuite : public TestSuite
@@ -5362,6 +6039,11 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplPacketInfoSubTlvTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplPacketInfoMalformedTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplPacketInfoProcessTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplSequenceCounterTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplVersionWrapTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplStaleDaoTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplInfiniteLifetimeDaoTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplDtsnWrapTestCase, TestCase::Duration::QUICK);
 }
 
 /// Static variable for test initialization.
