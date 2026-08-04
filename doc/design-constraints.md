@@ -2266,3 +2266,58 @@ GetTag()` は `GetInstanceTypeId()` の一致しか見ないことを利用し�
 ことを個別に確認済み: hysteresis は `actual=fe80::...2 limit=fe80::...3`
 (peerA のまま乗り換えない)、link metric は `actual="::" limit=...`
 (唯一の隣人が `>=` で除外され、DODAG に一度も参加できない) で落ちる。
+
+## 29. ルーティングテーブルの機械可読出力 (`PrintRoutingTableJson()`)
+
+外部ツール (GUI エディタ `ns3-editor`) から各ノードの RPL 状態を
+参照するために、`PrintRoutingTable()` と同じ状態を 1 行 1 JSON で
+出す `PrintRoutingTableJson()` を追加した。既存の `PrintRoutingTable()`
+はそのまま残す。
+
+### 29.1 なぜ既存出力のパースではなく専用出力なのか
+
+`PrintRoutingTable()` の出力は人間が読む前提の散文で、**設定によって
+列が出たり消えたりする**:
+
+- OCP が OF0 なら path ETX / link ETX の列自体が出ない
+- `EnableLql` が false なら LQL の列が出ない
+- 非 root なら topology のセクションごと出ない
+
+これを外部で正規表現パースすると、任意グループだらけの脆い実装になる
+うえ、print 書式を変えた瞬間に**無言で壊れる**隠れた結合ができる。
+モジュール側とツール側が別リポジトリなので、その破損はモジュールの
+テストでは検出されない。
+
+### 29.2 スキーマの方針: キーは常に全部出す
+
+専用出力を選んだ理由が上記なので、JSON 側で同じことをしては意味が
+無い。該当しない項目は**キーを落とさず `null` を入れる**:
+
+- `pathEtx`: OF0 のとき `null` (「0」ではない — OF0 は path cost を
+  計算しないので、報告すべき数値が存在しない)
+- `parents[].linkEtx` / `parents[].pathEtx`: OF0 のとき `null`。link ETX
+  は OF0 でも内部的には追跡しているが、親選択に一切関与していない値を
+  数値として出すと、関与したかのように読まれる
+- `parents[].lql`: `EnableLql` が false のとき `null`
+- `topology`: 非 root では `[]` (non-storing mode で topology を持つのは
+  root だけ)
+- 未 join のノードでも `joined:false` と併せて全キーを出す。消費側が
+  「まず joined で分岐してから」でなく素直にインデックスできる
+
+### 29.3 JSON ライブラリを使っていない
+
+出力する値は数値・真偽値・固定の 2 種類の role 文字列・IPv6 アドレス
+だけで、`Ipv6Address::operator<<` が出すのは 16 進数字・コロン・ドット
+のみ。エスケープが必要な文字が原理的に出てこないので、手書きで足りる。
+ns-3 本体に JSON 依存を持ち込まないほうが移植性の面でも良い。
+
+将来ここに任意文字列 (ノード名など) を足す場合はこの前提が崩れるので、
+そのときはエスケープを入れるか、値を数値 ID に留めること。
+
+### 29.4 ついでに直した表示バグ
+
+27.5 で Path Lifetime 0xFF (無限) を `Time::Max()` として保持する
+ようにしたが、`PrintRoutingTable()` は `expire - Now()` を無条件に
+出していたため、無限 lifetime のエントリで巨大な秒数が表示されていた
+(クラッシュはしないが意味不明)。`"never"` を出すよう修正。JSON 側は
+同じケースを `expiresIn: null` として出す。

@@ -105,6 +105,24 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
                                Ptr<Ipv6Route> route) override;
 
     /**
+     * @brief Write the same state PrintRoutingTable() does, as one line of
+     *        JSON, for a reader that is a program rather than a person.
+     *
+     * PrintRoutingTable()'s output is prose -- it drops the MRHOF columns
+     * when the objective function is OF0, and the LQL one unless LQL is
+     * enabled -- which makes it pleasant to read and unpleasant to parse
+     * against. This emits every key on every call instead, using a JSON null
+     * for the ones that do not apply to the current configuration, so that a
+     * consumer can index into the result without first working out which
+     * shape it got. One line per call, newline-terminated and flushed, so a
+     * consumer reading the simulation's stdout can act on each node's
+     * snapshot as it arrives.
+     *
+     * @param stream the output stream to write to
+     */
+    void PrintRoutingTableJson(Ptr<OutputStreamWrapper> stream) const;
+
+    /**
      * @brief Make this node the root of the DODAG.
      *
      * The DODAGID is the node's first global address, so this must be called

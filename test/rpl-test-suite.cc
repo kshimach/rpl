@@ -16,6 +16,7 @@
 #include "ns3/ipv6-raw-socket-factory.h"
 #include "ns3/ipv6-route.h"
 #include "ns3/node-container.h"
+#include "ns3/output-stream-wrapper.h"
 #include "ns3/packet.h"
 #include "ns3/rpl-header.h"
 #include "ns3/rpl-helper.h"
@@ -33,6 +34,7 @@
 #include "ns3/uinteger.h"
 
 #include <algorithm>
+#include <sstream>
 #include <vector>
 
 using namespace ns3;
@@ -6318,6 +6320,219 @@ RplInfiniteLifetimeDaoTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief Check RplRoutingProtocol::PrintRoutingTableJson(), in particular
+ *        that it reports the same keys whatever the node's configuration.
+ *
+ * The point of the JSON emitter over the human-readable one next to it is
+ * that a program can index into its output without first working out which
+ * of several shapes it got, so what is worth testing is exactly that: the
+ * keys that PrintRoutingTable() omits under OF0, without LQL, or on a node
+ * that never joined are present here too, carrying a null.
+ */
+class RplPrintRoutingTableJsonTestCase : public TestCase
+{
+  public:
+    RplPrintRoutingTableJsonTestCase();
+
+  private:
+    void DoRun() override;
+
+    /**
+     * @brief Capture one node's JSON snapshot.
+     * @param rpl the routing protocol to dump
+     * @return the line it wrote, newline stripped
+     */
+    std::string Dump(Ptr<RplRoutingProtocol> rpl) const;
+};
+
+RplPrintRoutingTableJsonTestCase::RplPrintRoutingTableJsonTestCase()
+    : TestCase("The JSON form of the routing table")
+{
+}
+
+std::string
+RplPrintRoutingTableJsonTestCase::Dump(Ptr<RplRoutingProtocol> rpl) const
+{
+    std::ostringstream captured;
+    Ptr<OutputStreamWrapper> stream = Create<OutputStreamWrapper>(&captured);
+    rpl->PrintRoutingTableJson(stream);
+    std::string line = captured.str();
+    while (!line.empty() && (line.back() == '\n' || line.back() == '\r'))
+    {
+        line.pop_back();
+    }
+    return line;
+}
+
+void
+RplPrintRoutingTableJsonTestCase::DoRun()
+{
+    // Every key the emitter is contracted to produce, checked for by name
+    // rather than by parsing: a missing one is exactly the failure this
+    // guards against, and spotting it does not need a JSON reader.
+    const std::vector<std::string> requiredKeys = {"\"node\":",
+                                                   "\"time\":",
+                                                   "\"role\":",
+                                                   "\"joined\":",
+                                                   "\"dodagId\":",
+                                                   "\"instance\":",
+                                                   "\"version\":",
+                                                   "\"ocp\":",
+                                                   "\"rank\":",
+                                                   "\"pathEtx\":",
+                                                   "\"preferredParent\":",
+                                                   "\"parents\":",
+                                                   "\"topology\":"};
+
+    auto checkKeys = [&](const std::string& line, const std::string& what) {
+        for (const auto& key : requiredKeys)
+        {
+            NS_TEST_ASSERT_MSG_EQ(line.find(key) != std::string::npos,
+                                  true,
+                                  "The snapshot of " << what << " is missing " << key << ": "
+                                                     << line);
+        }
+        NS_TEST_ASSERT_MSG_EQ(line.find('\n'),
+                             std::string::npos,
+                             "A snapshot of " << what << " spans more than the one line a "
+                                              << "line-oriented consumer expects");
+    };
+
+    NodeContainer nodes;
+    nodes.Create(3);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    rplHelper.Set("Ocp", UintegerValue(RPL_OCP_MRHOF));
+    rplHelper.Set("EnableLql", BooleanValue(true));
+
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    Ptr<RplRoutingProtocol> root = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> child = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+
+    // Before anything runs, nothing has joined: the "not joined" shape.
+    std::string beforeJoin = Dump(child);
+    checkKeys(beforeJoin, "a node that has not joined");
+    NS_TEST_ASSERT_MSG_EQ(beforeJoin.find("\"joined\":false") != std::string::npos,
+                          true,
+                          "A node that has not joined did not say so: " << beforeJoin);
+    NS_TEST_ASSERT_MSG_EQ(beforeJoin.find("\"dodagId\":null") != std::string::npos,
+                          true,
+                          "A node that has not joined reported a DODAGID: " << beforeJoin);
+    NS_TEST_ASSERT_MSG_EQ(beforeJoin.find("\"parents\":[]") != std::string::npos,
+                          true,
+                          "A node that has not joined reported candidate parents: "
+                              << beforeJoin);
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(60));
+    Simulator::Run();
+
+    // The root: the only node that reports a topology in non-storing mode.
+    std::string rootLine = Dump(root);
+    checkKeys(rootLine, "the root");
+    NS_TEST_ASSERT_MSG_EQ(rootLine.find("\"role\":\"root\"") != std::string::npos,
+                          true,
+                          "The root did not report itself as one: " << rootLine);
+    NS_TEST_ASSERT_MSG_EQ(rootLine.find("\"ocp\":\"mrhof\"") != std::string::npos,
+                          true,
+                          "The objective function in use was not reported: " << rootLine);
+    NS_TEST_ASSERT_MSG_EQ(rootLine.find("\"target\":") != std::string::npos,
+                          true,
+                          "The root reported no topology despite holding DAOs: " << rootLine);
+    NS_TEST_ASSERT_MSG_EQ(rootLine.find("\"expiresIn\":") != std::string::npos,
+                          true,
+                          "A topology entry carried no expiry: " << rootLine);
+
+    // A router: a topology of its own would be wrong, candidate parents
+    // would not be.
+    std::string childLine = Dump(child);
+    checkKeys(childLine, "a router");
+    NS_TEST_ASSERT_MSG_EQ(childLine.find("\"role\":\"router\"") != std::string::npos,
+                          true,
+                          "A non-root node reported itself as the root: " << childLine);
+    NS_TEST_ASSERT_MSG_EQ(childLine.find("\"topology\":[]") != std::string::npos,
+                          true,
+                          "A non-root node reported a topology: " << childLine);
+    NS_TEST_ASSERT_MSG_EQ(childLine.find("\"address\":") != std::string::npos,
+                          true,
+                          "A joined router reported no candidate parents: " << childLine);
+    // MRHOF and LQL are both on above, so these carry numbers here. The
+    // configurations that null them out are checked below.
+    NS_TEST_ASSERT_MSG_EQ(childLine.find("\"linkEtx\":null") == std::string::npos,
+                          true,
+                          "MRHOF is in use, but the link ETX was reported as null: "
+                              << childLine);
+    NS_TEST_ASSERT_MSG_EQ(childLine.find("\"lql\":null") == std::string::npos,
+                          true,
+                          "LQL is enabled, but it was reported as null: " << childLine);
+
+    Simulator::Destroy();
+
+    // The same DODAG under OF0 and with LQL off, the configuration whose
+    // columns PrintRoutingTable() drops from its output altogether.
+    NodeContainer plainNodes;
+    plainNodes.Create(2);
+
+    Ptr<SimpleChannel> plainChannel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper plainNetDevice;
+    NetDeviceContainer plainDevices = plainNetDevice.Install(plainNodes, plainChannel);
+
+    RplHelper plainHelper;
+    InternetStackHelper plainInternet;
+    plainInternet.SetRoutingHelper(plainHelper);
+    plainInternet.Install(plainNodes);
+
+    Ipv6AddressHelper plainIpv6;
+    Ipv6InterfaceContainer plainInterfaces = plainIpv6.AssignWithoutAddress(plainDevices);
+    for (uint32_t i = 0; i < plainNodes.GetN(); i++)
+    {
+        plainInterfaces.SetForwarding(i, true);
+    }
+
+    plainHelper.SetRoot(plainNodes.Get(0), Ipv6Address("2001:1::"), 64);
+    plainHelper.AssignStreams(plainNodes, 1);
+
+    Simulator::Stop(Seconds(60));
+    Simulator::Run();
+
+    std::string of0Line = Dump(plainNodes.Get(1)->GetObject<RplRoutingProtocol>());
+    checkKeys(of0Line, "a router running OF0 without LQL");
+    NS_TEST_ASSERT_MSG_EQ(of0Line.find("\"ocp\":\"of0\"") != std::string::npos,
+                          true,
+                          "OF0 was not reported as the objective function: " << of0Line);
+    NS_TEST_ASSERT_MSG_EQ(of0Line.find("\"pathEtx\":null") != std::string::npos,
+                          true,
+                          "OF0 derives no path cost, but one was reported anyway: " << of0Line);
+    NS_TEST_ASSERT_MSG_EQ(of0Line.find("\"linkEtx\":null") != std::string::npos,
+                          true,
+                          "The per-parent link ETX was not nulled out under OF0: " << of0Line);
+    NS_TEST_ASSERT_MSG_EQ(of0Line.find("\"lql\":null") != std::string::npos,
+                          true,
+                          "LQL is disabled, but a value was reported for it: " << of0Line);
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief The RPL test suite.
  */
 class RplTestSuite : public TestSuite
@@ -6374,6 +6589,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplStaleDaoTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplInfiniteLifetimeDaoTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDtsnWrapTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplPrintRoutingTableJsonTestCase, TestCase::Duration::QUICK);
 }
 
 /// Static variable for test initialization.

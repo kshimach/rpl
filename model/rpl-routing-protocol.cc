@@ -2388,10 +2388,134 @@ RplRoutingProtocol::PrintRoutingTable(Ptr<OutputStreamWrapper> stream, Time::Uni
         *os << "  Topology learnt from the DAOs:" << std::endl;
         for (const auto& [target, entry] : m_topology)
         {
-            *os << "    " << target << " under " << entry.parent << ", expires in "
-                << (entry.expire - Now()).As(unit) << std::endl;
+            *os << "    " << target << " under " << entry.parent << ", expires in ";
+            // An entry advertised with the infinite Path Lifetime (RFC 6550
+            // section 6.7.8, @see HandleDao()) is held at Time::Max(), which
+            // subtracted from the current time is a number of no use to
+            // anyone reading this.
+            if (entry.expire == Time::Max())
+            {
+                *os << "never";
+            }
+            else
+            {
+                *os << (entry.expire - Now()).As(unit);
+            }
+            *os << std::endl;
         }
     }
+
+    os->copyfmt(oldState);
+}
+
+void
+RplRoutingProtocol::PrintRoutingTableJson(Ptr<OutputStreamWrapper> stream) const
+{
+    std::ostream* os = stream->GetStream();
+    std::ios oldState(nullptr);
+    oldState.copyfmt(*os);
+
+    // Nothing written below needs escaping: every value is a number, a
+    // boolean, one of two fixed role strings, or an IPv6 address, and
+    // Ipv6Address's own operator<< emits nothing but hex digits, colons and
+    // dots. That is what lets this get away without a JSON library.
+    auto quoted = [os](const Ipv6Address& address) { *os << '"' << address << '"'; };
+
+    *os << "{\"node\":" << m_ipv6->GetObject<Node>()->GetId()
+        << ",\"time\":" << Now().GetSeconds() << ",\"role\":\""
+        << (m_isRoot ? "root" : "router") << "\",\"joined\":" << (m_joined ? "true" : "false");
+
+    if (!m_joined)
+    {
+        // Every key a joined node has, so that a consumer can read the same
+        // fields either way rather than branching on "joined" first.
+        *os << ",\"dodagId\":null,\"instance\":null,\"version\":null,\"ocp\":null"
+               ",\"rank\":null,\"pathEtx\":null,\"preferredParent\":null"
+               ",\"parents\":[],\"topology\":[]}"
+            << std::endl;
+        os->copyfmt(oldState);
+        return;
+    }
+
+    bool mrhof = m_ocp == RPL_OCP_MRHOF;
+
+    *os << ",\"dodagId\":";
+    quoted(m_dodagId);
+    *os << ",\"instance\":" << +m_instanceId << ",\"version\":" << +m_version << ",\"ocp\":\""
+        << (mrhof ? "mrhof" : "of0") << "\",\"rank\":" << m_rank << ",\"pathEtx\":";
+    if (mrhof)
+    {
+        *os << (double(m_pathEtx) / RPL_ETX_FIXED_POINT);
+    }
+    else
+    {
+        // OF0 derives no path cost, so there is no number to report here --
+        // as opposed to one that happens to be zero.
+        *os << "null";
+    }
+    *os << ",\"preferredParent\":";
+    quoted(m_preferredParent);
+
+    *os << ",\"parents\":[";
+    bool first = true;
+    for (const auto& [address, parent] : m_parents)
+    {
+        *os << (first ? "" : ",") << "{\"address\":";
+        quoted(address);
+        *os << ",\"rank\":" << parent.rank << ",\"interface\":" << parent.interface
+            << ",\"freshness\":" << +parent.freshness
+            << ",\"lastHeardAgo\":" << (Now() - parent.lastHeard).GetSeconds() << ",\"linkEtx\":";
+        if (mrhof)
+        {
+            *os << (double(parent.etx) / RPL_ETX_FIXED_POINT) << ",\"pathEtx\":"
+                << (double(parent.pathEtx) / RPL_ETX_FIXED_POINT);
+        }
+        else
+        {
+            // The link ETX is tracked whatever the objective function is, but
+            // only MRHOF gives it a meaning; reporting it under OF0 would
+            // invite reading a number into a decision it played no part in.
+            *os << "null,\"pathEtx\":null";
+        }
+        *os << ",\"lql\":";
+        if (m_enableLql)
+        {
+            *os << +parent.lql;
+        }
+        else
+        {
+            *os << "null";
+        }
+        *os << "}";
+        first = false;
+    }
+    *os << "],\"topology\":[";
+
+    // Empty for every node but the root, which is the only one that holds a
+    // topology at all in non-storing mode.
+    first = true;
+    for (const auto& [target, entry] : m_topology)
+    {
+        *os << (first ? "" : ",") << "{\"target\":";
+        quoted(target);
+        *os << ",\"parent\":";
+        quoted(entry.parent);
+        *os << ",\"pathSequence\":" << +entry.pathSequence << ",\"expiresIn\":";
+        // Time::Max() is how HandleDao() records the infinite Path Lifetime
+        // of RFC 6550 section 6.7.8. Reported as null rather than as the
+        // seconds between now and the end of representable time.
+        if (entry.expire == Time::Max())
+        {
+            *os << "null";
+        }
+        else
+        {
+            *os << (entry.expire - Now()).GetSeconds();
+        }
+        *os << "}";
+        first = false;
+    }
+    *os << "]}" << std::endl;
 
     os->copyfmt(oldState);
 }
