@@ -1865,7 +1865,7 @@ root に近く見え、親として選ばれやすくなる。DAGMaxRankIncrease
 ただし実害は無い: この値が外に出るのは DIO の Metric Container のみで、
 親を失った状態で送る DIO は 24 節の poisoning DIO だけであり、それは
 rank が INFINITE_RANK なので受信側は 8.2.2.5 節に従って親集合から
-除去する (Metric Container は見ない)。
+除去する (Metric Container は見ない)。**26.4 節の通り対応済み。**
 
 ### 25.7 対応方針
 
@@ -1878,7 +1878,8 @@ rank が INFINITE_RANK なので受信側は 8.2.2.5 節に従って親集合か
    `SendDio()` で広告する rank にクランプを入れるだけで形にはなる。
    count-to-infinity への独立した防御層が増える。**26.1 節の通り
    対応済み。**
-3. **25.6 (cur_min_path_cost)** — MUST だが実害なし。1 行。
+3. **25.6 (cur_min_path_cost)** — MUST だが実害なし。1 行。**26.4 節の
+   通り対応済み。**
 4. **25.5 (境界 1 単位)** — 違反ではない。他実装と厳密に挙動を揃える
    必要が出たときに。
 5. **25.4 (step_of_rank)** — 方針 (Contiki-NG との一致) と RFC 既定値
@@ -1952,3 +1953,54 @@ DioTrickleFire が一度も発火していない" ことを直接確認して原
 Trickle 周期に依存する監視ソケットの待機時間は Imax 一発分ではなく
 2 倍を見る、および「クラッシュを一旦テスト失敗に格下げしてから
 原因を探る」というデバッグ手順そのもの。
+
+### 26.4 25.7 の優先度 3 (cur_min_path_cost) を実装
+
+`LeaveDodag()` の `m_pathEtx = 0;` を
+`m_pathEtx = static_cast<uint16_t>(RPL_MRHOF_MAX_PATH_COST);` に修正。
+
+これを検証する回帰テスト `RplPathCostOnDetachTestCase` (MRHOF で
+child が唯一の親を失い poisoning DIO を送る際、その Metric Container
+の path ETX が MAX_PATH_COST であることを、root 上のモニターで実際の
+ワイヤ内容を見て確認する) を書いたところ、単純な代入位置の間違いが
+見つかった: poison 分岐
+
+```cpp
+if (poison && m_joined)
+{
+    m_rank = RPL_INFINITE_RANK;
+    SendDio(Ipv6Address(RPL_ALL_NODES_MULTICAST));
+}
+m_joined = false;
+m_rank = RPL_INFINITE_RANK;
+m_pathEtx = static_cast<uint16_t>(RPL_MRHOF_MAX_PATH_COST); // ここより後
+```
+
+`m_pathEtx` の更新を、poisoning DIO を送る `SendDio()` 呼び出しの
+**後**に書いていた。`SendDio()` は `m_pathEtx` を直接読んで Metric
+Container に載せるので、この順序だと肝心の poisoning DIO 自身は
+更新前の古い値 (直前まで実際に使っていたリンクの ETX、テストでは
+128) をそのまま運んでしまい、25.6 が問題にしていた値と同じく
+無意味な値を送っていた。`m_rank` は同じ分岐の中で先に更新して
+いたので `SendDio()` には正しく `INFINITE_RANK` が渡っていたが、
+`m_pathEtx` だけこの非対称に気づいていなかった。
+
+対処: poison 分岐の中で `m_rank` と同様に `m_pathEtx` も
+`SendDio()` 呼び出しの前に更新するよう移動。分岐の外にある
+(join すらしていなかった場合の) 代入はそのまま残し、二重更新には
+なるが実害はない (poison しない場合は元々 0 と MAX_PATH_COST の
+どちらでも DIO は送られない)。
+
+25.6 の記述で「実害なし」としていた根拠 (poisoning DIO は
+INFINITE_RANK なので受信側は Metric Container を見る前に親集合から
+除去する) はそれ自体正しく、今回のバグでも実際の相互運用上の実害は
+無かった。ただし「値が合っていることをテストで検証しようとしたら
+実装のバグが見つかった」という点で、25.6 の実装自体は当初から
+壊れていたことになる — 修正前の状態で `RplPathCostOnDetachTestCase`
+を実行すると `actual=128 limit=32768` で確実に失敗する。
+
+テスト実装時に `ns3-debug-pitfalls` に書いたばかりの教訓
+(「自ノードの送信は自ノードの受信ソケットに戻らない」) を自分で
+一度踏み外した: 最初 child が送る poisoning DIO を child 自身の
+ノードに置いたモニターで捕まえようとして無言のまま (0 件) 失敗し、
+モニターを root 側に置き直して直った。

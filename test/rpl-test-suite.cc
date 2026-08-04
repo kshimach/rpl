@@ -3684,6 +3684,152 @@ RplPoisonOnDetachTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief Check RFC 6719 section 3.2.2 rule 4: with no preferred parent,
+ *        cur_min_path_cost (m_pathEtx) is MAX_PATH_COST, not 0.
+ *
+ * The only DIO a node with no parent ever sends is the poisoning one
+ * (LeaveDodag(true)), whose INFINITE_RANK already gets it dropped from
+ * every listener's parent set before the Metric Container would matter
+ * (RFC 6550 section 8.2.2.5) -- so this checks the value on the wire
+ * directly rather than through any behavioural side effect, which is the
+ * whole reason 25.6/26 in design-constraints.md calls the bug harmless
+ * rather than unobservable.
+ */
+class RplPathCostOnDetachTestCase : public TestCase
+{
+  public:
+    RplPathCostOnDetachTestCase();
+
+  private:
+    void DoRun() override;
+
+    /**
+     * @brief Record a poisoning DIO's path ETX.
+     * @param socket the monitoring socket
+     */
+    void RecordDio(Ptr<Socket> socket);
+
+    std::vector<uint16_t> m_poisonPathEtx; //!< path ETX of every INFINITE_RANK DIO seen
+};
+
+RplPathCostOnDetachTestCase::RplPathCostOnDetachTestCase()
+    : TestCase("A detaching node advertises MAX_PATH_COST, not 0, under MRHOF")
+{
+}
+
+void
+RplPathCostOnDetachTestCase::RecordDio(Ptr<Socket> socket)
+{
+    Address sender;
+    Ptr<Packet> packet = socket->RecvFrom(sender);
+    if (!packet)
+    {
+        return;
+    }
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ipv6Header);
+    Icmpv6Header icmpv6Header;
+    packet->RemoveHeader(icmpv6Header);
+    if (icmpv6Header.GetType() != ICMPV6_RPL || icmpv6Header.GetCode() != RPL_CODE_DIO)
+    {
+        return;
+    }
+    RplDioHeader dio;
+    packet->RemoveHeader(dio);
+    if (dio.GetRank() == RPL_INFINITE_RANK && dio.HasMetricContainer())
+    {
+        m_poisonPathEtx.push_back(dio.GetPathEtx());
+    }
+}
+
+void
+RplPathCostOnDetachTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    rplHelper.Set("Ocp", UintegerValue(RPL_OCP_MRHOF));
+    rplHelper.Set("DioIntervalMin", TimeValue(MilliSeconds(256)));
+    rplHelper.Set("DioIntervalDoublings", UintegerValue(2));
+    rplHelper.Set("DisInterval", TimeValue(Seconds(2)));
+
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Ptr<Node> rootNode = nodes.Get(0);
+    Ptr<Node> childNode = nodes.Get(1);
+    // On the root, not the child: a node's own multicast transmissions are
+    // never delivered back to a socket on that same node, so a monitor on
+    // the child would never see the child's own poisoning DIO (@see
+    // .claude/skills/ns3-debug-pitfalls).
+    Ptr<Socket> dioMonitor = Socket::CreateSocket(rootNode, Ipv6RawSocketFactory::GetTypeId());
+    dioMonitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    dioMonitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    dioMonitor->BindToNetDevice(rootNode->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+    dioMonitor->SetRecvCallback(MakeCallback(&RplPathCostOnDetachTestCase::RecordDio, this));
+
+    Ptr<RplRoutingProtocol> root = rootNode->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> child = childNode->GetObject<RplRoutingProtocol>();
+
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(child->IsJoined(), true, "The child never joined the DODAG");
+    NS_TEST_ASSERT_MSG_LT(child->GetPathEtx(),
+                          static_cast<uint16_t>(RPL_MRHOF_MAX_PATH_COST),
+                          "The path ETX while still joined via the root is already at the "
+                          "ceiling, so a later MAX_PATH_COST reading would not be distinguishable "
+                          "from this baseline");
+
+    // Cut the root's DIOs off from the child (one direction only, same as
+    // RplPoisonOnDetachTestCase): the child loses its last parent and
+    // detaches, poisoning as it goes (LeaveDodag(true)). The reverse
+    // direction stays up, which is what lets the poisoning DIO -- still a
+    // multicast, addressed to the whole link -- reach the monitor on the
+    // root.
+    Ptr<SimpleNetDevice> rootDevice = DynamicCast<SimpleNetDevice>(devices.Get(0));
+    Ptr<SimpleNetDevice> childDevice = DynamicCast<SimpleNetDevice>(devices.Get(1));
+    channel->BlackList(rootDevice, childDevice);
+
+    Simulator::Stop(Seconds(15));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(child->IsJoined(), false, "The child never detached");
+    NS_TEST_ASSERT_MSG_GT_OR_EQ(m_poisonPathEtx.size(),
+                                1,
+                                "No poisoning DIO with a Metric Container was ever heard");
+    for (uint16_t pathEtx : m_poisonPathEtx)
+    {
+        NS_TEST_ASSERT_MSG_EQ(pathEtx,
+                              static_cast<uint16_t>(RPL_MRHOF_MAX_PATH_COST),
+                              "The poisoning DIO advertised the wrong path ETX -- MAX_PATH_COST "
+                              "expected, not 0");
+    }
+
+    dioMonitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Check that an unacknowledged DAO is retried DaoRetries times at
  *        DaoAckTimeout, then given up on until the next periodic DAO.
  *
@@ -5210,6 +5356,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplNoPathDaoSentOnParentLossTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplNoPathDaoSentOnPoisonTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplPoisonOnDetachTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplPathCostOnDetachTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDaoAckRetryTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplPacketInfoHeaderTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplPacketInfoSubTlvTestCase, TestCase::Duration::QUICK);

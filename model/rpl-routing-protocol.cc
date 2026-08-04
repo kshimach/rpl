@@ -1088,17 +1088,26 @@ RplRoutingProtocol::LeaveDodag(bool poison)
     //
     // The poisoning DIO goes out before m_joined is cleared, since
     // SendDio() declines to send anything once it is, and carries
-    // INFINITE_RANK because that is what m_rank is set to just below.
+    // INFINITE_RANK because that is what m_rank is set to just below --
+    // and, under MRHOF, MAX_PATH_COST in its Metric Container for the same
+    // reason (RFC 6719 section 3.2.2 rule 4: "the node does not have a
+    // preferred parent and MUST set cur_min_path_cost to MAX_PATH_COST",
+    // the worst representable cost, not 0 the best). Both have to be set
+    // before this SendDio() call, not after: SendDio() reads m_rank and
+    // m_pathEtx directly, so setting either afterwards would leave this
+    // one poisoning DIO carrying the stale values from whatever parent
+    // this node just lost.
     if (poison && m_joined)
     {
         m_rank = RPL_INFINITE_RANK;
+        m_pathEtx = static_cast<uint16_t>(RPL_MRHOF_MAX_PATH_COST);
         NS_LOG_INFO("Poisoning the sub-DODAG on the way out of " << m_dodagId);
         SendDio(Ipv6Address(RPL_ALL_NODES_MULTICAST));
     }
 
     m_joined = false;
     m_rank = RPL_INFINITE_RANK;
-    m_pathEtx = 0;
+    m_pathEtx = static_cast<uint16_t>(RPL_MRHOF_MAX_PATH_COST);
     m_preferredParent = Ipv6Address::GetAny();
     m_parents.clear();
     m_dioTrickle.Stop();
