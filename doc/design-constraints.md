@@ -1840,7 +1840,7 @@ root に近く見え、親として選ばれやすくなる。DAGMaxRankIncrease
 相対関係も変わる (25.2 が未実装なので現状は影響しないが、実装した
 場合はここが効いてくる)。
 
-### 25.5 乖離: MRHOF の境界比較が 1 単位ずれている (SHOULD/MAY)
+### 25.5 乖離: MRHOF の境界比較が 1 単位ずれている (SHOULD/MAY、**28 節の通り対応済み**)
 
 - 5 節 "If the selected metric for a link is greater than
   MAX_LINK_METRIC, the node SHOULD exclude that link" に対し、実装は
@@ -1882,7 +1882,7 @@ rank が INFINITE_RANK なので受信側は 8.2.2.5 節に従って親集合か
 3. **25.6 (cur_min_path_cost)** — MUST だが実害なし。1 行。**26.4 節の
    通り対応済み。**
 4. **25.5 (境界 1 単位)** — 違反ではない。他実装と厳密に挙動を揃える
-   必要が出たときに。
+   必要が出たときに。**28 節の通り対応済み。**
 5. **25.4 (step_of_rank)** — 方針 (Contiki-NG との一致) と RFC 既定値
    のどちらを優先するかの判断が要る。変更すると既存テストの期待 rank
    値がすべて変わる。
@@ -2186,3 +2186,83 @@ ns-3 の test-runner は、スイート内のあるテストケースが失敗�
 追加して「1 件しか落ちていない」ように見えるときは、実際には後続が
 走っていないだけの可能性がある。各バグの実在確認は、対象テストを
 登録順で先頭側へ一時的に移動して 1 件ずつ行った。
+
+## 28. 25.5 の MRHOF 境界比較 1 単位ずれを修正
+
+25.5 で「違反ではない」として先送りしていた 2 件の SHOULD/MAY 境界を
+修正した。MUST ではないため後回しにしていたが、実装依存の余地が
+ある条項ではなく、RFC 6719 が数値まで指定している既定パラメータの
+境界の話であり、直すこと自体に判断の余地は無い。
+
+### 28.1 リンク除外条件 (RFC 6719 section 5)
+
+> If the selected metric for a link is greater than MAX_LINK_METRIC,
+> the node SHOULD exclude that link from consideration during parent
+> selection.
+
+`parent.etx >= RPL_MRHOF_MAX_LINK_METRIC` を `>` に変更。同節の
+MAX_LINK_METRIC の定義 ("Maximum allowed value for the selected link
+metric") からも、512 (ETX 4.0) 自体は許容される最悪値であって、
+除外対象の最小値ではない。
+
+あわせて、ヒステリシス側で現在の preferred parent がまだ候補として
+有効かを見ている `current->second.etx < RPL_MRHOF_MAX_LINK_METRIC`
+も `<=` に変更した。これは 25.5 が名指ししていた乖離そのものではないが、
+除外条件の境界を動かした以上、同じ関数内の「このリンクは使えるか」を
+判定するもう一箇所がそれと矛盾したままでは、リンク ETX がちょうど 512
+の隣人が「候補としては除外されないのに、preferred parent としては
+ヒステリシス判定から弾かれる」という新しい不整合を作ってしまう。
+1 箇所の修正がもう 1 箇所を道連れにする、必然的な追随修正。
+
+### 28.2 ヒステリシス (RFC 6719 section 3.2.2 rule 3)
+
+> If the smallest path cost for paths through the candidate neighbors
+> is smaller than cur_min_path_cost by less than
+> PARENT_SWITCH_THRESHOLD, the node MAY continue to use the current
+> preferred parent.
+
+`currentPathCost <= bestPathCost + RPL_MRHOF_PARENT_SWITCH_THRESHOLD`
+を `<` に変更。差が閾値ちょうど (192) のときは "less than" が成立
+しないので、この rule 3 の適用対象から外れ、同節冒頭の MUST ("A node
+MUST select the candidate neighbor with the lowest path cost as its
+preferred parent") が効いて乗り換える。
+
+### 28.3 境界値テスト
+
+いずれも「ちょうど境界」の 1 点でしか実装と RFC が食い違わないため、
+回帰テストは境界値そのものを狙って構築した。
+
+`RplMrhofHysteresisBoundaryTestCase` は既存の
+`RplMrhofSelectionTestCase` と同じやり方 (DIO の Metric Container で
+advertise する path ETX を直接指定) で、閾値の 1 手前 (191) では現親
+維持、ちょうど閾値 (192) で乗り換えることの両方を確認する。追加の
+インフラは要らない。
+
+`RplMrhofLinkMetricBoundaryTestCase` は、リンク ETX 自体を動かす
+必要があるぶん一手間かかる。この実装でリンク ETX が既定値 (128、
+ETX 1.0) から動く唯一の経路は `LinkEtxFromPacket()` が受信パケット上の
+実 lr-wpan LQI タグを読む場合だけで (`rpl-routing-protocol.cc`)、その
+関数自体は `TypeId::LookupByNameFailSafe("ns3::lrwpan::LrWpanLqiTag",
+...)` によって、librpl が lr-wpan を `#include` することも、
+CMakeLists.txt でリンクすることも無しに動くよう書かれている
+(`LrWpanPeekByteTag` のコメント参照、`PacketTagIterator::Item::
+GetTag()` は `GetInstanceTypeId()` の一致しか見ないことを利用した
+トリック)。
+
+テスト側もこの実装と同じ手口を使い、DIO パケットへ手組みの
+`TestLqiByteTag` (`LrWpanPeekByteTag` と同型、書き込み用) を LQI 0
+(「受信成功が一度も無い」という `LinkEtxFromPacket()` 自身の特例で、
+`255/LQI` の固定小数点変換を経ずに `RPL_MRHOF_MAX_LINK_METRIC` へ
+そのままクリップされる) で付けて送る。`ns3::lrwpan::LrWpanLqiTag`
+という TypeId は lr-wpan モジュール自体がリンクされているバイナリで
+なければ登録されない (`TypeId::LookupByNameFailSafe` が false を返す)
+ため、テスト冒頭でそれを assert している。単体の
+`rpl-test` ライブラリは lr-wpan をリンクしていないが、通常この
+テストスイートを実行する経路であるモノリシックな
+`test-runner` バイナリは lr-wpan 一式をリンク済みなので、そちらでは
+問題なく通る。
+
+両テストとも修正前 (境界を `>=`/`<=` に戻した状態) で確実に失敗する
+ことを個別に確認済み: hysteresis は `actual=fe80::...2 limit=fe80::...3`
+(peerA のまま乗り換えない)、link metric は `actual="::" limit=...`
+(唯一の隣人が `>=` で除外され、DODAG に一度も参加できない) で落ちる。

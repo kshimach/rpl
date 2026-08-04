@@ -1782,9 +1782,15 @@ RplRoutingProtocol::SelectPreferredParent()
                 continue;
             }
 
-            if (m_ocp == RPL_OCP_MRHOF && parent.etx >= RPL_MRHOF_MAX_LINK_METRIC)
+            if (m_ocp == RPL_OCP_MRHOF && parent.etx > RPL_MRHOF_MAX_LINK_METRIC)
             {
-                // RFC 6719 section 3.2: a link this bad is not even considered.
+                // RFC 6719 section 5, verbatim: "If the selected metric for a
+                // link is greater than MAX_LINK_METRIC, the node SHOULD
+                // exclude that link from consideration." Strictly greater --
+                // MAX_LINK_METRIC is itself the worst *allowed* value (the
+                // Terminology section defines it as "Maximum allowed value
+                // for the selected link metric"), not the first disallowed
+                // one.
                 NS_LOG_LOGIC("Neighbour " << address << " has too high a link ETX");
                 continue;
             }
@@ -1836,13 +1842,25 @@ RplRoutingProtocol::SelectPreferredParent()
         if (current != m_parents.end() &&
             (!requireFresh || current->second.freshness >= RPL_FRESHNESS_TARGET) &&
             (!m_joined || currentRank == RPL_INFINITE_RANK || current->second.rank < currentRank) &&
-            current->second.etx < RPL_MRHOF_MAX_LINK_METRIC)
+            // Mirrors the candidate loop's own link ETX bound above (>
+            // RPL_MRHOF_MAX_LINK_METRIC excludes), so a link exactly at
+            // MAX_LINK_METRIC is not held to a stricter rule here, as the
+            // current preferred parent, than it was as an ordinary candidate.
+            current->second.etx <= RPL_MRHOF_MAX_LINK_METRIC)
         {
             uint32_t currentPathCost = 0;
             uint16_t currentCandidateRank = RankViaParent(current->second, &currentPathCost);
             if (currentCandidateRank != RPL_INFINITE_RANK &&
                 currentPathCost < RPL_MRHOF_MAX_PATH_COST &&
-                currentPathCost <= bestPathCost + RPL_MRHOF_PARENT_SWITCH_THRESHOLD)
+                // RFC 6719 section 3.2.2 rule 3, verbatim: "If the smallest
+                // path cost for paths through the candidate neighbors is
+                // smaller than cur_min_path_cost by less than
+                // PARENT_SWITCH_THRESHOLD, the node MAY continue to use the
+                // current preferred parent." Strictly less: at a difference
+                // of exactly PARENT_SWITCH_THRESHOLD, that condition does not
+                // hold, and the MUST rule above it -- select the lowest path
+                // cost -- applies instead.
+                currentPathCost < bestPathCost + RPL_MRHOF_PARENT_SWITCH_THRESHOLD)
             {
                 best = m_preferredParent;
                 bestRank = currentCandidateRank;

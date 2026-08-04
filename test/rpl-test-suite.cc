@@ -28,6 +28,7 @@
 #include "ns3/simple-net-device.h"
 #include "ns3/simulator.h"
 #include "ns3/socket.h"
+#include "ns3/tag.h"
 #include "ns3/test.h"
 #include "ns3/uinteger.h"
 
@@ -2031,6 +2032,333 @@ RplMrhofSelectionTestCase::DoRun()
     NS_TEST_ASSERT_MSG_EQ(leaf->GetPathEtx(), 128, "Wrong path cost via peerB");
     NS_TEST_ASSERT_MSG_EQ(leaf->GetRank(), 256, "Wrong MRHOF rank via peerB");
 
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief Check the exact boundary of MRHOF's hysteresis, RFC 6719 section
+ *        3.2.2 rule 3.
+ *
+ * The rule, verbatim: "If the smallest path cost for paths through the
+ * candidate neighbors is smaller than cur_min_path_cost by less than
+ * PARENT_SWITCH_THRESHOLD, the node MAY continue to use the current
+ * preferred parent." A difference one below the threshold keeps the current
+ * parent; a difference of exactly the threshold does not -- "less than" is
+ * strict -- and the MUST rule the paragraph opens with ("select the
+ * candidate neighbor with the lowest path cost") applies instead.
+ *
+ * Driven the same way RplMrhofSelectionTestCase is, through the advertised
+ * path ETX alone, so this does not need the link-layer LQI tag the
+ * MAX_LINK_METRIC boundary test below does.
+ */
+class RplMrhofHysteresisBoundaryTestCase : public TestCase
+{
+  public:
+    RplMrhofHysteresisBoundaryTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplMrhofHysteresisBoundaryTestCase::RplMrhofHysteresisBoundaryTestCase()
+    : TestCase("MRHOF hysteresis boundary: a difference of exactly PARENT_SWITCH_THRESHOLD")
+{
+}
+
+void
+RplMrhofHysteresisBoundaryTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(3); // 0 = leaf under test, 1 = peerA (current parent), 2 = peerB (the rival)
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.AssignStreams(nodes, 1);
+
+    Ptr<RplRoutingProtocol> leaf = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ipv6Address dodagId("2001:1::1");
+    Ipv6Address leafLinkLocal =
+        nodes.Get(0)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address peerALinkLocal =
+        nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address peerBLinkLocal =
+        nodes.Get(2)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    auto buildDio = [&dodagId](uint16_t pathEtx) {
+        RplDioHeader dio;
+        dio.SetInstanceId(RPL_DEFAULT_INSTANCE);
+        dio.SetVersionNumber(1);
+        dio.SetRank(RPL_MIN_HOPRANKINC);
+        dio.SetMop(RPL_MOP_NON_STORING);
+        dio.SetDodagId(dodagId);
+        dio.SetDagConfiguration(RPL_DIO_INTERVAL_DOUBLINGS,
+                                RPL_DIO_INTERVAL_MIN,
+                                RPL_DIO_REDUNDANCY,
+                                RPL_MAX_RANKINC,
+                                RPL_MIN_HOPRANKINC,
+                                RPL_OCP_MRHOF,
+                                RPL_DEFAULT_LIFETIME,
+                                RPL_DEFAULT_LIFETIME_UNIT);
+        dio.SetMetricContainer(pathEtx);
+        return dio;
+    };
+
+    auto send = [&](Ptr<Node> from, Ipv6Address fromAddress, const RplDioHeader& dio) {
+        Simulator::Schedule(Seconds(0),
+                            &SendRawRplMessage<RplDioHeader>,
+                            from,
+                            1,
+                            dio,
+                            static_cast<uint8_t>(RPL_CODE_DIO),
+                            fromAddress,
+                            leafLinkLocal);
+        Simulator::Stop(MilliSeconds(10));
+        Simulator::Run();
+    };
+
+    // peerA advertises a path ETX of 300, both link ETXes staying at the
+    // neutral default of 128 (no LQI tag on either DIO): path cost via
+    // peerA is 428, and being the only DIO leaf has heard, peerA becomes the
+    // preferred parent outright.
+    send(nodes.Get(1), peerALinkLocal, buildDio(300));
+    NS_TEST_ASSERT_MSG_EQ(leaf->GetPreferredParent(),
+                          peerALinkLocal,
+                          "peerA should be preferred, being the only parent so far");
+    NS_TEST_ASSERT_MSG_EQ(leaf->GetPathEtx(), 428, "Wrong path cost via peerA");
+
+    // peerB one short of the threshold: path cost 237, 191 below peerA's
+    // 428. 191 < PARENT_SWITCH_THRESHOLD (192), so hysteresis keeps peerA.
+    send(nodes.Get(2), peerBLinkLocal, buildDio(109));
+    NS_TEST_ASSERT_MSG_EQ(leaf->GetPreferredParent(),
+                          peerALinkLocal,
+                          "A difference one short of PARENT_SWITCH_THRESHOLD switched anyway");
+    NS_TEST_ASSERT_MSG_EQ(leaf->GetPathEtx(), 428, "The path cost should still be through peerA");
+
+    // peerB improves by exactly one more: path cost 236, exactly
+    // PARENT_SWITCH_THRESHOLD (192) below peerA's 428. Not "less than" the
+    // threshold, so hysteresis no longer applies and the MUST rule (lowest
+    // path cost wins) takes over.
+    send(nodes.Get(2), peerBLinkLocal, buildDio(108));
+    NS_TEST_ASSERT_MSG_EQ(leaf->GetPreferredParent(),
+                          peerBLinkLocal,
+                          "A difference of exactly PARENT_SWITCH_THRESHOLD did not switch, so "
+                          "hysteresis was applied one unit past where the RFC's \"less than\" "
+                          "stops");
+    NS_TEST_ASSERT_MSG_EQ(leaf->GetPathEtx(), 236, "Wrong path cost via peerB");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief Check the exact boundary of MRHOF's link exclusion rule, RFC 6719
+ *        section 5.
+ *
+ * The rule, verbatim: "If the selected metric for a link is greater than
+ * MAX_LINK_METRIC, the node SHOULD exclude that link from consideration
+ * during parent selection." MAX_LINK_METRIC is defined, in the same
+ * section, as "Maximum allowed value for the selected link metric" -- the
+ * worst value a link may still have and be considered, not the first value
+ * excluded.
+ *
+ * The only way this implementation ever sets a link ETX away from the
+ * neutral default is LinkEtxFromPacket() reading the real lr-wpan LQI tag
+ * off the received packet (@see rpl-routing-protocol.cc). This does not
+ * link librpl against lr-wpan -- the tag is matched purely by its globally
+ * registered TypeId name, the same trick LinkEtxFromPacket() itself uses to
+ * decode it -- but does rely on lr-wpan being linked into whatever binary
+ * runs this test suite so that TypeId is actually registered, true of the
+ * monolithic test-runner this suite is normally run from.
+ */
+class RplMrhofLinkMetricBoundaryTestCase : public TestCase
+{
+  public:
+    RplMrhofLinkMetricBoundaryTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplMrhofLinkMetricBoundaryTestCase::RplMrhofLinkMetricBoundaryTestCase()
+    : TestCase("MRHOF link metric boundary: a link at exactly MAX_LINK_METRIC")
+{
+}
+
+namespace
+{
+
+/// Writes an arbitrary tag's single-byte wire format under an arbitrary
+/// TypeId, the same encode-by-name trick RplRoutingProtocol's own
+/// LrWpanPeekByteTag uses to decode -- see that class's doc comment in
+/// rpl-routing-protocol.cc for why PacketTagIterator::Item::GetTag() only
+/// checking GetInstanceTypeId() makes this safe without #include-ing, or
+/// linking against, the lr-wpan module from this test.
+class TestLqiByteTag : public Tag
+{
+  public:
+    /**
+     * @param tid the real tag's TypeId, looked up by name
+     * @param value the byte to encode
+     */
+    TestLqiByteTag(TypeId tid, uint8_t value)
+        : m_tid(tid),
+          m_byte(value)
+    {
+    }
+
+    TypeId GetInstanceTypeId() const override
+    {
+        return m_tid;
+    }
+
+    uint32_t GetSerializedSize() const override
+    {
+        return 1;
+    }
+
+    void Serialize(TagBuffer i) const override
+    {
+        i.WriteU8(m_byte);
+    }
+
+    void Deserialize(TagBuffer i) override
+    {
+        m_byte = i.ReadU8();
+    }
+
+    void Print(std::ostream& os) const override
+    {
+        os << "Byte=" << +m_byte;
+    }
+
+  private:
+    TypeId m_tid;     //!< the real tag's TypeId
+    uint8_t m_byte;   //!< the byte to encode
+};
+
+} // namespace
+
+void
+RplMrhofLinkMetricBoundaryTestCase::DoRun()
+{
+    TypeId lqiTid;
+    bool haveLqiTag = TypeId::LookupByNameFailSafe("ns3::lrwpan::LrWpanLqiTag", &lqiTid);
+    NS_TEST_ASSERT_MSG_EQ(haveLqiTag,
+                          true,
+                          "ns3::lrwpan::LrWpanLqiTag is not registered in this test binary "
+                          "(lr-wpan not linked in), so the link ETX boundary this test targets "
+                          "cannot be produced");
+
+    NodeContainer nodes;
+    nodes.Create(2); // 0 = leaf under test, 1 = the one neighbour
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.AssignStreams(nodes, 1);
+
+    Ptr<RplRoutingProtocol> leaf = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ipv6Address dodagId("2001:1::1");
+    Ipv6Address leafLinkLocal =
+        nodes.Get(0)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address peerLinkLocal =
+        nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    RplDioHeader dio;
+    dio.SetInstanceId(RPL_DEFAULT_INSTANCE);
+    dio.SetVersionNumber(1);
+    dio.SetRank(RPL_MIN_HOPRANKINC);
+    dio.SetMop(RPL_MOP_NON_STORING);
+    dio.SetDodagId(dodagId);
+    dio.SetDagConfiguration(RPL_DIO_INTERVAL_DOUBLINGS,
+                            RPL_DIO_INTERVAL_MIN,
+                            RPL_DIO_REDUNDANCY,
+                            RPL_MAX_RANKINC,
+                            RPL_MIN_HOPRANKINC,
+                            RPL_OCP_MRHOF,
+                            RPL_DEFAULT_LIFETIME,
+                            RPL_DEFAULT_LIFETIME_UNIT);
+    dio.SetMetricContainer(0); // the peer is the root: path ETX 0
+
+    // Built by hand rather than through SendRawRplMessage(), so a packet tag
+    // can be attached before anything is sent. LQI 0 is LinkEtxFromPacket()'s
+    // own special case for "no successful reception at all", which it clips
+    // to RPL_MRHOF_MAX_LINK_METRIC directly rather than computing 255/LQI --
+    // exactly the boundary value this test needs, reached without having to
+    // reverse the fixed-point conversion to land on it.
+    Ptr<Packet> packet = Create<Packet>();
+    packet->AddPacketTag(TestLqiByteTag(lqiTid, 0));
+    packet->AddHeader(dio);
+
+    Icmpv6Header icmpv6Header;
+    icmpv6Header.SetType(ICMPV6_RPL);
+    icmpv6Header.SetCode(static_cast<uint8_t>(RPL_CODE_DIO));
+    icmpv6Header.CalculatePseudoHeaderChecksum(peerLinkLocal,
+                                               leafLinkLocal,
+                                               packet->GetSize() + icmpv6Header.GetSerializedSize(),
+                                               Icmpv6L4Protocol::GetStaticProtocolNumber());
+    packet->AddHeader(icmpv6Header);
+
+    Ptr<Socket> socket = Socket::CreateSocket(nodes.Get(1), Ipv6RawSocketFactory::GetTypeId());
+    socket->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    socket->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    socket->BindToNetDevice(nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+
+    SocketIpv6HopLimitTag hopLimitTag;
+    hopLimitTag.SetHopLimit(255);
+    packet->AddPacketTag(hopLimitTag);
+
+    Simulator::Schedule(Seconds(0),
+                       [socket, packet, leafLinkLocal]() {
+                           socket->SendTo(packet, 0, Inet6SocketAddress(leafLinkLocal, 0));
+                       });
+    Simulator::Stop(MilliSeconds(10));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(leaf->IsJoined(),
+                          true,
+                          "A link at exactly MAX_LINK_METRIC was excluded outright, so the only "
+                          "neighbour ever heard never bootstrapped a DODAG");
+    NS_TEST_ASSERT_MSG_EQ(leaf->GetPreferredParent(),
+                          peerLinkLocal,
+                          "The only neighbour there was did not become the preferred parent");
+    NS_TEST_ASSERT_MSG_EQ(leaf->GetPathEtx(),
+                          RPL_MRHOF_MAX_LINK_METRIC,
+                          "Wrong path cost through a link exactly at MAX_LINK_METRIC");
+
+    socket->Close();
     Simulator::Destroy();
 }
 
@@ -6028,6 +6356,8 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplDtsnRefreshTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplComputeSourceRouteFailureTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplMrhofSelectionTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplMrhofHysteresisBoundaryTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplMrhofLinkMetricBoundaryTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplLqlMappingTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplNoPathDaoTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplNoPathDaoSentOnParentLossTestCase, TestCase::Duration::QUICK);
