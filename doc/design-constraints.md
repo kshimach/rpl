@@ -190,7 +190,9 @@
   実際にはパケットを止められない、既知の制約あり (12.2 節)。
   RFC 6550 section 8.2.2.5 の poisoning は 24 節の通り実装済み
   (離脱時のみ。section 8.2.2.6 の「detach して floating DODAG の
-  root になる」代替手段の方は実装していない)。
+  root になる」代替手段の方は実装していない)。storing mode (MOP=2) は
+  方針により対象外としてきたが、AODV-RPL/P2P-RPL への拡張を検討する
+  なら再考が要る。30 節を参照。
 
 ## 11. ns-3 コアで見つかった既存バグ、および本実装側のバグ
 
@@ -2321,3 +2323,97 @@ ns-3 本体に JSON 依存を持ち込まないほうが移植性の面でも良
 出していたため、無限 lifetime のエントリで巨大な秒数が表示されていた
 (クラッシュはしないが意味不明)。`"never"` を出すよう修正。JSON 側は
 同じケースを `expiresIn: null` として出す。
+
+## 30. AODV-RPL / P2P-RPL への拡張を見据えた検討 (storing mode は先か)
+
+この実装を土台に AODV-RPL と P2P-RPL を追加実装したいという相談を受け、
+「まず storing mode に対応すべきか」を RFC 9854 (AODV-RPL) と
+RFC 6997 (P2P-RPL) の原文で確認した。10 節に「storing mode (MOP=2) は
+方針により対象外」とだけ書いていたが、その判断はこの 2 つの拡張との
+関係を検討する前のものだったので、ここで記録し直す。
+
+### 30.1 AODV-RPL (RFC 9854) は storing mode に直接依存する
+
+用語定義がそのまま答えを出している (原文の "Terminology" 節):
+
+> Hop-by-hop route: A route for which each router along the routing
+> path stores routing information about the next hop. A hop-by-hop
+> route is created using RPL's "storing mode".
+
+Introduction 節にも、AODV-RPL が core RPL から何を引き継ぐかがそのまま
+書いてある:
+
+> AODV-RPL reuses and extends the core RPL functionality to support
+> routes with bidirectional asymmetric links. It retains RPL's DODAG
+> formation, RPL Instance and the associated Objective Function (OF)
+> ..., Trickle timers, and support for storing and non-storing modes.
+
+ただし AODV-RPL の経路は RREQ/RREP オプションの H フラグで
+source routing (H=0) と hop-by-hop (H=1) を選択する方式なので、
+source routing 側だけを先に実装するなら storing mode 抜きでも動く。
+hop-by-hop 側を実装する時点で storing mode 相当の機構が要る、という
+のが正確な依存関係。
+
+### 30.2 P2P-RPL (RFC 6997) は base の storing mode には依存しない
+
+P2P-RPL も Hop-by-hop Route を持つが、AODV-RPL とは違い「RPL の
+storing mode を使う」とは書いていない。P2P-RPL 自身が完結した転送状態
+管理を定義している (12 節 "Packet Forwarding along a Route Discovered
+Using P2P-RPL"):
+
+> Travel along a Hop-by-hop Route, established using P2P-RPL, requires
+> specifying the RPLInstanceID and the DODAGID (of the temporary DAG
+> used for the route discovery) to identify the route. ... both the
+> RPLInstanceID (a local value assigned by the Origin) and the DODAGID
+> ... are required to uniquely identify a P2P-RPL Hop-by-hop Route to a
+> particular destination.
+
+local な RPLInstanceID + DODAGID + 宛先アドレスをキーにした、
+P2P-RPL 専用の転送エントリであり、base DODAG (instance 0) の MOP を
+storing に切り替える話ではない。13 節 "Interoperability with Core RPL"
+も "P2P-RPL operation does not affect core RPL operation, and vice
+versa" と明記している。
+
+### 30.3 より根本的な前提: どちらも「並行する別インスタンス」を要求する
+
+AODV-RPL、P2P-RPL のどちらも、base の DODAG (instance 0) とは別の
+RPL Instance を local な RPLInstanceID で立てる構造そのものが本体。
+
+- P2P-RPL: Origin を根とする一時的な DAG を、その都度 local instance
+  ID で形成する (5 節 "Functional Overview")。
+- AODV-RPL: "Paired DODAGs" — RREQ-Instance (OrigNode 起点) と
+  RREP-Instance (TargNode 起点) という 2 つの RPL Instance を、
+  経路探索のたびにそれぞれ local instance ID で形成する (2 節
+  "Terminology")。base RPL の有無にも依存しない:
+  > AODV-RPL can be operated whether or not P2P-RPL or RPL [RFC6550]
+  > is also running.
+
+この実装の `RplRoutingProtocol` は現状、1 ノードが同時に 1 つの
+DODAG にしか属せない設計になっている。`m_instanceId`、`m_dodagId`、
+`m_version`、`m_rank`、`m_parents`、`m_topology`、`m_dioTrickle` は
+すべてクラスの単一メンバー (instance をキーにしたコンテナではない)。
+AODV-RPL の経路探索 1 回で最低 2 つ、P2P-RPL でも 1 つ、base の
+instance 0 とは別に DODAG 状態を持つ必要があるので、storing mode の
+有無以前に、この単一インスタンス前提そのものが両拡張共通のボトル
+ネックになる。
+
+### 30.4 検討の結論
+
+優先順位は次のとおりと考える:
+
+1. **マルチインスタンス対応** — 複数 DODAG に同時所属できるよう、
+   rank・preferred parent・parent set・Trickle タイマー・topology を
+   instance 単位に持たせる。AODV-RPL・P2P-RPL 双方に共通する前提で、
+   storing mode の有無とは独立に必要。
+2. **storing mode** — AODV-RPL の hop-by-hop 側に直接必要
+   (30.1 節)。ここで作る「宛先ごとに next hop を引いて転送する」
+   機構は、P2P-RPL 自身の hop-by-hop 転送状態 (30.2 節) ともほぼ
+   同型なので、instance に紐付く形で汎用的に作っておけば P2P-RPL 側
+   からも流用できる可能性がある (P2P-RPL は RFC 上 base の storing
+   mode を要求してはいないが、実装を分けて二重に持つ理由もない)。
+3. AODV-RPL は source routing (H=0) 側から着手すれば 1, 2 の一部
+   だけで済む。hop-by-hop (H=1) 側は 2 の完了後。
+4. P2P-RPL は 1 の完了後に着手可能。
+
+まだ着手していない。この節は方針決定の記録であり、実装状況は
+10 節を参照。
