@@ -2404,7 +2404,8 @@ instance 0 とは別に DODAG 状態を持つ必要があるので、storing mod
 1. **マルチインスタンス対応** — 複数 DODAG に同時所属できるよう、
    rank・preferred parent・parent set・Trickle タイマー・topology を
    instance 単位に持たせる。AODV-RPL・P2P-RPL 双方に共通する前提で、
-   storing mode の有無とは独立に必要。
+   storing mode の有無とは独立に必要。**31 節の通りストレージ層を
+   対応済み (2 つ目の instance を実際に作る機能自体はまだ)。**
 2. **storing mode** — AODV-RPL の hop-by-hop 側に直接必要
    (30.1 節)。ここで作る「宛先ごとに next hop を引いて転送する」
    機構は、P2P-RPL 自身の hop-by-hop 転送状態 (30.2 節) ともほぼ
@@ -2417,3 +2418,116 @@ instance 0 とは別に DODAG 状態を持つ必要があるので、storing mod
 
 まだ着手していない。この節は方針決定の記録であり、実装状況は
 10 節を参照。
+
+## 31. DODAG 状態をインスタンス単位のストレージへ集約 (30 節の実装)
+
+30 節で立てた優先順位の 1 番目、マルチインスタンス対応の土台を実装した。
+スコープは 30 節および事前に承認を得た計画どおり、**純粋なストレージ層の
+リファクタのみ**: 公開 API のシグネチャ・観測できる挙動は一切変えず、
+2 つ目の DODAG Instance を実際に join/生成するロジックも作っていない。
+
+### 31.1 変更の中身
+
+`RplRoutingProtocol` が持っていた約 30 個のスカラーメンバー
+(`m_instanceId`・`m_dodagId`・`m_rank`・`m_parents`・`m_topology`・
+`m_dioTrickle` など、1 DODAG ぶんの状態を表すもの全て) を、新設した
+`DodagMembership` 構造体 1 つに集約し、`DodagKey` (RPLInstanceID と
+DODAGID の組、RFC 6550 section 5.1 の local instance ID がこの組で
+初めて一意になることに合わせた) をキーにした
+`std::map<DodagKey, DodagMembership> m_dodags;` に置いた。
+
+ノード全体のスカラーとして残したもの (instance に依らない):
+インターフェース/ソケット管理、DIS 関連 (base DODAG 固有のブート
+ストラップ概念)、`m_jitter`/`m_enableLql`/`m_rssiToLql` (無線機の設定)、
+DAO 関連の attribute (`DaoInterval` 等 — AODV-RPL は DAO を使わず
+(RFC 9854)、P2P-RPL も DAO ではなく P2P-DRO を使う (RFC 6997) ので、
+今のところ base DODAG 以外がこれを必要とする場面がない)、`RootPrefix`
+関連 (base DODAG の SLAAC 専用)。`Ocp`・`MinHopRankIncrease` は
+attribute としてはスカラーのまま残し、root が自分の `DodagMembership`
+を作る際にそこから値を種にする一方、非 root は join した DIO から
+上書きする、という二重構造にした (`DioIntervalMin` 等も同様)。
+
+`GetRank()`・`IsJoined()` などの公開アクセサは全て引数なしのまま、
+内部で `GetBaseDodag()` という非公開ヘルパー (「唯一存在するエントリを
+返す。2 件目が増えたらこの実装ごと書き直す必要がある」ことを
+`NS_ASSERT_MSG(m_dodags.size() <= 1, ...)` で自己文書化している) を
+経由する薄いラッパーになった。これが 30 節の事前調査で確認した
+「外部からの依存は 2 ファイル 3 箇所のみ、テストは 150 箇所以上が
+このアクセサ層に依存」という状況を無改修で乗り切れた理由。
+
+### 31.2 実装中に見つかった設計上の修正 2 件
+
+計画時点の設計をそのまま実装するとまずかった箇所が 2 つあり、実装中に
+修正した。
+
+**`m_isRoot` は二重管理にした。** 当初は `DodagMembership::isRoot` に
+完全移動する想定だったが、`DoInitialize()`/`HandleDadSuccess()` は
+「この DODAG の root かどうか」以前に「そもそもこのノードが root として
+振る舞うべきか (`SetAsRoot()` が呼ばれたか)」をまだ `DodagMembership`
+が存在しない時点で判定する必要がある。ノード全体のスカラー
+`m_isRoot` を残し、`DodagMembership::isRoot` はそれとは別に (AODV-RPL の
+OrigNode が自分の RREQ-Instance の root になる一方 base instance では
+root でない、という 30 節で確認したケースに備えて) 保持する二重構造に
+した。
+
+**`m_ocp` も同様にスカラーを残す必要があった。** `MinHopRankIncrease`
+はそうした一方、`Ocp` は当初 `DodagMembership` へ完全移動していたが、
+これは 25.7/26 節で見た「attribute はあくまで root 自身の初期値の
+種であり、非 root は DIO から上書きする」パターンと同型の attribute
+だったことを実装中 (ビルドエラー) で見落としに気付いた。
+`GetTypeId()` の `MakeUintegerAccessor(&RplRoutingProtocol::m_ocp)` が
+指す先が消えていてコンパイルが通らず、`MinHopRankIncrease` との
+非対称に気付いた形。
+
+### 31.3 見つけたバグ: StopInterface() のダングリング参照 (SIGSEGV)
+
+実装完了後の最初のテスト実行で 47 件全てが SIGSEGV (exit 139) で
+即死し、出力が一切出ない状態になった。`NS_LOG="RplRoutingProtocol=
+level_all|prefix_all"` で追跡したところ、クラッシュ直前のログは
+インターフェースが down した際の poisoning DIO 送信 (24 節) の
+シーケンスで途切れていた。
+
+原因は `StopInterface()`:
+
+```cpp
+for (auto& [key, dodag] : m_dodags)      // 範囲for、キーは m_dodags 自身
+{
+    ...
+    if (SelectPreferredParent(dodag))     // 最後の親を失うと内部で
+    {                                      // LeaveDodag(key, true) を呼び、
+        dodag.dioTrickle.Reset();          // m_dodags から今まさに visit
+    }                                      // している要素を erase() する
+}
+```
+
+`SelectPreferredParent()` が最後の親を失った場合に呼ぶ
+`LeaveDodag()` は、今回のリファクタで `m_dodags.erase(it)` を実行する
+ようになった (30 節で設計した通りの正しい実装)。しかし
+`StopInterface()` の**範囲for自体が今まさに指しているエントリを
+erase() してしまう**ため、(1) `if` の中の `dodag.dioTrickle.Reset()`
+がダングリング参照へのアクセスになり、(2) その後の範囲forの暗黙の
+`++it` が無効化されたイテレータを進める未定義動作になる。
+
+`DioTrickleFire()`・`HandleDio()` では「`SelectPreferredParent()` の
+戻り値を見た後、`dodag` を再利用せず `GetBaseDodag()` で取り直す」
+という安全策を最初から入れていたが、`StopInterface()` の range-for
+ループにはこれを入れ忘れていた。修正はキーを先にスナップショットして
+から個別に `m_dodags.find(key)` で引き直す形にし、`SelectPreferredParent()`
+呼び出し後の `dioTrickle.Reset()` も同様に存在確認してから触るよう
+にした。
+
+修正後は 47 件全て PASS (5 回連続)、4 シナリオ全て 0% packet loss
+(反復実行でも安定)。この 1 件を除けば、Timer/RplTrickleTimer の
+コピー禁止・`Timer::SetArguments()` によるコールバックへの key の
+bind・`DodagKey` に `operator==`/`operator!=` が要ること (ns-3 の
+`Callback` の bound argument が `CallbackComponent<T>::IsEqual()` で
+比較可能性を要求するため) など、事前に設計・検証した点はすべて
+想定通りに機能した。
+
+### 31.4 まだ実装していないこと
+
+30 節の優先順位どおり、これは土台のみ。2 つ目の (local な)
+RPLInstanceID を実際に join/生成する API、AODV-RPL、P2P-RPL は
+未着手。それぞれの実装時に、実際の要求に合わせて `DodagMembership`
+を新規作成する経路 (今回作った `m_dodags[key]` への in-place 構築の
+パターンを流用できるはず) を設計する。

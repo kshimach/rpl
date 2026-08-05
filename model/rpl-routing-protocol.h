@@ -24,6 +24,7 @@
 #include "ns3/timer.h"
 
 #include <map>
+#include <tuple>
 
 namespace ns3
 {
@@ -297,6 +298,151 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     };
 
     /**
+     * @brief Identifies one RPL Instance this node is currently part of.
+     *
+     * RFC 6550 section 5.1: a Local RPLInstanceID (the high bit set) is only
+     * meaningful together with the DODAGID of the node that assigned it --
+     * two different origins may reuse the same raw ID byte for two entirely
+     * unrelated instances. Keying on the pair rather than the ID alone
+     * covers that case for free, which is also the pairing RFC 6997 section
+     * 12 requires to identify a P2P-RPL Hop-by-hop Route. A Global
+     * RPLInstanceID (the only kind this module forms today) just always
+     * pairs with the one DODAG this node picked within it.
+     */
+    struct DodagKey
+    {
+        uint8_t instanceId; //!< RPLInstanceID
+        Ipv6Address dodagId; //!< DODAGID
+
+        /**
+         * @brief Order two keys, so this type can be a std::map key.
+         * @param other the key to compare against
+         * @return true if this key sorts before @p other
+         */
+        bool operator<(const DodagKey& other) const
+        {
+            return std::tie(instanceId, dodagId) < std::tie(other.instanceId, other.dodagId);
+        }
+
+        /**
+         * @brief Compare two keys for equality.
+         *
+         * Needed because a DodagKey travels as a bound argument on the
+         * Callback DioTrickleFire() is invoked through (MakeCallback(...,
+         * this, key) in JoinDodag()/HandleDadSuccess()): ns-3's
+         * CallbackComponent<T> requires operator== on any bound argument
+         * type, to support comparing two Callback objects for equality.
+         *
+         * @param other the key to compare against
+         * @return true if the two keys are equal
+         */
+        bool operator==(const DodagKey& other) const
+        {
+            return instanceId == other.instanceId && dodagId == other.dodagId;
+        }
+
+        /**
+         * @brief Compare two keys for inequality.
+         * @param other the key to compare against
+         * @return true if the two keys are not equal
+         */
+        bool operator!=(const DodagKey& other) const
+        {
+            return !(*this == other);
+        }
+    };
+
+    /**
+     * @brief Everything this node knows about its membership in one DODAG.
+     *
+     * One of these exists per RPL Instance this node is currently part of,
+     * keyed by DodagKey in m_dodags -- instanceId and dodagId below are
+     * carried again here, redundant with that key, purely so the many
+     * methods that take a DodagMembership& do not also have to be handed
+     * the key just to log or compare it.
+     *
+     * Holds live Timer state (dioTrickle's own two timers, daoEvent,
+     * daoRetryEvent). ns3::Timer owns a raw TimerImpl* it deletes in its own
+     * destructor and declares no copy or move of its own, so the compiler-
+     * generated copy constructor/assignment it falls back on would copy
+     * that pointer, not the object it points to -- two Timers left sharing
+     * one TimerImpl, and a double free the moment either is destroyed or
+     * reassigned. RplTrickleTimer holds two such Timers directly and
+     * inherits the same hazard. Deleting DodagMembership's own copy and
+     * move members below is what turns a future accidental copy of one of
+     * these into a compile error instead of that runtime corruption: every
+     * entry in m_dodags is built in place (std::map::operator[] on first
+     * access, or try_emplace()) and mutated only through a reference to
+     * that one instance, never assigned as a whole struct.
+     */
+    struct DodagMembership
+    {
+        DodagMembership() = default;
+        DodagMembership(const DodagMembership&) = delete;
+        DodagMembership& operator=(const DodagMembership&) = delete;
+        DodagMembership(DodagMembership&&) = delete;
+        DodagMembership& operator=(DodagMembership&&) = delete;
+
+        uint8_t instanceId{RPL_DEFAULT_INSTANCE}; //!< RPLInstanceID of the DODAG
+        Ipv6Address dodagId;    //!< DODAGID, i.e. the global address of the root
+        bool isRoot{false};     //!< true if this node is the root of this DODAG
+        uint8_t version{0};     //!< DODAG version number
+        uint16_t rank{RPL_INFINITE_RANK}; //!< rank of this node in the DODAG
+        uint8_t mop{RPL_MOP_NON_STORING}; //!< Mode of Operation of the DODAG
+        uint8_t dtsn{0};        //!< Destination Advertisement Trigger Sequence Number
+        bool grounded{false};   //!< Grounded flag of the DODAG
+        uint8_t preference{0};  //!< preference of the DODAG
+
+        uint16_t ocp{RPL_OCP_OF0}; //!< objective code point in use
+        uint16_t pathEtx{0}; //!< this node's own path ETX under MRHOF, fixed-point (*128)
+        uint16_t minHopRankIncrease{RPL_MIN_HOPRANKINC}; //!< MinHopRankIncrease, also the rank of the root
+        uint16_t maxRankIncrease{RPL_MAX_RANKINC};       //!< MaxRankIncrease
+
+        /**
+         * @brief L of RFC 6550 section 8.2.2.4 rule 3: the lowest rank this
+         *        node has advertised within the current DODAG Version.
+         *
+         * Reset to RPL_INFINITE_RANK by JoinDodag() (no rank advertised in
+         * this Version yet) and lowered by SelectPreferredParent() whenever
+         * the new rank stays within the bound the rule imposes; a rank that
+         * does not is never folded in, since INFINITE_RANK -- what the node
+         * advertises instead -- "is an exception to this rule".
+         */
+        uint16_t lowestRankThisVersion{RPL_INFINITE_RANK};
+        Time dioIntervalMin;              //!< Trickle Imin for DIOs
+        uint8_t dioIntervalDoublings{RPL_DIO_INTERVAL_DOUBLINGS}; //!< Trickle doublings for DIOs
+        uint8_t dioRedundancy{RPL_DIO_REDUNDANCY}; //!< Trickle redundancy constant for DIOs
+
+        /// Whether a Prefix Information option (RFC 6550 section 6.7.10) is
+        /// being carried: always true on the root once RootPrefix takes
+        /// effect, copied from the DIO joined on by every other node
+        /// (JoinDodag()) and re-advertised unchanged on this node's own
+        /// DIOs (SendDio()), the same "root decides, everyone forwards"
+        /// pattern as the DODAG Configuration option.
+        bool hasPrefixInfo{false};
+        Ipv6Address prefix;           //!< the prefix this DODAG's addresses are built on
+        uint8_t prefixLength{0};      //!< prefix length of prefix, in bits
+        bool prefixOnLink{false};     //!< 'L' flag
+        bool prefixAutonomous{false}; //!< 'A' flag
+        uint32_t prefixValidLifetime{0};     //!< Valid Lifetime, in seconds
+        uint32_t prefixPreferredLifetime{0}; //!< Preferred Lifetime, in seconds
+
+        RplTrickleTimer dioTrickle;            //!< paces the multicast DIOs
+        std::map<Ipv6Address, Parent> parents; //!< candidate parents, by link-local address
+        Ipv6Address preferredParent;           //!< link-local address of the preferred parent
+
+        uint8_t daoSequence{0};   //!< sequence of the last DAO this node sent
+        uint8_t pathSequence{0};  //!< path sequence of the route this node advertises
+        uint8_t daoRetriesLeft{0}; //!< retries left for the DAO awaiting an acknowledgement
+        bool daoAckPending{false}; //!< true while a DAO-ACK is being waited for
+        Timer daoEvent{Timer::CANCEL_ON_DESTROY};      //!< schedules the periodic DAO
+        Timer daoRetryEvent{Timer::CANCEL_ON_DESTROY}; //!< schedules the retry of an unacknowledged DAO
+
+        /// The root only: which parent each node reports sitting under.
+        std::map<Ipv6Address, TopologyEntry> topology;
+    };
+
+    /**
      * @brief Open the RPL raw socket on an interface and join ff02::1a.
      * @param interface the IPv6 interface index
      */
@@ -327,15 +473,17 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
 
     /**
      * @brief Send a DIO describing the DODAG this node belongs to.
+     * @param dodag the DODAG membership to describe
      * @param dst destination, ff02::1a for the multicast case
      * @param interface the interface to send on, 0 for all RPL interfaces
      */
-    void SendDio(Ipv6Address dst, uint32_t interface = 0);
+    void SendDio(DodagMembership& dodag, Ipv6Address dst, uint32_t interface = 0);
 
     /**
      * @brief Send a multicast DIO because the Trickle timer said so.
+     * @param key identifies which DODAG membership's Trickle timer fired
      */
-    void DioTrickleFire();
+    void DioTrickleFire(DodagKey key);
 
     /**
      * @brief Act on a received DIS, RFC 6550 section 8.3.
@@ -381,8 +529,10 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     void JoinDodag(const RplDioHeader& dio, uint32_t interface);
 
     /**
-     * @brief Leave the current DODAG and drop every candidate parent.
+     * @brief Leave a DODAG and erase its membership.
      *
+     * @param key identifies the membership to leave; must currently exist
+     *        in m_dodags
      * @param poison whether to advertise INFINITE_RANK on the way out (RFC
      *        6550 section 8.2.2.5). True when the node is detaching because
      *        it can no longer hold a parent, which is what tells its
@@ -391,7 +541,7 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      *        rule 5), where it rejoins in the same event and its next DIO
      *        already carries the new version.
      */
-    void LeaveDodag(bool poison);
+    void LeaveDodag(DodagKey key, bool poison);
 
     /**
      * @brief Compute the rank this node would have through a given parent.
@@ -403,6 +553,7 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      * MinHopRankIncrease, in which case the latter is used instead, so a
      * rank never implies a shorter path than the hop count actually taken.
      *
+     * @param dodag the DODAG membership the parent belongs to
      * @param parent the candidate parent
      * @param pathCost if not null, filled with the MRHOF path cost computed
      *                 along the way (PathCostViaParent(parent)), so a caller
@@ -410,7 +561,9 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      *                 path cost a second time. Left untouched under OF0.
      * @return the resulting rank, RPL_INFINITE_RANK if the parent is unusable
      */
-    uint16_t RankViaParent(const Parent& parent, uint32_t* pathCost = nullptr) const;
+    uint16_t RankViaParent(const DodagMembership& dodag,
+                           const Parent& parent,
+                           uint32_t* pathCost = nullptr) const;
 
     /**
      * @brief Compute the path cost this node would advertise through a given
@@ -482,17 +635,20 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      * RPL_MRHOF_PARENT_SWITCH_THRESHOLD, so the node does not flap between
      * parents of near-identical quality.
      *
+     * @param dodag the DODAG membership to reselect a preferred parent within
      * @return true if the preferred parent or the rank changed
      */
-    bool SelectPreferredParent();
+    bool SelectPreferredParent(DodagMembership& dodag);
 
     /**
      * @brief Advertise this node to the root, RFC 6550 section 6.4.
      *
      * The DAO travels to the DODAGID like any other upward traffic, so every
      * node on the way just forwards it and only the root ever reads it.
+     *
+     * @param dodag the DODAG membership to advertise
      */
-    void SendDao();
+    void SendDao(DodagMembership& dodag);
 
     /**
      * @brief Withdraw this node's own advertisement, RFC 6550 section 6.4.3.
@@ -507,21 +663,24 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      * advertised PathLifetime elapses) is what a lost No-Path ultimately
      * falls back on.
      *
+     * @param dodag the DODAG membership to withdraw from
      * @param viaParent the link-local address of the parent this node was
      *        last advertised as reachable through, i.e. the caller's own
-     *        m_preferredParent read before clearing it
+     *        preferredParent read before clearing it
      */
-    void SendNoPathDao(Ipv6Address viaParent);
+    void SendNoPathDao(DodagMembership& dodag, Ipv6Address viaParent);
 
     /**
      * @brief Send a DAO now and schedule the next refresh.
+     * @param key identifies which DODAG membership's DAO timer fired
      */
-    void DaoTimerExpire();
+    void DaoTimerExpire(DodagKey key);
 
     /**
      * @brief Re-send the DAO that was not acknowledged, or give up.
+     * @param key identifies which DODAG membership's retry timer fired
      */
-    void DaoRetry();
+    void DaoRetry(DodagKey key);
 
     /**
      * @brief Act on a received DAO. Only the root ever gets one.
@@ -539,8 +698,10 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
 
     /**
      * @brief Drop the topology entries whose lifetime has run out.
+     * @param dodag the DODAG membership to purge (the root's own only, since
+     *              only the root holds a topology in non-storing mode)
      */
-    void PurgeTopology();
+    void PurgeTopology(DodagMembership& dodag);
 
     /**
      * @brief Build the global address a neighbour has on the DODAG prefix.
@@ -553,10 +714,11 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      * interface identifier across its addresses, which is what an autoconfigured
      * LLN looks like.
      *
+     * @param dodag the DODAG membership the neighbour belongs to, for its DODAGID
      * @param linkLocal the link-local address of the neighbour
      * @return the global address of the neighbour, :: if it cannot be built
      */
-    Ipv6Address GlobalAddressOf(Ipv6Address linkLocal) const;
+    Ipv6Address GlobalAddressOf(const DodagMembership& dodag, Ipv6Address linkLocal) const;
 
     /**
      * @brief Build the link-local address that shares an interface identifier
@@ -574,10 +736,11 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
 
     /**
      * @brief Find the interface a one-hop neighbour sits on.
+     * @param dodag the DODAG membership to search the parent set of
      * @param neighbour the global address of the neighbour
      * @return the interface index, 0 if it cannot be told
      */
-    uint32_t InterfaceForNeighbour(Ipv6Address neighbour) const;
+    uint32_t InterfaceForNeighbour(const DodagMembership& dodag, Ipv6Address neighbour) const;
 
     /**
      * @brief Send an already-built RPL message body on every RPL interface.
@@ -640,10 +803,37 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
 
     /**
      * @brief Build the route towards the preferred parent.
+     * @param dodag the DODAG membership to route within
      * @param dst the destination to put in the route
      * @return the route, nullptr if there is no preferred parent
      */
-    Ptr<Ipv6Route> RouteViaPreferredParent(Ipv6Address dst) const;
+    Ptr<Ipv6Route> RouteViaPreferredParent(const DodagMembership& dodag, Ipv6Address dst) const;
+
+    /**
+     * @brief Get this node's membership in the base DODAG, if any.
+     *
+     * The "base DODAG" is the one this class has always formed: the single
+     * DODAG a RplHelper-configured node joins via DIS/DIO the ordinary way,
+     * or becomes the root of via SetAsRoot(). Every public accessor
+     * (GetRank(), IsJoined(), ...) reports this membership specifically, so
+     * their meaning is unchanged from before m_dodags existed.
+     *
+     * m_dodags holds at most one entry today -- nothing in this class yet
+     * creates a second one -- so "the base DODAG" and "the one entry, if
+     * any" are the same question for now, which is what the assertion
+     * below checks. A future second (local-instance) membership will need
+     * this resolved a different way, e.g. a stored DodagKey set at join
+     * time, rather than "whichever entry exists".
+     *
+     * @return a pointer to the membership, nullptr if not currently joined
+     */
+    DodagMembership* GetBaseDodag();
+
+    /**
+     * @brief Get this node's membership in the base DODAG, if any.
+     * @return a pointer to the membership, nullptr if not currently joined
+     */
+    const DodagMembership* GetBaseDodag() const;
 
     Ptr<Ipv6L3Protocol> m_ipv6;                    //!< the IPv6 stack of this node
     std::map<Ptr<Socket>, uint32_t> m_socketToIfc; //!< RPL raw socket -> interface index
@@ -654,71 +844,63 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     Timer m_disTimer;                    //!< schedules the periodic DIS
     Ptr<UniformRandomVariable> m_jitter; //!< jitter applied to control messages
 
-    bool m_joined;         //!< true once this node belongs to a DODAG
-    uint8_t m_instanceId;  //!< RPLInstanceID of the DODAG
-    Ipv6Address m_dodagId; //!< DODAGID, i.e. the global address of the root
-    uint8_t m_version;     //!< DODAG version number
-    uint16_t m_rank;       //!< rank of this node in the DODAG
-    uint8_t m_mop;         //!< Mode of Operation of the DODAG
-    uint8_t m_dtsn;        //!< Destination Advertisement Trigger Sequence Number
-    bool m_grounded;       //!< Grounded flag of the DODAG
-    uint8_t m_preference;  //!< preference of the DODAG
+    /**
+     * @brief The RNG stream number to assign a DODAG membership's Trickle
+     *        timer as it is created, -1 if AssignStreams() was never called.
+     *
+     * AssignStreams() runs once, before the simulation starts, but a
+     * DodagMembership -- and the RplTrickleTimer it owns -- is not
+     * constructed until this node actually joins or forms a DODAG, which
+     * happens dynamically later. This is what carries the number forward to
+     * JoinDodag() and HandleDadSuccess()'s root branch, the two places that
+     * construct one.
+     */
+    int64_t m_dioTrickleStream{-1};
 
-    uint16_t m_ocp;                //!< objective code point in use
-    uint16_t m_pathEtx; //!< this node's own path ETX under MRHOF, fixed-point (*128)
     bool m_enableLql;   //!< whether to derive and advertise LQL (RFC 6551 section 4.6)
     Callback<uint8_t, double> m_rssiToLql; //!< RSSI (dBm) -> LQL (0-7) mapping
+    // Ocp and MinHopRankIncrease are attributes (RplHelper can configure
+    // them) and the root's own DODAG membership seeds its ocp/rank from
+    // these scalars when it forms; every other node overwrites its own copy
+    // of both, inside DodagMembership, from the DODAG Configuration option
+    // (RFC 6550 section 6.7.6) of the DIO it joins on (JoinDodag()).
+    // MaxRankIncrease has no attribute of its own -- nothing sets it but the
+    // DodagMembership member initializer -- so it does not need a scalar
+    // counterpart the way these two do.
+    uint16_t m_ocp;                //!< objective code point in use
     uint16_t m_minHopRankIncrease; //!< MinHopRankIncrease, also the rank of the root
-    uint16_t m_maxRankIncrease;    //!< MaxRankIncrease
 
-    /**
-     * @brief L of RFC 6550 section 8.2.2.4 rule 3: the lowest rank this node
-     *        has advertised within the current DODAG Version.
-     *
-     * Reset to RPL_INFINITE_RANK by JoinDodag() (no rank advertised in this
-     * Version yet) and lowered by SelectPreferredParent() whenever the new
-     * rank stays within the bound the rule imposes; a rank that does not is
-     * never folded in, since INFINITE_RANK -- what the node advertises
-     * instead -- "is an exception to this rule".
-     */
-    uint16_t m_lowestRankThisVersion;
     Time m_dioIntervalMin;         //!< Trickle Imin for DIOs
     uint8_t m_dioIntervalDoublings; //!< Trickle doublings for DIOs
     uint8_t m_dioRedundancy;        //!< Trickle redundancy constant for DIOs
 
-    /// Whether a Prefix Information option (RFC 6550 section 6.7.10) is
-    /// being carried: always true on the root once RootPrefix takes effect,
-    /// copied from the DIO joined on by every other node (JoinDodag()) and
-    /// re-advertised unchanged on this node's own DIOs (SendDio()), the same
-    /// "root decides, everyone forwards" pattern as the DODAG Configuration
-    /// option.
-    bool m_hasPrefixInfo;
-    Ipv6Address m_prefix;         //!< the prefix this DODAG's addresses are built on
-    uint8_t m_prefixLength;       //!< prefix length of m_prefix, in bits
-    bool m_prefixOnLink;          //!< 'L' flag
-    bool m_prefixAutonomous;      //!< 'A' flag
-    uint32_t m_prefixValidLifetime;     //!< Valid Lifetime, in seconds
-    uint32_t m_prefixPreferredLifetime; //!< Preferred Lifetime, in seconds
+    /**
+     * @brief Every DODAG this node currently belongs to, keyed by DodagKey.
+     *
+     * Holds at most one entry today (the base DODAG, @see GetBaseDodag()):
+     * nothing in this class yet creates a membership in a second RPL
+     * Instance. The map exists ahead of that so the rest of this class
+     * already reads and writes DODAG state through a DodagMembership&
+     * rather than through single scalar members, which is the change a
+     * second membership (e.g. for AODV-RPL or P2P-RPL) will need in place
+     * regardless of what its own join logic ends up looking like.
+     *
+     * @see DodagMembership for why its entries can never be copied or
+     * moved once constructed.
+     */
+    std::map<DodagKey, DodagMembership> m_dodags;
 
-    RplTrickleTimer m_dioTrickle;            //!< paces the multicast DIOs
-    std::map<Ipv6Address, Parent> m_parents; //!< candidate parents, by link-local address
-    Ipv6Address m_preferredParent;           //!< link-local address of the preferred parent
-
+    // Policy attributes for the DAO/downward-route side, set once via
+    // RplHelper and shared by whatever DODAG membership uses them. Nothing
+    // besides the base DODAG exercises DAO in this module today -- AODV-RPL
+    // does not use RPL's DAO message at all (RFC 9854), and P2P-RPL uses its
+    // own P2P-DRO instead of DAO (RFC 6997) -- so there is no present need
+    // for these to vary per instance.
     Time m_daoInterval;      //!< how often this node refreshes its DAO
     Time m_daoAckTimeout;    //!< how long to wait for a DAO-ACK
     uint8_t m_daoRetries;    //!< how many times an unacknowledged DAO is resent
     uint8_t m_pathLifetime;  //!< lifetime this node advertises, in lifetime units
     uint16_t m_lifetimeUnit; //!< the unit of the path lifetime, in seconds
-
-    uint8_t m_daoSequence;   //!< sequence of the last DAO this node sent
-    uint8_t m_pathSequence;  //!< path sequence of the route this node advertises
-    uint8_t m_daoRetriesLeft; //!< retries left for the DAO awaiting an acknowledgement
-    bool m_daoAckPending;    //!< true while a DAO-ACK is being waited for
-    Timer m_daoEvent;        //!< schedules the periodic DAO
-    Timer m_daoRetryEvent;   //!< schedules the retry of an unacknowledged DAO
-
-    /// The root only: which parent each node reports sitting under.
-    std::map<Ipv6Address, TopologyEntry> m_topology;
 
     Ipv6Address m_rootPrefix;    //!< the root's own GUA/ULA prefix (RootPrefix attribute)
     uint8_t m_rootPrefixLength; //!< prefix length of m_rootPrefix, in bits
