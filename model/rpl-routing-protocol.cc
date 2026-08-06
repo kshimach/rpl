@@ -2271,6 +2271,34 @@ RplRoutingProtocol::RouteViaPreferredParent(const DodagMembership& dodag, Ipv6Ad
     }
 
     uint32_t interface = it->second.interface;
+
+    // Ipv6L3Protocol::SourceAddressSelection() asserts outright if the
+    // interface has no global address at all, rather than returning a
+    // sentinel this caller could check -- reasonable for its own callers,
+    // which only ever ask once a node's addressing has settled, but not
+    // for a route that can be requested (RouteInput() forwarding another
+    // node's packet, in particular) before this node's own SLAAC on the
+    // relevant DODAG has necessarily finished. Checked here instead of
+    // relying on the caller to know when that is safe: "no route yet" is
+    // this function's ordinary way of saying not ready, everywhere else it
+    // already applies (dodag.preferredParent.IsAny(), the parents lookup
+    // above), so a transiently addressless interface joins them rather
+    // than crashing the node that happened to be relaying at the wrong
+    // moment.
+    bool hasGlobalAddress = false;
+    for (uint32_t i = 0; i < m_ipv6->GetNAddresses(interface); i++)
+    {
+        if (m_ipv6->GetAddress(interface, i).GetScope() == Ipv6InterfaceAddress::GLOBAL)
+        {
+            hasGlobalAddress = true;
+            break;
+        }
+    }
+    if (!hasGlobalAddress)
+    {
+        return nullptr;
+    }
+
     Ptr<Ipv6Route> route = Create<Ipv6Route>();
     route->SetDestination(dst);
     route->SetGateway(dodag.preferredParent);
