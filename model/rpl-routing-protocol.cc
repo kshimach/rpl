@@ -1797,6 +1797,22 @@ RplRoutingProtocol::ReadRpiInstanceId(Ptr<const Packet> p,
     {
         return false;
     }
+    // RplPacketInfoHeader::Deserialize() reads whatever Option Type byte is
+    // there and stores it (Ipv6OptionHeader::SetType()) without checking it
+    // actually is RPL_HBH_OPTION_TYPE (0x63) -- the ordinary Ipv6OptionDemux-
+    // driven dispatch path never needs to check because the demux itself
+    // already only calls RplIpv6OptionRpl::Process() for that type, but this
+    // is a direct, offset-based read with no such dispatch in front of it.
+    // Without this, the first Hop-by-Hop option being anything else at all
+    // (Pad1/PadN in particular, RFC 8200 section 4.2, needed whenever the
+    // real first option does not already land on this header's 2-octet
+    // alignment) has its bytes misread as a fabricated RPI, handing an
+    // attacker- or protocol-controlled RPLInstanceID straight into the
+    // forwarding decision.
+    if (rpi.GetType() != RPL_HBH_OPTION_TYPE)
+    {
+        return false;
+    }
 
     instanceId = rpi.GetInstanceId();
     return true;

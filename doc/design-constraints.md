@@ -3152,3 +3152,69 @@ base の DAD 待ちレース対策、こちらは base 固有の問題なので�
 `ns3edit-rpl-line`、いずれも DODAG 1 つだけの単純なシナリオ) も
 0% packet loss を維持しており、今回の変更が既存の単一 DODAG シナリオ
 に一切影響していないことを確認した。
+
+### 34.6 `protocol-test-matrix` スキルで 34 節を監査し直して見つかったバグ
+
+34 節のコミット後、user-level スキル `protocol-test-matrix`
+(仕様準拠が求められるプロトコル実装を「正常系・準正常系(境界値)・
+異常系・準正常系(シーケンス状態遷移)」の 4 象限で監査する) を明示的に
+34 節の変更 (中継/root 一般化) に対して適用した。RFC を生テキストで
+読み直す Phase 0 の過程で、`ReadRpiInstanceId()`
+(`rpl-routing-protocol.cc`) に実装時には気づかなかったバグが見つかった。
+
+**RFC 6553 section 3 を実際に読んで確認したこと**: RPI (RPL Option) は
+Flags/RPLInstanceID/SenderRank の 8 オクテットのみ運び、DODAGID は
+無い — 34.2 節の前提はそのまま正しかった。ただし RFC 6550 section
+6.4.1 (DAO Base Object) の "D: ... This flag MUST be set when a local
+RPLInstanceID is used" は、`HandleDao()` の D flag clear
+(`dao.GetDodagId().IsAny()`) フォールバックが実質 Global instance の
+DAO でしか踏まれない (Local instance の DAO は規格上 D=1 が必須で
+DODAGID を必ず伴う) ことを確認する形になった — 実装は無改修で正しい
+ままだが、この確認によって「なぜその分岐でよいか」の根拠が RFC の
+条文で裏付けられた。
+
+**見つかったバグ**: `RplPacketInfoHeader::Deserialize()`
+(`rpl-header.cc:1321`) は Option Type バイトを読んで
+`Ipv6OptionHeader::SetType()` に格納するだけで、それが本当に
+`RPL_HBH_OPTION_TYPE` (0x63) かどうかを一切検証しない。既存の
+`RplIpv6OptionRpl::Process()` (Ipv6OptionDemux 経由のディスパッチ) は
+デマルチプレクサ自身が type で振り分けた後にしか呼ばれないので
+この検証が要らないが、`ReadRpiInstanceId()` は固定オフセット
+(HBH 自身の 2 オクテットプレフィクスの直後) を無条件に読みに行く
+実装で、そのようなディスパッチを経ない。結果、Hop-by-Hop ヘッダの
+最初のオプションが RPI ではなく Pad1/PadN (RFC 8200 section 4.2、
+本来のオプションを 2n アラインメントに合わせるためのパディング) や
+他プロトコルの何らかのオプションだった場合、その中身のバイト列を
+そのまま RPI の Flags/InstanceId/SenderRank として誤読し、無関係な
+値を `RouteInput()` の中継判定にそのまま渡してしまう。
+
+**プローブでの再現** (`scratch/rpl-rpi-typecheck-probe.cc`、確認後
+削除): Hop-by-Hop の中身を手作りし、HBH 自身の 2 バイトプレフィクス
+の直後に PadN オプション (Option Type 0x01、Opt Data Len 4、
+パディング 4 バイト = `0x00, 0x55, 0x00, 0x00`) を置いた。修正前は
+`ReadRpiInstanceId()` が `true, instanceId=0x55` を返した — PadN の
+パディングバイトが InstanceId として読まれてしまうことを直接確認。
+
+**修正**: `rpi.GetType() != RPL_HBH_OPTION_TYPE` の場合は
+`false` を返すチェックを追加。この実装は RPI 以外の HBH オプションを
+一切送信しないため (`PrepareOutgoingPacket()` が唯一の書き手で、常に
+RPI だけを付ける)、この修正は自分自身が生成する正規のトラフィックには
+一切影響しない — 外部から来た/偽装された/他プロトコルのオプションを
+拒否するだけ。回帰テスト
+`RplReadRpiInstanceIdRejectsWrongOptionTypeTestCase` を追加し、
+`./test.py -s rpl` 相当 (58 件) を 5 回連続実行して全件安定して
+PASS することを確認した。4 つの既存シナリオも 0% packet loss を維持。
+
+**スコープ外として見つかったが今回は対応しなかったこと**: RFC 6550
+section 5.1 の Local RPLInstanceID フィールド (`1|D|ID(6bit)` — 最上位
+ビットが local フラグ、次のビットが「このデータパケットの送信元/宛先
+どちらが DODAGID か」を示す D フラグ、残り 6 ビットが実際のローカル
+ID、0..63) は、この実装の `CreateLocalDodag()` が呼び出し元から渡された
+`instanceId` を丸ごと不透明なバイトとして扱っており、data パケット
+ごとにこの D ビットを立てる/読む処理を一切実装していない。今回の
+中継一般化ロジック自身はこの D ビットに一切依存しない設計
+(別途 `rpi.SetDown()`/`GetDown()` という独立した機構で上り/下りを
+判定しており、機能的な不具合は生じていない) ので、今回選んだ監査
+対象 (中継一般化ロジックそのもの) の範囲外と判断し、あえて手を
+付けなかった。`CreateLocalDodag()` 自体を対象にした将来の監査で
+検討する。

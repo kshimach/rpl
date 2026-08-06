@@ -3593,6 +3593,109 @@ RplNonBaseRootDownwardPacketTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief ReadRpiInstanceId() refuses to read a Hop-by-Hop option that is not
+ *        actually the RPL Option (RFC 6553), rather than misreading whatever
+ *        bytes happen to be there as one.
+ *
+ * Found while building this fix's own test matrix, not requested by any
+ * prior bug report: RplPacketInfoHeader::Deserialize() reads and stores
+ * whatever Option Type byte is on the wire (Ipv6OptionHeader::SetType())
+ * without ever checking it is really RPL_HBH_OPTION_TYPE (0x63) -- safe for
+ * the ordinary Ipv6OptionDemux-driven dispatch path, which only ever calls
+ * RplIpv6OptionRpl::Process() once the demux itself has already matched that
+ * type, but ReadRpiInstanceId() reads directly at a fixed offset with no
+ * such dispatch in front of it. A Pad1/PadN option (RFC 8200 section 4.2,
+ * needed whenever the real first option does not already land on the RPL
+ * Option's own alignment) sitting first in the Hop-by-Hop header would have
+ * its Length/padding bytes misread as Flags/RPLInstanceID/SenderRank,
+ * handing whatever those padding bytes happen to be straight into
+ * RouteInput()'s forwarding decision as if it were a trustworthy
+ * RPLInstanceID.
+ *
+ * A probe (scratch/rpl-rpi-typecheck-probe.cc, deleted once this was
+ * confirmed and fixed) reproduced this directly: a PadN option, Opt Data
+ * Len 4, whose four padding bytes were chosen so the byte at the position
+ * SenderRank... no, InstanceId would land on read back as 0x55 --
+ * ReadRpiInstanceId() returned true with instanceId 0x55, a value that
+ * appeared nowhere in any real RPL Option at all.
+ */
+class RplReadRpiInstanceIdRejectsWrongOptionTypeTestCase : public TestCase
+{
+  public:
+    RplReadRpiInstanceIdRejectsWrongOptionTypeTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplReadRpiInstanceIdRejectsWrongOptionTypeTestCase::
+    RplReadRpiInstanceIdRejectsWrongOptionTypeTestCase()
+    : TestCase("ReadRpiInstanceId() does not misread a non-RPL Hop-by-Hop option as one")
+{
+}
+
+void
+RplReadRpiInstanceIdRejectsWrongOptionTypeTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(1);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.AssignWithoutAddress(devices);
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    Simulator::Stop(Seconds(2));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> rpl = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+
+    // A fabricated Hop-by-Hop payload: the mandatory 2-octet Next Header/Hdr
+    // Ext Len prefix, then a PadN option (Option Type 0x01, Opt Data Len 4)
+    // whose four padding octets are deliberately non-zero. Read as if it
+    // were an RPI (2 bytes skipped, then Type/Length/Flags/InstanceId/
+    // SenderRank), byte 5 here (0x55) would land exactly on InstanceId.
+    uint8_t bytes[] = {
+        59,   // HBH Next Header: No Next Header
+        0,    // HBH Hdr Ext Len
+        0x01, // PadN Option Type -- not RPL_HBH_OPTION_TYPE (0x63)
+        0x04, // PadN Opt Data Len: 4 bytes of padding follow
+        0x00, // padding: would read as RPI Flags if misread
+        0x55, // padding: would read as RPI InstanceId if misread
+        0x00,
+        0x00, // padding: would read as RPI SenderRank if misread
+    };
+    Ptr<Packet> packet = Create<Packet>(bytes, sizeof(bytes));
+
+    Ipv6Header header;
+    header.SetNextHeader(Ipv6Header::IPV6_EXT_HOP_BY_HOP);
+
+    uint8_t instanceId = 0xAB; // a value neither 0 nor 0x55, so either bug leaves a trace
+    bool ok = rpl->ReadRpiInstanceId(packet, header, instanceId);
+
+    NS_TEST_ASSERT_MSG_EQ(ok,
+                          false,
+                          "A PadN option was accepted as if it were the RPL Option");
+    NS_TEST_ASSERT_MSG_EQ(static_cast<uint32_t>(instanceId),
+                          0xABu,
+                          "instanceId was written even though ReadRpiInstanceId() reported "
+                          "failure");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Check MRHOF (RFC 6719) parent selection: path cost, not just hop
  *        count, decides the preferred parent, and hysteresis
  *        (PARENT_SWITCH_THRESHOLD) keeps it from flapping over a marginal
@@ -8275,6 +8378,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplLocalDodagRootWithoutSetAsRootTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplRankInconsistencyPerInstanceTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplNonBaseRootDownwardPacketTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplReadRpiInstanceIdRejectsWrongOptionTypeTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDioRejectionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplParentLossRejoinTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplInterfaceRestartTestCase, TestCase::Duration::QUICK);
