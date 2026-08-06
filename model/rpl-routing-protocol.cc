@@ -2741,6 +2741,13 @@ RplRoutingProtocol::GetRankIn(uint8_t instanceId, Ipv6Address dodagId) const
     return it != m_dodags.end() ? it->second.rank : RPL_INFINITE_RANK;
 }
 
+bool
+RplRoutingProtocol::IsDaoAckPendingIn(uint8_t instanceId, Ipv6Address dodagId) const
+{
+    auto it = m_dodags.find(DodagKey{instanceId, dodagId});
+    return it != m_dodags.end() && it->second.daoAckPending;
+}
+
 uint32_t
 RplRoutingProtocol::GetDodagCount() const
 {

@@ -294,6 +294,16 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     uint16_t GetRankIn(uint8_t instanceId, Ipv6Address dodagId) const;
 
     /**
+     * @brief Whether this node is still waiting on a DAO-ACK for a specific
+     *        DODAG's most recently sent DAO.
+     * @param instanceId the RPLInstanceID of the DODAG
+     * @param dodagId the DODAGID of the DODAG
+     * @return true if a DAO-ACK is outstanding, false if it has been
+     *         acknowledged or this node is not part of that DODAG
+     */
+    bool IsDaoAckPendingIn(uint8_t instanceId, Ipv6Address dodagId) const;
+
+    /**
      * @brief Get how many DODAGs this node currently belongs to at once.
      * @return the number of concurrent DODAG memberships
      */

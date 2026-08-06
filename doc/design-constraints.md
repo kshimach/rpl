@@ -2936,3 +2936,83 @@ scratch (2 root + 共有ノードが間接 join し合う構成、`--RngRun` を
 level_all|prefix_all"` で直接確認済み (33.4 節) であり、今回の修正は
 その特定のアサーションを踏む経路を直接塞ぐもの。`./test.py -s rpl`
 相当 (52 件) は無改修で全件 PASS のままであることを確認した。
+
+### 33.8 `HandleDaoAck()` 修正の回帰テストを追加、途中で ND キャッシュの
+     非対称性という別問題に遭遇して設計を作り直した
+
+32 節で `HandleDaoAck()` を `GetBaseDodag()` 無条件参照から
+`m_dodags.find(DodagKey{daoAck.GetInstanceId(), daoAck.GetDodagId()})`
+による key 解決に直した際、レビュー指摘のみを根拠に直しており、
+それを固定する回帰テストが無いままだった。それを埋めるため
+`RplMultiDodagDaoAckIsolationTestCase` を追加した。
+
+**最初の設計 (失敗)**: 33.1-33.3 節の 3 テストと同じ「2 root + 共有
+ノード」構成で、両 root への応答をチャネルごと blacklist した状態で
+DTSN bump により未 ACK の DAO を意図的に作り、そこへ手作りの DAO-ACK
+を注入する設計にした。ところが blacklist を上げた**後**に DTSN bump
+DIO を注入して「新しい DAO を送らせる」ステップで、root A 宛の DAO
+だけが `Ipv6Interface::Send()` の `"NDISC Lookup"` で止まり、
+実際に送信されなかった (`NS_LOG="RplRoutingProtocol=level_all|
+prefix_all:Ipv6Interface=level_all|prefix_all"` で確認)。同じ
+タイミング・同じ構造で送られる root B 宛の DAO は
+`"Address Resolved.  Send."` が即座に付いて成功しており、
+両者の差の原因 (Neighbor Discovery キャッシュの何が違うのか) は、
+`ReachableTime` (デフォルト 30s) の単純な失効では説明が付かないまま
+特定できなかった。独立した scratch (`scratch/rpl-daoack-probe.cc`、
+検証後に削除済み) で同じ非対称性が再現することは確認できたので、
+少なくとも「テスト全体の実行順序に依存する話ではない」ことは切り
+分けられたが、それ以上の根本原因究明は打ち切った。
+
+**設計をやり直した理由**: `ns3-debug-pitfalls` スキルが既に文書化
+している「合成パケットをチャネル経由 (BlackList/UnBlackList) で
+注入しない」という落とし穴に、今回も別の切り口で嵌っていたと判断
+した。そもそもこのテストが検証したいのは `HandleDaoAck()` が
+DAO-ACK 自身の (RPLInstanceID, DODAGID) で正しい membership を
+引けているか、という一点だけであり、DAO が実際に root まで届く
+かどうかは無関係。`SendDao()` (rpl-routing-protocol.cc:1419) を
+読み直すと、`dodag.daoAckPending = true;` と
+`dodag.daoRetryEvent.Schedule(...)` は `SendRplMessageUnicast()`
+(実際の送信呼び出し) の**後**に、その送信が実際に届いたかどうかとは
+無関係に無条件で実行されている。つまり「相手ノードに実際に届くか」
+は `HandleDaoAck()` の回帰テストには一切必要無く、ND 解決が絡む
+チャネル越しの往復を丸ごと避けられる。
+
+**新しい設計**: ノード 1 個だけで完結させた。両方の DODAG の
+root (`2001:1::1`/`2001:2::1`) はチャネル上に実在しない、ラベル
+としてのアドレスに過ぎない — `DeliverRawRplMessage()` で
+ノードの `Receive()` に直接渡す DIO/DAO-ACK の `src` フィールドが
+本物のデバイスに対応している必要が無いのは
+`RplMultiDodagVersionIsolationTestCase` 等、既存の複数テストが
+既に前提にしている性質のもの。DIO を 2 本注入して両 DODAG に
+join させると、それぞれの初回 `SendDao()` が (相手が実在しなくても)
+`daoAckPending` を立てるので、これだけで「2 つの membership が
+同時に ACK 待ち」という狙った状態を、blacklist もタイミング調整も
+無しに確定的に作れる。
+
+検証には新しい薄いアクセサ `IsDaoAckPendingIn(instanceId, dodagId)`
+(`IsJoinedTo()`/`GetRankIn()` と同じ最小ラッパ、
+`rpl-routing-protocol.h/.cc`) を追加し、これを直接読むことで
+「実際に DAO-ACK パケットが何本届いたか」をチャネル越しに数える
+必要そのものを無くした。テストの流れ:
+
+- 準正常: 両 DODAG に join、両方 `daoAckPending == true` を確認。
+- 異常 (旧バグが実際に踏んでいた混同そのもの): 両 membership の
+  初回 `daoSequence` はどちらも 1 (`DodagMembership::daoSequence`
+  は 0 始まりの前置インクリメントなので、2 つとも独立に 1 から
+  始まる) — この偶然の一致を利用し、DODAG B 宛の正しい key + 数値 1
+  の DAO-ACK を注入。修正後のコードは B だけを正しく解除し、A は
+  ACK 待ちのまま残ることを確認 (旧 `GetBaseDodag()` 版なら
+  base = A を誤って解除していたはずの場面)。
+- その後 A だけ DTSN bump で 2 回目の DAO を送らせ、2 つの
+  `daoSequence` を意図的に不一致にしてから:
+  - 境界値: 正しい DODAGID + Local RPLInstanceID (0x80、本来の
+    Global ではない方) → 何も解除されない。
+  - 異常: 一度も join していない DODAGID → 何も解除されない。
+  - 準正常: A 自身の正しい key + 正しい sequence → A だけ解除、
+    B は既に解除済みのまま変化無し。
+
+`./test.py -s rpl` 相当 (53 件、新規込み) を 5 回連続実行し全件
+安定して PASS することを確認した。新テストの実行時間は 0.001s
+(旧設計は数秒のシミュレーション時間を要していた) — ND 解決や
+Trickle ジッタの実時間待ちを一切必要としない設計になったこと
+自体も、副次的な確認材料になっている。

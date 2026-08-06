@@ -2832,6 +2832,249 @@ RplMultiDodagPathSequenceIsolationTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief A DAO-ACK is matched against the membership its own
+ *        (RPLInstanceID, DODAGID) names, not just against its DAOSequence.
+ *
+ * The regression test for HandleDaoAck()'s key resolution. Before that was
+ * fixed it resolved through GetBaseDodag() unconditionally and compared
+ * only the sequence, so an acknowledgement from one DODAG's root could
+ * clear another membership's pending state -- leaving the membership that
+ * really was waiting to retransmit forever despite having been
+ * acknowledged. The fix was made on a design review's word alone, with no
+ * test to hold it; this is that test.
+ *
+ * One node joins two independently rooted DODAGs. Neither root is a real,
+ * behaving node: both DODAGs are bootstrapped by hand-built DIOs
+ * (DeliverRawRplMessage(), so no real device or channel round trip is
+ * needed at all) naming addresses nothing on the channel answers to.
+ * SendDao() marks a membership's own daoAckPending true and arms its
+ * retry timer unconditionally, before the packet it just built ever
+ * reaches RouteOutput() -- so both memberships end up genuinely pending,
+ * with no need to actually deliver anything to a listening root, and
+ * nothing in this test depends on Neighbour Discovery ever resolving a
+ * gateway (the earlier version of this test did, over a channel with a
+ * blacklist raised mid-run, and that dependency on which of two
+ * unrelated nodes' Neighbour Discovery cache happened to still be warm
+ * made it flaky enough to replace outright). Every acknowledgement from
+ * there on is hand-built too (IsDaoAckPendingIn(), not a wire capture,
+ * is what each step checks):
+ *
+ * - semi-normal: the right key and the right sequence clears that
+ *   membership's pending state, and only that one's;
+ * - abnormal: the right sequence carried under the *other* DODAG's key
+ *   (exactly the confusion the old code fell for), or under a DODAG this
+ *   node has never joined, clears neither;
+ * - boundary: the right DODAGID paired with a *Local* RPLInstanceID (high
+ *   bit set, RFC 6550 section 5.1) rather than the Global one the
+ *   membership actually holds -- the two halves of the key's own
+ *   namespace, which a comparison looking at DODAGID alone would not tell
+ *   apart.
+ *
+ * The two memberships' DAOSequences start identical by construction (both
+ * memberships' first-ever SendDao() lands on 1, DodagMembership::daoSequence
+ * pre-incrementing from a fresh 0) and are deliberately left that way for
+ * the first abnormal case, so "A's real pending sequence" is also exactly
+ * what B is (not) waiting on -- the coincidence a sequence-only comparison
+ * could hide behind. A DTSN bump on DODAG A alone then earns it one extra
+ * DAO (RFC 6550 section 9.6 rule 1) before the rest of the cases run, so
+ * from there on the two sequences are provably out of step too.
+ */
+class RplMultiDodagDaoAckIsolationTestCase : public TestCase
+{
+  public:
+    RplMultiDodagDaoAckIsolationTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplMultiDodagDaoAckIsolationTestCase::RplMultiDodagDaoAckIsolationTestCase()
+    : TestCase("A DAO-ACK is matched per DODAG, not by DAOSequence alone")
+{
+}
+
+void
+RplMultiDodagDaoAckIsolationTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(1); // the only node under test; both DODAGs' roots are addresses of convenience
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    rplHelper.Set("DaoAckTimeout", TimeValue(Seconds(1)));
+    rplHelper.Set("DaoRetries", UintegerValue(30));
+
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    interfaces.SetForwarding(0, true);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Ptr<Node> node = nodes.Get(0);
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+    Ipv6Address nodeLinkLocal = node->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    // Neither address below corresponds to a real node on the channel:
+    // nothing here needs a reply, only a DODAGID and a link-local to source
+    // the hand-built DIOs from.
+    Ipv6Address dodagAId("2001:1::1");
+    Ipv6Address dodagBId("2001:2::1");
+    Ipv6Address rootALinkLocal("fe80::a");
+    Ipv6Address rootBLinkLocal("fe80::b");
+
+    auto buildDio = [](Ipv6Address dodagId, Ipv6Address prefix, uint8_t dtsn) {
+        RplDioHeader dio;
+        dio.SetInstanceId(RPL_DEFAULT_INSTANCE);
+        dio.SetVersionNumber(0);
+        dio.SetRank(RPL_MIN_HOPRANKINC);
+        dio.SetMop(RPL_MOP_NON_STORING);
+        dio.SetDodagId(dodagId);
+        dio.SetDtsn(dtsn);
+        // Without the Configuration option a joining node adopts a
+        // zero-length Trickle interval; without Prefix Information it never
+        // SLAACs an address and SendDao() gives up before sending anything
+        // at all (RplMultiDodagDtsnIsolationTestCase hit both the same way).
+        dio.SetDagConfiguration(0,
+                                20,
+                                RPL_DIO_REDUNDANCY,
+                                RPL_MAX_RANKINC,
+                                RPL_MIN_HOPRANKINC,
+                                RPL_OCP_OF0,
+                                RPL_DEFAULT_LIFETIME,
+                                RPL_DEFAULT_LIFETIME_UNIT);
+        dio.SetPrefixInfo(prefix,
+                          64,
+                          true,
+                          true,
+                          RPL_PREFIX_VALID_LIFETIME,
+                          RPL_PREFIX_PREFERRED_LIFETIME);
+        return dio;
+    };
+    auto deliverDio = [&](Ipv6Address rootLinkLocal,
+                          Ipv6Address dodagId,
+                          Ipv6Address prefix,
+                          uint8_t dtsn) {
+        Simulator::Schedule(Seconds(0),
+                            &DeliverRawRplMessage<RplDioHeader>,
+                            node,
+                            1,
+                            buildDio(dodagId, prefix, dtsn),
+                            static_cast<uint8_t>(RPL_CODE_DIO),
+                            rootLinkLocal,
+                            nodeLinkLocal);
+    };
+
+    // Join both DODAGs. GetGlobalAddress() is usable on a TENTATIVE_OPTIMISTIC
+    // address (RFC 4429, HandleDadSuccess()'s own comment on this), so
+    // nothing here needs to wait out DAD before SelectPreferredParent()'s
+    // parent-changed branch schedules the first SendDao() -- 2s is ample
+    // margin over its own [0, 1) jitter for both.
+    deliverDio(rootALinkLocal, dodagAId, Ipv6Address("2001:1::"), 0);
+    deliverDio(rootBLinkLocal, dodagBId, Ipv6Address("2001:2::"), 0);
+    Simulator::Stop(Seconds(2));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetDodagCount(), 2, "Did not join both DODAGs");
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsDaoAckPendingIn(RPL_DEFAULT_INSTANCE, dodagAId),
+                          true,
+                          "DODAG A's initial DAO should still be unacknowledged");
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsDaoAckPendingIn(RPL_DEFAULT_INSTANCE, dodagBId),
+                          true,
+                          "DODAG B's initial DAO should still be unacknowledged");
+
+    auto deliverAck = [&](uint8_t instanceId,
+                          Ipv6Address dodagId,
+                          Ipv6Address fromAddress,
+                          uint8_t sequence) {
+        RplDaoAckHeader ack;
+        ack.SetInstanceId(instanceId);
+        ack.SetDodagId(dodagId);
+        ack.SetSequence(sequence);
+        ack.SetStatus(0); // unqualified acceptance
+        Simulator::Schedule(Seconds(0),
+                            &DeliverRawRplMessage<RplDaoAckHeader>,
+                            node,
+                            1,
+                            ack,
+                            static_cast<uint8_t>(RPL_CODE_DAO_ACK),
+                            fromAddress,
+                            nodeLinkLocal);
+        Simulator::Stop(MilliSeconds(10));
+        Simulator::Run();
+    };
+
+    // Abnormal, and exactly the confusion the old code fell for: DODAG A's
+    // real pending sequence (1, both memberships' first ever) carried under
+    // DODAG B's key. The fix resolves this by key to DODAG B, whose own
+    // pending sequence really is 1 too, so it clears B correctly -- the
+    // assertion that matters is the one right after, that A (whose own
+    // sequence the acknowledgement also happens to equal) is still pending:
+    // the old code, matching by sequence against whatever GetBaseDodag()
+    // returned, would have cleared A here instead.
+    deliverAck(RPL_DEFAULT_INSTANCE, dodagBId, rootBLinkLocal, 1);
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsDaoAckPendingIn(RPL_DEFAULT_INSTANCE, dodagBId),
+                          false,
+                          "DODAG B's own acknowledgement (sequence 1) did not clear DODAG B");
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsDaoAckPendingIn(RPL_DEFAULT_INSTANCE, dodagAId),
+                          true,
+                          "A DAO-ACK carrying DODAG B's key cleared DODAG A instead: the "
+                          "acknowledgement was matched by sequence alone, GetBaseDodag()-style");
+
+    // Desync the two DAOSequences properly before the rest of the cases: a
+    // DTSN bump from A's own DAO parent earns it one extra DAO (RFC 6550
+    // section 9.6 rule 1), landing A on sequence 2 while B stays acknowledged.
+    deliverDio(rootALinkLocal, dodagAId, Ipv6Address("2001:1::"), 1);
+    Simulator::Stop(Seconds(2));
+    Simulator::Run();
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsDaoAckPendingIn(RPL_DEFAULT_INSTANCE, dodagAId),
+                          true,
+                          "The DTSN-triggered refresh DAO for DODAG A should be unacknowledged");
+
+    // Boundary: the right DODAGID, but paired with a Local RPLInstanceID
+    // (high bit set, RFC 6550 section 5.1) where the membership holds the
+    // Global one -- the two halves of the key's namespace, told apart only
+    // if the comparison actually looks at the RPLInstanceID too.
+    static constexpr uint8_t LOCAL_INSTANCE = 0x80;
+    deliverAck(LOCAL_INSTANCE, dodagAId, rootALinkLocal, 2);
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsDaoAckPendingIn(RPL_DEFAULT_INSTANCE, dodagAId),
+                          true,
+                          "A DAO-ACK naming a Local RPLInstanceID cleared a membership held under "
+                          "the Global one: the RPLInstanceID half of the key is not being compared");
+
+    // Abnormal: a DODAG this node has never joined at all.
+    deliverAck(RPL_DEFAULT_INSTANCE, Ipv6Address("2001:9::1"), rootALinkLocal, 2);
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsDaoAckPendingIn(RPL_DEFAULT_INSTANCE, dodagAId),
+                          true,
+                          "A DAO-ACK for a DODAG this node never joined cleared DODAG A");
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsDaoAckPendingIn(RPL_DEFAULT_INSTANCE, dodagBId),
+                          false,
+                          "A DAO-ACK for a DODAG this node never joined disturbed DODAG B, which "
+                          "was already acknowledged");
+
+    // Semi-normal: DODAG A's own key and its own (now desynced) pending
+    // sequence clears it, without disturbing DODAG B (already acknowledged
+    // above, and confirmed to stay that way).
+    deliverAck(RPL_DEFAULT_INSTANCE, dodagAId, rootALinkLocal, 2);
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsDaoAckPendingIn(RPL_DEFAULT_INSTANCE, dodagAId),
+                          false,
+                          "DODAG A's own correct acknowledgement did not clear it");
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsDaoAckPendingIn(RPL_DEFAULT_INSTANCE, dodagBId),
+                          false,
+                          "Acknowledging DODAG A disturbed DODAG B's already-acknowledged state");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Check MRHOF (RFC 6719) parent selection: path cost, not just hop
  *        count, decides the preferred parent, and hysteresis
  *        (PARENT_SWITCH_THRESHOLD) keeps it from flapping over a marginal
@@ -5598,7 +5841,10 @@ RplDaoAckSequenceTestCase::DoRun()
     };
 
     // RplRoutingProtocol::HandleDaoAck() never checks who a DAO-ACK actually
-    // came from, only its sequence and status, and DeliverRawRplMessage()
+    // came from -- only which DODAG it names, plus its sequence and status
+    // (@see RplMultiDodagDaoAckIsolationTestCase for the key resolution
+    // itself; here there is only ever the one membership for it to
+    // resolve to) -- and DeliverRawRplMessage()
     // hands it straight to the child's Ipv6L3Protocol::Receive() -- no
     // channel involved, so the blacklist above cannot swallow it, and
     // nothing about a real send (routing, Neighbour Discovery) has to
@@ -7506,6 +7752,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplMultiDodagVersionIsolationTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplMultiDodagDtsnIsolationTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplMultiDodagPathSequenceIsolationTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplMultiDodagDaoAckIsolationTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDioRejectionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplParentLossRejoinTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplInterfaceRestartTestCase, TestCase::Duration::QUICK);
