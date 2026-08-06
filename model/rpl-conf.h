@@ -215,6 +215,16 @@ constexpr uint16_t RPL_MAX_RANKINC = 8 * RPL_MIN_HOPRANKINC;
 constexpr uint16_t RPL_SIGNIFICANT_CHANGE_THRESHOLD = 4 * RPL_MIN_HOPRANKINC;
 constexpr uint8_t RPL_DEFAULT_INSTANCE = 0;
 
+/// RPLInstanceID field sub-bits for a Local instance (RFC 6550 section 5.1,
+/// "|1|D|ID|"): set on the top bit to mark the field as Local rather than a
+/// 7-bit Global instance number, cleared for a Global one.
+constexpr uint8_t RPL_LOCAL_INSTANCE_FLAG = 0x80;
+/// The Local RPLInstanceID's own 'D' flag (the second-highest bit): "always
+/// set to 0 in RPL control messages" (RFC 6550 section 5.1). Only ever
+/// meaningful together with RPL_LOCAL_INSTANCE_FLAG -- for a Global
+/// instance this same bit is simply part of its 7-bit ID space (0..127).
+constexpr uint8_t RPL_LOCAL_INSTANCE_D_FLAG = 0x40;
+
 /// Routing Metric/Constraint object types (RFC 6551, section 4).
 constexpr uint8_t RPL_DAG_MC_LQL = 6;
 constexpr uint8_t RPL_DAG_MC_ETX = 7;

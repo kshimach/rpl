@@ -2872,6 +2872,20 @@ RplRoutingProtocol::CreateLocalDodag(uint8_t instanceId, uint8_t mop)
         return DodagKey{instanceId, Ipv6Address::GetAny()};
     }
 
+    // RFC 6550 section 5.1: a Local RPLInstanceID's own 'D' flag "is always
+    // set to 0 in RPL control messages". Every control message this DODAG
+    // ever sends (SendDio()/SendDao()/DaoRetry()/the root's own DAO-ACK
+    // reply) just copies dodag.instanceId verbatim, so clearing the flag
+    // once here is what keeps all of them compliant regardless of what the
+    // caller passed, rather than needing every one of those call sites to
+    // know about it. Left untouched when the top bit (RPL_LOCAL_INSTANCE_
+    // FLAG) is clear: for a Global RPLInstanceID this same bit is simply
+    // part of its own 7-bit ID space (0..127), not a flag at all.
+    if (instanceId & RPL_LOCAL_INSTANCE_FLAG)
+    {
+        instanceId &= static_cast<uint8_t>(~RPL_LOCAL_INSTANCE_D_FLAG);
+    }
+
     DodagKey key{instanceId, address};
     // No Prefix Information option: unlike RplHelper::SetRoot()'s DODAG,
     // neither AODV-RPL (RFC 9854) nor P2P-RPL (RFC 6997) SLAAC an address

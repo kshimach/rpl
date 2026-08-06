@@ -2160,6 +2160,118 @@ RplCreateLocalDodagTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief CreateLocalDodag() clears a Local RPLInstanceID's own 'D' flag,
+ *        regardless of what the caller passed, and leaves a Global
+ *        RPLInstanceID's identical bit position untouched.
+ *
+ * Found auditing CreateLocalDodag() with the protocol-test-matrix skill,
+ * against RFC 6550 section 5.1: the Local RPLInstanceID field is
+ * "|1|D|ID|" (top bit marks it Local, the next is the 'D' flag, the
+ * remaining six are the actual ID, 0..63), and "the 'D' flag ... is always
+ * set to 0 in RPL control messages". Every control message a DODAG sends
+ * (SendDio(), SendDao(), ...) just copies DodagMembership::instanceId
+ * verbatim, so an uncorrected 'D' flag on it would land on the wire in
+ * every one of them. A probe (scratch/rpl-local-instance-d-flag-probe.cc,
+ * deleted once this was confirmed and fixed) confirmed the DODAG's own key
+ * carried the caller's uncorrected byte straight through before this fix.
+ *
+ * The Global case matters just as much here: the exact same bit position
+ * (0x40) is simply part of a Global RPLInstanceID's own 7-bit ID space
+ * (0..127) when the top bit is clear, not a flag at all -- masking it
+ * unconditionally would silently corrupt an otherwise ordinary Global ID
+ * like 64 (0x40) into 0.
+ */
+class RplCreateLocalDodagClearsDFlagTestCase : public TestCase
+{
+  public:
+    RplCreateLocalDodagClearsDFlagTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplCreateLocalDodagClearsDFlagTestCase::RplCreateLocalDodagClearsDFlagTestCase()
+    : TestCase("CreateLocalDodag() clears the Local RPLInstanceID's own 'D' flag")
+{
+}
+
+void
+RplCreateLocalDodagClearsDFlagTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(1);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.AssignWithoutAddress(devices);
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    Simulator::Stop(Seconds(2));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> rpl = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+
+    struct
+    {
+        uint8_t requested;      //!< instanceId passed to CreateLocalDodag()
+        uint8_t expected;       //!< instanceId the resulting key should carry
+        const char* what;       //!< what the case is, for the failure message
+    } cases[] = {
+        // Local, D already clear: minimum ID (0) and maximum ID (63)
+        // together with D=0, both already compliant, must pass through as
+        // is. Every case below deliberately maps to a distinct final
+        // instanceId, since a repeated key would trip
+        // CreateDodagMembership()'s own "already has a membership"
+        // assertion on the second CreateLocalDodag() call for this same
+        // node (same DODAGID throughout: its own one global address).
+        {0x80, 0x80, "a Local instanceId with D already clear, minimum ID"},
+        {0xBF, 0xBF, "a Local instanceId with D already clear, maximum ID"},
+        // Local, D set: the actual regression case, at two different ID
+        // values from the pair above.
+        {0xC1, 0x81, "a Local instanceId with D set, ID one above the minimum"},
+        {0xFE, 0xBE, "a Local instanceId with D set, ID one below the maximum"},
+        // Global: bit 0x40 is part of the 7-bit ID space here, not a flag,
+        // and must never be touched. RPL_DEFAULT_INSTANCE (0) itself is not
+        // included here: the root already holds the base DODAG's own
+        // membership under that exact key (RplHelper::SetRoot() forms it at
+        // this same node's own global address), and CreateDodagMembership()
+        // asserts against forming a second membership under a key that is
+        // already taken.
+        {0x40, 0x40, "a Global instanceId that happens to have bit 0x40 set"},
+        {0x7F, 0x7F, "the maximum Global instanceId (127)"},
+    };
+
+    for (const auto& testCase : cases)
+    {
+        RplRoutingProtocol::DodagKey key =
+            rpl->CreateLocalDodag(testCase.requested, RPL_MOP_NON_STORING);
+        NS_TEST_ASSERT_MSG_NE(key.dodagId,
+                              Ipv6Address::GetAny(),
+                              "CreateLocalDodag() failed for " << testCase.what);
+        NS_TEST_ASSERT_MSG_EQ(static_cast<uint32_t>(key.instanceId),
+                              static_cast<uint32_t>(testCase.expected),
+                              "Wrong resulting instanceId for " << testCase.what);
+        NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(testCase.expected, key.dodagId),
+                              true,
+                              "Not joined under the expected (corrected) key for "
+                                  << testCase.what);
+    }
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief The DODAG Version Number lollipop counter (RFC 6550 section 7.2) is
  *        tracked and compared per DODAG, not shared node-wide.
  *
@@ -8370,6 +8482,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplDodagFormationTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplMultiDodagTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplCreateLocalDodagTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplCreateLocalDodagClearsDFlagTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplMultiDodagVersionIsolationTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplMultiDodagDtsnIsolationTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplMultiDodagPathSequenceIsolationTestCase, TestCase::Duration::QUICK);

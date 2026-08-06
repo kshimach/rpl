@@ -3218,3 +3218,54 @@ ID、0..63) は、この実装の `CreateLocalDodag()` が呼び出し元から�
 対象 (中継一般化ロジックそのもの) の範囲外と判断し、あえて手を
 付けなかった。`CreateLocalDodag()` 自体を対象にした将来の監査で
 検討する。
+
+### 34.7 34.6 節のスコープ外事項を回収: `CreateLocalDodag()` の 'D' フラグ
+
+34.6 節で「将来の監査で検討する」としたスコープ外事項を、
+`CreateLocalDodag()` を対象に `protocol-test-matrix` を改めて適用する
+形で回収した。
+
+**設計判断**: RFC 6550 section 5.1 の "The 'D' flag in a local
+RPLInstanceID is always set to 0 in RPL control messages" は無条件
+(例外の記述が無い) — 一方 data パケットでの D フラグの意味
+(DODAGID が送信元か宛先かを示す) は、この実装ではローカル DODAG が
+常に 1 ノードに根付く (root は必ずその DODAGID の所有者) という前提
+から、実質的に「上り/下り」と等価であり、これは既に `RplPacketInfo
+Header` 自身の 'O' (Down) フラグが正しく担っている。よって今回は
+**制御メッセージの D=0 強制のみ** を直し、data パケットごとの動的な
+D ビット管理は見送った — 実装するには `PrepareOutgoingPacket()` の
+RPI 付与部分と `FindDodagByInstance()`/`ReadRpiInstanceId()` の
+照合ロジックの両方を、動的に変わりうる D ビットを無視してマッチする
+よう同時に直す必要があり (でないと、送信側だけ D を動的に変えて
+受信側が固定値でしか照合できないと、中継が壊れる)、34 節でコミット
+したばかりの中継一般化ロジックに新たな回帰リスクを持ち込む。この
+実装には RFC 6553 section 4 の IPv6-in-IPv6 トンネリングモデルも
+無く、D ビットを実際に読む相手も存在しないため、費用対効果で見送りが
+妥当と判断した。
+
+**プローブでの再現** (`scratch/rpl-local-instance-d-flag-probe.cc`、
+確認後削除): `CreateLocalDodag(0xC5, ...)` (ローカルフラグ + D フラグ
++ ID=5) を呼び、戻ってきた `DodagKey.instanceId` が `0xc5` のまま
+(未補正) であることを確認。`SendDio()` が `dodag.instanceId` を
+無条件でそのまま `dio.SetInstanceId()` に渡すことも確認済みなので、
+この未補正値がそのまま全ての制御メッセージ (DIO/DAO/DAO-ACK) の
+ワイヤ上に乗ることが分かる。
+
+**修正**: `rpl-conf.h` に `RPL_LOCAL_INSTANCE_FLAG = 0x80`
+(トップビット、Local マーカ) と `RPL_LOCAL_INSTANCE_D_FLAG = 0x40`
+(D フラグ自身) を追加。`CreateLocalDodag()` の冒頭で、渡された
+`instanceId` の `RPL_LOCAL_INSTANCE_FLAG` が立っている場合のみ
+`RPL_LOCAL_INSTANCE_D_FLAG` をクリアしてから `DodagKey` を構築する
+— Global instanceId (トップビット無し) はこのビット位置が単に
+7 ビット ID 空間の一部 (0..127) なので一切触らない。この 1 箇所
+(membership 作成時) で直すことで、以降その `dodag.instanceId` を
+そのままコピーするだけの全ての送信経路 (`SendDio()`/`SendDao()`/
+`SendNoPathDao()`/`DaoRetry()`/root の DAO-ACK 応答) が自動的に
+準拠する。
+
+**検証**: 回帰テスト `RplCreateLocalDodagClearsDFlagTestCase` を追加
+— Local で D 既にクリア (最小/最大 ID)・Local で D 立っている
+(別の ID で衝突回避)・Global でビット 0x40 がたまたま立っている値
+(64) や最大値 (127) が無改修のまま通ることを、テーブル駆動で確認。
+`./test.py -s rpl` 相当 (60 件) を 5 回連続実行して全件安定して PASS
+することを確認、4 つの既存シナリオも 0% packet loss を維持。
