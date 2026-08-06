@@ -2404,8 +2404,10 @@ instance 0 とは別に DODAG 状態を持つ必要があるので、storing mod
 1. **マルチインスタンス対応** — 複数 DODAG に同時所属できるよう、
    rank・preferred parent・parent set・Trickle タイマー・topology を
    instance 単位に持たせる。AODV-RPL・P2P-RPL 双方に共通する前提で、
-   storing mode の有無とは独立に必要。**31 節の通りストレージ層を
-   対応済み (2 つ目の instance を実際に作る機能自体はまだ)。**
+   storing mode の有無とは独立に必要。**31 節でストレージ層、32 節で
+   実際に 2 つ目以降の instance を join/生成する経路まで対応済み
+   (受動 join は `HandleDio()`、能動形成は `CreateLocalDodag()`)。
+   ただし 2 つ目以降の DODAG での中継は対象外 (32.6 節)。**
 2. **storing mode** — AODV-RPL の hop-by-hop 側に直接必要
    (30.1 節)。ここで作る「宛先ごとに next hop を引いて転送する」
    機構は、P2P-RPL 自身の hop-by-hop 転送状態 (30.2 節) ともほぼ
@@ -2531,3 +2533,372 @@ RPLInstanceID を実際に join/生成する API、AODV-RPL、P2P-RPL は
 未着手。それぞれの実装時に、実際の要求に合わせて `DodagMembership`
 を新規作成する経路 (今回作った `m_dodags[key]` への in-place 構築の
 パターンを流用できるはず) を設計する。
+
+## 32. 複数 DODAG への実際の同時参加 (31 節の続き)
+
+31 節が「ストレージ層のみ」に留めた続き。ユーザーから「(AODV-RPL/
+P2P-RPL 本体を実装しなくても) 複数 DODAG に本当に同時参加できるように
+してほしい」との要望を受け、`m_dodags` に実際に 2 件目以降の
+`DodagMembership` を作る/使う経路を実装した。RFC 6550 section 3.4 が
+想定する「1 つのネットワークに複数の DODAG が共存する」一般的な
+ケースであり、AODV-RPL/P2P-RPL 固有の意味論は要らない。
+
+設計は Plan agent によるレビューを 1 回挟んで確定させた
+(`/Users/kawashy/.claude/plans/vast-chasing-map.md` に経緯を残した
+プラン)。実装・テスト作成の過程でさらに 1 件、レビューでは見つからな
+かったバグを実機テストで発見した (32.4 節)。
+
+### 32.1 変更の中身
+
+- **`GetBaseDodag()` の再定義**: 「`m_dodags` の唯一のエントリ」から
+  「最初に作られたメンバーシップ」に変更。`bool m_hasBaseDodag` +
+  `DodagKey m_baseDodagKey` を追加し、`JoinDodag()`・
+  `HandleDadSuccess()` の root 分岐・新設の `CreateDodagMembership()`
+  (下記) がメンバーシップを新規作成するたびに「まだ base が無ければ
+  自分を base にする」。`GetRank()`・`IsJoined()`・`RouteOutput()`・
+  `RouteInput()`・`PrepareOutgoingPacket()` など、引数を取らない既存の
+  公開アクセサは全てこの「base」を指したままで意味が変わらない
+  (31 節で作った「薄いラッパー」の構造がそのまま活きた)。
+- **`HandleDio()`**: 「既に何か 1 つに join していたら他の DIO は
+  無視する」という単一メンバーシップ前提を撤廃。DIO 自身が運ぶ
+  `(instanceId, dodagId)` で `m_dodags` を引き、無ければ
+  `JoinDodag()` で新規 join、あれば version 比較へ、という判定に
+  変えた。root 側のゲートも「自分が root の DODAG では親を取らない」
+  だけに絞り、それ以外の DODAG の DIO は通常の join 判定に落ちる
+  ようにした — root が同時に別 DODAG のただの member になれる
+  (AODV-RPL の OrigNode が自分の RREQ-Instance の root でありながら
+  base の member でもある、という 30 節で確認した形に対応)。
+- **`HandleDis()`**: base 1 件だけを見ていたのを `m_dodags` 全体への
+  range-for に変更 (multicast なら全メンバーシップの Trickle を
+  reset、unicast なら全メンバーシップ分の DIO を返す)。
+- **`HandleDaoAck()`**: `GetBaseDodag()` で無条件に解決していたのを
+  DAO-ACK 自身が運ぶ `(instanceId, dodagId)` で解決するよう修正
+  (Plan agent レビューで発見。2 つ目の DODAG の root から来た
+  DAO-ACK が base の `daoAckPending` に誤って適用され、実際の対象
+  membership が永遠に再送し続けるバグだった)。
+- **`GetGlobalAddressIn(const DodagMembership&)`** を新設し、
+  `SendDao()`/`SendNoPathDao()`/`DaoRetry()` の `GetGlobalAddress()`
+  呼び出しを置き換えた (Plan agent レビューで発見。
+  `GetGlobalAddress()` は「インターフェース順で最初に見つかった
+  GLOBAL アドレス」を返すだけで DODAG を区別しないため、2 つの
+  DODAG がそれぞれ別 prefix を配ると、2 つ目の DODAG 向け DAO が
+  1 つ目の DODAG の GUA を Target に詰めてしまっていた)。
+  `dodag.prefix`/`dodag.prefixLength` に実際に一致する、TENTATIVE
+  でない GLOBAL アドレスを探す実装で、`GlobalAddressOf()` (隣接
+  ノード向け、アドレスをビット演算で再構築するだけ) をそのまま
+  使わなかったのは、DAD 失敗でアドレスが実在しなくなっているケース
+  を見逃さないため。
+- **`CreateLocalDodag(instanceId, mop)`** を新設。AODV-RPL/P2P-RPL が
+  どちらも要求する「ノードが実行時に任意のタイミングで、自分自身を
+  root とする新しい (ローカルな) DODAG を能動的に立てられる」という
+  能力 (ユーザーからの追加フィードバック、32 節冒頭)。DODAGID は
+  呼び出し時点のこのノード自身のグローバルアドレス、Prefix
+  Information は載せない (どちらの RFC も local instance では
+  SLAAC させない)。`HandleDadSuccess()` の root 分岐と共通の
+  `CreateDodagMembership(key, mop)` に括り出した。
+
+### 32.2 `LeaveDodag()`: base が抜けた場合の昇格、ただし version 移行時は昇格させない
+
+base のメンバーシップが (poison=true で) 本当に detach した場合、
+生き残っているメンバーシップがあればその先頭を新しい base に昇格
+させる。これをしないと、複数 DODAG に参加しているノードが base だけ
+失っても `GetRank()`/`IsJoined()`/`RouteOutput()` 等が「何にも
+参加していない」ことになってしまう。
+
+昇格は `poison == true` の時だけ行う。`HandleDio()` の version
+migration 分岐は `LeaveDodag(key, false); JoinDodag(dio, interface);`
+という「同じ key を一旦消してすぐ作り直す」ペアを 1 イベント内で
+呼ぶ (旧コードのコメントの通り「rejoins in the same event」)。
+ここで無条件に昇格させると、消えている一瞬の間に別のメンバーシップへ
+base が移り、直後に `JoinDodag()` が同じ key を作り直しても
+(`m_hasBaseDodag` が既に true になっているため) base の座が戻って
+こない — version bump のたびに base が別の DODAG へすり替わってしまう
+バグになる。`poison` はまさに「これは本当に detach か、それとも
+同じ key へすぐ戻ってくる migration か」を区別する既存のフラグ
+だったので、それをそのまま昇格の条件にした。
+
+### 32.3 `RplHelper` は無改修
+
+`RplHelper::SetRoot()` を異なるノードに複数回呼ぶこと自体は元々
+禁止されていなかった。各 root の DODAGID は自分自身のグローバル
+アドレスなので、2 つの root は (`RootPrefix` さえ別にしておけば)
+自動的に異なる `DodagKey` を持つ。2 つの DODAG が今まで同時に
+立たなかった唯一の理由は `HandleDio()` の単一メンバーシップ前提
+だったので、そちらを直せば `RplHelper`/ワイヤフォーマット/`RplConf`
+は一切変更せずに複数 root のシナリオが動くようになった。
+
+### 32.4 テストで見つけたバグ: `RouteOutput()` の判定順序
+
+Plan agent のレビューを経て実装・ビルドまで完了した後、新規テスト
+`RplMultiDodagTestCase` (2 root + 共有ノード 1 台) が
+`rootB->ComputeSourceRoute(sharedOnDodagB, hops)` で失敗した。
+
+原因は `RouteOutput()` の判定順序。非 root メンバーの上り unicast
+トラフィックは:
+
+```cpp
+if (dodag)  // dodag == GetBaseDodag()
+{
+    Ptr<Ipv6Route> route = RouteViaPreferredParent(*dodag, dst);
+    if (route) { return route; }
+}
+// この後に「dst が他の DODAG 自身の DODAGID と一致するか」を見る
+// fallback ループがあった
+```
+
+という順序で書いていたが、`RouteViaPreferredParent(dodag, dst)`
+(cc:2128) は `dodag.preferredParent`/`dodag.parents` だけを見て
+route を組み立てるだけで、**`dst` が実際にその DODAG に関係あるか
+どうかは一切見ていない**。つまり base の分岐は `dst` が何であろうと、
+base に preferred parent さえあれば無条件に成功してしまい、後ろの
+fallback ループには絶対に到達しない。
+
+結果として、2 つ目の DODAG (dodagB) 向けの DAO は base (dodagA) の
+preferred parent 経由で送られてしまい、物理的に dodagA の root
+(rootA) へ向かって出ていく。rootA は forwarding が有効なので
+`RouteInput()` で中継しようとするが、`RouteInput()` は意図的に
+base 専用のままにしてあるため経路が見つからず、パケットはそこで
+落ちる — dodagB の root には永遠に届かない。
+
+`NS_LOG="RplRoutingProtocol=level_all|prefix_all"` を有効にした
+使い捨て scratch (`rpl-multi-dodag-probe.cc`、確認後に削除) で
+`PrepareOutgoingPacket`/`RouteInput`/`RouteOutput` の実際の送信先
+IP を追跡し、dodagB 宛のパケットが rootA の `RouteInput()` で
+"No route to ..." として落ちている行を直接確認して特定した。
+
+修正は判定順序を逆にしただけ: 「`dst` が他のどれかのメンバーシップ
+自身の DODAGID と一致するか」を **先に** 見て一致すればそちらの
+preferred parent 経由で返し、一致しなければ base の
+`RouteViaPreferredParent()` にフォールバックする。単一 DODAG しか
+無いシナリオでは新しいループは何もヒットしないので既存 47 テスト・
+4 シナリオの挙動は変わらない。
+
+この一件を除けば、Plan agent のレビューで洗い出した 2 件のバグ
+(`GetGlobalAddress()`・`HandleDaoAck()`、32.1 節) と `LeaveDodag()`
+の昇格タイミング (32.2 節) はすべて実装前に潰せていた。
+
+### 32.5 テストで見つけたもう1つの落とし穴: 中継の巻き添え
+
+`RplMultiDodagTestCase` の初版は
+`rootA->GetTopologySize() == 1`/`rootB->GetTopologySize() == 1` を
+直接アサートしていたが、これは誤りだった。2 root + 共有ノード 1 台
+という 3 ノード構成で、root 同士だけを `SimpleChannel::BlackList()`
+で直接聞こえなくしても、**共有ノードが両方の DODAG に join した
+時点で、共有ノード自身の DIO が両方の DODAG の Configuration/Prefix
+情報を運んで再送されるため**、もう一方の root がその DIO を共有
+ノード経由で受信し、そちらの DODAG にも (受動的に) join してしまう
+— これは 32.1 節で relax した root のゲートが正しく機能している
+証拠であり、実際の RPL の多段伝播そのものなので直すべきバグではない。
+
+`BlackList()` はデバイスのペア単位でしか効かず、「経由するノードが
+何を relay しているか」までは区別できないため、この巻き添えを
+テスト構成だけで完全に防ぐ方法は無い。テスト側を
+`GetTopologySize()` の厳密一致から、`ComputeSourceRoute()` で
+共有ノード自身の (各 DODAG の prefix 上の) アドレスへの到達性だけを
+個別に確認する形に直した。こちらなら root 同士が巻き添えで
+何を追加で learn しようと影響を受けない。
+
+### 32.6 意図的にやらないこと
+
+- **2 つ目以降の DODAG での中継**: `RouteInput()`/
+  `PrepareOutgoingPacket()` は base 専用のまま。あるノードが 2 つ目の
+  DODAG に参加し、その root へ自分の DAO を送ることはできる (32.1/
+  32.4 節) が、別のノードの 2 つ目の DODAG 宛トラフィックを中継は
+  しない。2 つ目以降の DODAG は「root と直接無線到達できるノードだけ
+  が確実に参加できる」という制約になる (32.5 節で見た通り、間接的な
+  join 自体は起こりうるが、それは中継とは別の話)。
+- **Trickle の RNG ストリーム**: `AssignStreams()` は
+  `Simulator::Run()` 前に 1 回しか呼ばれず、この時点でそのノードが
+  将来いくつの DODAG に join するかは分からない (ns-3 のストリーム
+  予約は静的な数を要求する)。今回は全メンバーシップが同じ
+  `m_dioTrickleStream` を使い回す今の挙動をそのまま残した (=同一
+  ノード上の複数 DODAG の Trickle ジッタは独立でない)。正しく直すに
+  は固定の上限を決め打ちするか別の割り当て方式が要り、どちらも
+  今回のスコープには重いと判断した。
+- **1 ノードが `RplHelper::SetRoot()` で複数 DODAG の root になる
+  こと**: 対象外。`CreateLocalDodag()` (32.1 節) が実行時に自分自身
+  を root とする DODAG を追加で立てられるので、AODV-RPL/P2P-RPL が
+  必要とする範囲はこちらでカバーする想定。
+
+### 32.7 テスト
+
+`RplDioRejectionTestCase` (「DIOs HandleDio() must turn away」) の
+「別 DODAG の DIO は既に join 済みなら無視される」という
+サブシナリオを削除した。これは今回撤廃した旧仕様そのものを検証する
+アサーションだったため (`node->GetDodagId()`/`GetRank()` が変わらない
+ことを確認していたが、新仕様では実際に 2 つ目の DODAG として join
+される)。
+
+新規に 2 件追加 (`./test.py -s rpl`、既存 47 件 + 新規 2 件で計 49 件、
+5 回連続 PASS 確認済み):
+
+- **`RplMultiDodagTestCase`**: 独立した 2 root (異なる `RootPrefix`)
+  + 両方と直接無線到達できる共有ノード。共有ノードの
+  `GetDodagCount() == 2`、base とそれ以外の両方で有限の rank、
+  そして両方の root から `ComputeSourceRoute()` で共有ノードへ到達
+  できること (32.4 節で見つけた `RouteOutput()` の順序バグを実際に
+  検出したのはこのアサーション)。
+- **`RplCreateLocalDodagTestCase`**: base に join 済みの root ノードで
+  `CreateLocalDodag()` を呼び、戻り値の key で
+  `IsJoinedTo()`/`GetRankIn()` が正しいこと、`GetDodagCount() == 2`
+  で base を置き換えていないこと、隣接ノードがその local DODAG に
+  受動 join できるが Prefix Information が無いので SLAAC しない
+  (アドレス数が base 分の 2 個のまま) ことを確認する。
+
+新しく公開した `IsJoinedTo()`/`GetRankIn()`/`GetDodagCount()` は
+`m_dodags` を薄くラップするだけの最小限の API で、
+`GetPreferredParentIn()` 等は今回のテストに不要なので追加していない
+(AODV-RPL/P2P-RPL 実装時に要れば足す)。
+
+### 32.8 検証
+
+- `./ns3 build`: 警告・エラー無し。
+- `./test.py -s rpl` 相当 (`test-runner --suite=rpl`): 49/49 PASS、
+  5 回連続。
+- 既存 4 シナリオ、全て 0% packet loss を維持:
+  `rpl-6lowpan-simple` (OF0 デフォルト、`--mrhof --lql`)、
+  `ns3edit-rpl-mesh`、`ns3edit-rpl-line`。
+
+## 33. 複数 DODAG でのシーケンス番号 (準正常・異常・境界値) の独立性検証
+
+32 節で複数 DODAG への実際の同時参加を実装した後、ユーザーから
+「複数 instance で、シーケンスの準正常・異常・境界値の試験をしてほしい」
+との要望を受け、DODAG Version Number・DTSN・Path Sequence という 3 つの
+lollipop シーケンスカウンタ (RFC 6550 section 7.2) それぞれについて、
+2 つの DODAG が同時に存在するとき互いの状態が漏れ出さないことを検証する
+テストを追加した。DAO Sequence (`dodag.daoSequence`) は lollipop 比較を
+受けない (DAO-ACK の相関にしか使わない、ローカルなカウンタ) ため対象外。
+
+### 33.1 追加したテスト
+
+いずれも「準正常 (通常の増分)」「異常 (newer でない値は無視される)」
+「境界値 (255 -> 0 の wrap、および wrap 後の逆行拒否)」の 3 パターンを
+1 つの DODAG (A) に対して行い、**そのたびにもう一方の DODAG (B) の
+状態が一切動かないことを毎回確認する** という構成で統一した。
+
+- **`RplMultiDodagVersionIsolationTestCase`**: 1 ノードが 2 つの peer
+  (それぞれ別 DODAG を広告) から DIO を受け取る構成
+  (`RplVersionWrapTestCase` と同型)。A の rank (= `GetRank()`) が
+  準正常・異常・境界値それぞれで正しく動く/動かないことを、B の rank
+  (`GetRankIn()`) が終始不変であることと合わせて確認する。
+- **`RplMultiDodagDtsnIsolationTestCase`**: 独立した 2 root + 共有ノード
+  (`RplMultiDodagTestCase` と同型)。各 root に DAO 監視ソケットを立て、
+  A の DAO parent から届く DTSN が rule 1/2 (RFC 6550 section 9.6) 通り
+  DAO 再送を起こすかどうかを DAO 到着数の増減で見る。B 側の DAO 数が
+  終始動かないことを毎回確認する。
+- **`RplMultiDodagPathSequenceIsolationTestCase`**: 独立した 2 root の
+  み (中継ノード無し)。`RplStaleDaoTestCase` と同じ判定ロジックを、
+  **わざと数値的に同一の target/nowhere アドレス** (プレフィックスだけ
+  違う) を両方の root に送りつける形で検証する — Path Sequence の状態が
+  target アドレス単体をキーにした共有テーブルだったとしたら、この作り
+  でなければ検出できない。
+
+### 33.2 lollipop 比較の線形/循環領域をまたぐ遷移は「newer」にならないことがある
+
+3 つのテストのうち Version と DTSN の両方で最初に踏んだ罠: `RplSequenceCompare()`
+(rpl-conf.h) は 128 を境に「線形領域」(128-255) と「循環領域」(0-127) を
+分けており (section 7.2 rule 3.1/3.2)、**この 2 領域をまたぐ比較は単純な
+大小比較にならない**。例えば `RplSequenceCompare(255, 2)` (候補=255 が
+線形領域、既存=2 が循環領域) は `LESS` を返す — 255 は 2 より「新しい」
+どころか「古い」と判定される。これは実装のバグではなく RFC の rule 3.1
+そのもの (SEQUENCE_WINDOW=16 以内で領域をまたぐ場合だけ「循環側が線形側
+を追い越した」とみなす、それ以外は通常の大小関係と逆になる) だが、
+テストの数値設計で見落としやすい。
+
+対処: version/DTSN とも「開始値を境界 (253 や 250 ではなく、実際には
+253) に置き、その後は同じ線形領域内で 1 ずつ進め、最後に 255 -> 0 の
+wrap だけを踏む」という、`RplVersionWrapTestCase` が最初から採っていた
+設計に揃えた。低い値 (循環領域) から高い値 (線形領域) へ一気に飛ぶ
+ステップは入れない。
+
+### 33.3 生きている root 自身の背景送信と、手作りインジェクションの競合
+
+DTSN テストの当初の実装は `RplHelper::SetRoot()` で作った**本物の
+root** に対して `SendRawRplMessage(rootNode, ...)` で「root からの
+DIO」を偽装注入していた。root は実際に稼働しているノードなので、
+自分自身の Trickle タイマーによる本物の DIO (DTSN は常に 0 のまま、
+何もこの値を bump していないので) も並行して送信され続ける。この
+本物の DIO が、直前に注入した偽の DTSN=1 を「上書きして 0 に戻す」
+タイミングで割り込むと、次に送る「同じ DTSN をもう一度」という
+異常系ステップが、実際には「0 から 1 への正当な増分」に化けてしまい、
+本来 0 件であるべき DAO 再送が発生した (`NS_LOG="RplRoutingProtocol=
+level_all|prefix_all"` で `HandleDio(): DAO parent ... incremented its
+DTSN` が 2 回目の注入でも発火しているのを直接確認して特定)。
+
+対処: `RplHelper::Set("DioIntervalMin", TimeValue(Seconds(3600)))` を
+テスト全体に適用し、root 自身の Trickle 再送がテスト時間内に絶対に
+起きないようにした上で、最初の join DIO 自体も (root の自然な送信を
+待たず) 手動で注入するよう作り替えた。あわせて、この注入 DIO が
+`SetDagConfiguration()` を省略していたために JoinDodag() がゼロ長の
+Trickle interval を採用してしまっていた欠落と、`SetPrefixInfo()` を
+省略していたために共有ノードが一切 SLAAC できず `SendDao()` が
+「no global address」で永遠に送信を諦めていた欠落も、同じ手動注入
+DIO の作り込み不足として合わせて見つかり、修正した。
+
+### 33.4 「非 base DODAG の中継」という 32.6 節の既知の制限が、クラッシュとして顕在化した
+
+33.3 節の対処の途中、DTSN テストが `NS_ASSERT failed, cond="!ret.IsAny()",
+msg="Could not find any address for ... on interface 1"`
+(`src/internet/model/ipv6-l3-protocol.cc:677`,
+`Ipv6L3Protocol::SourceAddressSelection()`) で丸ごとクラッシュする
+事象に遭遇した。
+
+原因は 32.5 節で確認した「共有ノードが 2 つの DODAG に join すると、
+自分の DIO で両方を再広告するため、直接聞こえないはずの 2 つの root
+同士が共有ノード経由で間接的に互いを発見し、受動的に相手の DODAG にも
+join してしまう」という現象そのもの。root B がこうして DODAG A にも
+非 root member として join すると、root B は DODAG A の root (root A)
+へ自分の DAO を送ろうとするが、その経路は共有ノードを経由した中継が
+必要になる。`RouteInput()` は 32.6 節で意図的に base DODAG 専用のまま
+にしてあるため、この中継は「サポート外」のはずだった — が、実際には
+きれいに「経路が見つからず drop」にはならず、`RouteViaPreferredParent()`
+が内部で無条件に呼ぶ `Ipv6L3Protocol::SourceAddressSelection()` が
+(中継中の一時的な状態で) どのグローバルアドレスも見つけられずに
+`NS_ASSERT` でクラッシュする経路が存在した。
+
+32.6 節で「サポート外」と書いた制限が、実際には「静かな失敗」ではなく
+「クラッシュしうる」ものだったことが分かったのはこの副産物として大きい
+発見だが、今回のスコープ (テスト追加) でそこまで直すのは大きすぎると
+判断し、**テスト側でこの経路を踏まないようにする** (33.3 節の対処が
+副次的にこれも防いだ: 共有ノード自身の Trickle 間隔を長大化したことで、
+root 同士が発見し合う前にテストが完了するようになった) に留めた。
+
+**既知の課題として明記**: `RouteViaPreferredParent()` を経由する中継
+(`RouteInput()`) が、宛先に対応するグローバルアドレスを持たない状態で
+呼ばれると、ns-3 core 側の `SourceAddressSelection()` がクラッシュしうる。
+32.6 節の「非 base DODAG は中継されない」という制限を、クラッシュでは
+なく通常の経路探索失敗としてきれいに扱うようにするのは、32.6 節の
+「2 つ目以降の DODAG での中継」自体に本格的に着手する際の前提作業と
+すべきである。
+
+### 33.5 DeliverRawRplMessage() と SendRawRplMessage() の使い分けの再確認
+
+Path Sequence テストは当初 `SendRawRplMessage()` で「root 自身から
+root 自身へ」DAO を送ろうとして、`GetTopologySize()` が終始 0 のまま
+という別の失敗を踏んだ。`SendRawRplMessage()` の `src` 引数は ICMPv6
+チェックサムの計算にしか使われず、実際にワイヤに乗る IP ヘッダの送信元
+アドレスは送信元ノード自身の本当のインターフェースアドレスになる —
+`src` に本物の送信ノードのアドレスと異なる値を渡すと、受信側の
+チェックサム検証が (静かに) 失敗してパケットが drop される。
+`RplStaleDaoTestCase` が問題なく動くのは、送信元に指定するノード
+(子ノード) 自身の本物のアドレスを `src` にも渡しているから。
+
+このテストには「本物の子ノード」に相当するものが無い (root 2 台の
+みの構成) ため、`DeliverRawRplMessage()` (チャネル・ソケット送信を
+経由せず `Ipv6L3Protocol::Receive()` に直接手渡す、`RplDtsnWrapTestCase`
+や `RplDaoAckSequenceTestCase` が同じ理由で使っているもの) に切り替えて
+解決した。あわせて `parent` 引数に `target` 自身を渡していた誤りにも
+気付いた (`ComputeSourceRoute()` が正しい経路を組めなくなる) — 有効な
+エントリの `parent` は root 自身のアドレス (target が root の直接の子)
+にする必要がある。
+
+### 33.6 Path Sequence が「同値」を stale として拒否しないことの再確認
+
+Path Sequence の異常系ステップを当初「直前と同じ値をもう一度送る」
+形で書いたが、`HandleDao()` の stale 判定 (`order == LESS ||
+order == NOT_COMPARABLE`) は **同値 (EQUAL) を stale として扱わない**
+— これは RFC 6550 section 9.2.1 の「同じ Target への DAO は同じ
+Path Sequence で送り直されることがある (再送)」という規定に沿った、
+意図的な挙動 (`RplStaleDaoTestCase` の既存コメントに同じ説明がある)。
+そのため「同値を送っても内容が更新されないこと」を確認するテストは
+書けず、実際に古い値 (5 の次に 4) を使う形に直した。

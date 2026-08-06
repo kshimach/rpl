@@ -64,6 +64,64 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
 {
   public:
     /**
+     * @brief Identifies one RPL Instance this node is currently part of.
+     *
+     * RFC 6550 section 5.1: a Local RPLInstanceID (the high bit set) is only
+     * meaningful together with the DODAGID of the node that assigned it --
+     * two different origins may reuse the same raw ID byte for two entirely
+     * unrelated instances. Keying on the pair rather than the ID alone
+     * covers that case for free, which is also the pairing RFC 6997 section
+     * 12 requires to identify a P2P-RPL Hop-by-hop Route. A Global
+     * RPLInstanceID (the only kind this module forms today) just always
+     * pairs with the one DODAG this node picked within it.
+     *
+     * Public because CreateLocalDodag() hands one back to its caller, and
+     * IsJoinedTo()/GetRankIn() take one to identify a non-base membership.
+     */
+    struct DodagKey
+    {
+        uint8_t instanceId; //!< RPLInstanceID
+        Ipv6Address dodagId; //!< DODAGID
+
+        /**
+         * @brief Order two keys, so this type can be a std::map key.
+         * @param other the key to compare against
+         * @return true if this key sorts before @p other
+         */
+        bool operator<(const DodagKey& other) const
+        {
+            return std::tie(instanceId, dodagId) < std::tie(other.instanceId, other.dodagId);
+        }
+
+        /**
+         * @brief Compare two keys for equality.
+         *
+         * Needed because a DodagKey travels as a bound argument on the
+         * Callback DioTrickleFire() is invoked through (MakeCallback(...,
+         * this, key) in JoinDodag()/HandleDadSuccess()): ns-3's
+         * CallbackComponent<T> requires operator== on any bound argument
+         * type, to support comparing two Callback objects for equality.
+         *
+         * @param other the key to compare against
+         * @return true if the two keys are equal
+         */
+        bool operator==(const DodagKey& other) const
+        {
+            return instanceId == other.instanceId && dodagId == other.dodagId;
+        }
+
+        /**
+         * @brief Compare two keys for inequality.
+         * @param other the key to compare against
+         * @return true if the two keys are not equal
+         */
+        bool operator!=(const DodagKey& other) const
+        {
+            return !(*this == other);
+        }
+    };
+
+    /**
      * @brief Get the type ID.
      * @return the object TypeId
      */
@@ -132,6 +190,29 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     void SetAsRoot();
 
     /**
+     * @brief Become the root of a new, self-originated local DODAG.
+     *
+     * For a node that wants to initiate its own DODAG at runtime rather than
+     * (or in addition to) joining one via RplHelper::SetRoot() -- e.g. an
+     * AODV-RPL (RFC 9854) OrigNode forming its RREQ-Instance, or a P2P-RPL
+     * (RFC 6997) Origin forming a temporary DAG. DODAGID is this node's own
+     * current global address (both RFCs root their local instance at the
+     * initiating node itself), so this must be called after the node has
+     * one. Carries no Prefix Information Option -- neither RFC uses one for
+     * the local instance, since every participant already has whatever
+     * address the base DODAG gave it -- so joiners of this DODAG never
+     * attempt SLAAC on it.
+     *
+     * @param instanceId the local RPLInstanceID (high bit set, RFC 6550
+     *        section 5.1) to form the new DODAG under; must not already
+     *        identify a DODAG this node is part of
+     * @param mop the Mode of Operation to advertise
+     * @return the key of the new membership, an empty key (dodagId ::) if
+     *         this node has no global address yet to root the DODAG at
+     */
+    DodagKey CreateLocalDodag(uint8_t instanceId, uint8_t mop = RPL_MOP_NON_STORING);
+
+    /**
      * @brief Whether this node is the DODAG root.
      * @return true if this node is the root
      */
@@ -191,6 +272,32 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      * @return the preferred parent, :: if there is none
      */
     Ipv6Address GetPreferredParent() const;
+
+    /**
+     * @brief Whether this node is currently part of a specific DODAG.
+     *
+     * Unlike IsJoined(), which only ever answers for the base DODAG, this
+     * checks any membership -- base or not -- by its own key.
+     *
+     * @param instanceId the RPLInstanceID of the DODAG
+     * @param dodagId the DODAGID of the DODAG
+     * @return true if this node is part of that DODAG
+     */
+    bool IsJoinedTo(uint8_t instanceId, Ipv6Address dodagId) const;
+
+    /**
+     * @brief Get the rank of this node within a specific DODAG.
+     * @param instanceId the RPLInstanceID of the DODAG
+     * @param dodagId the DODAGID of the DODAG
+     * @return the rank, RPL_INFINITE_RANK if this node is not part of it
+     */
+    uint16_t GetRankIn(uint8_t instanceId, Ipv6Address dodagId) const;
+
+    /**
+     * @brief Get how many DODAGs this node currently belongs to at once.
+     * @return the number of concurrent DODAG memberships
+     */
+    uint32_t GetDodagCount() const;
 
     /**
      * @brief Act on a rank inconsistency reported by the RPL Option (RFC 6553,
@@ -295,61 +402,6 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
         Ipv6Address parent;     //!< the parent the node reports sitting under
         uint8_t pathSequence{0}; //!< path sequence of the DAO this came from
         Time expire;            //!< when the entry goes stale
-    };
-
-    /**
-     * @brief Identifies one RPL Instance this node is currently part of.
-     *
-     * RFC 6550 section 5.1: a Local RPLInstanceID (the high bit set) is only
-     * meaningful together with the DODAGID of the node that assigned it --
-     * two different origins may reuse the same raw ID byte for two entirely
-     * unrelated instances. Keying on the pair rather than the ID alone
-     * covers that case for free, which is also the pairing RFC 6997 section
-     * 12 requires to identify a P2P-RPL Hop-by-hop Route. A Global
-     * RPLInstanceID (the only kind this module forms today) just always
-     * pairs with the one DODAG this node picked within it.
-     */
-    struct DodagKey
-    {
-        uint8_t instanceId; //!< RPLInstanceID
-        Ipv6Address dodagId; //!< DODAGID
-
-        /**
-         * @brief Order two keys, so this type can be a std::map key.
-         * @param other the key to compare against
-         * @return true if this key sorts before @p other
-         */
-        bool operator<(const DodagKey& other) const
-        {
-            return std::tie(instanceId, dodagId) < std::tie(other.instanceId, other.dodagId);
-        }
-
-        /**
-         * @brief Compare two keys for equality.
-         *
-         * Needed because a DodagKey travels as a bound argument on the
-         * Callback DioTrickleFire() is invoked through (MakeCallback(...,
-         * this, key) in JoinDodag()/HandleDadSuccess()): ns-3's
-         * CallbackComponent<T> requires operator== on any bound argument
-         * type, to support comparing two Callback objects for equality.
-         *
-         * @param other the key to compare against
-         * @return true if the two keys are equal
-         */
-        bool operator==(const DodagKey& other) const
-        {
-            return instanceId == other.instanceId && dodagId == other.dodagId;
-        }
-
-        /**
-         * @brief Compare two keys for inequality.
-         * @param other the key to compare against
-         * @return true if the two keys are not equal
-         */
-        bool operator!=(const DodagKey& other) const
-        {
-            return !(*this == other);
-        }
     };
 
     /**
@@ -721,6 +773,30 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     Ipv6Address GlobalAddressOf(const DodagMembership& dodag, Ipv6Address linkLocal) const;
 
     /**
+     * @brief Get this node's own global address on a specific DODAG's prefix.
+     *
+     * GetGlobalAddress() answers "some global address of this node", picked
+     * by address-list order, which is fine while at most one exists. Once a
+     * node has joined more than one DODAG advertising different prefixes, it
+     * SLAACs one GUA per prefix, and a DAO for a given DODAG has to name the
+     * GUA that DODAG's own root actually recognises -- not just whichever
+     * one happens to enumerate first. Rebuilding the address the way
+     * GlobalAddressOf() does for a neighbour is deliberately not reused
+     * here: that would keep returning an address even after Duplicate
+     * Address Detection rejected it and it was withdrawn, since it is a
+     * pure bit rebuild with no knowledge of what is actually still
+     * assigned. This scans the real, currently assigned addresses instead,
+     * the same as GetGlobalAddress() itself, just filtered to the one
+     * DODAG's prefix.
+     *
+     * @param dodag the DODAG membership to find this node's address on
+     * @return the global address on that DODAG's prefix, :: if none is
+     *         assigned (including while still TENTATIVE); falls back to
+     *         GetGlobalAddress() if the DODAG carries no prefix at all
+     */
+    Ipv6Address GetGlobalAddressIn(const DodagMembership& dodag) const;
+
+    /**
      * @brief Build the link-local address that shares an interface identifier
      *        with a global address.
      *
@@ -810,28 +886,50 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     Ptr<Ipv6Route> RouteViaPreferredParent(const DodagMembership& dodag, Ipv6Address dst) const;
 
     /**
+     * @brief Construct a new DODAG membership in place and start its Trickle timer.
+     *
+     * Shared by HandleDadSuccess()'s root branch (RplHelper::SetRoot()'s
+     * DODAG) and CreateLocalDodag() (a self-originated local one): both
+     * build a fresh root membership, bind its Trickle timer to
+     * DioTrickleFire(), and register it as the base DODAG if none exists
+     * yet. What differs between the two callers -- Prefix Information,
+     * MinHopRankIncrease/Ocp seeding -- is left to them to fill in on the
+     * returned reference afterwards.
+     *
+     * @param key the key to construct the membership under; must not
+     *        already exist in m_dodags
+     * @param mop the Mode of Operation to advertise
+     * @return a reference to the newly constructed membership
+     */
+    DodagMembership& CreateDodagMembership(DodagKey key, uint8_t mop);
+
+    /**
      * @brief Get this node's membership in the base DODAG, if any.
      *
-     * The "base DODAG" is the one this class has always formed: the single
-     * DODAG a RplHelper-configured node joins via DIS/DIO the ordinary way,
-     * or becomes the root of via SetAsRoot(). Every public accessor
+     * The "base DODAG" is the first DODAG this node ever joined or formed,
+     * whether via RplHelper::SetRoot() (HandleDadSuccess()'s root branch),
+     * ordinary DIS/DIO bootstrap (JoinDodag()), or CreateLocalDodag().
+     * Every public accessor that does not take a DodagKey of its own
      * (GetRank(), IsJoined(), ...) reports this membership specifically, so
-     * their meaning is unchanged from before m_dodags existed.
+     * their meaning stays what it was back when m_dodags could hold only
+     * one entry. m_baseDodagKey is what now answers "which one", tracked
+     * separately from m_dodags itself so a second (or third...) concurrent
+     * membership does not change which one these accessors mean.
      *
-     * m_dodags holds at most one entry today -- nothing in this class yet
-     * creates a second one -- so "the base DODAG" and "the one entry, if
-     * any" are the same question for now, which is what the assertion
-     * below checks. A future second (local-instance) membership will need
-     * this resolved a different way, e.g. a stored DodagKey set at join
-     * time, rather than "whichever entry exists".
+     * If the base membership is later left (LeaveDodag()) while others
+     * survive, one of them is promoted to base rather than leaving every
+     * base-scoped accessor blind to a node that is still very much
+     * participating in RPL -- see LeaveDodag().
      *
      * @return a pointer to the membership, nullptr if not currently joined
+     *         to anything
      */
     DodagMembership* GetBaseDodag();
 
     /**
      * @brief Get this node's membership in the base DODAG, if any.
      * @return a pointer to the membership, nullptr if not currently joined
+     *         to anything
      */
     const DodagMembership* GetBaseDodag() const;
 
@@ -877,18 +975,24 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     /**
      * @brief Every DODAG this node currently belongs to, keyed by DodagKey.
      *
-     * Holds at most one entry today (the base DODAG, @see GetBaseDodag()):
-     * nothing in this class yet creates a membership in a second RPL
-     * Instance. The map exists ahead of that so the rest of this class
-     * already reads and writes DODAG state through a DodagMembership&
-     * rather than through single scalar members, which is the change a
-     * second membership (e.g. for AODV-RPL or P2P-RPL) will need in place
-     * regardless of what its own join logic ends up looking like.
+     * Can hold more than one entry: a node may passively join a second (or
+     * further) DODAG on top of its base one (HandleDio()), and/or actively
+     * form its own local one (CreateLocalDodag()), e.g. an AODV-RPL (RFC
+     * 9854) OrigNode's RREQ-Instance or a P2P-RPL (RFC 6997) Origin's
+     * temporary DAG. RouteInput()/PrepareOutgoingPacket() still only ever
+     * act on the base DODAG (@see GetBaseDodag()) -- this node originates
+     * its own traffic, including its own DAO, on every membership it
+     * holds, but does not relay a third node's traffic for anything but
+     * the base one.
      *
      * @see DodagMembership for why its entries can never be copied or
      * moved once constructed.
      */
     std::map<DodagKey, DodagMembership> m_dodags;
+
+    bool m_hasBaseDodag{false}; //!< whether m_baseDodagKey currently names a real entry
+    //!< key of the base DODAG, meaningful only if m_hasBaseDodag
+    DodagKey m_baseDodagKey{0, Ipv6Address::GetAny()};
 
     // Policy attributes for the DAO/downward-route side, set once via
     // RplHelper and shared by whatever DODAG membership uses them. Nothing

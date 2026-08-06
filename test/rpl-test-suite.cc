@@ -1889,6 +1889,949 @@ RplDodagFormationTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief A node in radio range of two independent DODAG roots joins both at
+ *        once, and each root's own topology genuinely learns about it.
+ *
+ * Two roots, each with its own RootPrefix, sit on either end of a line; the
+ * node between them cannot avoid hearing both. The two roots are
+ * blacklisted against each other so this test only has to reason about the
+ * shared node's own behaviour, not whether a root also ends up a passive
+ * member of the other root's DODAG (which HandleDio()'s relaxed root gate
+ * now allows, but is not what this test is checking).
+ *
+ * GetTopologySize() == 1 on both roots is the real assertion here: without
+ * RouteOutput()'s non-base-DODAG fallback and GetGlobalAddressIn() (the two
+ * fixes a plain "the join happened" check would not catch), the shared
+ * node's DAO for its second DODAG would either misroute through the first
+ * DODAG's preferred parent or advertise the wrong DODAG's address as its
+ * Target, and the second root's topology would stay empty.
+ */
+class RplMultiDodagTestCase : public TestCase
+{
+  public:
+    RplMultiDodagTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplMultiDodagTestCase::RplMultiDodagTestCase()
+    : TestCase("A node can join two independent DODAGs at once")
+{
+}
+
+void
+RplMultiDodagTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(3); // 0 = root A, 1 = shared node, 2 = root B
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    Ptr<SimpleNetDevice> rootADevice = DynamicCast<SimpleNetDevice>(devices.Get(0));
+    Ptr<SimpleNetDevice> rootBDevice = DynamicCast<SimpleNetDevice>(devices.Get(2));
+    channel->BlackList(rootADevice, rootBDevice);
+    channel->BlackList(rootBDevice, rootADevice);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.SetRoot(nodes.Get(2), Ipv6Address("2001:2::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    // Same margin RplDodagFormationTestCase gives a one-hop DODAG: Imin plus
+    // DAD for both the roots' own addresses and the shared node's two SLAAC
+    // addresses (one per prefix).
+    Simulator::Stop(Seconds(200));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> rootA = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> shared = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> rootB = nodes.Get(2)->GetObject<RplRoutingProtocol>();
+
+    Ipv6Address dodagAId = rootA->GetGlobalAddress();
+    Ipv6Address dodagBId = rootB->GetGlobalAddress();
+    NS_TEST_ASSERT_MSG_NE(dodagAId, Ipv6Address::GetAny(), "Root A never started its DODAG");
+    NS_TEST_ASSERT_MSG_NE(dodagBId, Ipv6Address::GetAny(), "Root B never started its DODAG");
+
+    NS_TEST_ASSERT_MSG_EQ(shared->GetDodagCount(), 2, "The shared node did not join both DODAGs");
+
+    // Whichever DIO happened to arrive first becomes the base; this test
+    // does not care which, only that the base is one of the two and the
+    // other is reachable through the key-scoped accessors.
+    Ipv6Address baseDodagId = shared->GetDodagId();
+    NS_TEST_ASSERT_MSG_EQ(baseDodagId == dodagAId || baseDodagId == dodagBId,
+                          true,
+                          "The base DODAG is neither root A nor root B");
+    Ipv6Address otherDodagId = (baseDodagId == dodagAId) ? dodagBId : dodagAId;
+
+    NS_TEST_ASSERT_MSG_EQ(shared->IsJoined(), true, "The shared node left its base DODAG");
+    NS_TEST_ASSERT_MSG_NE(shared->GetRank(), RPL_INFINITE_RANK, "The base DODAG rank is infinite");
+
+    NS_TEST_ASSERT_MSG_EQ(shared->IsJoinedTo(RPL_DEFAULT_INSTANCE, otherDodagId),
+                          true,
+                          "The shared node did not join the second DODAG");
+    NS_TEST_ASSERT_MSG_NE(shared->GetRankIn(RPL_DEFAULT_INSTANCE, otherDodagId),
+                          RPL_INFINITE_RANK,
+                          "The second DODAG's rank is infinite");
+
+    // The real proof that the second membership is not just tracking rank:
+    // its DAO reached its own root, which needed RouteOutput()'s non-base
+    // fallback (to leave via the right preferred parent) and
+    // GetGlobalAddressIn() (to advertise the right Target address) both to
+    // be correct.
+    //
+    // Checked with ComputeSourceRoute() for the shared node's own address on
+    // each prefix specifically, rather than GetTopologySize() == 1: the
+    // shared node is not the only thing that can end up in either topology
+    // here. Once it holds both memberships it also re-advertises both in
+    // its own DIOs (SendDio() carries every DODAG's Configuration/Prefix
+    // options onward, not just the root's), which the OTHER root -- within
+    // radio range of the shared node even though the two roots are
+    // blacklisted from hearing each other directly -- can and does pick up
+    // and passively join in turn. That transitive join is correct RPL
+    // behaviour in general (this is exactly how a DIO propagates outward
+    // through a real multi-hop DODAG) and is not what this test is
+    // checking, so the assertions below must not assume either topology
+    // holds only the shared node.
+    auto addressOnPrefix = [](Ptr<Node> node, Ipv6Address dodagId) {
+        Ptr<Ipv6L3Protocol> ipv6 = node->GetObject<Ipv6L3Protocol>();
+        Ipv6Prefix prefix(64);
+        for (uint32_t j = 0; j < ipv6->GetNAddresses(1); j++)
+        {
+            Ipv6InterfaceAddress iaddr = ipv6->GetAddress(1, j);
+            if (iaddr.GetScope() == Ipv6InterfaceAddress::GLOBAL &&
+                prefix.IsMatch(iaddr.GetAddress(), dodagId))
+            {
+                return iaddr.GetAddress();
+            }
+        }
+        return Ipv6Address::GetAny();
+    };
+
+    Ipv6Address sharedOnDodagA = addressOnPrefix(nodes.Get(1), dodagAId);
+    Ipv6Address sharedOnDodagB = addressOnPrefix(nodes.Get(1), dodagBId);
+    NS_TEST_ASSERT_MSG_NE(sharedOnDodagA,
+                          Ipv6Address::GetAny(),
+                          "The shared node never SLAACed an address on DODAG A's prefix");
+    NS_TEST_ASSERT_MSG_NE(sharedOnDodagB,
+                          Ipv6Address::GetAny(),
+                          "The shared node never SLAACed an address on DODAG B's prefix");
+
+    std::vector<Ipv6Address> hops;
+    NS_TEST_ASSERT_MSG_EQ(rootA->ComputeSourceRoute(sharedOnDodagA, hops),
+                          true,
+                          "Root A cannot reach the shared node: its DAO for DODAG A never "
+                          "registered");
+    NS_TEST_ASSERT_MSG_EQ(rootB->ComputeSourceRoute(sharedOnDodagB, hops),
+                          true,
+                          "Root B cannot reach the shared node: its DAO for DODAG B never "
+                          "registered");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief CreateLocalDodag() lets a node form its own DODAG at runtime, on
+ *        top of (not instead of) whatever base DODAG it already has.
+ *
+ * The primitive AODV-RPL/P2P-RPL will need to root their own local
+ * instance: this checks it in isolation, without either protocol built on
+ * top of it yet. A neighbour picking up the resulting DIO and joining
+ * passively re-uses the exact mechanism RplMultiDodagTestCase checks, so
+ * this only has to confirm the local DODAG itself forms correctly.
+ */
+class RplCreateLocalDodagTestCase : public TestCase
+{
+  public:
+    RplCreateLocalDodagTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplCreateLocalDodagTestCase::RplCreateLocalDodagTestCase()
+    : TestCase("CreateLocalDodag() forms a self-rooted DODAG at runtime")
+{
+}
+
+void
+RplCreateLocalDodagTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2); // 0 = base DODAG root, also forms a local one; 1 = neighbour
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    // Long enough for DAD to clear on the root's base address before
+    // CreateLocalDodag() is called on it below.
+    Simulator::Stop(Seconds(5));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> root = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(root->IsJoined(), true, "The base DODAG never formed");
+
+    static constexpr uint8_t LOCAL_INSTANCE = 0x80; // high bit set, RFC 6550 section 5.1
+    RplRoutingProtocol::DodagKey localKey = root->CreateLocalDodag(LOCAL_INSTANCE, RPL_MOP_NON_STORING);
+
+    NS_TEST_ASSERT_MSG_EQ(localKey.instanceId, LOCAL_INSTANCE, "Wrong instanceId in the returned key");
+    NS_TEST_ASSERT_MSG_NE(localKey.dodagId, Ipv6Address::GetAny(), "No DODAGID in the returned key");
+    NS_TEST_ASSERT_MSG_EQ(localKey.dodagId,
+                          root->GetGlobalAddress(),
+                          "The local DODAG is not rooted at this node's own address");
+
+    // The base DODAG (RplHelper::SetRoot()'s) is untouched: CreateLocalDodag()
+    // adds a second membership, it does not replace the first. DODAGID
+    // alone cannot tell the two apart here -- both are rooted at this same
+    // node's one global address, RFC 9854/6997 fashion -- only instanceId
+    // differs (RPL_DEFAULT_INSTANCE vs LOCAL_INSTANCE), which is exactly
+    // what GetDodagCount() == 2 plus the IsJoinedTo() check just below
+    // together confirm: two distinct keyed memberships, not one replaced by
+    // the other.
+    NS_TEST_ASSERT_MSG_EQ(root->GetDodagCount(), 2, "CreateLocalDodag() did not add a membership");
+
+    NS_TEST_ASSERT_MSG_EQ(root->IsJoinedTo(localKey.instanceId, localKey.dodagId),
+                          true,
+                          "Not joined to the DODAG CreateLocalDodag() just formed");
+    NS_TEST_ASSERT_MSG_EQ(root->GetRankIn(localKey.instanceId, localKey.dodagId),
+                          RPL_MIN_HOPRANKINC,
+                          "The local DODAG's root is not at MinHopRankIncrease");
+
+    // The local DODAG carries no Prefix Information, unlike the base one:
+    // a neighbour joining it must not attempt SLAAC on it.
+    Ptr<RplRoutingProtocol> neighbour = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    Simulator::Stop(Seconds(200));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(neighbour->IsJoinedTo(localKey.instanceId, localKey.dodagId),
+                          true,
+                          "The neighbour did not passively join the local DODAG");
+    // Exactly one link-local plus one global (SLAACed on the base DODAG's
+    // RootPrefix): if the local DODAG had wrongly carried Prefix
+    // Information, the neighbour would have SLAACed a second global address
+    // on it too. Checked as a final count rather than a before/after delta
+    // around CreateLocalDodag() -- the base DODAG's own DIO is paced by a
+    // Trickle timer whose very first firing is itself randomised within
+    // [Imin/2, Imin) (RFC 6206), so whether the neighbour has already
+    // SLAACed the base address by the time CreateLocalDodag() is called a
+    // few seconds in is not deterministic, only that it has by the time the
+    // full run ends.
+    NS_TEST_ASSERT_MSG_EQ(nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetNAddresses(1),
+                          2,
+                          "The neighbour has the wrong number of addresses: the local DODAG must not "
+                          "have triggered a second SLAAC");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief The DODAG Version Number lollipop counter (RFC 6550 section 7.2) is
+ *        tracked and compared per DODAG, not shared node-wide.
+ *
+ * One node under test hears two peers, each advertising its own DODAG
+ * (hand-built DIOs, RplVersionWrapTestCase's style). Every step below is
+ * applied to DODAG A only and checked against DODAG B's rank
+ * (GetRankIn()) to confirm nothing leaked across: a semi-normal step
+ * (an ordinary version bump), an abnormal one (a stale version rejected),
+ * and the boundary the lollipop encoding exists for (the 255 -> 0 wrap,
+ * both accepted forward and refused backward, mirroring
+ * RplVersionWrapTestCase but now with a second, untouched DODAG alongside
+ * it). The two DODAGs share one RPLInstanceID (RPL_DEFAULT_INSTANCE) and
+ * are told apart purely by DODAGID, the ordinary case this module forms
+ * today (@see DodagKey).
+ */
+class RplMultiDodagVersionIsolationTestCase : public TestCase
+{
+  public:
+    RplMultiDodagVersionIsolationTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplMultiDodagVersionIsolationTestCase::RplMultiDodagVersionIsolationTestCase()
+    : TestCase("DODAG Version Number sequencing is independent per DODAG")
+{
+}
+
+void
+RplMultiDodagVersionIsolationTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(3); // 0 = node under test, 1 = peer advertising DODAG A, 2 = peer advertising DODAG B
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+    rplHelper.AssignStreams(nodes, 1);
+
+    Ptr<RplRoutingProtocol> node = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ipv6Address dodagAId("2001:1::1");
+    Ipv6Address dodagBId("2001:2::1");
+    Ipv6Address nodeLinkLocal =
+        nodes.Get(0)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address peerALinkLocal =
+        nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address peerBLinkLocal =
+        nodes.Get(2)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    auto buildDio = [](Ipv6Address dodagId, uint8_t version, uint16_t rank) {
+        RplDioHeader dio;
+        dio.SetInstanceId(RPL_DEFAULT_INSTANCE);
+        dio.SetVersionNumber(version);
+        dio.SetRank(rank);
+        dio.SetMop(RPL_MOP_NON_STORING);
+        dio.SetDodagId(dodagId);
+        dio.SetDagConfiguration(RPL_DIO_INTERVAL_DOUBLINGS,
+                                RPL_DIO_INTERVAL_MIN,
+                                RPL_DIO_REDUNDANCY,
+                                RPL_MAX_RANKINC,
+                                RPL_MIN_HOPRANKINC,
+                                RPL_OCP_OF0,
+                                RPL_DEFAULT_LIFETIME,
+                                RPL_DEFAULT_LIFETIME_UNIT);
+        return dio;
+    };
+
+    auto sendFrom = [&](Ptr<Node> peer, Ipv6Address peerLinkLocal, const RplDioHeader& dio) {
+        Simulator::Schedule(Seconds(0),
+                            &SendRawRplMessage<RplDioHeader>,
+                            peer,
+                            1,
+                            dio,
+                            static_cast<uint8_t>(RPL_CODE_DIO),
+                            peerLinkLocal,
+                            nodeLinkLocal);
+        Simulator::Stop(MilliSeconds(10));
+        Simulator::Run();
+    };
+
+    // Join both DODAGs. A starts at 253, three short of its own wrap (room
+    // for two ordinary small steps -- RplSequenceCompare()'s SEQUENCE_WINDOW
+    // is 16, well clear of a single increment -- before the boundary step
+    // reaches it); B starts at 50, deep in the lollipop's circular region
+    // and nowhere near either version. B is never touched again after this:
+    // the strongest isolation proof is everything below happening to A
+    // alone while B provably does not move at all.
+    sendFrom(nodes.Get(1), peerALinkLocal, buildDio(dodagAId, 253, RPL_MIN_HOPRANKINC));
+    NS_TEST_ASSERT_MSG_EQ(node->IsJoined(), true, "DODAG A did not bootstrap");
+    NS_TEST_ASSERT_MSG_EQ(node->GetDodagId(), dodagAId, "Joined the wrong base DODAG");
+
+    sendFrom(nodes.Get(2), peerBLinkLocal, buildDio(dodagBId, 50, RPL_MIN_HOPRANKINC));
+    NS_TEST_ASSERT_MSG_EQ(node->IsJoinedTo(RPL_DEFAULT_INSTANCE, dodagBId),
+                          true,
+                          "DODAG B did not bootstrap");
+    NS_TEST_ASSERT_MSG_EQ(node->GetRankIn(RPL_DEFAULT_INSTANCE, dodagBId),
+                          2 * RPL_MIN_HOPRANKINC,
+                          "Wrong initial rank in DODAG B");
+
+    // Semi-normal: an ordinary version bump on A alone (253 -> 254, both in
+    // the lollipop's linear region, RFC 6550 section 7.2 rule 3.2). The
+    // peer's own advertised rank goes from 1x to 2x MinHopRankIncrease, so
+    // the node's resulting rank (peer's rank + one more hop) goes from 2x
+    // to 3x.
+    sendFrom(nodes.Get(1), peerALinkLocal, buildDio(dodagAId, 254, 2 * RPL_MIN_HOPRANKINC));
+    NS_TEST_ASSERT_MSG_EQ(node->GetRank(),
+                          3 * RPL_MIN_HOPRANKINC,
+                          "DODAG A did not migrate to version 254");
+    NS_TEST_ASSERT_MSG_EQ(node->GetRankIn(RPL_DEFAULT_INSTANCE, dodagBId),
+                          2 * RPL_MIN_HOPRANKINC,
+                          "DODAG B's rank moved when only A's version changed");
+
+    // Abnormal: a stale version for A (253, already superseded by 254) is
+    // rejected -- neither A nor B's rank may move.
+    sendFrom(nodes.Get(1), peerALinkLocal, buildDio(dodagAId, 253, RPL_MIN_HOPRANKINC));
+    NS_TEST_ASSERT_MSG_EQ(node->GetRank(),
+                          3 * RPL_MIN_HOPRANKINC,
+                          "A stale DODAG A version was adopted");
+    NS_TEST_ASSERT_MSG_EQ(node->GetRankIn(RPL_DEFAULT_INSTANCE, dodagBId),
+                          2 * RPL_MIN_HOPRANKINC,
+                          "DODAG B's rank moved when A's stale DIO was (correctly) rejected");
+
+    // Boundary: A advances to 255, then wraps 255 -> 0 (RFC 6550 section
+    // 7.2 rule 3.1), while B -- still at 50 the whole time -- must not move
+    // just because A did.
+    sendFrom(nodes.Get(1), peerALinkLocal, buildDio(dodagAId, 255, RPL_MIN_HOPRANKINC));
+    NS_TEST_ASSERT_MSG_EQ(node->GetRank(),
+                          2 * RPL_MIN_HOPRANKINC,
+                          "DODAG A did not migrate to version 255");
+    sendFrom(nodes.Get(1), peerALinkLocal, buildDio(dodagAId, 0, 2 * RPL_MIN_HOPRANKINC));
+    NS_TEST_ASSERT_MSG_EQ(node->GetRank(),
+                          3 * RPL_MIN_HOPRANKINC,
+                          "DODAG A did not migrate across its own wrap to version 0");
+    NS_TEST_ASSERT_MSG_EQ(node->GetRankIn(RPL_DEFAULT_INSTANCE, dodagBId),
+                          2 * RPL_MIN_HOPRANKINC,
+                          "DODAG B's rank moved when only A crossed its version wrap");
+
+    // And the other direction still has to be refused for A specifically,
+    // or the wrap above would just be "accept anything that differs": 255
+    // is now the stale side of the wrap it already crossed.
+    sendFrom(nodes.Get(1), peerALinkLocal, buildDio(dodagAId, 255, RPL_MIN_HOPRANKINC));
+    NS_TEST_ASSERT_MSG_EQ(node->GetRank(),
+                          3 * RPL_MIN_HOPRANKINC,
+                          "DODAG A migrated backwards into the version it had already left");
+    NS_TEST_ASSERT_MSG_EQ(node->GetRankIn(RPL_DEFAULT_INSTANCE, dodagBId),
+                          2 * RPL_MIN_HOPRANKINC,
+                          "DODAG B's rank moved when A's backward wrap attempt was (correctly) "
+                          "rejected");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief The DTSN lollipop counter (RFC 6550 section 7.2) and the DAO
+ *        refresh it triggers (section 9.6 rules 1/2) are per DODAG, not
+ *        shared node-wide.
+ *
+ * A node is a member of two independently rooted DODAGs at once (the same
+ * shape as RplMultiDodagTestCase). A DAO-count monitor sits on each root:
+ * a DTSN bump hand-delivered as though from the shared node's DODAG A
+ * parent must refresh only the DAO count at root A (semi-normal), a
+ * same-or-stale DTSN must refresh neither (abnormal -- RplSequenceNewer()
+ * rule 1/2 only fires on a genuine increment), and a DTSN wrapping past
+ * its maximum must still be read as newer for A alone (boundary, the same
+ * wrap RplDtsnWrapTestCase checks for a single DODAG).
+ */
+class RplMultiDodagDtsnIsolationTestCase : public TestCase
+{
+  public:
+    RplMultiDodagDtsnIsolationTestCase();
+
+  private:
+    void DoRun() override;
+
+    /**
+     * @brief Count an arriving DAO at root A's monitor.
+     * @param socket the monitoring socket
+     */
+    void RecordDaoA(Ptr<Socket> socket);
+
+    /**
+     * @brief Count an arriving DAO at root B's monitor.
+     * @param socket the monitoring socket
+     */
+    void RecordDaoB(Ptr<Socket> socket);
+
+    /**
+     * @brief Shared implementation of RecordDaoA()/RecordDaoB().
+     * @param socket the monitoring socket
+     * @param count the counter to increment on a DAO
+     */
+    void RecordDaoOn(Ptr<Socket> socket, uint32_t& count);
+
+    uint32_t m_daoCountA{0}; //!< DAOs seen at root A
+    uint32_t m_daoCountB{0}; //!< DAOs seen at root B
+};
+
+RplMultiDodagDtsnIsolationTestCase::RplMultiDodagDtsnIsolationTestCase()
+    : TestCase("DTSN sequencing and the DAO refresh it triggers are independent per DODAG")
+{
+}
+
+void
+RplMultiDodagDtsnIsolationTestCase::RecordDaoOn(Ptr<Socket> socket, uint32_t& count)
+{
+    Address sender;
+    Ptr<Packet> packet = socket->RecvFrom(sender);
+    if (!packet)
+    {
+        return;
+    }
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ipv6Header);
+    Icmpv6Header icmpv6Header;
+    packet->RemoveHeader(icmpv6Header);
+    if (icmpv6Header.GetType() != ICMPV6_RPL || icmpv6Header.GetCode() != RPL_CODE_DAO)
+    {
+        return;
+    }
+    count++;
+}
+
+void
+RplMultiDodagDtsnIsolationTestCase::RecordDaoA(Ptr<Socket> socket)
+{
+    RecordDaoOn(socket, m_daoCountA);
+}
+
+void
+RplMultiDodagDtsnIsolationTestCase::RecordDaoB(Ptr<Socket> socket)
+{
+    RecordDaoOn(socket, m_daoCountB);
+}
+
+void
+RplMultiDodagDtsnIsolationTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(3); // 0 = root A, 1 = shared node, 2 = root B
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    Ptr<SimpleNetDevice> rootADevice = DynamicCast<SimpleNetDevice>(devices.Get(0));
+    Ptr<SimpleNetDevice> rootBDevice = DynamicCast<SimpleNetDevice>(devices.Get(2));
+    channel->BlackList(rootADevice, rootBDevice);
+    channel->BlackList(rootBDevice, rootADevice);
+
+    RplHelper rplHelper;
+    // Deliberately never refires on its own within this test: every DIO
+    // that matters below, including the very first, join-bootstrapping one,
+    // is hand-built and injected explicitly (see sendFromRootA()/the B
+    // bootstrap below). If either root's own Trickle timer were also live,
+    // its own un-bumped DTSN=0 background DIOs would race the hand-built
+    // bumps below and silently reset dodag.parents[from].dtsn back to 0
+    // between them, making a repeat of an already-adopted DTSN look like a
+    // fresh increment again purely by accident of timing.
+    rplHelper.Set("DioIntervalMin", TimeValue(Seconds(3600)));
+
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.SetRoot(nodes.Get(2), Ipv6Address("2001:2::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Ptr<Node> rootANode = nodes.Get(0);
+    Ptr<Node> sharedNode = nodes.Get(1);
+    Ptr<Node> rootBNode = nodes.Get(2);
+
+    Ptr<Socket> daoMonitorA = Socket::CreateSocket(rootANode, Ipv6RawSocketFactory::GetTypeId());
+    daoMonitorA->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    daoMonitorA->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    daoMonitorA->BindToNetDevice(rootANode->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+    daoMonitorA->SetRecvCallback(
+        MakeCallback(&RplMultiDodagDtsnIsolationTestCase::RecordDaoA, this));
+
+    Ptr<Socket> daoMonitorB = Socket::CreateSocket(rootBNode, Ipv6RawSocketFactory::GetTypeId());
+    daoMonitorB->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    daoMonitorB->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    daoMonitorB->BindToNetDevice(rootBNode->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+    daoMonitorB->SetRecvCallback(
+        MakeCallback(&RplMultiDodagDtsnIsolationTestCase::RecordDaoB, this));
+
+    // Just long enough for DAD to clear on both roots' own addresses; with
+    // DioIntervalMin above, neither root says anything on its own beyond
+    // that.
+    Simulator::Stop(Seconds(2));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> rootA = rootANode->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> rootB = rootBNode->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> shared = sharedNode->GetObject<RplRoutingProtocol>();
+
+    Ipv6Address dodagAId = rootA->GetGlobalAddress();
+    Ipv6Address dodagBId = rootB->GetGlobalAddress();
+    NS_TEST_ASSERT_MSG_NE(dodagAId, Ipv6Address::GetAny(), "Root A's own DODAG never formed");
+    NS_TEST_ASSERT_MSG_NE(dodagBId, Ipv6Address::GetAny(), "Root B's own DODAG never formed");
+
+    Ipv6Address rootALinkLocal =
+        rootANode->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address rootBLinkLocal =
+        rootBNode->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address sharedLinkLocal =
+        sharedNode->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    auto buildDio = [](Ipv6Address dodagId, Ipv6Address prefix, uint8_t dtsn) {
+        RplDioHeader dio;
+        dio.SetInstanceId(RPL_DEFAULT_INSTANCE);
+        dio.SetVersionNumber(0);
+        dio.SetRank(RPL_MIN_HOPRANKINC); // the root's own, fixed rank
+        dio.SetMop(RPL_MOP_NON_STORING);
+        dio.SetDodagId(dodagId);
+        dio.SetDtsn(dtsn);
+        // Without this, the shared node never SLAACs a global address on
+        // either prefix (JoinDodag() only calls AddAutoconfiguredAddress()
+        // when HasPrefixInfo()), so SendDao() perpetually logs "no global
+        // address for this node or its parent" and no DAO -- the very
+        // thing daoCountA/B exist to observe -- is ever actually sent.
+        dio.SetPrefixInfo(prefix,
+                          64,
+                          true,
+                          true,
+                          RPL_PREFIX_VALID_LIFETIME,
+                          RPL_PREFIX_PREFERRED_LIFETIME);
+        // Needed even for a DODAG the shared node has already joined: this
+        // test's roots never send a real DIO of their own (DioIntervalMin
+        // above), so the very first DIO carrying this is also what seeds
+        // Trickle parameters on JoinDodag() -- omitting it would leave a
+        // zero-length interval instead of one this test can control.
+        //
+        // The interval itself is deliberately huge (2^20 ms, ~17 min), the
+        // same reasoning as the node-wide DioIntervalMin attribute above,
+        // extended to what JoinDodag() actually adopts: RplHelper's
+        // attribute only seeds a *root's own* membership (HandleDadSuccess()'s
+        // root branch), not one formed by joining a DIO, so the shared
+        // node's own re-advertisements of DODAG A/B need their Trickle
+        // pace fixed here instead. Left at the fast default, the shared
+        // node keeps re-advertising both DODAGs' Configuration/Prefix
+        // options at the normal cadence, which root B can and does pick up
+        // and passively join DODAG A through in turn (the same transitive
+        // join RplMultiDodagTestCase documents, @see design-constraints.md
+        // section 32.5) -- and root B's own resulting DAO for that
+        // membership then needs relaying through the shared node, which
+        // RouteInput() does not support for a non-base DODAG (section
+        // 32.6), so this test would otherwise flirt with that unsupported
+        // path by accident of timing rather than by anything it means to
+        // exercise.
+        dio.SetDagConfiguration(0,
+                                20,
+                                RPL_DIO_REDUNDANCY,
+                                RPL_MAX_RANKINC,
+                                RPL_MIN_HOPRANKINC,
+                                RPL_OCP_OF0,
+                                RPL_DEFAULT_LIFETIME,
+                                RPL_DEFAULT_LIFETIME_UNIT);
+        return dio;
+    };
+
+    auto sendFromRootA = [&](uint8_t dtsn) {
+        Simulator::Schedule(Seconds(0),
+                            &SendRawRplMessage<RplDioHeader>,
+                            rootANode,
+                            1,
+                            buildDio(dodagAId, Ipv6Address("2001:1::"), dtsn),
+                            static_cast<uint8_t>(RPL_CODE_DIO),
+                            rootALinkLocal,
+                            sharedLinkLocal);
+        Simulator::Stop(Seconds(1));
+        Simulator::Run();
+    };
+
+    // Bootstrap both memberships by hand: neither root's own Trickle timer
+    // will ever do it within this test (see the DioIntervalMin comment
+    // above). A starts at 253, three short of its own wrap and in the
+    // lollipop's linear region throughout (RFC 6550 section 7.2 rule 3.2
+    // does not wrap within that region, so every step on A below stays
+    // safely comparable until the boundary step deliberately crosses into
+    // the wrap); B starts at 0 and is never touched again. One second
+    // gives SelectPreferredParent()'s jittered daoEvent (0-1s) room to fire
+    // and the resulting DAO to reach and be ACKed by the real root on each
+    // side.
+    sendFromRootA(253);
+    Simulator::Schedule(Seconds(0),
+                        &SendRawRplMessage<RplDioHeader>,
+                        rootBNode,
+                        1,
+                        buildDio(dodagBId, Ipv6Address("2001:2::"), 0),
+                        static_cast<uint8_t>(RPL_CODE_DIO),
+                        rootBLinkLocal,
+                        sharedLinkLocal);
+    Simulator::Stop(Seconds(1));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(shared->GetDodagCount(), 2, "The shared node did not join both DODAGs");
+    NS_TEST_ASSERT_MSG_GT_OR_EQ(m_daoCountA, 1, "Root A never saw the shared node's initial DAO");
+    NS_TEST_ASSERT_MSG_GT_OR_EQ(m_daoCountB, 1, "Root B never saw the shared node's initial DAO");
+
+    // Semi-normal: DTSN 253 -> 254 from root A, the shared node's actual
+    // DAO parent for DODAG A, is a genuine increment (RplSequenceNewer
+    // rule 1/2) and must refresh the DAO at root A alone.
+    uint32_t daoCountABefore = m_daoCountA;
+    uint32_t daoCountBBefore = m_daoCountB;
+    sendFromRootA(254);
+    NS_TEST_ASSERT_MSG_GT(m_daoCountA, daoCountABefore, "The DTSN bump on A did not refresh A's DAO");
+    NS_TEST_ASSERT_MSG_EQ(m_daoCountB,
+                          daoCountBBefore,
+                          "A DTSN bump on DODAG A refreshed DODAG B's DAO too");
+
+    // Abnormal: the same DTSN again (254, not newer than the 254 just
+    // adopted) must not trigger another refresh on either side.
+    daoCountABefore = m_daoCountA;
+    daoCountBBefore = m_daoCountB;
+    sendFromRootA(254);
+    NS_TEST_ASSERT_MSG_EQ(m_daoCountA,
+                          daoCountABefore,
+                          "A DTSN that was not actually newer still refreshed A's DAO");
+    NS_TEST_ASSERT_MSG_EQ(m_daoCountB, daoCountBBefore, "DODAG B's DAO moved on A's unchanged DTSN");
+
+    // Boundary: DTSN wraps 255 -> 0 for DODAG A (RFC 6550 section 7.2 rule
+    // 3.1, the same wrap RplDtsnWrapTestCase checks for a single DODAG).
+    // Getting there first needs one more real increment (254 -> 255, still
+    // within the linear region), so the wrap itself is the second of two
+    // DIOs.
+    sendFromRootA(255);
+    daoCountABefore = m_daoCountA;
+    daoCountBBefore = m_daoCountB;
+    sendFromRootA(0);
+    NS_TEST_ASSERT_MSG_GT(m_daoCountA,
+                          daoCountABefore,
+                          "DODAG A's DTSN wrap (255 -> 0) was not read as newer");
+    NS_TEST_ASSERT_MSG_EQ(m_daoCountB,
+                          daoCountBBefore,
+                          "DODAG B's DAO moved when only A's DTSN wrapped");
+
+    daoMonitorA->Close();
+    daoMonitorB->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief The Path Sequence lollipop counter (RFC 6550 section 7.1/9.2.1)
+ *        that orders DAOs for one target is scoped to one root's own
+ *        topology, not shared across DODAGs.
+ *
+ * Two independent roots, each with their own topology (RplStaleDaoTestCase
+ * runs this exact staleness logic against a single one). Both are handed
+ * DAOs for the identical numeric target address, on purpose: if Path
+ * Sequence state were ever accidentally keyed by target address alone
+ * rather than being a genuinely separate map per DodagMembership, a stale
+ * DAO rejected at root A could still be leaking state that corrupts root
+ * B's independent judgement of the very same target.
+ */
+class RplMultiDodagPathSequenceIsolationTestCase : public TestCase
+{
+  public:
+    RplMultiDodagPathSequenceIsolationTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplMultiDodagPathSequenceIsolationTestCase::RplMultiDodagPathSequenceIsolationTestCase()
+    : TestCase("Path Sequence ordering of DAOs is independent per DODAG's own topology")
+{
+}
+
+void
+RplMultiDodagPathSequenceIsolationTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2); // 0 = root A, 1 = root B -- neither hears the other
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    Ptr<SimpleNetDevice> rootADevice = DynamicCast<SimpleNetDevice>(devices.Get(0));
+    Ptr<SimpleNetDevice> rootBDevice = DynamicCast<SimpleNetDevice>(devices.Get(1));
+    channel->BlackList(rootADevice, rootBDevice);
+    channel->BlackList(rootBDevice, rootADevice);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.SetRoot(nodes.Get(1), Ipv6Address("2001:2::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(5));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> rootA = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> rootB = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(rootA->IsJoined(), true, "Root A's own DODAG never formed");
+    NS_TEST_ASSERT_MSG_EQ(rootB->IsJoined(), true, "Root B's own DODAG never formed");
+
+    // The identical target and "nowhere" addresses under each root's own
+    // prefix: deliberately the same low bits, so a leak between the two
+    // topology maps would be indistinguishable from correct isolation if
+    // the addresses also happened to differ.
+    Ipv6Address targetA("2001:1::ff:fe00:aa");
+    Ipv6Address nowhereA("2001:1::ff:fe00:bb");
+    Ipv6Address targetB("2001:2::ff:fe00:aa");
+    Ipv6Address nowhereB("2001:2::ff:fe00:bb");
+
+    auto sendDao = [&](Ptr<Node> rootNode,
+                       Ipv6Address rootAddress,
+                       Ipv6Address target,
+                       Ipv6Address parent,
+                       uint8_t pathSequence,
+                       uint8_t lifetime) {
+        RplDaoHeader dao;
+        dao.SetInstanceId(RPL_DEFAULT_INSTANCE);
+        dao.SetSequence(pathSequence);
+        dao.SetTarget(target);
+        dao.SetTransitInformation(parent, pathSequence, lifetime);
+        // DeliverRawRplMessage(), not SendRawRplMessage(): unlike
+        // RplStaleDaoTestCase's identical-looking helper, which sends from
+        // a real, distinct child node whose own address genuinely matches
+        // the src it hands to the checksum, this test has no such node --
+        // both "sources" below are addresses of convenience (target itself,
+        // standing in for whatever unspecified child would really send
+        // this), not a real device's own address. Routed through a real
+        // send, that mismatch would leave the wire packet's actual source
+        // (the real sending interface's own address) disagreeing with the
+        // checksum computed against the fake one, and the receiver would
+        // silently drop it on a checksum failure -- indistinguishable from
+        // "the DAO was rejected as stale" without a deeper look, which is
+        // exactly the failure mode this test needs to rule out to mean
+        // anything. Delivering directly to rootNode's own Receive() (like
+        // RplDaoAckSequenceTestCase's/RplDtsnWrapTestCase's own equally
+        // fully-fabricated senders) sidesteps needing a real device to back
+        // the address at all: HandleDao() only ever reads the DAO's own
+        // fields.
+        Simulator::Schedule(Seconds(0),
+                            &DeliverRawRplMessage<RplDaoHeader>,
+                            rootNode,
+                            1,
+                            dao,
+                            static_cast<uint8_t>(RPL_CODE_DAO),
+                            target,
+                            rootAddress);
+        Simulator::Stop(MilliSeconds(10));
+        Simulator::Run();
+    };
+
+    std::vector<Ipv6Address> hops;
+
+    // Semi-normal: an ordinary fresh DAO registers at A; B's topology,
+    // touched by nothing yet, stays empty. Parent is the root's own
+    // address -- the simplest valid entry, a direct child one hop out --
+    // so ComputeSourceRoute() below has an actual path to find; "nowhere"
+    // is reserved for the deliberately-unroutable stale attempts further
+    // down.
+    sendDao(nodes.Get(0),
+           rootA->GetGlobalAddress(),
+           targetA,
+           rootA->GetGlobalAddress(),
+           20,
+           RPL_DEFAULT_LIFETIME);
+    NS_TEST_ASSERT_MSG_EQ(rootA->GetTopologySize(), 1, "Root A's fresh DAO was not recorded");
+    NS_TEST_ASSERT_MSG_EQ(rootB->GetTopologySize(),
+                          0,
+                          "Root B's topology grew from a DAO sent only to root A");
+
+    // The matching fresh DAO at B, for the numerically identical target.
+    sendDao(nodes.Get(1),
+           rootB->GetGlobalAddress(),
+           targetB,
+           rootB->GetGlobalAddress(),
+           5,
+           RPL_DEFAULT_LIFETIME);
+    NS_TEST_ASSERT_MSG_EQ(rootB->GetTopologySize(), 1, "Root B's fresh DAO was not recorded");
+    NS_TEST_ASSERT_MSG_EQ(rootA->GetTopologySize(),
+                          1,
+                          "Root A's topology changed size from a DAO sent only to root B");
+    NS_TEST_ASSERT_MSG_EQ(rootA->ComputeSourceRoute(targetA, hops),
+                          true,
+                          "Root A's own route was disturbed by root B's unrelated DAO");
+
+    // Abnormal: a stale DAO for A's target (Path Sequence 19, superseded by
+    // the 20 already recorded) must be rejected at A, and must not touch
+    // B's independent Path Sequence bookkeeping for the same numeric
+    // target (still on its own sequence, currently 5).
+    sendDao(nodes.Get(0), rootA->GetGlobalAddress(), targetA, nowhereA, 19, RPL_DEFAULT_LIFETIME);
+    NS_TEST_ASSERT_MSG_EQ(rootA->ComputeSourceRoute(targetA, hops),
+                          true,
+                          "Root A's stale DAO overwrote the newer entry it was overtaken by");
+    // Proven by B still rejecting a stale Path Sequence for its own target
+    // (4, lower than the 5 already recorded -- an equal one is not stale,
+    // RFC 6550 section 9.2.1's retransmission case, RplStaleDaoTestCase
+    // covers that distinction for a single DODAG): if the two roots shared
+    // any Path Sequence state, root A's unrelated stale DAO just above
+    // (Path Sequence 19) would already have left something for this one to
+    // disagree with.
+    sendDao(nodes.Get(1), rootB->GetGlobalAddress(), targetB, nowhereB, 4, RPL_DEFAULT_LIFETIME);
+    NS_TEST_ASSERT_MSG_EQ(rootB->ComputeSourceRoute(targetB, hops),
+                          true,
+                          "Root B accepted a stale Path Sequence, or root A's stale DAO corrupted "
+                          "root B's own Path Sequence state for the identical target");
+
+    // Boundary: Path Sequence wraps 255 -> 0 for A's target, independently
+    // of B, which is nowhere near its own wrap (still at 5).
+    sendDao(nodes.Get(0),
+           rootA->GetGlobalAddress(),
+           targetA,
+           rootA->GetGlobalAddress(),
+           255,
+           RPL_DEFAULT_LIFETIME);
+    NS_TEST_ASSERT_MSG_EQ(rootA->GetTopologySize(), 1, "Root A did not accept Path Sequence 255");
+    sendDao(nodes.Get(0),
+           rootA->GetGlobalAddress(),
+           targetA,
+           rootA->GetGlobalAddress(),
+           0,
+           RPL_DEFAULT_LIFETIME);
+    NS_TEST_ASSERT_MSG_EQ(rootA->ComputeSourceRoute(targetA, hops),
+                          true,
+                          "Root A did not accept its own Path Sequence wrap (255 -> 0)");
+    NS_TEST_ASSERT_MSG_EQ(rootB->GetTopologySize(),
+                          1,
+                          "Root B's topology changed when only root A's Path Sequence wrapped");
+    NS_TEST_ASSERT_MSG_EQ(rootB->ComputeSourceRoute(targetB, hops),
+                          true,
+                          "Root B's own route was disturbed by root A's unrelated Path Sequence "
+                          "wrap");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Check MRHOF (RFC 6719) parent selection: path cost, not just hop
  *        count, decides the preferred parent, and hysteresis
  *        (PARENT_SWITCH_THRESHOLD) keeps it from flapping over a marginal
@@ -2416,7 +3359,6 @@ RplDioRejectionTestCase::DoRun()
 
     Ptr<RplRoutingProtocol> node = nodes.Get(0)->GetObject<RplRoutingProtocol>();
     Ipv6Address dodagId("2001:1::1");
-    Ipv6Address otherDodagId("2001:2::1");
     Ipv6Address nodeLinkLocal =
         nodes.Get(0)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
     Ipv6Address peerLinkLocal =
@@ -2479,11 +3421,9 @@ RplDioRejectionTestCase::DoRun()
     NS_TEST_ASSERT_MSG_EQ(node->GetPreferredParent(), peerLinkLocal, "Wrong preferred parent");
     NS_TEST_ASSERT_MSG_EQ(node->GetRank(), 2 * RPL_MIN_HOPRANKINC, "Wrong rank one hop out");
 
-    // Another DODAG entirely, advertising a better rank: ignored, since
-    // this node already belongs to one.
-    send(buildDio(otherDodagId, 9, 1, RPL_MOP_NON_STORING));
-    NS_TEST_ASSERT_MSG_EQ(node->GetDodagId(), dodagId, "A DIO for another DODAG was adopted");
-    NS_TEST_ASSERT_MSG_EQ(node->GetRank(), 2 * RPL_MIN_HOPRANKINC, "Its rank was adopted too");
+    // A DIO for another DODAG entirely is no longer turned away: a node can
+    // belong to more than one DODAG at once (@see RplMultiDodagTestCase),
+    // so this is deliberately not covered by this rejection-focused test.
 
     // A stale version of the DODAG this node is in: ignored.
     send(buildDio(dodagId, 4, 1, RPL_MOP_NON_STORING));
@@ -6561,6 +7501,11 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplPrepareOutgoingPacketNonRplInterfaceTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplTrickleTimerTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDodagFormationTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplMultiDodagTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplCreateLocalDodagTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplMultiDodagVersionIsolationTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplMultiDodagDtsnIsolationTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplMultiDodagPathSequenceIsolationTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDioRejectionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplParentLossRejoinTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplInterfaceRestartTestCase, TestCase::Duration::QUICK);

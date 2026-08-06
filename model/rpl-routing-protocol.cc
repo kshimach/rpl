@@ -394,19 +394,74 @@ RplRoutingProtocol::DoDispose()
 RplRoutingProtocol::DodagMembership*
 RplRoutingProtocol::GetBaseDodag()
 {
-    NS_ASSERT_MSG(m_dodags.size() <= 1,
-                 "GetBaseDodag() assumes at most one DODAG membership; a second one has been "
-                 "added somewhere without updating this to track which key is the base DODAG");
-    return m_dodags.empty() ? nullptr : &m_dodags.begin()->second;
+    if (!m_hasBaseDodag)
+    {
+        return nullptr;
+    }
+    auto it = m_dodags.find(m_baseDodagKey);
+    return it == m_dodags.end() ? nullptr : &it->second;
 }
 
 const RplRoutingProtocol::DodagMembership*
 RplRoutingProtocol::GetBaseDodag() const
 {
-    NS_ASSERT_MSG(m_dodags.size() <= 1,
-                 "GetBaseDodag() assumes at most one DODAG membership; a second one has been "
-                 "added somewhere without updating this to track which key is the base DODAG");
-    return m_dodags.empty() ? nullptr : &m_dodags.begin()->second;
+    if (!m_hasBaseDodag)
+    {
+        return nullptr;
+    }
+    auto it = m_dodags.find(m_baseDodagKey);
+    return it == m_dodags.end() ? nullptr : &it->second;
+}
+
+RplRoutingProtocol::DodagMembership&
+RplRoutingProtocol::CreateDodagMembership(DodagKey key, uint8_t mop)
+{
+    NS_LOG_FUNCTION(this << +key.instanceId << key.dodagId << +mop);
+    NS_ASSERT_MSG(m_dodags.find(key) == m_dodags.end(),
+                 "CreateDodagMembership() called for a DODAG this node already has a membership "
+                 "in");
+
+    // In-place construction only, straight into the map: see
+    // DodagMembership's own doc comment for why.
+    DodagMembership& dodag = m_dodags[key];
+    dodag.instanceId = key.instanceId;
+    dodag.dodagId = key.dodagId;
+    dodag.isRoot = true;
+    dodag.mop = mop;
+    dodag.grounded = true;
+    dodag.rank = m_minHopRankIncrease;
+
+    // Seeded from this node's own attribute-configured defaults, the same
+    // values JoinDodag() would instead read off a received DIO's DODAG
+    // Configuration option -- a self-formed DODAG's root is the one node
+    // that originates them rather than adopting them from somewhere else.
+    dodag.ocp = m_ocp;
+    dodag.minHopRankIncrease = m_minHopRankIncrease;
+    dodag.dioIntervalMin = m_dioIntervalMin;
+    dodag.dioIntervalDoublings = m_dioIntervalDoublings;
+    dodag.dioRedundancy = m_dioRedundancy;
+
+    // No daoEvent/daoRetryEvent binding: SendDao() is a no-op for a root
+    // (dodag.isRoot), and nothing ever schedules either Timer for one in
+    // the first place -- only SelectPreferredParent() does that, on
+    // picking a first preferred parent, which a root never has.
+    dodag.dioTrickle.SetFunction(MakeCallback(&RplRoutingProtocol::DioTrickleFire, this, key));
+    dodag.dioTrickle.SetParameters(dodag.dioIntervalMin,
+                                   dodag.dioIntervalDoublings,
+                                   dodag.dioRedundancy);
+    if (m_dioTrickleStream >= 0)
+    {
+        dodag.dioTrickle.AssignStreams(m_dioTrickleStream);
+    }
+    dodag.dioTrickle.Start();
+
+    if (!m_hasBaseDodag)
+    {
+        m_hasBaseDodag = true;
+        m_baseDodagKey = key;
+    }
+
+    return dodag;
 }
 
 void
@@ -551,6 +606,42 @@ RplRoutingProtocol::GetGlobalAddress() const
     return Ipv6Address::GetAny();
 }
 
+Ipv6Address
+RplRoutingProtocol::GetGlobalAddressIn(const DodagMembership& dodag) const
+{
+    if (!dodag.hasPrefixInfo)
+    {
+        // No prefix known for this DODAG (e.g. one CreateLocalDodag()
+        // formed, which never carries a Prefix Information option): there
+        // is nothing to filter by, so fall back to whichever global
+        // address this node has, the same as before this DODAG-aware
+        // lookup existed.
+        return GetGlobalAddress();
+    }
+
+    Ipv6Prefix prefix(dodag.prefixLength);
+    for (uint32_t i = 1; i < m_ipv6->GetNInterfaces(); i++)
+    {
+        for (uint32_t j = 0; j < m_ipv6->GetNAddresses(i); j++)
+        {
+            Ipv6InterfaceAddress iaddr = m_ipv6->GetAddress(i, j);
+            // Same TENTATIVE guard as GetGlobalAddress(): an address DAD
+            // has not cleared yet is not actually usable. Matched against
+            // the real, currently assigned addresses rather than rebuilt
+            // from dodag.dodagId + a link-local (the way GlobalAddressOf()
+            // does for a neighbour) precisely so an address DAD rejected
+            // and withdrew is not still handed out here.
+            if (iaddr.GetScope() == Ipv6InterfaceAddress::GLOBAL &&
+                iaddr.GetState() != Ipv6InterfaceAddress::TENTATIVE &&
+                prefix.IsMatch(iaddr.GetAddress(), dodag.prefix))
+            {
+                return iaddr.GetAddress();
+            }
+        }
+    }
+    return Ipv6Address::GetAny();
+}
+
 void
 RplRoutingProtocol::HandleDadSuccess(const Ipv6Address& address)
 {
@@ -578,27 +669,8 @@ RplRoutingProtocol::HandleDadSuccess(const Ipv6Address& address)
         // DAD has actually confirmed the address DoInitialize() asked for is
         // unique, which is what starting the DODAG on an address that might
         // still get pulled out from under it would risk.
-        //
-        // In-place construction only, straight into the map, the same as
-        // JoinDodag(): see DodagMembership's own doc comment for why.
         DodagKey key{RPL_DEFAULT_INSTANCE, address};
-        DodagMembership& dodag = m_dodags[key];
-        dodag.instanceId = key.instanceId;
-        dodag.dodagId = key.dodagId;
-        dodag.isRoot = true;
-        dodag.mop = RPL_MOP_NON_STORING;
-        dodag.grounded = true;
-        dodag.rank = m_minHopRankIncrease;
-
-        // Seeded from this node's own attribute-configured defaults, the
-        // same values JoinDodag() would instead read off a received DIO's
-        // DODAG Configuration option -- the root is the one node that
-        // originates them rather than adopting them from somewhere else.
-        dodag.ocp = m_ocp;
-        dodag.minHopRankIncrease = m_minHopRankIncrease;
-        dodag.dioIntervalMin = m_dioIntervalMin;
-        dodag.dioIntervalDoublings = m_dioIntervalDoublings;
-        dodag.dioRedundancy = m_dioRedundancy;
+        DodagMembership& dodag = CreateDodagMembership(key, RPL_MOP_NON_STORING);
 
         // Every DIO this root sends carries the Prefix Information option
         // (RFC 6550 section 6.7.10) so every other node can SLAAC an address
@@ -610,20 +682,6 @@ RplRoutingProtocol::HandleDadSuccess(const Ipv6Address& address)
         dodag.prefixAutonomous = true;
         dodag.prefixValidLifetime = RPL_PREFIX_VALID_LIFETIME;
         dodag.prefixPreferredLifetime = RPL_PREFIX_PREFERRED_LIFETIME;
-
-        // No daoEvent/daoRetryEvent binding: SendDao() is a no-op for a root
-        // (dodag.isRoot), and nothing ever schedules either Timer for one in
-        // the first place -- only SelectPreferredParent() does that, on
-        // picking a first preferred parent, which a root never has.
-        dodag.dioTrickle.SetFunction(MakeCallback(&RplRoutingProtocol::DioTrickleFire, this, key));
-        dodag.dioTrickle.SetParameters(dodag.dioIntervalMin,
-                                       dodag.dioIntervalDoublings,
-                                       dodag.dioRedundancy);
-        if (m_dioTrickleStream >= 0)
-        {
-            dodag.dioTrickle.AssignStreams(m_dioTrickleStream);
-        }
-        dodag.dioTrickle.Start();
 
         NS_LOG_INFO("Root of DODAG " << dodag.dodagId << " at rank " << dodag.rank);
         return;
@@ -925,21 +983,26 @@ RplRoutingProtocol::HandleDis(Ipv6Address from, uint32_t interface, bool toMulti
 {
     NS_LOG_FUNCTION(this << from << interface << toMulticast);
 
-    DodagMembership* dodag = GetBaseDodag();
-    if (!dodag)
+    // Answer for every DODAG this node currently belongs to, not just the
+    // base one: a DIS is not addressed to a particular Instance, so a
+    // neighbour soliciting one wants to hear about all of them. Neither
+    // branch below ever calls LeaveDodag() (dioTrickle.Reset() only
+    // perturbs the Trickle timer; SendDio() only serializes and sends), so
+    // unlike StopInterface() this plain range-for needs no snapshot-then-
+    // refind guard against a mid-loop erase().
+    for (auto& [key, dodag] : m_dodags)
     {
-        return;
-    }
-
-    if (toMulticast)
-    {
-        // RFC 6550, section 8.3: a multicast DIS is an inconsistency, so the
-        // Trickle timer restarts and the answer goes out to the whole link.
-        dodag->dioTrickle.Reset();
-    }
-    else
-    {
-        SendDio(*dodag, from, interface);
+        if (toMulticast)
+        {
+            // RFC 6550, section 8.3: a multicast DIS is an inconsistency, so
+            // the Trickle timer restarts and the answer goes out to the
+            // whole link.
+            dodag.dioTrickle.Reset();
+        }
+        else
+        {
+            SendDio(dodag, from, interface);
+        }
     }
 }
 
@@ -952,10 +1015,28 @@ RplRoutingProtocol::HandleDio(const RplDioHeader& dio,
 {
     NS_LOG_FUNCTION(this << from << interface);
 
+    DodagKey dioKey{dio.GetInstanceId(), dio.GetDodagId()};
+
     if (m_isRoot)
     {
-        // The root originates the DODAG and never takes a parent in it.
-        return;
+        DodagMembership* own = GetBaseDodag();
+        if (!own)
+        {
+            // This node's own DODAG has not formed yet (HandleDadSuccess()
+            // is still waiting on DAD for the address it roots at): ignore
+            // every DIO until then, so nothing else can beat it to becoming
+            // the base DODAG (@see GetBaseDodag()).
+            return;
+        }
+        if (own->instanceId == dioKey.instanceId && own->dodagId == dioKey.dodagId)
+        {
+            // The root never takes a parent within the DODAG it roots.
+            return;
+        }
+        // A DIO for some other DODAG: fall through. A root may still join
+        // it as a regular (non-root) member, the way an AODV-RPL (RFC
+        // 9854) OrigNode is root of its own RREQ-Instance while remaining
+        // an ordinary member of the base DODAG.
     }
 
     if (dio.GetMop() != RPL_MOP_NON_STORING)
@@ -966,7 +1047,8 @@ RplRoutingProtocol::HandleDio(const RplDioHeader& dio,
         return;
     }
 
-    DodagMembership* existing = GetBaseDodag();
+    auto existingIt = m_dodags.find(dioKey);
+    DodagMembership* existing = existingIt != m_dodags.end() ? &existingIt->second : nullptr;
 
     if (dio.GetRank() == RPL_INFINITE_RANK)
     {
@@ -987,11 +1069,15 @@ RplRoutingProtocol::HandleDio(const RplDioHeader& dio,
             existing->parents.erase(from);
             // SelectPreferredParent() may lose the last parent and call
             // LeaveDodag(), which erases this very entry -- existing would
-            // then dangle, so the Trickle reset below re-resolves it fresh
+            // then dangle, so the Trickle reset below re-resolves it by key
             // rather than reusing the pointer already in hand.
-            if (SelectPreferredParent(*existing) && GetBaseDodag())
+            if (SelectPreferredParent(*existing))
             {
-                GetBaseDodag()->dioTrickle.Reset();
+                auto it = m_dodags.find(dioKey);
+                if (it != m_dodags.end())
+                {
+                    it->second.dioTrickle.Reset();
+                }
             }
         }
         return;
@@ -1000,12 +1086,6 @@ RplRoutingProtocol::HandleDio(const RplDioHeader& dio,
     if (!existing)
     {
         JoinDodag(dio, interface);
-    }
-    else if (dio.GetInstanceId() != existing->instanceId || dio.GetDodagId() != existing->dodagId)
-    {
-        NS_LOG_LOGIC("Ignoring a DIO for instance " << +dio.GetInstanceId() << " DODAG "
-                                                    << dio.GetDodagId());
-        return;
     }
     else if (dio.GetVersionNumber() != existing->version)
     {
@@ -1036,8 +1116,10 @@ RplRoutingProtocol::HandleDio(const RplDioHeader& dio,
         }
     }
 
-    DodagMembership* dodag = GetBaseDodag();
-    NS_ASSERT_MSG(dodag, "JoinDodag() must have created the base membership by this point");
+    auto dodagIt = m_dodags.find(dioKey);
+    NS_ASSERT_MSG(dodagIt != m_dodags.end(),
+                 "JoinDodag() must have created this membership by this point");
+    DodagMembership* dodag = &dodagIt->second;
 
     // RFC 6550 section 9.6, rules 1 and 2: hearing a DAO parent increment
     // its DTSN means new downward state exists to refresh. "DAO parent" is
@@ -1092,9 +1174,13 @@ RplRoutingProtocol::HandleDio(const RplDioHeader& dio,
 
     // Same dangling-pointer hazard as the infinite-rank branch above:
     // SelectPreferredParent() can erase this very entry via LeaveDodag().
-    if (SelectPreferredParent(*dodag) && GetBaseDodag())
+    if (SelectPreferredParent(*dodag))
     {
-        GetBaseDodag()->dioTrickle.Reset();
+        auto it = m_dodags.find(dioKey);
+        if (it != m_dodags.end())
+        {
+            it->second.dioTrickle.Reset();
+        }
     }
 }
 
@@ -1110,6 +1196,13 @@ RplRoutingProtocol::JoinDodag(const RplDioHeader& dio, uint32_t interface)
     // never happen. operator[] on a not-yet-present key default-constructs
     // the value directly inside the map node, no temporary involved.
     DodagMembership& dodag = m_dodags[key];
+
+    if (!m_hasBaseDodag)
+    {
+        m_hasBaseDodag = true;
+        m_baseDodagKey = key;
+    }
+
     dodag.instanceId = key.instanceId;
     dodag.dodagId = key.dodagId;
     dodag.isRoot = false;
@@ -1256,6 +1349,37 @@ RplRoutingProtocol::LeaveDodag(DodagKey key, bool poison)
     dodag.daoEvent.Cancel();
     dodag.daoRetryEvent.Cancel();
     m_dodags.erase(it);
+
+    if (poison && m_hasBaseDodag && m_baseDodagKey == key)
+    {
+        // The base DODAG itself was just left for good. Promote a survivor
+        // (in an arbitrary but deterministic order) rather than leaving
+        // every base-scoped accessor (GetRank(), IsJoined(), RouteOutput(),
+        // ...) blind to a node that may still be actively participating in
+        // other DODAGs: existing single-DODAG scenarios never reach this
+        // branch with a non-empty m_dodags left over (leaving the only
+        // membership there is empties it), so this only ever activates
+        // once a second membership genuinely exists.
+        //
+        // Gated on poison rather than running unconditionally: the other
+        // caller (HandleDio()'s version-mismatch branch) passes poison =
+        // false specifically because it always calls JoinDodag() for this
+        // exact same key immediately afterwards, in the same event
+        // ("migrating ... not detaching"). Promoting a survivor there too
+        // would hand the base slot to some unrelated DODAG for the instant
+        // before JoinDodag() puts this key right back -- and, worse, leave
+        // it there afterwards, since m_hasBaseDodag would already be true
+        // by the time JoinDodag() runs its own "assign if none yet" check.
+        // Leaving m_baseDodagKey untouched here instead means it is still
+        // exactly the key JoinDodag() is about to reinsert, so the base
+        // identity survives the migration unchanged, which is the whole
+        // point of not poisoning on the way out.
+        m_hasBaseDodag = !m_dodags.empty();
+        if (m_hasBaseDodag)
+        {
+            m_baseDodagKey = m_dodags.begin()->first;
+        }
+    }
 }
 
 Ipv6Address
@@ -1301,7 +1425,7 @@ RplRoutingProtocol::SendDao(DodagMembership& dodag)
         return;
     }
 
-    Ipv6Address target = GetGlobalAddress();
+    Ipv6Address target = GetGlobalAddressIn(dodag);
     Ipv6Address parent = GlobalAddressOf(dodag, dodag.preferredParent);
     if (target.IsAny() || parent.IsAny())
     {
@@ -1335,7 +1459,7 @@ RplRoutingProtocol::SendNoPathDao(DodagMembership& dodag, Ipv6Address viaParent)
 {
     NS_LOG_FUNCTION(this << viaParent);
 
-    Ipv6Address target = GetGlobalAddress();
+    Ipv6Address target = GetGlobalAddressIn(dodag);
     Ipv6Address parent = GlobalAddressOf(dodag, viaParent);
     if (target.IsAny() || parent.IsAny())
     {
@@ -1414,7 +1538,7 @@ RplRoutingProtocol::DaoRetry(DodagKey key)
     dao.SetDodagId(dodag.dodagId);
     dao.SetSequence(dodag.daoSequence);
     dao.SetAckRequested(true);
-    dao.SetTarget(GetGlobalAddress());
+    dao.SetTarget(GetGlobalAddressIn(dodag));
     dao.SetTransitInformation(GlobalAddressOf(dodag, dodag.preferredParent),
                               dodag.pathSequence,
                               m_pathLifetime);
@@ -1564,11 +1688,19 @@ RplRoutingProtocol::HandleDaoAck(const RplDaoAckHeader& daoAck, Ipv6Address from
 {
     NS_LOG_FUNCTION(this << from);
 
-    DodagMembership* dodag = GetBaseDodag();
-    if (!dodag)
+    // Resolved by the DODAG the DAO-ACK itself names (HandleDao() stamps
+    // both onto every DAO-ACK it sends, from the DAO that earned it), not
+    // GetBaseDodag(): with more than one membership pending its own DAO at
+    // once, a DAO-ACK from a non-base DODAG's root must not be applied to
+    // the base membership's daoAckPending/daoRetryEvent instead, which
+    // would leave the actual target membership retrying forever despite
+    // having already been acknowledged.
+    auto it = m_dodags.find(DodagKey{daoAck.GetInstanceId(), daoAck.GetDodagId()});
+    if (it == m_dodags.end())
     {
         return;
     }
+    DodagMembership* dodag = &it->second;
 
     if (daoAck.GetSequence() != dodag->daoSequence)
     {
@@ -2224,6 +2356,35 @@ RplRoutingProtocol::RouteOutput(Ptr<Packet> p,
         }
     }
 
+    // dst may be some OTHER DODAG's own DODAGID: the only unicast traffic a
+    // non-root membership ever originates besides its DIOs (multicast, so
+    // never seen here) is its own DAO/DAO-ACK-retry, always addressed to
+    // that DODAG's DODAGID (SendDao(), SendNoPathDao(), DaoRetry()).
+    // Checked, and returned on a match, before the base DODAG's fallback
+    // below: RouteViaPreferredParent() builds a route from nothing but
+    // dodag.preferredParent and dodag.parents -- it does not check dst
+    // against the DODAG at all -- so the base DODAG's own attempt would
+    // otherwise succeed unconditionally for ANY destination as long as it
+    // has picked a preferred parent, silently absorbing this traffic
+    // before this loop ever ran. Without this running first, a non-base
+    // membership could join and rank successfully but never actually get a
+    // route registered at its own root, its DAO instead heading towards
+    // the base DODAG's parent, who has no idea what to do with it.
+    for (auto& [key, other] : m_dodags)
+    {
+        if (dodag == &other || other.dodagId != dst)
+        {
+            continue;
+        }
+        Ptr<Ipv6Route> route = RouteViaPreferredParent(other, dst);
+        if (route)
+        {
+            NS_LOG_LOGIC("Routing " << dst << " (a non-base DODAG's own DODAGID) via its "
+                                    << "preferred parent " << other.preferredParent);
+            return route;
+        }
+    }
+
     if (dodag)
     {
         Ptr<Ipv6Route> route = RouteViaPreferredParent(*dodag, dst);
@@ -2476,6 +2637,29 @@ RplRoutingProtocol::SetAsRoot()
     m_disTimer.Cancel();
 }
 
+RplRoutingProtocol::DodagKey
+RplRoutingProtocol::CreateLocalDodag(uint8_t instanceId, uint8_t mop)
+{
+    NS_LOG_FUNCTION(this << +instanceId << +mop);
+
+    Ipv6Address address = GetGlobalAddress();
+    if (address.IsAny())
+    {
+        NS_LOG_WARN("Cannot form a local DODAG: this node has no global address yet");
+        return DodagKey{instanceId, Ipv6Address::GetAny()};
+    }
+
+    DodagKey key{instanceId, address};
+    // No Prefix Information option: unlike RplHelper::SetRoot()'s DODAG,
+    // neither AODV-RPL (RFC 9854) nor P2P-RPL (RFC 6997) SLAAC an address
+    // on their local instance -- every participant already has whatever
+    // address the base DODAG gave it.
+    CreateDodagMembership(key, mop);
+
+    NS_LOG_INFO("Formed local DODAG " << key.dodagId << " under instance " << +instanceId);
+    return key;
+}
+
 bool
 RplRoutingProtocol::IsRoot() const
 {
@@ -2514,6 +2698,25 @@ RplRoutingProtocol::GetPreferredParent() const
 {
     const DodagMembership* dodag = GetBaseDodag();
     return dodag ? dodag->preferredParent : Ipv6Address::GetAny();
+}
+
+bool
+RplRoutingProtocol::IsJoinedTo(uint8_t instanceId, Ipv6Address dodagId) const
+{
+    return m_dodags.find(DodagKey{instanceId, dodagId}) != m_dodags.end();
+}
+
+uint16_t
+RplRoutingProtocol::GetRankIn(uint8_t instanceId, Ipv6Address dodagId) const
+{
+    auto it = m_dodags.find(DodagKey{instanceId, dodagId});
+    return it != m_dodags.end() ? it->second.rank : RPL_INFINITE_RANK;
+}
+
+uint32_t
+RplRoutingProtocol::GetDodagCount() const
+{
+    return static_cast<uint32_t>(m_dodags.size());
 }
 
 void
