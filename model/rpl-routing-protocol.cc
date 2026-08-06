@@ -1017,27 +1017,36 @@ RplRoutingProtocol::HandleDio(const RplDioHeader& dio,
 
     DodagKey dioKey{dio.GetInstanceId(), dio.GetDodagId()};
 
-    if (m_isRoot)
+    if (m_isRoot && !GetBaseDodag())
     {
-        DodagMembership* own = GetBaseDodag();
-        if (!own)
-        {
-            // This node's own DODAG has not formed yet (HandleDadSuccess()
-            // is still waiting on DAD for the address it roots at): ignore
-            // every DIO until then, so nothing else can beat it to becoming
-            // the base DODAG (@see GetBaseDodag()).
-            return;
-        }
-        if (own->instanceId == dioKey.instanceId && own->dodagId == dioKey.dodagId)
-        {
-            // The root never takes a parent within the DODAG it roots.
-            return;
-        }
-        // A DIO for some other DODAG: fall through. A root may still join
-        // it as a regular (non-root) member, the way an AODV-RPL (RFC
-        // 9854) OrigNode is root of its own RREQ-Instance while remaining
-        // an ordinary member of the base DODAG.
+        // This node's own base DODAG has not formed yet (HandleDadSuccess()
+        // is still waiting on DAD for the address it roots at): ignore
+        // every DIO until then, so nothing else can beat it to becoming the
+        // base DODAG (@see GetBaseDodag()). Specific to the base's own
+        // formation, not the general "root never takes a parent within its
+        // own DODAG" rule just below -- a CreateLocalDodag()-formed
+        // membership has no equivalent race, it exists synchronously the
+        // moment that call returns.
+        return;
     }
+
+    auto selfIt = m_dodags.find(dioKey);
+    if (selfIt != m_dodags.end() && selfIt->second.isRoot)
+    {
+        // This node roots the DODAG the DIO names -- the base one or a
+        // CreateLocalDodag()-formed local one, either way -- and a root
+        // never takes a parent within its own DODAG. Resolved by key
+        // rather than GetBaseDodag(): the old base-only version of this
+        // check let a local DODAG's own re-advertised DIO reach its root
+        // and be treated as an ordinary join candidate, a self-loop.
+        return;
+    }
+
+    // A DIO for some DODAG this node does not itself root: fall through,
+    // including for a root, which may still join another DODAG as a
+    // regular (non-root) member -- the way an AODV-RPL (RFC 9854) OrigNode
+    // is root of its own RREQ-Instance while remaining an ordinary member
+    // of the base DODAG.
 
     if (dio.GetMop() != RPL_MOP_NON_STORING)
     {
@@ -1556,26 +1565,36 @@ RplRoutingProtocol::HandleDao(const RplDaoHeader& dao, Ipv6Address from)
 {
     NS_LOG_FUNCTION(this << from);
 
-    if (!m_isRoot)
+    // Resolved by the DODAG the DAO itself names, not GetBaseDodag(): a
+    // node rooting a CreateLocalDodag()-formed DODAG (m_isRoot false, since
+    // it never called SetAsRoot() for the base) must still be able to
+    // receive DAOs for that DODAG. The D flag clear (RFC 6550 section 6.4,
+    // dao.GetDodagId().IsAny()) falls back to resolving by RPLInstanceID
+    // alone, the same limit FindDodagByInstance() documents elsewhere.
+    DodagMembership* dodag = nullptr;
+    if (!dao.GetDodagId().IsAny())
     {
-        // In non-storing mode a DAO is addressed to the root, so a node that
-        // is not the root only ever forwards one. Getting here means the
-        // sender is confused about who the root is.
-        NS_LOG_WARN("Ignoring a DAO from " << from << ": this node is not the root");
-        return;
+        auto it = m_dodags.find(DodagKey{dao.GetInstanceId(), dao.GetDodagId()});
+        if (it != m_dodags.end() && it->second.isRoot)
+        {
+            dodag = &it->second;
+        }
     }
-
-    DodagMembership* dodag = GetBaseDodag();
+    else
+    {
+        DodagMembership* candidate = FindDodagByInstance(dao.GetInstanceId());
+        if (candidate && candidate->isRoot)
+        {
+            dodag = candidate;
+        }
+    }
     if (!dodag)
     {
-        NS_LOG_LOGIC("Ignoring a DAO: not yet the root of any DODAG");
-        return;
-    }
-
-    if (dao.GetInstanceId() != dodag->instanceId ||
-        (!dao.GetDodagId().IsAny() && dao.GetDodagId() != dodag->dodagId))
-    {
-        NS_LOG_LOGIC("Ignoring a DAO for another DODAG");
+        // In non-storing mode a DAO is addressed to the root, so either the
+        // sender is confused about who the root is, or this DAO belongs to
+        // a DODAG this node does not root at all.
+        NS_LOG_LOGIC("Ignoring a DAO from " << from << ": this node does not root the DODAG it "
+                                                        "names");
         return;
     }
 
@@ -1730,14 +1749,96 @@ RplRoutingProtocol::PurgeTopology(DodagMembership& dodag)
     }
 }
 
+RplRoutingProtocol::DodagMembership*
+RplRoutingProtocol::FindDodagByInstance(uint8_t instanceId)
+{
+    auto it = m_dodags.lower_bound(DodagKey{instanceId, Ipv6Address::GetAny()});
+    return (it != m_dodags.end() && it->first.instanceId == instanceId) ? &it->second : nullptr;
+}
+
+const RplRoutingProtocol::DodagMembership*
+RplRoutingProtocol::FindDodagByInstance(uint8_t instanceId) const
+{
+    auto it = m_dodags.lower_bound(DodagKey{instanceId, Ipv6Address::GetAny()});
+    return (it != m_dodags.end() && it->first.instanceId == instanceId) ? &it->second : nullptr;
+}
+
 bool
-RplRoutingProtocol::ComputeSourceRoute(Ipv6Address destination,
+RplRoutingProtocol::ReadRpiInstanceId(Ptr<const Packet> p,
+                                      const Ipv6Header& header,
+                                      uint8_t& instanceId) const
+{
+    if (header.GetNextHeader() != Ipv6Header::IPV6_EXT_HOP_BY_HOP)
+    {
+        return false;
+    }
+
+    // The RPI is always the first (and, on this module's own traffic, only)
+    // option in the Hop-by-Hop header, immediately after its own 2-octet
+    // Next Header/Hdr Ext Len prefix: PrepareOutgoingPacket() is the only
+    // writer, RplPacketInfoHeader declares no alignment that would ever get
+    // a Pad1/PadN inserted ahead of it, and every hop after that only
+    // rewrites it in place (RplIpv6OptionRpl::Process()), never removes or
+    // reorders it. A copy, not the real packet: this is a look, not a
+    // consume, and RouteInput()'s caller still owns p.
+    Ptr<Packet> fragment = p->Copy();
+    if (fragment->GetSize() < 2)
+    {
+        return false;
+    }
+    fragment = fragment->CreateFragment(2, fragment->GetSize() - 2);
+
+    RplPacketInfoHeader rpi;
+    if (fragment->GetSize() < rpi.GetSerializedSize() || fragment->RemoveHeader(rpi) == 0)
+    {
+        return false;
+    }
+    if (rpi.IsMalformed())
+    {
+        return false;
+    }
+
+    instanceId = rpi.GetInstanceId();
+    return true;
+}
+
+RplRoutingProtocol::DodagMembership*
+RplRoutingProtocol::FindRootDodagFor(Ipv6Address destination, std::vector<Ipv6Address>& hops)
+{
+    DodagMembership* base = GetBaseDodag();
+    if (base && base->isRoot)
+    {
+        PurgeTopology(*base);
+        if (ComputeSourceRoute(*base, destination, hops))
+        {
+            return base;
+        }
+    }
+
+    for (auto& [key, other] : m_dodags)
+    {
+        if (&other == base || !other.isRoot)
+        {
+            continue;
+        }
+        PurgeTopology(other);
+        if (ComputeSourceRoute(other, destination, hops))
+        {
+            return &other;
+        }
+    }
+
+    return nullptr;
+}
+
+bool
+RplRoutingProtocol::ComputeSourceRoute(const DodagMembership& dodag,
+                                       Ipv6Address destination,
                                        std::vector<Ipv6Address>& hops) const
 {
     hops.clear();
 
-    const DodagMembership* dodag = GetBaseDodag();
-    if (!m_isRoot || !dodag || dodag->topology.find(destination) == dodag->topology.end())
+    if (!dodag.isRoot || dodag.topology.find(destination) == dodag.topology.end())
     {
         return false;
     }
@@ -1750,17 +1851,17 @@ RplRoutingProtocol::ComputeSourceRoute(Ipv6Address destination,
     // between, destination included. The loop cannot run longer than the
     // topology is wide, which is what keeps a cycle in the reported parents
     // from hanging the simulation.
-    for (size_t step = 0; step <= dodag->topology.size(); step++)
+    for (size_t step = 0; step <= dodag.topology.size(); step++)
     {
-        auto it = dodag->topology.find(current);
-        if (it == dodag->topology.end() || it->second.expire <= now)
+        auto it = dodag.topology.find(current);
+        if (it == dodag.topology.end() || it->second.expire <= now)
         {
             return false;
         }
 
         globalChain.push_back(current);
         current = it->second.parent;
-        if (current == dodag->dodagId)
+        if (current == dodag.dodagId)
         {
             std::reverse(globalChain.begin(), globalChain.end());
             for (const auto& global : globalChain)
@@ -1774,6 +1875,34 @@ RplRoutingProtocol::ComputeSourceRoute(Ipv6Address destination,
     NS_LOG_WARN("The reported parents of " << destination << " do not lead to the root");
     hops.clear();
     return false;
+}
+
+bool
+RplRoutingProtocol::ComputeSourceRoute(Ipv6Address destination,
+                                       std::vector<Ipv6Address>& hops) const
+{
+    const DodagMembership* dodag = GetBaseDodag();
+    if (!dodag)
+    {
+        hops.clear();
+        return false;
+    }
+    return ComputeSourceRoute(*dodag, destination, hops);
+}
+
+bool
+RplRoutingProtocol::ComputeSourceRoute(uint8_t instanceId,
+                                       Ipv6Address dodagId,
+                                       Ipv6Address destination,
+                                       std::vector<Ipv6Address>& hops) const
+{
+    auto it = m_dodags.find(DodagKey{instanceId, dodagId});
+    if (it == m_dodags.end())
+    {
+        hops.clear();
+        return false;
+    }
+    return ComputeSourceRoute(it->second, destination, hops);
 }
 
 uint32_t
@@ -1800,9 +1929,10 @@ RplRoutingProtocol::InterfaceForNeighbour(const DodagMembership& dodag, Ipv6Addr
 }
 
 Ptr<Ipv6Route>
-RplRoutingProtocol::RouteToNeighbour(Ipv6Address neighbour, Ipv6Address dst) const
+RplRoutingProtocol::RouteToNeighbour(const DodagMembership* dodag,
+                                     Ipv6Address neighbour,
+                                     Ipv6Address dst) const
 {
-    const DodagMembership* dodag = GetBaseDodag();
     uint32_t interface = dodag ? InterfaceForNeighbour(*dodag, neighbour) : 0;
     if (interface == 0)
     {
@@ -1836,6 +1966,18 @@ RplRoutingProtocol::RouteToNeighbour(Ipv6Address neighbour, Ipv6Address dst) con
     route->SetOutputDevice(m_ipv6->GetNetDevice(interface));
     route->SetSource(m_ipv6->SourceAddressSelection(interface, dst));
     return route;
+}
+
+Ptr<Ipv6Route>
+RplRoutingProtocol::RouteToNeighbour(Ipv6Address neighbour, Ipv6Address dst) const
+{
+    return RouteToNeighbour(GetBaseDodag(), neighbour, dst);
+}
+
+Ptr<Ipv6Route>
+RplRoutingProtocol::RouteToNeighbour(uint8_t instanceId, Ipv6Address neighbour, Ipv6Address dst) const
+{
+    return RouteToNeighbour(FindDodagByInstance(instanceId), neighbour, dst);
 }
 
 uint32_t
@@ -2360,23 +2502,23 @@ RplRoutingProtocol::RouteOutput(Ptr<Packet> p,
     // The root is the only node that knows how to go down, so it is the only
     // one that can put a path into a packet; everyone else sends everything to
     // its preferred parent and lets the root turn it around.
+    // Any DODAG this node itself roots can put a path into a packet -- the
+    // base one, or one CreateLocalDodag() formed at runtime -- not only the
+    // base (FindRootDodagFor() tries the base first, so a node with only
+    // that one behaves exactly as before). dodag itself stays the base
+    // membership below: the two blocks after this one deliberately still
+    // mean "the base DODAG", for the non-base-DODAG's-own-DODAGID fallback
+    // and the base fallback respectively.
     DodagMembership* dodag = GetBaseDodag();
-    if (m_isRoot && dodag)
     {
-        // Lazy cleanup, on the routing hot path rather than on a dedicated
-        // timer, the way AODV's RoutingProtocol::Forwarding() purges its
-        // table: the root only needs an up-to-date topology when it is about
-        // to use it.
-        PurgeTopology(*dodag);
-
         std::vector<Ipv6Address> hops;
-        if (ComputeSourceRoute(dst, hops))
+        if (DodagMembership* root = FindRootDodagFor(dst, hops))
         {
             NS_ASSERT(!hops.empty());
             NS_LOG_LOGIC("Source routing " << dst << " through " << (hops.size() - 1)
                                            << " intermediate router(s), first hop "
                                            << hops.front());
-            Ptr<Ipv6Route> route = RouteToNeighbour(hops.front(), dst);
+            Ptr<Ipv6Route> route = RouteToNeighbour(root->instanceId, hops.front(), dst);
             if (route)
             {
                 return route;
@@ -2462,75 +2604,95 @@ RplRoutingProtocol::PrepareOutgoingPacket(Ptr<Packet> packet, Ipv6Header& header
     uint8_t innerNextHeader = header.GetNextHeader();
     bool hasRoutingHeader = false;
 
-    // The Routing Header (RFC 6554), root only: only the root has the
-    // topology to compute a downward path at all; every other node's
-    // traffic goes up, which needs no Routing Header.
-    if (m_isRoot)
+    // The Routing Header (RFC 6554): only a node that roots the DODAG dst
+    // belongs to -- the base one, or one CreateLocalDodag() formed at
+    // runtime -- has the topology to compute a downward path at all; every
+    // other node's traffic goes up, which needs no Routing Header. The
+    // membership found here (if any) is reused below for the RPL Option
+    // this same packet also needs, rather than resolving twice.
+    std::vector<Ipv6Address> hops;
+    DodagMembership* originDodag = FindRootDodagFor(dst, hops);
+    if (originDodag && hops.size() > 1)
     {
-        std::vector<Ipv6Address> hops;
-        if (ComputeSourceRoute(dst, hops) && hops.size() > 1)
+        std::vector<Ipv6Address> addresses(hops.begin() + 1, hops.end());
+        // The last address is the packet's real final destination. Every
+        // other entry is only ever a next-hop identifier and is fine as
+        // link-local, but this one also becomes the IPv6 header's
+        // Destination once segmentsLeft reaches 0
+        // (RplIpv6ExtensionSourceRouting::Process()), and from there
+        // Icmpv6L4Protocol::HandleEchoRequest() (and any other ICMPv6/UDP
+        // responder) echoes it straight back as the reply's source
+        // address. A link-local source is scoped to one hop
+        // (Ipv6L3Protocol::IpForward() drops it outright further on), so
+        // a link-local final hop silently breaks every reply that has to
+        // cross more than one hop back to the root. Using the global
+        // address here keeps the reply's source address, and so its
+        // onward routing, working; RouteToNeighbour() (used below and by
+        // RplIpv6ExtensionSourceRouting::Process()) resolves a neighbour
+        // by its interface identifier alone, so it still finds the right
+        // interface for a global address.
+        addresses.back() = dst;
+        RplSourceRoutingHeader srh;
+        srh.SetNextHeader(innerNextHeader);
+        srh.SetAddresses(addresses);
+
+        // Both Segments Left and Hdr Ext Len are eight-bit fields (RFC
+        // 8200 section 4.4), so a path this long cannot be written down
+        // as one Routing Header, and writing one anyway would wrap the
+        // length silently. A DODAG deep enough to hit this is not
+        // something this implementation can source route through at
+        // all, so the packet goes out with only the RPL Option and is
+        // dropped by the first hop that finds no route -- which is at
+        // least a visible failure rather than a corrupted header.
+        if (addresses.size() > std::numeric_limits<uint8_t>::max() ||
+            srh.GetSerializedSize() > RplSourceRoutingHeader::MAX_SERIALIZED_SIZE)
         {
-            std::vector<Ipv6Address> addresses(hops.begin() + 1, hops.end());
-            // The last address is the packet's real final destination. Every
-            // other entry is only ever a next-hop identifier and is fine as
-            // link-local, but this one also becomes the IPv6 header's
-            // Destination once segmentsLeft reaches 0
-            // (RplIpv6ExtensionSourceRouting::Process()), and from there
-            // Icmpv6L4Protocol::HandleEchoRequest() (and any other ICMPv6/UDP
-            // responder) echoes it straight back as the reply's source
-            // address. A link-local source is scoped to one hop
-            // (Ipv6L3Protocol::IpForward() drops it outright further on), so
-            // a link-local final hop silently breaks every reply that has to
-            // cross more than one hop back to the root. Using the global
-            // address here keeps the reply's source address, and so its
-            // onward routing, working; RouteToNeighbour() (used below and by
-            // RplIpv6ExtensionSourceRouting::Process()) resolves a neighbour
-            // by its interface identifier alone, so it still finds the right
-            // interface for a global address.
-            addresses.back() = dst;
-            RplSourceRoutingHeader srh;
-            srh.SetNextHeader(innerNextHeader);
-            srh.SetAddresses(addresses);
+            NS_LOG_WARN("The path to " << dst << " needs " << addresses.size()
+                                       << " addresses, too many for one Routing Header");
+        }
+        else
+        {
+            srh.SetSegmentsLeft(static_cast<uint8_t>(hops.size() - 1));
+            packet->AddHeader(srh);
+            header.SetDestination(hops.front());
+            innerNextHeader = Ipv6Header::IPV6_EXT_ROUTING;
+            hasRoutingHeader = true;
 
-            // Both Segments Left and Hdr Ext Len are eight-bit fields (RFC
-            // 8200 section 4.4), so a path this long cannot be written down
-            // as one Routing Header, and writing one anyway would wrap the
-            // length silently. A DODAG deep enough to hit this is not
-            // something this implementation can source route through at
-            // all, so the packet goes out with only the RPL Option and is
-            // dropped by the first hop that finds no route -- which is at
-            // least a visible failure rather than a corrupted header.
-            if (addresses.size() > std::numeric_limits<uint8_t>::max() ||
-                srh.GetSerializedSize() > RplSourceRoutingHeader::MAX_SERIALIZED_SIZE)
-            {
-                NS_LOG_WARN("The path to " << dst << " needs " << addresses.size()
-                                           << " addresses, too many for one Routing Header");
-            }
-            else
-            {
-                srh.SetSegmentsLeft(static_cast<uint8_t>(hops.size() - 1));
-                packet->AddHeader(srh);
-                header.SetDestination(hops.front());
-                innerNextHeader = Ipv6Header::IPV6_EXT_ROUTING;
-                hasRoutingHeader = true;
-
-                NS_LOG_LOGIC("Attached a Routing Header for "
-                            << dst << " with " << (hops.size() - 1) << " address(es), first hop "
-                            << hops.front());
-            }
+            NS_LOG_LOGIC("Attached a Routing Header for "
+                        << dst << " with " << (hops.size() - 1) << " address(es), first hop "
+                        << hops.front());
         }
     }
 
-    // The RPL Option (RFC 6553), on every node's own traffic: the root's is
-    // always heading down, since the root never originates traffic of its
-    // own going up, and everyone else's is always heading up, since a
-    // non-storing mode node other than the root never originates downward
-    // traffic itself, only relays what the root already source routed.
-    DodagMembership* dodag = GetBaseDodag();
+    if (!originDodag)
+    {
+        // Not this node's own downward traffic (no membership it roots
+        // reaches dst): either upward traffic on some membership -- the
+        // same "dst is some non-base membership's own DODAGID" case
+        // RouteOutput()'s own fallback loop resolves, covering
+        // SendDao()/SendNoPathDao()/DaoRetry() addressed to a non-base
+        // root -- or, if that finds nothing either, the base DODAG, the
+        // same fallback RouteOutput() itself ends on.
+        originDodag = GetBaseDodag();
+        for (auto& [key, other] : m_dodags)
+        {
+            if (&other == originDodag || other.dodagId != dst)
+            {
+                continue;
+            }
+            originDodag = &other;
+            break;
+        }
+    }
+
+    // The RPL Option (RFC 6553), on every node's own traffic: down if
+    // originDodag is a DODAG this node roots (its own downward traffic),
+    // up otherwise (this node's own upward traffic on some membership, or
+    // nothing recognised at all).
     RplPacketInfoHeader rpi;
-    rpi.SetDown(m_isRoot);
-    rpi.SetInstanceId(dodag ? dodag->instanceId : RPL_DEFAULT_INSTANCE);
-    rpi.SetSenderRank(dodag ? dodag->rank : RPL_INFINITE_RANK);
+    rpi.SetDown(originDodag ? originDodag->isRoot : false);
+    rpi.SetInstanceId(originDodag ? originDodag->instanceId : RPL_DEFAULT_INSTANCE);
+    rpi.SetSenderRank(originDodag ? originDodag->rank : RPL_INFINITE_RANK);
 
     Ipv6ExtensionHopByHopHeader hbh;
     hbh.AddOption(rpi);
@@ -2582,9 +2744,26 @@ RplRoutingProtocol::RouteInput(Ptr<const Packet> p,
     // to whichever node currently holds it, so it is handled as a local
     // receive, one hop at a time, and re-injected through RouteOutput()
     // rather than ever reaching RouteInput(). What is left to forward here is
-    // upward traffic, which always goes to the preferred parent regardless of
-    // its destination.
+    // upward traffic, which always goes to the preferred parent -- but which
+    // DODAG's preferred parent depends on which DODAG this packet's own
+    // sender attached it to, not always the base one, once this node holds
+    // more than one membership. The RPI (RFC 6553) that sender's own
+    // PrepareOutgoingPacket() stamped on it is still on the packet, still
+    // readable here (@see ReadRpiInstanceId()); base is kept as both the
+    // starting guess and the fallback, so a single-DODAG node (the common
+    // case) never pays for a parse it cannot possibly need.
     const DodagMembership* dodag = GetBaseDodag();
+    if (m_dodags.size() > 1)
+    {
+        uint8_t instanceId;
+        if (ReadRpiInstanceId(p, header, instanceId))
+        {
+            if (const DodagMembership* forInstance = FindDodagByInstance(instanceId))
+            {
+                dodag = forInstance;
+            }
+        }
+    }
     Ptr<Ipv6Route> route = dodag ? RouteViaPreferredParent(*dodag, dst) : nullptr;
     if (route)
     {
@@ -2741,6 +2920,13 @@ RplRoutingProtocol::GetRankIn(uint8_t instanceId, Ipv6Address dodagId) const
     return it != m_dodags.end() ? it->second.rank : RPL_INFINITE_RANK;
 }
 
+uint16_t
+RplRoutingProtocol::GetRankForInstance(uint8_t instanceId) const
+{
+    const DodagMembership* dodag = FindDodagByInstance(instanceId);
+    return dodag ? dodag->rank : RPL_INFINITE_RANK;
+}
+
 bool
 RplRoutingProtocol::IsDaoAckPendingIn(uint8_t instanceId, Ipv6Address dodagId) const
 {
@@ -2755,10 +2941,10 @@ RplRoutingProtocol::GetDodagCount() const
 }
 
 void
-RplRoutingProtocol::NotifyRankInconsistency()
+RplRoutingProtocol::NotifyRankInconsistency(uint8_t instanceId)
 {
-    NS_LOG_FUNCTION(this);
-    DodagMembership* dodag = GetBaseDodag();
+    NS_LOG_FUNCTION(this << +instanceId);
+    DodagMembership* dodag = FindDodagByInstance(instanceId);
     if (dodag)
     {
         dodag->dioTrickle.Reset();

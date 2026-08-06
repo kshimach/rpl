@@ -261,7 +261,23 @@ RplIpv6ExtensionSourceRouting::Process(Ptr<Packet>& packet,
     Ptr<Ipv6Route> rtentry;
     if (Ptr<rpl::RplRoutingProtocol> rpl = GetNode()->GetObject<rpl::RplRoutingProtocol>())
     {
-        rtentry = rpl->RouteToNeighbour(nextAddress, ipv6header.GetDestination());
+        // Scoped to the DODAG this source-routed packet's own RPI names,
+        // not always the base one: a relay forwarding a downward packet
+        // for a non-base DODAG (one CreateLocalDodag() formed) needs that
+        // membership's own Parent set, which may sit on a different
+        // interface than the base's (RouteToNeighbour()'s own comment on
+        // InterfaceForNeighbour()'s single-interface fallback). Falls back
+        // to the base-scoped overload when nothing is found, which is
+        // this node's own base DODAG in the ordinary, single-DODAG case.
+        uint8_t instanceId;
+        if (rpl->ReadRpiInstanceId(packet, ipv6header, instanceId))
+        {
+            rtentry = rpl->RouteToNeighbour(instanceId, nextAddress, ipv6header.GetDestination());
+        }
+        if (!rtentry)
+        {
+            rtentry = rpl->RouteToNeighbour(nextAddress, ipv6header.GetDestination());
+        }
     }
     if (!rtentry)
     {

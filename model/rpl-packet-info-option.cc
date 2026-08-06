@@ -127,7 +127,16 @@ RplIpv6OptionRpl::Process(Ptr<Packet> packet,
 
     bool down = rpi.GetDown();
     uint16_t senderRank = rpi.GetSenderRank();
-    uint16_t ownRank = rpl->GetRank();
+    // Scoped to the DODAG this packet's own RPLInstanceID names, not
+    // whichever one is this node's base: a node holding more than one
+    // concurrent membership (contrib/rpl's own extension beyond a single
+    // DODAG) still owns a distinct rank in each, and this packet only ever
+    // belongs to one of them. The RPI carries no DODAGID, so this is
+    // resolved by RPLInstanceID alone (@see
+    // RplRoutingProtocol::FindDodagByInstance()); a node with only the base
+    // DODAG sees no behaviour change (GetRankForInstance(RPL_DEFAULT_INSTANCE)
+    // is GetRank()).
+    uint16_t ownRank = rpl->GetRankForInstance(rpi.GetInstanceId());
 
     // RFC 6550 section 11.2: moving up, the previous hop should be further
     // from the root, i.e. of higher rank, than this one; moving down, the
@@ -165,7 +174,7 @@ RplIpv6OptionRpl::Process(Ptr<Packet> packet,
                         << (down ? "down" : "up") << ", sender rank " << senderRank
                         << ", own rank " << ownRank << ")");
             isDropped = true;
-            rpl->NotifyRankInconsistency();
+            rpl->NotifyRankInconsistency(rpi.GetInstanceId());
         }
         else
         {

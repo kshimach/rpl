@@ -3075,6 +3075,524 @@ RplMultiDodagDaoAckIsolationTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief A non-base DODAG's DAO is relayed through intermediate nodes, not
+ *        just originated by them.
+ *
+ * The regression test for RouteInput()'s own generalisation: before that
+ * was fixed, an intermediate node only ever forwarded traffic via its base
+ * DODAG's preferred parent, so a DAO for any other DODAG this node happened
+ * to relay for -- a CreateLocalDodag()-formed one in particular -- was
+ * silently absorbed instead of passed on.
+ *
+ * A 4-node line: root0 roots both the base DODAG (RplHelper::SetRoot()) and,
+ * once that has converged, a local one (CreateLocalDodag()); relay1 and
+ * relay2 sit in between; leaf3 is at the far end, three hops out on either
+ * DODAG. All four join the base DODAG normally, then relay1/relay2/leaf3
+ * each passively pick up the local DODAG's own DIO too, the same
+ * transitive-join mechanism RplMultiDodagTestCase documents -- but relaying
+ * leaf3's own DAO for that local DODAG back to root0 needs relay2 and then
+ * relay1 to each forward it correctly, which is what actually proves this
+ * fix: ComputeSourceRoute() only succeeds at root0 if both hops resolved
+ * the right (non-base) preferred parent for it.
+ */
+class RplNonBaseDodagRelayTestCase : public TestCase
+{
+  public:
+    RplNonBaseDodagRelayTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplNonBaseDodagRelayTestCase::RplNonBaseDodagRelayTestCase()
+    : TestCase("A non-base DODAG's DAO is relayed through intermediate nodes")
+{
+}
+
+void
+RplNonBaseDodagRelayTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(4); // 0 = root, 1 = relay1, 2 = relay2, 3 = leaf, a line
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    // Only adjacent nodes hear each other, RplDodagFormationTestCase's own
+    // line-topology recipe for 3 nodes, extended to 4.
+    auto blacklist = [&](uint32_t a, uint32_t b) {
+        Ptr<SimpleNetDevice> devA = DynamicCast<SimpleNetDevice>(devices.Get(a));
+        Ptr<SimpleNetDevice> devB = DynamicCast<SimpleNetDevice>(devices.Get(b));
+        channel->BlackList(devA, devB);
+        channel->BlackList(devB, devA);
+    };
+    blacklist(0, 2);
+    blacklist(0, 3);
+    blacklist(1, 3);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    // The base DODAG across all three hops first: RplDodagFormationTestCase's
+    // own budget for two hops, with margin for the extra one here.
+    Simulator::Stop(Seconds(250));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> root = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> relay1 = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> relay2 = nodes.Get(2)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> leaf = nodes.Get(3)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(leaf->IsJoined(), true, "The base DODAG did not reach the far end");
+
+    static constexpr uint8_t LOCAL_INSTANCE = 0x80; // high bit set, RFC 6550 section 5.1
+    RplRoutingProtocol::DodagKey localKey =
+        root->CreateLocalDodag(LOCAL_INSTANCE, RPL_MOP_NON_STORING);
+    NS_TEST_ASSERT_MSG_NE(localKey.dodagId, Ipv6Address::GetAny(), "The local DODAG did not form");
+
+    // The local DODAG's own DIO needs the same multi-hop cascade to reach
+    // leaf3, and leaf3's own DAO for it the same distance back.
+    Simulator::Stop(Seconds(250));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(root->GetDodagCount(), 2, "The root did not form both DODAGs");
+    NS_TEST_ASSERT_MSG_EQ(relay1->IsJoinedTo(LOCAL_INSTANCE, localKey.dodagId),
+                          true,
+                          "relay1 did not join the local DODAG");
+    NS_TEST_ASSERT_MSG_EQ(relay2->IsJoinedTo(LOCAL_INSTANCE, localKey.dodagId),
+                          true,
+                          "relay2 did not join the local DODAG");
+    NS_TEST_ASSERT_MSG_EQ(leaf->IsJoinedTo(LOCAL_INSTANCE, localKey.dodagId),
+                          true,
+                          "leaf3 did not join the local DODAG");
+
+    std::vector<Ipv6Address> hops;
+    NS_TEST_ASSERT_MSG_EQ(root->ComputeSourceRoute(LOCAL_INSTANCE,
+                                                    localKey.dodagId,
+                                                    leaf->GetGlobalAddress(),
+                                                    hops),
+                          true,
+                          "leaf3's DAO for the local DODAG was not relayed back to the root");
+    NS_TEST_ASSERT_MSG_EQ(hops.size(), 3u, "Wrong hop count for the local DODAG's path to leaf3");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief A CreateLocalDodag()-formed root can receive and act on a DAO for
+ *        its own DODAG even though it never called SetAsRoot() (m_isRoot
+ *        stays false).
+ *
+ * The regression test for HandleDao()'s own generalisation. Before that was
+ * fixed, HandleDao() refused every DAO outright unless m_isRoot was true --
+ * exactly the case an AODV-RPL (RFC 9854) OrigNode is in: root of its own
+ * RREQ-Instance while remaining an ordinary member of the base DODAG, never
+ * the base's own root.
+ *
+ * A 3-node line: R roots the base DODAG; A is an ordinary base member that
+ * additionally CreateLocalDodag()s (A->IsRoot() stays false, the base
+ * root's own node-wide flag it never sets); B, A's neighbour, joins A's
+ * local DODAG. The only thing this test needs to prove is that A actually
+ * processed B's DAO.
+ */
+class RplLocalDodagRootWithoutSetAsRootTestCase : public TestCase
+{
+  public:
+    RplLocalDodagRootWithoutSetAsRootTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplLocalDodagRootWithoutSetAsRootTestCase::RplLocalDodagRootWithoutSetAsRootTestCase()
+    : TestCase("A CreateLocalDodag() root without SetAsRoot() still accepts a DAO")
+{
+}
+
+void
+RplLocalDodagRootWithoutSetAsRootTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(3); // 0 = R (base root), 1 = A (base member, local root), 2 = B
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    Ptr<SimpleNetDevice> first = DynamicCast<SimpleNetDevice>(devices.Get(0));
+    Ptr<SimpleNetDevice> last = DynamicCast<SimpleNetDevice>(devices.Get(2));
+    channel->BlackList(first, last);
+    channel->BlackList(last, first);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(200));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> a = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> b = nodes.Get(2)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(b->IsJoined(), true, "The base DODAG did not reach B");
+
+    static constexpr uint8_t LOCAL_INSTANCE = 0x80;
+    RplRoutingProtocol::DodagKey localKey = a->CreateLocalDodag(LOCAL_INSTANCE, RPL_MOP_NON_STORING);
+    NS_TEST_ASSERT_MSG_NE(localKey.dodagId, Ipv6Address::GetAny(), "A's local DODAG did not form");
+    NS_TEST_ASSERT_MSG_EQ(a->IsRoot(),
+                          false,
+                          "A is the base root; this test needs it not to be, to prove HandleDao() "
+                          "does not need m_isRoot");
+
+    Simulator::Stop(Seconds(200));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(b->IsJoinedTo(LOCAL_INSTANCE, localKey.dodagId),
+                          true,
+                          "B did not join A's local DODAG");
+
+    std::vector<Ipv6Address> hops;
+    NS_TEST_ASSERT_MSG_EQ(
+        a->ComputeSourceRoute(LOCAL_INSTANCE, localKey.dodagId, b->GetGlobalAddress(), hops),
+        true,
+        "A did not accept B's DAO for A's own local DODAG: HandleDao() still needs m_isRoot");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief Rank-inconsistency checking (RFC 6550 section 11.2) is scoped per
+ *        RPLInstanceID, not always the base DODAG.
+ *
+ * The regression test for RplIpv6OptionRpl::Process()'s own generalisation
+ * (GetRankForInstance()/NotifyRankInconsistency(instanceId), driven by the
+ * RPI's own RPLInstanceID): before that was fixed, every rank check and
+ * every SenderRank rewrite used GetRank() (the base DODAG's own rank)
+ * regardless of which DODAG the packet actually named.
+ *
+ * One node roots the base DODAG (a fixed, known rank) and separately joins
+ * a second, fabricated DODAG under a Local RPLInstanceID (high bit set,
+ * RFC 6550 section 5.1) as an ordinary member, at a rank deliberately
+ * different from the base's own -- what actually lets this test tell
+ * "checked against the right membership" apart from "checked against
+ * whichever one happened to agree anyway". The same SenderRank is then fed
+ * through option->Process() twice, once under each RPLInstanceID: it must
+ * come out consistent against one and inconsistent against the other.
+ */
+class RplRankInconsistencyPerInstanceTestCase : public TestCase
+{
+  public:
+    RplRankInconsistencyPerInstanceTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplRankInconsistencyPerInstanceTestCase::RplRankInconsistencyPerInstanceTestCase()
+    : TestCase("Rank-inconsistency checking is scoped per RPLInstanceID, not always the base")
+{
+}
+
+void
+RplRankInconsistencyPerInstanceTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(1);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.AssignWithoutAddress(devices);
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+
+    Simulator::Stop(Seconds(2));
+    Simulator::Run();
+
+    Ptr<Node> node = nodes.Get(0);
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetRank(), RPL_MIN_HOPRANKINC, "The base root is not at a fixed rank");
+
+    Ipv6Address nodeLinkLocal = node->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    // A fabricated DODAG under a Local RPLInstanceID, joined as an ordinary
+    // member -- rank ends up as the peer's own advertised rank (200) plus
+    // one hop increment, RplVersionWrapTestCase's own established
+    // convention for this DIO field.
+    static constexpr uint8_t LOCAL_INSTANCE = 0x80;
+    Ipv6Address localDodagId("2001:9::1");
+    Ipv6Address peerLinkLocal("fe80::9");
+    RplDioHeader dio;
+    dio.SetInstanceId(LOCAL_INSTANCE);
+    dio.SetVersionNumber(0);
+    dio.SetRank(200);
+    dio.SetMop(RPL_MOP_NON_STORING);
+    dio.SetDodagId(localDodagId);
+    dio.SetDtsn(0);
+    dio.SetDagConfiguration(0,
+                            20,
+                            RPL_DIO_REDUNDANCY,
+                            RPL_MAX_RANKINC,
+                            RPL_MIN_HOPRANKINC,
+                            RPL_OCP_OF0,
+                            RPL_DEFAULT_LIFETIME,
+                            RPL_DEFAULT_LIFETIME_UNIT);
+    DeliverRawRplMessage<RplDioHeader>(node,
+                                       1,
+                                       dio,
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       peerLinkLocal,
+                                       nodeLinkLocal);
+
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(LOCAL_INSTANCE, localDodagId),
+                          true,
+                          "Did not join the fabricated local-instance DODAG");
+    uint16_t localRank = rpl->GetRankIn(LOCAL_INSTANCE, localDodagId);
+    NS_TEST_ASSERT_MSG_NE(static_cast<uint32_t>(localRank),
+                          static_cast<uint32_t>(RPL_MIN_HOPRANKINC),
+                          "The local-instance rank coincides with the base's; cannot discriminate "
+                          "between them below");
+
+    Ptr<Ipv6OptionDemux> demux = node->GetObject<Ipv6OptionDemux>();
+    Ptr<Ipv6Option> option = demux->GetOption(RPL_HBH_OPTION_TYPE);
+    Ipv6Header ipv6Header;
+    ipv6Header.SetSource(Ipv6Address("fe80::99"));
+    ipv6Header.SetDestination(nodeLinkLocal);
+    ipv6Header.SetHopLimit(64);
+
+    // Consistent against the base (200 > 128, moving up): checked against
+    // the base's own rank when the RPI names the Global RPLInstanceID.
+    {
+        RplPacketInfoHeader rpi;
+        rpi.SetInstanceId(RPL_DEFAULT_INSTANCE);
+        rpi.SetDown(false);
+        rpi.SetSenderRank(200);
+
+        Ptr<Packet> packet = Create<Packet>();
+        packet->AddHeader(rpi);
+        bool isDropped = false;
+        option->Process(packet, 0, ipv6Header, isDropped);
+        NS_TEST_ASSERT_MSG_EQ(isDropped,
+                              false,
+                              "A packet consistent against the base's own rank was dropped");
+
+        RplPacketInfoHeader received;
+        packet->RemoveHeader(received);
+        NS_TEST_ASSERT_MSG_EQ(received.GetRankError(),
+                              false,
+                              "Flagged inconsistent against the base when it should not have been");
+        NS_TEST_ASSERT_MSG_EQ(received.GetSenderRank(),
+                              RPL_MIN_HOPRANKINC,
+                              "SenderRank was not rewritten to the base's own rank");
+    }
+
+    // The identical SenderRank, but under the local instance's own key:
+    // inconsistent there (200 is not greater than localRank), and rewritten
+    // to the local membership's own rank, not the base's.
+    {
+        RplPacketInfoHeader rpi;
+        rpi.SetInstanceId(LOCAL_INSTANCE);
+        rpi.SetDown(false);
+        rpi.SetSenderRank(200);
+
+        Ptr<Packet> packet = Create<Packet>();
+        packet->AddHeader(rpi);
+        bool isDropped = false;
+        option->Process(packet, 0, ipv6Header, isDropped);
+        NS_TEST_ASSERT_MSG_EQ(isDropped,
+                              false,
+                              "The first inconsistency was already treated as confirmed");
+
+        RplPacketInfoHeader received;
+        packet->RemoveHeader(received);
+        NS_TEST_ASSERT_MSG_EQ(received.GetRankError(),
+                              true,
+                              "Not flagged inconsistent against the local instance's own rank: the "
+                              "base's rank was used instead");
+        NS_TEST_ASSERT_MSG_EQ(received.GetSenderRank(),
+                              localRank,
+                              "SenderRank was rewritten to the base's rank, not the local "
+                              "membership's own");
+    }
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief RouteOutput()/PrepareOutgoingPacket() compute and stamp a correct
+ *        downward path through a CreateLocalDodag()-formed root, not only
+ *        the base one.
+ *
+ * The regression test for FindRootDodagFor()'s own generalisation and for
+ * PrepareOutgoingPacket()'s originDodag resolution (the RPL Option this
+ * same outgoing packet gets stamped with): before that was fixed, both were
+ * hardcoded to the base DODAG's own topology and rank/instanceId, so a
+ * CreateLocalDodag()-formed root's own downward traffic either found no
+ * route at all or carried the base's identity on the wire instead of its
+ * own.
+ *
+ * One node roots both the base DODAG and, once that has settled, a local
+ * one. A two-level topology is hand-built directly into the local
+ * membership (fabricated DAOs, RplMultiDodagPathSequenceIsolationTestCase's
+ * own recipe: HandleDao() only ever reads the DAO's own fields, so no real
+ * second node is needed), deliberately naming addresses that never appear
+ * in the base DODAG's own topology at all -- both DODAGs are rooted at this
+ * same node's one global address, so reusing a real base member's address
+ * here would leave RouteOutput()'s base-first attempt silently satisfying
+ * the request and prove nothing about the local DODAG's own path.
+ */
+class RplNonBaseRootDownwardPacketTestCase : public TestCase
+{
+  public:
+    RplNonBaseRootDownwardPacketTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplNonBaseRootDownwardPacketTestCase::RplNonBaseRootDownwardPacketTestCase()
+    : TestCase("A CreateLocalDodag() root computes and stamps its own downward path")
+{
+}
+
+void
+RplNonBaseRootDownwardPacketTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(1);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.AssignWithoutAddress(devices);
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+
+    Simulator::Stop(Seconds(2));
+    Simulator::Run();
+
+    Ptr<Node> node = nodes.Get(0);
+    Ptr<RplRoutingProtocol> root = node->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(root->IsJoined(), true, "The base DODAG never formed");
+
+    static constexpr uint8_t LOCAL_INSTANCE = 0x80;
+    RplRoutingProtocol::DodagKey localKey =
+        root->CreateLocalDodag(LOCAL_INSTANCE, RPL_MOP_NON_STORING);
+    NS_TEST_ASSERT_MSG_NE(localKey.dodagId, Ipv6Address::GetAny(), "The local DODAG did not form");
+
+    Ipv6Address child("2001:9::ff:fe00:aa");      // a direct child of the local root
+    Ipv6Address grandchild("2001:9::ff:fe00:bb"); // one hop further out than child
+
+    auto deliverDao = [&](Ipv6Address target, Ipv6Address parent) {
+        RplDaoHeader dao;
+        dao.SetInstanceId(LOCAL_INSTANCE);
+        dao.SetDodagId(localKey.dodagId);
+        dao.SetSequence(1);
+        dao.SetTarget(target);
+        dao.SetTransitInformation(parent, 1, RPL_DEFAULT_LIFETIME);
+        Simulator::Schedule(Seconds(0),
+                            &DeliverRawRplMessage<RplDaoHeader>,
+                            node,
+                            1,
+                            dao,
+                            static_cast<uint8_t>(RPL_CODE_DAO),
+                            target,
+                            localKey.dodagId);
+        Simulator::Stop(MilliSeconds(10));
+        Simulator::Run();
+    };
+    deliverDao(child, localKey.dodagId);
+    deliverDao(grandchild, child);
+
+    std::vector<Ipv6Address> hops;
+    NS_TEST_ASSERT_MSG_EQ(
+        root->ComputeSourceRoute(LOCAL_INSTANCE, localKey.dodagId, grandchild, hops),
+        true,
+        "The fabricated local-DODAG topology was not recorded");
+    NS_TEST_ASSERT_MSG_EQ(hops.size(), 2u, "Wrong hop count for the fabricated 2-level topology");
+
+    // Nothing of this exists in the base DODAG's own (empty) topology: a
+    // route found here can only have come from the local membership.
+    Ipv6Header header;
+    header.SetDestination(grandchild);
+    Socket::SocketErrno sockerr;
+    Ptr<Ipv6Route> route = root->RouteOutput(Create<Packet>(), header, nullptr, sockerr);
+    NS_TEST_ASSERT_MSG_EQ(route != nullptr,
+                          true,
+                          "RouteOutput() found no path through the local DODAG's own root");
+
+    Ptr<Packet> packet = Create<Packet>();
+    root->PrepareOutgoingPacket(packet, header, route);
+
+    // ReadRpiInstanceId() reading back exactly what PrepareOutgoingPacket()
+    // just wrote is itself the proof that PrepareOutgoingPacket() resolved
+    // this outgoing packet's own RPL Option against the local membership
+    // (originDodag), not the base's: an untouched Ipv6Header passed to
+    // RouteOutput() above, so header.GetNextHeader() here is still whatever
+    // it was before this call, checked instead through the RPI itself.
+    Ipv6Header afterPrepare;
+    afterPrepare.SetNextHeader(header.GetNextHeader());
+    uint8_t instanceId = 0;
+    NS_TEST_ASSERT_MSG_EQ(root->ReadRpiInstanceId(packet, afterPrepare, instanceId),
+                          true,
+                          "No RPL Option was attached to the outgoing packet");
+    NS_TEST_ASSERT_MSG_EQ(static_cast<uint32_t>(instanceId),
+                          static_cast<uint32_t>(LOCAL_INSTANCE),
+                          "The RPL Option named the base DODAG's RPLInstanceID, not the local "
+                          "membership's own");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Check MRHOF (RFC 6719) parent selection: path cost, not just hop
  *        count, decides the preferred parent, and hysteresis
  *        (PARENT_SWITCH_THRESHOLD) keeps it from flapping over a marginal
@@ -7753,6 +8271,10 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplMultiDodagDtsnIsolationTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplMultiDodagPathSequenceIsolationTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplMultiDodagDaoAckIsolationTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplNonBaseDodagRelayTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplLocalDodagRootWithoutSetAsRootTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplRankInconsistencyPerInstanceTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplNonBaseRootDownwardPacketTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDioRejectionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplParentLossRejoinTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplInterfaceRestartTestCase, TestCase::Duration::QUICK);

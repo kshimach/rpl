@@ -3016,3 +3016,139 @@ join させると、それぞれの初回 `SendDao()` が (相手が実在しな
 (旧設計は数秒のシミュレーション時間を要していた) — ND 解決や
 Trickle ジッタの実時間待ちを一切必要としない設計になったこと
 自体も、副次的な確認材料になっている。
+
+## 34. 非 base DODAG での中継/root 動作の一般化
+
+32 節で対応したのは「このノード自身が root へ DAO を送る」経路
+(`RouteOutput()` の fallback ループ) までで、「他ノードの代わりに
+中継する」経路 (`RouteInput()`/`PrepareOutgoingPacket()`) は base
+DODAG 専用のまま意図的に残していた (32.6 節)。今回はこれを一般化
+した。動機は AODV-RPL (RFC 9854) / P2P-RPL (RFC 6997) の将来実装:
+どちらもノードが base DODAG の一般メンバーのまま、自分自身を root
+とする小さなローカル DODAG (RPLInstanceID 最上位ビット on) を実行時
+に持つ。`CreateLocalDodag()` (31/32 節で追加済み) はその DODAG を
+「形成」するところまでしか面倒を見ておらず、そのローカル DODAG が
+実際に機能する root として動く (DAO を受理する、下り経路を計算する)
+ことも、他ノードがそのローカル DODAG のために中継することも、今回
+まで出来なかった。
+
+### 34.1 何を直したか
+
+- 新しい private ヘルパー `FindDodagByInstance(instanceId)`
+  (`m_dodags` を `(instanceId, dodagId)` 順のソート性を使って
+  `lower_bound` で O(log n) 解決)、public `ReadRpiInstanceId(p, header,
+  instanceId)` (到達パケットの RPL Option (RFC 6553 の "RPI") から
+  RPLInstanceID を読む)、private `FindRootDodagFor(destination, hops)`
+  (base を最初に試し、次に他の `isRoot` membership を map 順で試す)
+  を追加。
+- `NotifyRankInconsistency()`/新規 `GetRankForInstance()` を
+  RPLInstanceID 引数化し、`RplIpv6OptionRpl::Process()`
+  (`rpl-packet-info-option.cc`) の無条件 `rpl->GetRank()`/
+  `rpl->NotifyRankInconsistency()` を `rpi.GetInstanceId()` 経由の
+  呼び出しに置き換え。
+- `HandleDio()` の「root は自分の DODAG では親を取らない」ガードを
+  `m_isRoot`/`GetBaseDodag()` 決め打ちから、DIO 自身の key を引いて
+  その membership の `isRoot` を見る形に修正 (34.3 節、副次的に
+  見つけたバグ)。
+- `HandleDao()` を、DAO 自身が運ぶ `(instanceId, dodagId)` で解決する
+  形に修正 (D flag clear、`GetDodagId().IsAny()` の場合は
+  `FindDodagByInstance()` による instanceId のみのフォールバック)。
+  先頭の `if (!m_isRoot) return;` を撤廃 — `CreateLocalDodag()` だけの
+  root (`m_isRoot` は false のまま) も自分の DODAG 宛の DAO を受理
+  できるようになった。
+- `RouteInput()`: `m_dodags.size() > 1` のときだけ
+  `ReadRpiInstanceId()` でパケット自身の RPI を読み、
+  `FindDodagByInstance()` で解決した membership 経由で中継する。
+  1 DODAG しかない今まで通りのノードはこのパースを一切払わない。
+- `ComputeSourceRoute()` を `const DodagMembership&` を取る private
+  実装 + 2 つの public オーバーロード (既存の base 限定版はそのまま、
+  `(instanceId, dodagId, destination, hops)` の新版を追加) に分割。
+- `RouteOutput()`/`PrepareOutgoingPacket()` の root 分岐を
+  `FindRootDodagFor()` 経由にし、`PrepareOutgoingPacket()` が
+  この送信パケットに付ける RPI の `instanceId`/`rank`/`down` も、
+  見つかった root membership (無ければ「dst が非 base membership 自身
+  の DODAGID か」という `RouteOutput()` の fallback と同じチェック、
+  それも無ければ base) から取るよう修正。
+- `RouteToNeighbour()` にも `(instanceId, neighbour, dst)` オーバー
+  ロードを追加し、`RplIpv6ExtensionSourceRouting::Process()`
+  (`rpl-source-routing-extension.cc`) がソースルーティングパケット
+  自身の RPI から instanceId を読んでこちらを呼ぶよう更新した。
+
+### 34.2 RPI に DODAGID が無いことへの対応方針
+
+RFC 6553 の RPL Option (RPI) は Flags/RPLInstanceID/SenderRank しか
+運ばず、DODAGID は無い。中継ノードがパケット自体から知れるのは
+「どの RPLInstanceID か」までで「どの DODAG か」までは分からない。
+今回は中継/rank 判定を RPLInstanceID だけで解決する方針にした。同じ
+RPLInstanceID を持つ DODAG に同時に 2 つ join しているケース (この
+モジュール自身のテストや `scratch/rpl-multi-instance-demo.cc` が
+意図的に作っている、`RplHelper::SetRoot()` を複数ノードに呼んだ
+だけのケース。RFC 6550 3.4 節が想定する「1 ノード 1 Instance につき
+1 DODAG」より緩い) は、中継対象としては曖昧なまま残る
+(`FindDodagByInstance()` は決定的だが必ずしも「正しい」とは限らない
+DODAGID を返す) — 既知の限界として明記する。実際の想定用途
+(`CreateLocalDodag()` によるローカル instance) は呼び出しごとに
+instanceId が別になるので、この限界には当たらない。
+
+### 34.3 副次的に見つけたバグ: `HandleDio()` の自己ループ・ガード
+
+修正前の `HandleDio()` は「root は自分の DODAG では親を取らない」
+チェックを `if (m_isRoot) { ... GetBaseDodag() ... }` という形で
+base 専用にしていた。`CreateLocalDodag()` だけの root
+(`m_isRoot == false`) はこのガードの対象外で、ローカル DODAG 自身の
+DIO が (32.5 節の transitive join で) 巡り巡って root 自身に戻ると、
+root が自分の元子ノードを親として選んでしまう自己ループの余地が
+あった。base 用の「自分の DODAG がまだ形成されていない間は全ての
+DIO を無視する」という別のガード (`m_isRoot && !GetBaseDodag()`、
+base の DAD 待ちレース対策、こちらは base 固有の問題なので温存) と
+混同しないよう、2 つを分けて修正した。
+
+### 34.4 検証: `scratch/rpl-multi-instance-demo.cc` の非対称性は「直っていない」— それが正しい
+
+このデモ (33 節の前、複数インスタンス実行ログ確認の際に作成) は
+`RplHelper::SetRoot()` を 2 つのノードに呼んだだけの、2 つとも
+`RPL_DEFAULT_INSTANCE` の DODAG だった。今回の修正を適用した後も
+同じログ (root A の DAO だけ 2 hop 中継で timeout する) が再現する
+— これはバグではなく、34.2 節で明記した「同じ RPLInstanceID を
+共有する DODAG は中継対象として曖昧」という既知の限界がそのまま
+表れたもの。このデモは修正の効果を確認する題材としては最初から
+不適切だった (`RplHelper` に instanceId を指定する経路が無いため)。
+実際に修正されたことは、`CreateLocalDodag()` を使う
+`RplNonBaseDodagRelayTestCase` (34.5 節) で確認している。
+
+### 34.5 テスト
+
+新規 4 件、全て `RplHelper`/`CreateLocalDodag()` の実際の組み合わせ
+または手作りパケットで、旧コードでは失敗していたはずの経路を直接
+踏む:
+
+- `RplNonBaseDodagRelayTestCase`: 4 ノードの列
+  (root0 = base root かつローカル DODAG も root; relay1; relay2;
+  leaf3)。leaf3 のローカル DODAG 向け DAO が relay2/relay1 を経由して
+  root0 に届く (`ComputeSourceRoute()` が 3 hop で成功) ことを確認 —
+  `RouteInput()` の一般化が無いと relay1/relay2 は base 経由でしか
+  中継しないため、leaf3 の DAO は root0 に届かない。
+- `RplLocalDodagRootWithoutSetAsRootTestCase`: 3 ノード (R=base root、
+  A=base の一般メンバー + `CreateLocalDodag()`、B=A のローカル DODAG
+  に join)。`A->IsRoot() == false` (SetAsRoot() を一度も呼んでいない)
+  のまま A が B の DAO を受理できることを確認 — `HandleDao()` の
+  `!m_isRoot` ガード撤廃の直接の回帰テスト。
+- `RplRankInconsistencyPerInstanceTestCase`: 単体テスト
+  (`RplPacketInfoProcessTestCase` 流儀、トポロジ無し)。base と手作り
+  DIO で join したローカル instance とで意図的に rank を違えておき、
+  同じ SenderRank を両方の RPLInstanceID の下で `option->Process()`
+  に通すと、一方は consistent・他方は inconsistent になり、書き換え後
+  の SenderRank もそれぞれの membership 自身の rank になることを確認。
+- `RplNonBaseRootDownwardPacketTestCase`: 1 ノードが base とローカル
+  DODAG 両方の root。ローカル DODAG 側にだけ (base には存在しない
+  アドレスで) 2 段の topology を手作りの DAO で作り、
+  `RouteOutput()`/`PrepareOutgoingPacket()` がそれを見つけて正しい
+  RPLInstanceID (base のではなくローカルの) を出力パケットの RPI に
+  スタンプすることを `ReadRpiInstanceId()` で読み返して確認。
+
+`./test.py -s rpl` 相当 (57 件、新規 4 件込み) を 5 回連続実行し全件
+安定して PASS することを確認した。4 つの既存シナリオ
+(`rpl-6lowpan-simple` OF0/MRHOF+LQL、`ns3edit-rpl-mesh`、
+`ns3edit-rpl-line`、いずれも DODAG 1 つだけの単純なシナリオ) も
+0% packet loss を維持しており、今回の変更が既存の単一 DODAG シナリオ
+に一切影響していないことを確認した。

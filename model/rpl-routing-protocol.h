@@ -294,6 +294,23 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     uint16_t GetRankIn(uint8_t instanceId, Ipv6Address dodagId) const;
 
     /**
+     * @brief Get the rank of this node within whichever DODAG it holds under
+     *        a given RPLInstanceID.
+     *
+     * Unlike GetRankIn(), which needs the full (instanceId, dodagId) key,
+     * this is what a receive-side check driven only by a packet's own RPL
+     * Option (RFC 6553's RPI, which carries no DODAGID -- @see RouteInput())
+     * can resolve with. If more than one membership shares instanceId, an
+     * arbitrary but deterministic one of them answers (@see
+     * FindDodagByInstance()).
+     *
+     * @param instanceId the RPLInstanceID of the DODAG
+     * @return the rank, RPL_INFINITE_RANK if this node holds no membership
+     *         under that RPLInstanceID
+     */
+    uint16_t GetRankForInstance(uint8_t instanceId) const;
+
+    /**
      * @brief Whether this node is still waiting on a DAO-ACK for a specific
      *        DODAG's most recently sent DAO.
      * @param instanceId the RPLInstanceID of the DODAG
@@ -316,9 +333,13 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      *        otherwise would, in case this node's own view of the DODAG is
      *        what is stale.
      *
-     * Called by RplIpv6OptionRpl, not by anything in this class.
+     * Called by RplIpv6OptionRpl, not by anything in this class. Resolved by
+     * RPLInstanceID alone (@see FindDodagByInstance()), the same limit
+     * GetRankForInstance() documents: the RPI carries no DODAGID.
+     *
+     * @param instanceId the RPLInstanceID the inconsistent packet belongs to
      */
-    void NotifyRankInconsistency();
+    void NotifyRankInconsistency(uint8_t instanceId);
 
     /**
      * @brief Get how many nodes the root has heard a DAO from.
@@ -354,6 +375,26 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     bool ComputeSourceRoute(Ipv6Address destination, std::vector<Ipv6Address>& hops) const;
 
     /**
+     * @brief ComputeSourceRoute(), for a DODAG other than the base one.
+     *
+     * The two-argument overload only ever answers for the base DODAG (the
+     * root's own downward topology). A node that additionally roots a
+     * CreateLocalDodag()-formed DODAG needs the same computation scoped to
+     * that membership's own topology instead.
+     *
+     * @param instanceId the RPLInstanceID of the DODAG to compute over
+     * @param dodagId the DODAGID of the DODAG to compute over
+     * @param destination the address to reach, root excluded
+     * @param [out] hops as the two-argument overload
+     * @return true if a path was found; false if this node does not root
+     *         that DODAG at all
+     */
+    bool ComputeSourceRoute(uint8_t instanceId,
+                            Ipv6Address dodagId,
+                            Ipv6Address destination,
+                            std::vector<Ipv6Address>& hops) const;
+
+    /**
      * @brief Assign a fixed stream number to the random variables used here.
      * @param stream first stream index to use
      * @return the number of stream indices assigned
@@ -379,6 +420,53 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      * @return the route, nullptr if the neighbour is on no known interface
      */
     Ptr<Ipv6Route> RouteToNeighbour(Ipv6Address neighbour, Ipv6Address dst) const;
+
+    /**
+     * @brief RouteToNeighbour(), scoped to a specific DODAG's own parent set.
+     *
+     * The two-argument overload only ever looks the neighbour up in the base
+     * DODAG's own Parent set (InterfaceForNeighbour()'s default), which is
+     * indistinguishable from "unknown" on a genuinely multi-interface node
+     * if the neighbour was only ever heard advertising a different
+     * RPLInstanceID. Threaded through by RplIpv6ExtensionSourceRouting::
+     * Process() once it has read the source-routed packet's own RPI.
+     *
+     * @param instanceId the RPLInstanceID whose Parent set to search
+     * @param neighbour the address of the neighbour to send to
+     * @param dst the destination to put in the route
+     * @return the route, nullptr if the neighbour is on no known interface
+     */
+    Ptr<Ipv6Route> RouteToNeighbour(uint8_t instanceId,
+                                    Ipv6Address neighbour,
+                                    Ipv6Address dst) const;
+
+    /**
+     * @brief Read the RPLInstanceID out of a packet's own RPL Option.
+     *
+     * A relaying/forwarding node needs to know which DODAG a packet
+     * belongs to, and the only place that is recorded is the RPI (RFC
+     * 6553) PrepareOutgoingPacket() attached when the packet was
+     * originated. Public so both RouteInput() and
+     * RplIpv6ExtensionSourceRouting::Process() (a different class,
+     * resolving the instanceId to pass to the instance-aware
+     * RouteToNeighbour() above) can use it. Safe to read directly here
+     * rather than needing it stashed somewhere by RplIpv6OptionRpl::
+     * Process(): that Hop-by-Hop option processing (Ipv6L3Protocol::
+     * Receive() -> Ipv6ExtensionHopByHop::Process() -> Ipv6Extension::
+     * ProcessOptions()) only ever rewrites the RPI in place at its
+     * original offset, and Receive() never trims the bytes it reports
+     * consumed off the packet before a forwarding decision is made -- so
+     * the RPI is still exactly where PrepareOutgoingPacket() put it by the
+     * time either caller runs.
+     *
+     * @param p the packet being routed
+     * @param header the packet's own IPv6 header
+     * @param [out] instanceId the RPLInstanceID found
+     * @return true if a well-formed RPI was found and @p instanceId was set
+     */
+    bool ReadRpiInstanceId(Ptr<const Packet> p,
+                           const Ipv6Header& header,
+                           uint8_t& instanceId) const;
 
     /**
      * @brief Get the first global address of this node.
@@ -764,6 +852,84 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      *              only the root holds a topology in non-storing mode)
      */
     void PurgeTopology(DodagMembership& dodag);
+
+    /**
+     * @brief Find a membership by its RPLInstanceID alone.
+     *
+     * The only lookup a packet's own RPL Option (RFC 6553's RPI, which
+     * carries no DODAGID -- @see ReadRpiInstanceId()) lets a relaying or
+     * rank-checking node do. m_dodags sorts by (instanceId, dodagId)
+     * (DodagKey::operator<), so the first entry with a matching instanceId
+     * is found in O(log n) via lower_bound() rather than a linear scan.
+     *
+     * If more than one membership shares instanceId -- this module's own
+     * DodagKey design allows joining two DODAGs under the same
+     * RPLInstanceID at once, looser than RFC 6550 section 3.4's one-DODAG-
+     * per-Instance model -- the answer is deterministic (the lowest
+     * DODAGID) but not necessarily the "right" one for a given packet: the
+     * wire format has nothing left to disambiguate with. Documented as a
+     * known limitation rather than solved, since the motivating use case
+     * (CreateLocalDodag()'s local instances) mints a distinct instanceId
+     * per call and never hits it.
+     *
+     * @param instanceId the RPLInstanceID to search for
+     * @return the membership, nullptr if this node holds none under it
+     */
+    DodagMembership* FindDodagByInstance(uint8_t instanceId);
+    /**
+     * @brief FindDodagByInstance(), const overload.
+     * @param instanceId the RPLInstanceID to search for
+     * @return the membership, nullptr if this node holds none under it
+     */
+    const DodagMembership* FindDodagByInstance(uint8_t instanceId) const;
+
+    /**
+     * @brief Find whichever DODAG this node roots that can reach a
+     *        destination, base included.
+     *
+     * The generalisation of "the root computes a source route"
+     * (RouteOutput()'s and PrepareOutgoingPacket()'s own root branches used
+     * to hardcode GetBaseDodag()) to any DODAG this node happens to root,
+     * including one CreateLocalDodag() formed at runtime. The base
+     * membership is tried first (keeps today's single-DODAG behaviour and
+     * its performance exactly unchanged), then every other membership with
+     * isRoot true in map order; the first one whose topology actually
+     * reaches @p destination wins. Calls PurgeTopology() on each membership
+     * it tries, the same lazy-cleanup-on-the-hot-path timing RouteOutput()
+     * already used for the base case.
+     *
+     * @param destination the address to reach
+     * @param [out] hops as ComputeSourceRoute()'s own out-parameter
+     * @return the membership the path was found through, nullptr if none of
+     *         this node's root memberships can reach @p destination
+     */
+    DodagMembership* FindRootDodagFor(Ipv6Address destination, std::vector<Ipv6Address>& hops);
+
+    /**
+     * @brief The shared implementation both public ComputeSourceRoute()
+     *        overloads delegate to, scoped to one already-resolved
+     *        membership.
+     * @param dodag the DODAG membership to compute the path over
+     * @param destination the address to reach, root excluded
+     * @param [out] hops as the public overloads' own out-parameter
+     * @return true if a path was found
+     */
+    bool ComputeSourceRoute(const DodagMembership& dodag,
+                            Ipv6Address destination,
+                            std::vector<Ipv6Address>& hops) const;
+
+    /**
+     * @brief The shared implementation both public RouteToNeighbour()
+     *        overloads delegate to.
+     * @param dodag the DODAG membership to search the Parent set of,
+     *              nullptr if this node holds no such membership
+     * @param neighbour the address of the neighbour to send to
+     * @param dst the destination to put in the route
+     * @return the route, nullptr if the neighbour is on no known interface
+     */
+    Ptr<Ipv6Route> RouteToNeighbour(const DodagMembership* dodag,
+                                    Ipv6Address neighbour,
+                                    Ipv6Address dst) const;
 
     /**
      * @brief Build the global address a neighbour has on the DODAG prefix.
