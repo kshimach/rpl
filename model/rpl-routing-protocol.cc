@@ -455,8 +455,15 @@ RplRoutingProtocol::CreateDodagMembership(DodagKey key, uint8_t mop)
     }
     dodag.dioTrickle.Start();
 
-    if (!m_hasBaseDodag)
+    if (!m_hasBaseDodag && mop != RPL_MOP_P2P_ROUTE_DISCOVERY)
     {
+        // A route-discovery instance never becomes the base DODAG, however
+        // early it is formed. The base is what every base-scoped accessor
+        // (GetRank(), IsJoined(), RouteOutput()'s own fallback, ...) answers
+        // for, and an AODV-RPL RREQ-Instance is a transient thing that
+        // LeaveDodag() will erase within seconds -- letting it take the slot
+        // on a node that has not joined its base DODAG yet would hand all of
+        // those the wrong DODAG and then strand them when it expires.
         m_hasBaseDodag = true;
         m_baseDodagKey = key;
     }
@@ -992,6 +999,17 @@ RplRoutingProtocol::HandleDis(Ipv6Address from, uint32_t interface, bool toMulti
     // refind guard against a mid-loop erase().
     for (auto& [key, dodag] : m_dodags)
     {
+        if (dodag.mop == RPL_MOP_P2P_ROUTE_DISCOVERY)
+        {
+            // Not an ordinary DODAG a neighbour can usefully join: an
+            // AODV-RPL RREQ-Instance exists only for the route discovery
+            // that created it, is scoped by that discovery's own RankLimit
+            // and Address Vector, and is torn down when its 'L' field
+            // expires. Answering a DIS with one would pull an uninvolved
+            // neighbour into somebody else's discovery.
+            continue;
+        }
+
         if (toMulticast)
         {
             // RFC 6550, section 8.3: a multicast DIS is an inconsistency, so
@@ -1048,11 +1066,11 @@ RplRoutingProtocol::HandleDio(const RplDioHeader& dio,
     // is root of its own RREQ-Instance while remaining an ordinary member
     // of the base DODAG.
 
-    if (dio.GetMop() != RPL_MOP_NON_STORING)
+    if (dio.GetMop() != RPL_MOP_NON_STORING && dio.GetMop() != RPL_MOP_P2P_ROUTE_DISCOVERY)
     {
-        NS_LOG_WARN("Ignoring a DIO advertising mode of operation " << +dio.GetMop()
-                                                                    << ", only non-storing is "
-                                                                       "implemented");
+        NS_LOG_WARN("Ignoring a DIO advertising mode of operation "
+                    << +dio.GetMop()
+                    << ", only non-storing and P2P route discovery are implemented");
         return;
     }
 
@@ -1164,7 +1182,10 @@ RplRoutingProtocol::HandleDio(const RplDioHeader& dio,
         parent.pathEtx = dio.GetPathEtx();
     }
 
-    if (preferredParentBumpedDtsn)
+    // The DTSN drives the DAO refresh, which an AODV-RPL instance has no
+    // DAOs to refresh (@see SendDao()). Skipped rather than left to
+    // SendDao()'s own guard so no pointless timer is armed for it at all.
+    if (preferredParentBumpedDtsn && dodag->mop != RPL_MOP_P2P_ROUTE_DISCOVERY)
     {
         // Rule 2: in non-storing mode, this node's own DTSN follows its
         // parent's up.
@@ -1206,8 +1227,14 @@ RplRoutingProtocol::JoinDodag(const RplDioHeader& dio, uint32_t interface)
     // the value directly inside the map node, no temporary involved.
     DodagMembership& dodag = m_dodags[key];
 
-    if (!m_hasBaseDodag)
+    if (!m_hasBaseDodag && dio.GetMop() != RPL_MOP_P2P_ROUTE_DISCOVERY)
     {
+        // Never let a route-discovery instance become the base DODAG, for
+        // the same reason CreateDodagMembership() refuses to: it is
+        // transient, scoped to somebody else's discovery, and every
+        // base-scoped accessor would be left answering for it and then
+        // stranded when its 'L' field expires. Reached whenever a node hears
+        // an AODV-RPL RREQ-DIO before its own base DODAG has formed.
         m_hasBaseDodag = true;
         m_baseDodagKey = key;
     }
@@ -1431,6 +1458,18 @@ RplRoutingProtocol::SendDao(DodagMembership& dodag)
 
     if (dodag.isRoot || dodag.preferredParent.IsAny())
     {
+        return;
+    }
+
+    if (dodag.mop == RPL_MOP_P2P_ROUTE_DISCOVERY)
+    {
+        // AODV-RPL "does not utilize the Destination Advertisement Object
+        // (DAO) control message of RPL" (RFC 9854 section 1) -- its routes
+        // come from the RREQ/RREP exchange instead. The guard above is not
+        // enough on its own: an intermediate router in an RREQ-Instance is
+        // not the root and does have a preferred parent, so without this it
+        // would advertise itself to the OrigNode as if this were an
+        // ordinary DODAG.
         return;
     }
 
@@ -2402,11 +2441,12 @@ RplRoutingProtocol::SelectPreferredParent(DodagMembership& dodag)
         dodag.lowestRankThisVersion = std::min(dodag.lowestRankThisVersion, dodag.rank);
     }
 
-    if (parentChanged)
+    if (parentChanged && dodag.mop != RPL_MOP_P2P_ROUTE_DISCOVERY)
     {
         // RFC 6550, section 9.5: a node that changes parent has to tell the
         // root about it. The path sequence is what lets the root tell the new
-        // report from the one the old parent may still be relaying.
+        // report from the one the old parent may still be relaying. Not for
+        // an AODV-RPL instance, which sends no DAOs at all (@see SendDao()).
         dodag.pathSequence++;
         dodag.daoEvent.Cancel();
         dodag.daoEvent.Schedule(Seconds(m_jitter->GetValue(0.0, 1.0)));

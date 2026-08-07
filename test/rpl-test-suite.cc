@@ -4486,6 +4486,224 @@ RplMrhofLinkMetricBoundaryTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief A DIO advertising the P2P Route Discovery mode of operation (MOP 4,
+ *        AODV-RPL) is joined, but the membership it forms takes no part in
+ *        core RPL's own DAO and DIS machinery.
+ *
+ * MOP 4 was refused outright until AODV-RPL (RFC 9854) work began. Letting
+ * it in means a membership now exists that looks ordinary to every piece of
+ * core RPL it flows past but must not behave like one:
+ *
+ * - it sends no DAO, because "AODV-RPL does not utilize the Destination
+ *   Advertisement Object (DAO) control message of RPL" (RFC 9854 section 1).
+ *   SendDao()'s pre-existing guard is not enough on its own -- an
+ *   intermediate router in an RREQ-Instance is neither the root nor without
+ *   a preferred parent, which is exactly the shape that guard lets through;
+ * - it never answers a DIS, since a route-discovery instance is scoped to
+ *   the discovery that created it and pulling an uninvolved neighbour into
+ *   one would be meaningless;
+ * - it never becomes the base DODAG, however early it is heard. The base is
+ *   what every base-scoped accessor answers for, and this one is torn down
+ *   when its 'L' field expires.
+ */
+class RplAodvMopAcceptedTestCase : public TestCase
+{
+  public:
+    RplAodvMopAcceptedTestCase();
+
+  private:
+    void DoRun() override;
+
+    /**
+     * @brief Count an RPL message seen at the monitor, by code and, for a
+     *        DIO, by mode of operation.
+     * @param socket the monitoring socket
+     */
+    void CountRplMessage(Ptr<Socket> socket);
+
+    uint32_t m_dioCount{0};     //!< DIOs seen at the monitor
+    uint32_t m_mop4DioCount{0}; //!< of those, ones advertising MOP 4
+    uint32_t m_daoCount{0};     //!< DAOs seen at the monitor
+};
+
+RplAodvMopAcceptedTestCase::RplAodvMopAcceptedTestCase()
+    : TestCase("A MOP 4 DIO is joined but stays out of core RPL's DAO and DIS machinery")
+{
+}
+
+void
+RplAodvMopAcceptedTestCase::CountRplMessage(Ptr<Socket> socket)
+{
+    Address sender;
+    Ptr<Packet> packet = socket->RecvFrom(sender);
+    if (!packet)
+    {
+        return;
+    }
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ipv6Header);
+    Icmpv6Header icmpv6Header;
+    packet->RemoveHeader(icmpv6Header);
+    if (icmpv6Header.GetType() != ICMPV6_RPL)
+    {
+        return;
+    }
+    if (icmpv6Header.GetCode() == RPL_CODE_DAO)
+    {
+        m_daoCount++;
+        return;
+    }
+    if (icmpv6Header.GetCode() != RPL_CODE_DIO)
+    {
+        return;
+    }
+    RplDioHeader dio;
+    packet->RemoveHeader(dio);
+    m_dioCount++;
+    if (dio.GetMop() == RPL_MOP_P2P_ROUTE_DISCOVERY)
+    {
+        m_mop4DioCount++;
+    }
+}
+
+void
+RplAodvMopAcceptedTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2); // 0 = the node under test, 1 = a peer that need not run RPL itself
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    interfaces.SetForwarding(0, true);
+    interfaces.SetForwarding(1, true);
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    // Long enough for the peer to have joined the base DODAG and SLAACed an
+    // address on it: the first Trickle-paced DIO fires somewhere in
+    // [Imin/2, Imin) = [2.048, 4.096) seconds, and Duplicate Address
+    // Detection takes about a second after that.
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    Ptr<Node> node = nodes.Get(0);
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> peer = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoined(), true, "The base DODAG never formed");
+    NS_TEST_ASSERT_MSG_EQ(peer->IsJoined(), true, "The peer never joined the base DODAG");
+    Ipv6Address baseDodagId = rpl->GetDodagId();
+
+    Ipv6Address nodeLinkLocal = node->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address peerLinkLocal = nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    // Watching from the peer, which is where anything the node under test
+    // unicasts upward has to go: its preferred parent in the route-discovery
+    // instance below is the peer, so a DAO for that instance would pass here.
+    // Installed before the RREQ-DIO so nothing sent in response to it is
+    // missed.
+    Ptr<Socket> monitor = Socket::CreateSocket(nodes.Get(1), Ipv6RawSocketFactory::GetTypeId());
+    monitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    monitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    monitor->BindToNetDevice(nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+    monitor->SetRecvCallback(MakeCallback(&RplAodvMopAcceptedTestCase::CountRplMessage, this));
+
+    // An RREQ-DIO under a Local RPLInstanceID, cast as if the peer itself
+    // were the OrigNode. Its DODAGID is the peer's own address rather than a
+    // fabricated one for a specific reason: a DAO for this instance would be
+    // addressed to the DODAGID and routed via this node's preferred parent
+    // in it, which is the peer. Addressed to any other host the peer would
+    // merely forward it, and a raw socket only ever sees what is delivered
+    // locally -- so the monitor below would count nothing whether or not a
+    // DAO was sent, and the assertion would be vacuous.
+    static constexpr uint8_t LOCAL_INSTANCE = 0x81;
+    Ipv6Address origNode = peer->GetGlobalAddress();
+    NS_TEST_ASSERT_MSG_NE(origNode, Ipv6Address::GetAny(), "The peer has no global address yet");
+    RplDioHeader rreqDio;
+    rreqDio.SetInstanceId(LOCAL_INSTANCE);
+    rreqDio.SetVersionNumber(0);
+    rreqDio.SetRank(RPL_MIN_HOPRANKINC);
+    rreqDio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+    rreqDio.SetDodagId(origNode);
+    rreqDio.SetDtsn(0);
+    rreqDio.SetDagConfiguration(0,
+                                20,
+                                RPL_DIO_REDUNDANCY,
+                                RPL_MAX_RANKINC,
+                                RPL_MIN_HOPRANKINC,
+                                RPL_OCP_OF0,
+                                RPL_DEFAULT_LIFETIME,
+                                RPL_DEFAULT_LIFETIME_UNIT);
+    // No Prefix Information: an AODV-RPL local instance never SLAACs
+    // (@see CreateLocalDodag()).
+    DeliverRawRplMessage<RplDioHeader>(node,
+                                       1,
+                                       rreqDio,
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       peerLinkLocal,
+                                       nodeLinkLocal);
+
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(LOCAL_INSTANCE, origNode),
+                          true,
+                          "A MOP 4 DIO was turned away: the mode of operation gate still "
+                          "refuses P2P route discovery");
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetDodagCount(), 2, "The MOP 4 membership was not added");
+
+    // The base DODAG is untouched: the route-discovery instance did not take
+    // its slot, and every base-scoped accessor still answers for the base.
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetDodagId(),
+                          baseDodagId,
+                          "The route-discovery instance took the base DODAG's slot");
+
+    // Long enough for the jittered DAO a parent change would have scheduled
+    // (SelectPreferredParent() uses [0, 1) seconds) and for several of its
+    // DaoAckTimeout retries on top. Counted as packets on the wire rather
+    // than read off daoAckPending: that flag is cleared again once DaoRetry()
+    // exhausts DaoRetries and gives up, so a test that sampled it after the
+    // fact would pass whether or not a DAO was ever sent.
+    Simulator::Stop(Seconds(5));
+    Simulator::Run();
+    NS_TEST_ASSERT_MSG_EQ(m_daoCount,
+                          0,
+                          "A DAO was sent for the route-discovery instance, which AODV-RPL does "
+                          "not use at all (RFC 9854 section 1)");
+
+    // A unicast DIS must be answered for the base DODAG and for that one
+    // only.
+    RplDisHeader dis;
+    Simulator::Schedule(Seconds(0),
+                        &SendRawRplMessage<RplDisHeader>,
+                        nodes.Get(1),
+                        1,
+                        dis,
+                        static_cast<uint8_t>(RPL_CODE_DIS),
+                        peerLinkLocal,
+                        nodeLinkLocal);
+    Simulator::Stop(Seconds(1));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_GT_OR_EQ(m_dioCount, 1, "The unicast DIS was never answered at all");
+    NS_TEST_ASSERT_MSG_EQ(m_mop4DioCount,
+                          0,
+                          "A DIS was answered with the route-discovery instance's own DIO");
+
+    monitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Check which DIOs RplRoutingProtocol::HandleDio() acts on and which
  *        it turns away: a mode of operation it does not implement, another
  *        RPL instance or DODAG, a stale DODAG version, and the infinite
@@ -8691,6 +8909,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplRankInconsistencyPerInstanceTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplNonBaseRootDownwardPacketTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplReadRpiInstanceIdRejectsWrongOptionTypeTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplAodvMopAcceptedTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDioRejectionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplParentLossRejoinTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplInterfaceRestartTestCase, TestCase::Duration::QUICK);
