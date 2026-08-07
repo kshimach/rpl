@@ -49,15 +49,21 @@ enum RplOptionType : uint8_t
     RPL_OPTION_SOLICITED_INFO = 7,
     RPL_OPTION_PREFIX_INFO = 8,
     RPL_OPTION_TARGET_DESC = 9,
+    RPL_OPTION_AODV_RREQ = 0x0B, //!< AODV-RPL Route Request (RFC 9854, section 4.1)
+    RPL_OPTION_AODV_RREP = 0x0C, //!< AODV-RPL Route Reply (RFC 9854, section 4.2)
+    RPL_OPTION_AODV_ART = 0x0D,  //!< AODV-RPL Target (RFC 9854, section 4.3)
 };
 
-/// Mode of Operation (RFC 6550, section 20.14). Only NON_STORING is implemented.
+/// Mode of Operation (RFC 6550, section 20.14). NON_STORING is what core RPL
+/// runs here; P2P_ROUTE_DISCOVERY is AODV-RPL's (RFC 9854, section 9, which
+/// reuses the value RFC 6997 registered for P2P-RPL).
 enum RplMop : uint8_t
 {
     RPL_MOP_NO_DOWNWARD_ROUTES = 0,
     RPL_MOP_NON_STORING = 1,
     RPL_MOP_STORING_NO_MULTICAST = 2,
     RPL_MOP_STORING_MULTICAST = 3,
+    RPL_MOP_P2P_ROUTE_DISCOVERY = 4,
 };
 
 /// Objective Code Points (RFC 6552, RFC 6719).
@@ -224,6 +230,71 @@ constexpr uint8_t RPL_LOCAL_INSTANCE_FLAG = 0x80;
 /// meaningful together with RPL_LOCAL_INSTANCE_FLAG -- for a Global
 /// instance this same bit is simply part of its 7-bit ID space (0..127).
 constexpr uint8_t RPL_LOCAL_INSTANCE_D_FLAG = 0x40;
+
+/// AODV-RPL (RFC 9854) RREQ/RREP option bit positions, in the first of the two
+/// octets that follow Option Type and Opt Data Len. The 'L' field straddles
+/// those two octets (bits 23-24 of the row in RFC 9854 sections 4.1 and 4.2),
+/// so it has no single mask here -- @see RplDioHeader::Serialize().
+constexpr uint8_t RPL_AODV_S_FLAG = 0x80;      //!< RREQ 'S': the route so far is symmetric
+constexpr uint8_t RPL_AODV_G_FLAG = 0x80;      //!< RREP 'G': Gratuitous RREP (never set here)
+constexpr uint8_t RPL_AODV_H_FLAG = 0x40;      //!< 'H': 1 hop-by-hop, 0 source routed
+constexpr uint8_t RPL_AODV_COMPR_MASK = 0x1E;  //!< 'Compr', 4 bits
+constexpr uint8_t RPL_AODV_COMPR_SHIFT = 1;
+
+/// The 'RankLimit' field of the RREQ/RREP options. RFC 9854 sections 4.1 and
+/// 4.2 call it "8-bit" in prose, but their own figures leave it only bits
+/// 25-31 once S/G, H, X, Compr and L have taken bits 16-24 -- the prose
+/// reading would make the row 33 bits wide. The figure is the only
+/// dimensionally consistent reading, so seven bits it is; harmless in
+/// practice, since this is compared against DAGRank() (rank divided by
+/// MinHopRankIncrease), which tops out at 511 for the 16-bit ranks and
+/// default MinHopRankIncrease of 128 used here and is far below 127 for any
+/// realistic hop count. @see design-constraints.md.
+constexpr uint8_t RPL_AODV_RANK_LIMIT_MASK = 0x7F;
+/// Zero means "no limit" (RFC 9854 sections 4.1, 4.2).
+constexpr uint8_t RPL_AODV_RANK_LIMIT_INFINITE = 0;
+
+/// The 'Delta' field of the RREP option (RFC 9854 section 4.2): six bits,
+/// added to the RREQ-InstanceID to obtain the RREP-InstanceID (section 6.3.3).
+constexpr uint8_t RPL_AODV_DELTA_MASK = 0xFC;
+constexpr uint8_t RPL_AODV_DELTA_SHIFT = 2;
+
+/// The ART option's 'Prefix Length' field (RFC 9854 section 4.3): seven bits,
+/// the top bit of that octet being the reserved 'X'. Zero means the Target
+/// Prefix / Address field carries a full 128-bit address rather than a prefix.
+constexpr uint8_t RPL_AODV_PREFIX_LENGTH_MASK = 0x7F;
+
+/// The 'L' field of the RREQ/RREP options (RFC 9854 section 4.1): how long a
+/// node may stay in the RREQ-Instance. Zero imposes no limit at all.
+constexpr uint8_t RPL_AODV_LIFETIME_MASK = 0x03;
+constexpr uint8_t RPL_AODV_LIFETIME_UNLIMITED = 0;
+
+/**
+ * @brief How long the 'L' field of an RREQ/RREP option lets a node stay in
+ *        the RREQ-Instance, in seconds.
+ *
+ * RFC 9854 section 4.1 tabulates the two-bit field as 0x00 "no time limit
+ * imposed", 0x01 16 seconds, 0x02 64 seconds, 0x03 256 seconds. Expressed in
+ * seconds rather than an ns3::Time so this stays a pure-constant header.
+ *
+ * @param lifetimeField the 'L' field, only its low two bits are read
+ * @return the duration in seconds, 0 for the "no limit" encoding
+ */
+constexpr uint32_t
+RplAodvLifetimeSeconds(uint8_t lifetimeField)
+{
+    switch (lifetimeField & RPL_AODV_LIFETIME_MASK)
+    {
+    case 1:
+        return 16;
+    case 2:
+        return 64;
+    case 3:
+        return 256;
+    default:
+        return 0;
+    }
+}
 
 /// Routing Metric/Constraint object types (RFC 6551, section 4).
 constexpr uint8_t RPL_DAG_MC_LQL = 6;

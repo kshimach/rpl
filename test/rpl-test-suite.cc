@@ -355,6 +355,122 @@ RplDioHeaderTestCase::DoRun()
     NS_TEST_ASSERT_MSG_EQ(received.GetPrefixOnLink(), false, "The 'L' flag leaked");
     NS_TEST_ASSERT_MSG_EQ(received.GetPrefixAutonomous(), false, "The 'A' flag leaked");
     NS_TEST_ASSERT_MSG_EQ(received.GetPrefix(), Ipv6Address("fd00::"), "Wrong ULA prefix");
+
+    // The AODV-RPL RREQ option (RFC 9854 section 4.1), carried alongside
+    // everything already on the DIO above. Two Address Vector entries, so
+    // 2 (Type+Length) + 3 (the fixed part) + 2 * 16.
+    NS_TEST_ASSERT_MSG_EQ(dio.HasRreq(), false, "There is no RREQ option yet");
+    RplDioHeader::RreqOption rreq;
+    rreq.symmetric = true;
+    rreq.hopByHop = false;
+    rreq.compr = 0;
+    rreq.lifetime = 2; // 64 seconds
+    rreq.rankLimit = 5;
+    rreq.origSeqNo = 42;
+    rreq.addressVector = {Ipv6Address("2001:1::1"), Ipv6Address("2001:1::2")};
+    dio.SetRreq(rreq);
+    NS_TEST_ASSERT_MSG_EQ(dio.GetSerializedSize(), 121, "The RREQ option adds 37 bytes");
+
+    packet = Create<Packet>();
+    packet->AddHeader(dio);
+    packet->RemoveHeader(received);
+
+    NS_TEST_ASSERT_MSG_EQ(received.HasRreq(), true, "The RREQ option was lost");
+    NS_TEST_ASSERT_MSG_EQ(received.GetRreq().symmetric, true, "Wrong 'S' flag");
+    NS_TEST_ASSERT_MSG_EQ(received.GetRreq().hopByHop, false, "Wrong 'H' flag");
+    NS_TEST_ASSERT_MSG_EQ(received.GetRreq().compr, 0, "Wrong Compr");
+    // 'L' straddles the two flag octets, so a wrong shift on either side
+    // shows up here and nowhere else.
+    NS_TEST_ASSERT_MSG_EQ(received.GetRreq().lifetime, 2, "Wrong 'L' field");
+    NS_TEST_ASSERT_MSG_EQ(received.GetRreq().rankLimit, 5, "Wrong RankLimit");
+    NS_TEST_ASSERT_MSG_EQ(received.GetRreq().origSeqNo, 42, "Wrong Orig SeqNo");
+    NS_TEST_ASSERT_MSG_EQ(received.GetRreq().addressVector.size(), 2, "Wrong Address Vector size");
+    NS_TEST_ASSERT_MSG_EQ(received.GetRreq().addressVector[0],
+                          Ipv6Address("2001:1::1"),
+                          "Wrong first Address Vector entry");
+    NS_TEST_ASSERT_MSG_EQ(received.GetRreq().addressVector[1],
+                          Ipv6Address("2001:1::2"),
+                          "Wrong second Address Vector entry");
+    NS_TEST_ASSERT_MSG_EQ(received.HasPrefixInfo(), true, "An earlier option was lost");
+    NS_TEST_ASSERT_MSG_EQ(received.GetRank(), 384, "An option ate part of the base object");
+
+    // The RREP option (RFC 9854 section 4.2): the same shape, with 'G' in
+    // place of 'S' and Delta in place of Orig SeqNo. An empty Address Vector
+    // here, the boundary the length arithmetic has to get right, so
+    // 2 + 3 + 0 * 16.
+    NS_TEST_ASSERT_MSG_EQ(dio.HasRrep(), false, "There is no RREP option yet");
+    RplDioHeader::RrepOption rrep;
+    rrep.gratuitous = false;
+    rrep.hopByHop = false;
+    rrep.lifetime = 1; // 16 seconds
+    rrep.rankLimit = 0;
+    rrep.delta = 6;
+    dio.SetRrep(rrep);
+    NS_TEST_ASSERT_MSG_EQ(dio.GetSerializedSize(),
+                          126,
+                          "The RREP option with an empty Address Vector adds 5 bytes");
+
+    packet = Create<Packet>();
+    packet->AddHeader(dio);
+    packet->RemoveHeader(received);
+
+    NS_TEST_ASSERT_MSG_EQ(received.HasRrep(), true, "The RREP option was lost");
+    NS_TEST_ASSERT_MSG_EQ(received.GetRrep().gratuitous, false, "Wrong 'G' flag");
+    NS_TEST_ASSERT_MSG_EQ(received.GetRrep().lifetime, 1, "Wrong 'L' field");
+    NS_TEST_ASSERT_MSG_EQ(received.GetRrep().rankLimit, 0, "Wrong RankLimit");
+    NS_TEST_ASSERT_MSG_EQ(received.GetRrep().delta, 6, "Wrong Delta");
+    NS_TEST_ASSERT_MSG_EQ(received.GetRrep().addressVector.size(),
+                          0,
+                          "An empty Address Vector came back non-empty");
+    NS_TEST_ASSERT_MSG_EQ(received.HasRreq(), true, "The RREQ option was lost");
+    NS_TEST_ASSERT_MSG_EQ(received.GetRreq().origSeqNo, 42, "The RREQ option's content was lost");
+    NS_TEST_ASSERT_MSG_EQ(received.GetRank(), 384, "An option ate part of the base object");
+
+    // The ART option (RFC 9854 section 4.3), a fixed 20 bytes at Prefix
+    // Length 0 -- which the RFC defines as "this is an address, not a
+    // prefix", the only form this implementation sends.
+    NS_TEST_ASSERT_MSG_EQ(dio.HasArt(), false, "There is no ART option yet");
+    RplDioHeader::ArtOption art;
+    art.destSeqNo = 7;
+    art.prefixLength = 0;
+    art.target = Ipv6Address("2001:2::9");
+    dio.SetArt(art);
+    NS_TEST_ASSERT_MSG_EQ(dio.GetSerializedSize(), 146, "The ART option adds 20 bytes");
+
+    packet = Create<Packet>();
+    packet->AddHeader(dio);
+    packet->RemoveHeader(received);
+
+    NS_TEST_ASSERT_MSG_EQ(received.HasArt(), true, "The ART option was lost");
+    NS_TEST_ASSERT_MSG_EQ(received.GetArt().destSeqNo, 7, "Wrong Dest SeqNo");
+    NS_TEST_ASSERT_MSG_EQ(received.GetArt().prefixLength, 0, "Wrong Prefix Length");
+    NS_TEST_ASSERT_MSG_EQ(received.GetArt().target, Ipv6Address("2001:2::9"), "Wrong target");
+    NS_TEST_ASSERT_MSG_EQ(received.HasRrep(), true, "An earlier option was lost");
+    NS_TEST_ASSERT_MSG_EQ(received.GetRank(), 384, "An option ate part of the base object");
+
+    // 'S'/'G' and 'H' share their octet with Compr and the high bit of 'L':
+    // a DIO that sets every one of them at its maximum must not have any of
+    // them bleed into a neighbour. RankLimit at 127 is its own 7-bit
+    // maximum, which is the field RFC 9854's prose and figure disagree
+    // about (@see design-constraints.md) -- 127 is what the figure allows.
+    RplDioHeader packed;
+    RplDioHeader::RreqOption dense;
+    dense.symmetric = true;
+    dense.hopByHop = true;
+    dense.compr = 15;
+    dense.lifetime = 3;
+    dense.rankLimit = 127;
+    dense.origSeqNo = 255;
+    packed.SetRreq(dense);
+    packet = Create<Packet>();
+    packet->AddHeader(packed);
+    packet->RemoveHeader(received);
+    NS_TEST_ASSERT_MSG_EQ(received.GetRreq().symmetric, true, "'S' was lost when every bit was set");
+    NS_TEST_ASSERT_MSG_EQ(received.GetRreq().hopByHop, true, "'H' was lost when every bit was set");
+    NS_TEST_ASSERT_MSG_EQ(received.GetRreq().compr, 15, "Compr was truncated at its maximum");
+    NS_TEST_ASSERT_MSG_EQ(received.GetRreq().lifetime, 3, "'L' was truncated at its maximum");
+    NS_TEST_ASSERT_MSG_EQ(received.GetRreq().rankLimit, 127, "RankLimit was truncated at its 7-bit maximum");
+    NS_TEST_ASSERT_MSG_EQ(received.GetRreq().origSeqNo, 255, "Orig SeqNo was truncated");
 }
 
 /**
@@ -891,6 +1007,89 @@ RplDioOptionEdgeTestCase::DoRun()
         NS_TEST_ASSERT_MSG_EQ(received.HasLql(), false, "An option appeared");
         NS_TEST_ASSERT_MSG_EQ(received.HasPrefixInfo(), false, "An option appeared");
         NS_TEST_ASSERT_MSG_EQ(received.GetRank(), 256, "Wrong rank");
+    }
+
+    // The AODV-RPL RREQ/RREP options (RFC 9854 sections 4.1, 4.2) are the
+    // only variable-length options here, so they cannot use the exact
+    // `length == <X>_OPTION_LENGTH` guard the four RFC 6550 options above
+    // do. What replaces it is a shape check -- a 3-byte fixed part plus a
+    // whole number of 16-byte Address Vector entries -- and these cases are
+    // what hold that check to the same standard: a length that is not of
+    // that shape must be skipped whole, exactly as a wrong fixed length is.
+    for (uint8_t badLength : {uint8_t(0), uint8_t(2), uint8_t(4), uint8_t(18), uint8_t(20)})
+    {
+        std::vector<uint8_t> options;
+        options.push_back(RPL_OPTION_AODV_RREQ);
+        options.push_back(badLength);
+        options.insert(options.end(), badLength, 0);
+
+        // A real ETX metric container behind it, the same way the wrong-length
+        // cases above prove the walk resumed at the right offset.
+        const uint8_t etx[8] =
+            {RPL_OPTION_DAG_METRIC_CONTAINER, 6, RPL_DAG_MC_ETX, 0, 0, 2, 0x01, 0x40};
+        options.insert(options.end(), etx, etx + sizeof(etx));
+
+        RplDioHeader received = RoundTrip(options.data(), options.size());
+        NS_TEST_ASSERT_MSG_EQ(received.HasRreq(),
+                              false,
+                              "An RREQ option of length "
+                                  << +badLength
+                                  << ", which is not 3 + a multiple of 16, was parsed anyway");
+        NS_TEST_ASSERT_MSG_EQ(received.HasMetricContainer(),
+                              true,
+                              "The option after a length-" << +badLength
+                                                            << " RREQ was never reached");
+        NS_TEST_ASSERT_MSG_EQ(received.GetPathEtx(), 320, "The following option was misparsed");
+    }
+
+    // The two lengths that ARE of the right shape at the small end: 3 (an
+    // empty Address Vector) and 19 (exactly one entry). Both must parse.
+    {
+        const uint8_t empty[5] = {RPL_OPTION_AODV_RREQ, 3, 0x80, 0x05, 42};
+        RplDioHeader received = RoundTrip(empty, sizeof(empty));
+        NS_TEST_ASSERT_MSG_EQ(received.HasRreq(), true, "An empty Address Vector was rejected");
+        NS_TEST_ASSERT_MSG_EQ(received.GetRreq().addressVector.size(), 0, "Wrong vector size");
+        NS_TEST_ASSERT_MSG_EQ(received.GetRreq().symmetric, true, "Wrong 'S' flag");
+        NS_TEST_ASSERT_MSG_EQ(received.GetRreq().rankLimit, 5, "Wrong RankLimit");
+        NS_TEST_ASSERT_MSG_EQ(received.GetRreq().origSeqNo, 42, "Wrong Orig SeqNo");
+        NS_TEST_ASSERT_MSG_EQ(received.GetRank(), 256, "The option ate part of the base object");
+    }
+    {
+        std::vector<uint8_t> options = {RPL_OPTION_AODV_RREQ, 19, 0x00, 0x00, 1};
+        options.insert(options.end(), 16, 0xAB);
+        RplDioHeader received = RoundTrip(options.data(), options.size());
+        NS_TEST_ASSERT_MSG_EQ(received.HasRreq(), true, "A one-entry Address Vector was rejected");
+        NS_TEST_ASSERT_MSG_EQ(received.GetRreq().addressVector.size(), 1, "Wrong vector size");
+        NS_TEST_ASSERT_MSG_EQ(received.GetRank(), 256, "The option ate part of the base object");
+    }
+
+    // The ART option is fixed at 20 bytes (Prefix Length 0, a full address),
+    // so it keeps the ordinary exact-length guard -- checked here so that
+    // stays true if the variable-length work above is ever generalised to it.
+    {
+        std::vector<uint8_t> options = {RPL_OPTION_AODV_ART, 17};
+        options.insert(options.end(), 17, 0);
+        const uint8_t etx[8] =
+            {RPL_OPTION_DAG_METRIC_CONTAINER, 6, RPL_DAG_MC_ETX, 0, 0, 2, 0x01, 0x40};
+        options.insert(options.end(), etx, etx + sizeof(etx));
+
+        RplDioHeader received = RoundTrip(options.data(), options.size());
+        NS_TEST_ASSERT_MSG_EQ(received.HasArt(), false, "An ART option of length 17 was parsed");
+        NS_TEST_ASSERT_MSG_EQ(received.HasMetricContainer(),
+                              true,
+                              "The option after a wrong-length ART was never reached");
+    }
+
+    // An RREQ option whose declared length runs past the end of the packet:
+    // the loop's own remaining-size check has to stop the walk before the
+    // Address Vector read below it ever runs.
+    {
+        const uint8_t truncated[6] = {RPL_OPTION_AODV_RREQ, 51, 0x80, 0x00, 1, 0};
+        RplDioHeader received = RoundTrip(truncated, sizeof(truncated));
+        NS_TEST_ASSERT_MSG_EQ(received.HasRreq(),
+                              false,
+                              "An RREQ claiming more bytes than the packet holds was parsed");
+        NS_TEST_ASSERT_MSG_EQ(received.GetRank(), 256, "It also ate part of the base object");
     }
 }
 

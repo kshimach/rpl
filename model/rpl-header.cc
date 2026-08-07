@@ -100,7 +100,10 @@ RplDioHeader::RplDioHeader()
       m_prefixOnLink(false),
       m_prefixAutonomous(false),
       m_prefixValidLifetime(0),
-      m_prefixPreferredLifetime(0)
+      m_prefixPreferredLifetime(0),
+      m_hasRreq(false),
+      m_hasRrep(false),
+      m_hasArt(false)
 {
 }
 
@@ -145,6 +148,23 @@ RplDioHeader::Print(std::ostream& os) const
     {
         os << " prefix " << m_prefix << "/" << +m_prefixLength;
     }
+    if (m_hasRreq)
+    {
+        os << " RREQ" << (m_rreq.symmetric ? " S" : "") << (m_rreq.hopByHop ? " H" : "")
+           << " OrigSeqNo " << +m_rreq.origSeqNo << " RankLimit " << +m_rreq.rankLimit
+           << " AV " << m_rreq.addressVector.size();
+    }
+    if (m_hasRrep)
+    {
+        os << " RREP" << (m_rrep.gratuitous ? " G" : "") << (m_rrep.hopByHop ? " H" : "")
+           << " Delta " << +m_rrep.delta << " RankLimit " << +m_rrep.rankLimit
+           << " AV " << m_rrep.addressVector.size();
+    }
+    if (m_hasArt)
+    {
+        os << " ART " << m_art.target << "/" << +m_art.prefixLength << " DestSeqNo "
+           << +m_art.destSeqNo;
+    }
 }
 
 uint32_t
@@ -153,7 +173,14 @@ RplDioHeader::GetSerializedSize() const
     return 24 + (m_hasDagConf ? DAG_CONF_OPTION_SIZE : 0) +
            (m_hasMetricContainer ? METRIC_CONTAINER_OPTION_SIZE : 0) +
            (m_hasLql ? LQL_OPTION_SIZE : 0) +
-           (m_hasPrefixInfo ? PREFIX_INFO_OPTION_SIZE : 0);
+           (m_hasPrefixInfo ? PREFIX_INFO_OPTION_SIZE : 0) +
+           (m_hasRreq ? 2 + AODV_RREQ_OPTION_BASE_LENGTH +
+                            m_rreq.addressVector.size() * AODV_ADDRESS_VECTOR_ENTRY_SIZE
+                      : 0) +
+           (m_hasRrep ? 2 + AODV_RREP_OPTION_BASE_LENGTH +
+                            m_rrep.addressVector.size() * AODV_ADDRESS_VECTOR_ENTRY_SIZE
+                      : 0) +
+           (m_hasArt ? AODV_ART_OPTION_SIZE : 0);
 }
 
 void
@@ -235,6 +262,72 @@ RplDioHeader::Serialize(Buffer::Iterator start) const
         m_prefix.Serialize(prefixBuf);
         start.Write(prefixBuf, 16);
     }
+
+    // The AODV-RPL options (RFC 9854) come last, after every RFC 6550 option
+    // above, purely so adding them left the byte offsets of the existing
+    // ones alone. Nothing in the RFCs orders the option list.
+    //
+    // 'L' straddles the two flag octets in both the RREQ and the RREP option
+    // (bits 23-24 of their rows in RFC 9854 sections 4.1 and 4.2): its high
+    // bit is the last bit of the first octet, its low bit the top bit of the
+    // second, which is why neither can be written with a single mask.
+    if (m_hasRreq)
+    {
+        start.WriteU8(RPL_OPTION_AODV_RREQ);
+        start.WriteU8(static_cast<uint8_t>(AODV_RREQ_OPTION_BASE_LENGTH +
+                                           m_rreq.addressVector.size() *
+                                               AODV_ADDRESS_VECTOR_ENTRY_SIZE));
+        start.WriteU8(static_cast<uint8_t>((m_rreq.symmetric ? RPL_AODV_S_FLAG : 0) |
+                                           (m_rreq.hopByHop ? RPL_AODV_H_FLAG : 0) |
+                                           ((m_rreq.compr << RPL_AODV_COMPR_SHIFT) &
+                                            RPL_AODV_COMPR_MASK) |
+                                           ((m_rreq.lifetime >> 1) & AODV_LIFETIME_HIGH_BIT)));
+        start.WriteU8(static_cast<uint8_t>(((m_rreq.lifetime & 0x01) ? AODV_LIFETIME_LOW_BIT : 0) |
+                                           (m_rreq.rankLimit & RPL_AODV_RANK_LIMIT_MASK)));
+        start.WriteU8(m_rreq.origSeqNo);
+        for (const auto& address : m_rreq.addressVector)
+        {
+            uint8_t addressBuf[16];
+            address.Serialize(addressBuf);
+            start.Write(addressBuf, 16);
+        }
+    }
+
+    if (m_hasRrep)
+    {
+        start.WriteU8(RPL_OPTION_AODV_RREP);
+        start.WriteU8(static_cast<uint8_t>(AODV_RREP_OPTION_BASE_LENGTH +
+                                           m_rrep.addressVector.size() *
+                                               AODV_ADDRESS_VECTOR_ENTRY_SIZE));
+        start.WriteU8(static_cast<uint8_t>((m_rrep.gratuitous ? RPL_AODV_G_FLAG : 0) |
+                                           (m_rrep.hopByHop ? RPL_AODV_H_FLAG : 0) |
+                                           ((m_rrep.compr << RPL_AODV_COMPR_SHIFT) &
+                                            RPL_AODV_COMPR_MASK) |
+                                           ((m_rrep.lifetime >> 1) & AODV_LIFETIME_HIGH_BIT)));
+        start.WriteU8(static_cast<uint8_t>(((m_rrep.lifetime & 0x01) ? AODV_LIFETIME_LOW_BIT : 0) |
+                                           (m_rrep.rankLimit & RPL_AODV_RANK_LIMIT_MASK)));
+        // Delta occupies the top six bits, the low two being reserved.
+        start.WriteU8(static_cast<uint8_t>((m_rrep.delta << RPL_AODV_DELTA_SHIFT) &
+                                           RPL_AODV_DELTA_MASK));
+        for (const auto& address : m_rrep.addressVector)
+        {
+            uint8_t addressBuf[16];
+            address.Serialize(addressBuf);
+            start.Write(addressBuf, 16);
+        }
+    }
+
+    if (m_hasArt)
+    {
+        start.WriteU8(RPL_OPTION_AODV_ART);
+        start.WriteU8(AODV_ART_OPTION_LENGTH);
+        start.WriteU8(m_art.destSeqNo);
+        // The top bit of this octet is the reserved 'X', always zero.
+        start.WriteU8(static_cast<uint8_t>(m_art.prefixLength & RPL_AODV_PREFIX_LENGTH_MASK));
+        uint8_t targetBuf[16];
+        m_art.target.Serialize(targetBuf);
+        start.Write(targetBuf, 16);
+    }
 }
 
 uint32_t
@@ -265,6 +358,9 @@ RplDioHeader::Deserialize(Buffer::Iterator start)
     m_hasMetricContainer = false;
     m_hasLql = false;
     m_hasPrefixInfo = false;
+    m_hasRreq = false;
+    m_hasRrep = false;
+    m_hasArt = false;
     while (!i.IsEnd())
     {
         uint8_t type = i.ReadU8();
@@ -358,6 +454,75 @@ RplDioHeader::Deserialize(Buffer::Iterator start)
             uint8_t prefixBuf[16];
             i.Read(prefixBuf, 16);
             m_prefix = Ipv6Address::Deserialize(prefixBuf);
+        }
+        // The AODV-RPL RREQ/RREP options (RFC 9854 sections 4.1, 4.2) are the
+        // only variable-length options here, so they cannot use the exact
+        // `length == <X>_OPTION_LENGTH` guard every option above does. The
+        // shape check below is the equivalent: a fixed part plus a whole
+        // number of Address Vector entries. It is still the option's own
+        // declared length that is being checked rather than trusted -- the
+        // loop already refused a length longer than the packet, and no
+        // arithmetic below reads past what this check accounts for.
+        //
+        // No separate bound on the entry count is needed: length is eight
+        // bits, so 3 + 16n <= 255 caps n at 15 on the wire
+        // (AODV_ADDRESS_VECTOR_MAX_ENTRIES), whatever a sender intended.
+        else if (type == RPL_OPTION_AODV_RREQ && length >= AODV_RREQ_OPTION_BASE_LENGTH &&
+                 (length - AODV_RREQ_OPTION_BASE_LENGTH) % AODV_ADDRESS_VECTOR_ENTRY_SIZE == 0)
+        {
+            m_hasRreq = true;
+            uint8_t flags = i.ReadU8();
+            uint8_t limits = i.ReadU8();
+            m_rreq.symmetric = (flags & RPL_AODV_S_FLAG) != 0;
+            m_rreq.hopByHop = (flags & RPL_AODV_H_FLAG) != 0;
+            m_rreq.compr = (flags & RPL_AODV_COMPR_MASK) >> RPL_AODV_COMPR_SHIFT;
+            m_rreq.lifetime = static_cast<uint8_t>(((flags & AODV_LIFETIME_HIGH_BIT) << 1) |
+                                                   ((limits & AODV_LIFETIME_LOW_BIT) ? 1 : 0));
+            m_rreq.rankLimit = limits & RPL_AODV_RANK_LIMIT_MASK;
+            m_rreq.origSeqNo = i.ReadU8();
+            m_rreq.addressVector.clear();
+            uint8_t entries = static_cast<uint8_t>((length - AODV_RREQ_OPTION_BASE_LENGTH) /
+                                                   AODV_ADDRESS_VECTOR_ENTRY_SIZE);
+            for (uint8_t entry = 0; entry < entries; entry++)
+            {
+                uint8_t addressBuf[16];
+                i.Read(addressBuf, 16);
+                m_rreq.addressVector.push_back(Ipv6Address::Deserialize(addressBuf));
+            }
+        }
+        else if (type == RPL_OPTION_AODV_RREP && length >= AODV_RREP_OPTION_BASE_LENGTH &&
+                 (length - AODV_RREP_OPTION_BASE_LENGTH) % AODV_ADDRESS_VECTOR_ENTRY_SIZE == 0)
+        {
+            m_hasRrep = true;
+            uint8_t flags = i.ReadU8();
+            uint8_t limits = i.ReadU8();
+            m_rrep.gratuitous = (flags & RPL_AODV_G_FLAG) != 0;
+            m_rrep.hopByHop = (flags & RPL_AODV_H_FLAG) != 0;
+            m_rrep.compr = (flags & RPL_AODV_COMPR_MASK) >> RPL_AODV_COMPR_SHIFT;
+            m_rrep.lifetime = static_cast<uint8_t>(((flags & AODV_LIFETIME_HIGH_BIT) << 1) |
+                                                   ((limits & AODV_LIFETIME_LOW_BIT) ? 1 : 0));
+            m_rrep.rankLimit = limits & RPL_AODV_RANK_LIMIT_MASK;
+            m_rrep.delta = (i.ReadU8() & RPL_AODV_DELTA_MASK) >> RPL_AODV_DELTA_SHIFT;
+            m_rrep.addressVector.clear();
+            uint8_t entries = static_cast<uint8_t>((length - AODV_RREP_OPTION_BASE_LENGTH) /
+                                                   AODV_ADDRESS_VECTOR_ENTRY_SIZE);
+            for (uint8_t entry = 0; entry < entries; entry++)
+            {
+                uint8_t addressBuf[16];
+                i.Read(addressBuf, 16);
+                m_rrep.addressVector.push_back(Ipv6Address::Deserialize(addressBuf));
+            }
+        }
+        else if (type == RPL_OPTION_AODV_ART && length == AODV_ART_OPTION_LENGTH)
+        {
+            m_hasArt = true;
+            m_art.destSeqNo = i.ReadU8();
+            // The top bit is the reserved 'X', ignored on receipt per RFC
+            // 9854 section 4.3.
+            m_art.prefixLength = i.ReadU8() & RPL_AODV_PREFIX_LENGTH_MASK;
+            uint8_t targetBuf[16];
+            i.Read(targetBuf, 16);
+            m_art.target = Ipv6Address::Deserialize(targetBuf);
         }
         else
         {
@@ -648,6 +813,85 @@ uint32_t
 RplDioHeader::GetPrefixPreferredLifetime() const
 {
     return m_prefixPreferredLifetime;
+}
+
+bool
+RplDioHeader::HasRreq() const
+{
+    return m_hasRreq;
+}
+
+void
+RplDioHeader::SetRreq(const RreqOption& rreq)
+{
+    // Asserted rather than clamped, the same way SetMop() treats a Mode of
+    // Operation too wide for its field: a caller that built one of these out
+    // of range has a bug of its own, and silently narrowing the value would
+    // put a different DODAG's worth of meaning on the wire.
+    NS_ASSERT_MSG(rreq.addressVector.size() <= AODV_ADDRESS_VECTOR_MAX_ENTRIES,
+                  "The Address Vector does not fit the RREQ option's 8-bit Opt Data Len");
+    NS_ASSERT_MSG(rreq.compr <= (RPL_AODV_COMPR_MASK >> RPL_AODV_COMPR_SHIFT),
+                  "Compr does not fit its 4-bit field");
+    NS_ASSERT_MSG(rreq.lifetime <= RPL_AODV_LIFETIME_MASK, "L does not fit its 2-bit field");
+    NS_ASSERT_MSG(rreq.rankLimit <= RPL_AODV_RANK_LIMIT_MASK,
+                  "RankLimit does not fit its 7-bit field");
+    m_hasRreq = true;
+    m_rreq = rreq;
+}
+
+const RplDioHeader::RreqOption&
+RplDioHeader::GetRreq() const
+{
+    return m_rreq;
+}
+
+bool
+RplDioHeader::HasRrep() const
+{
+    return m_hasRrep;
+}
+
+void
+RplDioHeader::SetRrep(const RrepOption& rrep)
+{
+    NS_ASSERT_MSG(rrep.addressVector.size() <= AODV_ADDRESS_VECTOR_MAX_ENTRIES,
+                  "The Address Vector does not fit the RREP option's 8-bit Opt Data Len");
+    NS_ASSERT_MSG(rrep.compr <= (RPL_AODV_COMPR_MASK >> RPL_AODV_COMPR_SHIFT),
+                  "Compr does not fit its 4-bit field");
+    NS_ASSERT_MSG(rrep.lifetime <= RPL_AODV_LIFETIME_MASK, "L does not fit its 2-bit field");
+    NS_ASSERT_MSG(rrep.rankLimit <= RPL_AODV_RANK_LIMIT_MASK,
+                  "RankLimit does not fit its 7-bit field");
+    NS_ASSERT_MSG(rrep.delta <= (RPL_AODV_DELTA_MASK >> RPL_AODV_DELTA_SHIFT),
+                  "Delta does not fit its 6-bit field");
+    m_hasRrep = true;
+    m_rrep = rrep;
+}
+
+const RplDioHeader::RrepOption&
+RplDioHeader::GetRrep() const
+{
+    return m_rrep;
+}
+
+bool
+RplDioHeader::HasArt() const
+{
+    return m_hasArt;
+}
+
+void
+RplDioHeader::SetArt(const ArtOption& art)
+{
+    NS_ASSERT_MSG(art.prefixLength <= RPL_AODV_PREFIX_LENGTH_MASK,
+                  "Prefix Length does not fit the ART option's 7-bit field");
+    m_hasArt = true;
+    m_art = art;
+}
+
+const RplDioHeader::ArtOption&
+RplDioHeader::GetArt() const
+{
+    return m_art;
 }
 
 NS_OBJECT_ENSURE_REGISTERED(RplDaoHeader);

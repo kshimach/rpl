@@ -346,6 +346,128 @@ class RplDioHeader : public Header
      */
     uint32_t GetPrefixPreferredLifetime() const;
 
+    /**
+     * @brief The AODV-RPL Route Request option (RFC 9854, section 4.1).
+     *
+     * Grouped into a struct rather than spread across loose members the way
+     * this class's four RFC 6550 options are: these carry six scalars and a
+     * variable-length vector each, and three such sets of loose members
+     * would be considerably harder to read than the existing four options
+     * are. @see design-constraints.md for the deviation.
+     *
+     * The Address Vector accumulates, hop by hop on the way out, the route
+     * the RREQ-DIO has taken (RFC 9854 section 6.2.5), OrigNode-side first.
+     * Its entries are full 128-bit addresses: this implementation always
+     * sends Compr == 0, so no prefix octets are ever elided.
+     */
+    struct RreqOption
+    {
+        bool symmetric{true};   //!< 'S': the route so far is symmetric (section 5)
+        bool hopByHop{false};   //!< 'H': 1 hop-by-hop, 0 source routed
+        uint8_t compr{0};       //!< 'Compr', 4 bits: elided prefix octets
+        uint8_t lifetime{0};    //!< 'L', 2 bits: @see RplAodvLifetimeSeconds()
+        uint8_t rankLimit{0};   //!< 'RankLimit', 7 bits, 0 meaning no limit
+        uint8_t origSeqNo{0};   //!< 'Orig SeqNo': the OrigNode's Sequence Number
+        std::vector<Ipv6Address> addressVector; //!< the route accumulated so far
+    };
+
+    /**
+     * @brief The AODV-RPL Route Reply option (RFC 9854, section 4.2).
+     *
+     * The same shape as RreqOption, with 'S' replaced by 'G' (Gratuitous
+     * RREP, section 7, which this implementation never sets) and 'Orig
+     * SeqNo' by 'Delta' (section 6.3.3's RPLInstanceID pairing).
+     */
+    struct RrepOption
+    {
+        bool gratuitous{false}; //!< 'G': a Gratuitous RREP (section 7)
+        bool hopByHop{false};   //!< 'H', matching the RREQ's own
+        uint8_t compr{0};       //!< 'Compr', 4 bits
+        uint8_t lifetime{0};    //!< 'L', 2 bits
+        uint8_t rankLimit{0};   //!< 'RankLimit', 7 bits, 0 meaning no limit
+        uint8_t delta{0};       //!< 'Delta', 6 bits: RREP-InstanceID - RREQ-InstanceID
+        std::vector<Ipv6Address> addressVector; //!< the route back to the OrigNode
+    };
+
+    /**
+     * @brief The AODV-RPL Target (ART) option (RFC 9854, section 4.3).
+     *
+     * RFC 6550's own Target option with the Flags field replaced by the
+     * TargNode's Destination Sequence Number and Prefix Length narrowed to
+     * seven bits. This implementation only ever sends prefixLength 0, which
+     * RFC 9854 section 4.3 defines as "the value in the Target Prefix /
+     * Address field represents an IPv6 address, not a prefix" -- so the
+     * field is always a full 16 bytes and the option a fixed 20 bytes, the
+     * same size as RFC 6550's Target option.
+     */
+    struct ArtOption
+    {
+        uint8_t destSeqNo{0};    //!< 'Dest SeqNo', 0 when nothing is known
+        uint8_t prefixLength{0}; //!< 'Prefix Length', 7 bits; 0 means an address
+        Ipv6Address target;      //!< 'Target Prefix / Address'
+    };
+
+    /**
+     * @brief Whether the AODV-RPL RREQ option is present.
+     * @return true if the option is present
+     */
+    bool HasRreq() const;
+    /**
+     * @brief Attach an AODV-RPL RREQ option (RFC 9854, section 4.1).
+     * @param rreq the option; its Address Vector must hold at most
+     *             AODV_ADDRESS_VECTOR_MAX_ENTRIES entries
+     */
+    void SetRreq(const RreqOption& rreq);
+    /**
+     * @brief Get the AODV-RPL RREQ option.
+     * @return the option, default-constructed if none is present
+     */
+    const RreqOption& GetRreq() const;
+
+    /**
+     * @brief Whether the AODV-RPL RREP option is present.
+     * @return true if the option is present
+     */
+    bool HasRrep() const;
+    /**
+     * @brief Attach an AODV-RPL RREP option (RFC 9854, section 4.2).
+     * @param rrep the option; its Address Vector must hold at most
+     *             AODV_ADDRESS_VECTOR_MAX_ENTRIES entries
+     */
+    void SetRrep(const RrepOption& rrep);
+    /**
+     * @brief Get the AODV-RPL RREP option.
+     * @return the option, default-constructed if none is present
+     */
+    const RrepOption& GetRrep() const;
+
+    /**
+     * @brief Whether the AODV-RPL Target (ART) option is present.
+     * @return true if the option is present
+     */
+    bool HasArt() const;
+    /**
+     * @brief Attach an AODV-RPL Target (ART) option (RFC 9854, section 4.3).
+     *
+     * At most one, unlike the RFC, which lets an RREQ-DIO carry several to
+     * look for several targets at once -- @see design-constraints.md for why
+     * multiple targets are out of scope. A second call replaces the first.
+     *
+     * @param art the option
+     */
+    void SetArt(const ArtOption& art);
+    /**
+     * @brief Get the AODV-RPL Target (ART) option.
+     * @return the option, default-constructed if none is present
+     */
+    const ArtOption& GetArt() const;
+
+    /// How many Address Vector entries an RREQ/RREP option can carry. Not a
+    /// policy choice: the option's own Opt Data Len is eight bits, so with a
+    /// 3-byte fixed part and 16 bytes per entry (Compr is always 0 here) the
+    /// wire format itself stops at 15, since 3 + 16 * 16 = 259 > 255.
+    static constexpr uint8_t AODV_ADDRESS_VECTOR_MAX_ENTRIES = 15;
+
   private:
     /// Serialized size of the DODAG Configuration option, type and length byte
     /// included (RFC 6550, section 6.7.6).
@@ -378,6 +500,29 @@ class RplDioHeader : public Header
     static constexpr uint8_t PREFIX_INFO_OPTION_LENGTH = PREFIX_INFO_OPTION_SIZE - 2;
     static constexpr uint8_t PREFIX_INFO_L_FLAG = 0x80; //!< 'L' (on-link) flag
     static constexpr uint8_t PREFIX_INFO_A_FLAG = 0x40; //!< 'A' (autonomous) flag
+    /// Bytes one Address Vector entry takes on the wire. Sixteen, not
+    /// 16 - Compr: this implementation always sends Compr == 0 (@see
+    /// RreqOption) and refuses to parse a nonzero one.
+    static constexpr uint8_t AODV_ADDRESS_VECTOR_ENTRY_SIZE = 16;
+    /// The part of the RREQ option's length field that is there whatever the
+    /// Address Vector holds: the two octets carrying S/H/X/Compr/L/RankLimit,
+    /// plus Orig SeqNo (RFC 9854, section 4.1).
+    static constexpr uint8_t AODV_RREQ_OPTION_BASE_LENGTH = 3;
+    /// The same for the RREP option, whose third octet is Delta/reserved
+    /// rather than Orig SeqNo (RFC 9854, section 4.2).
+    static constexpr uint8_t AODV_RREP_OPTION_BASE_LENGTH = 3;
+    /// Serialized size of the ART option carrying a full address (Prefix
+    /// Length 0): Type+Length (2), Dest SeqNo (1), X/Prefix Length (1) and
+    /// the 16-byte address.
+    static constexpr uint8_t AODV_ART_OPTION_SIZE = 20;
+    /// Value of the length field of the ART option.
+    static constexpr uint8_t AODV_ART_OPTION_LENGTH = AODV_ART_OPTION_SIZE - 2;
+    /// Mask of the 'L' field's high bit, which sits in the last bit of the
+    /// RREQ/RREP option's first flag octet (bit 23 of the row); its low bit
+    /// is the top bit of the octet after (bit 24). @see rpl-conf.h.
+    static constexpr uint8_t AODV_LIFETIME_HIGH_BIT = 0x01;
+    /// Mask of the 'L' field's low bit in the second octet.
+    static constexpr uint8_t AODV_LIFETIME_LOW_BIT = 0x80;
 
     uint8_t m_instanceId;    //!< RPLInstanceID
     uint8_t m_versionNumber; //!< DODAG version number
@@ -412,6 +557,13 @@ class RplDioHeader : public Header
     bool m_prefixAutonomous;      //!< 'A' flag
     uint32_t m_prefixValidLifetime;     //!< Valid Lifetime, in seconds
     uint32_t m_prefixPreferredLifetime; //!< Preferred Lifetime, in seconds
+
+    bool m_hasRreq;    //!< true if the AODV-RPL RREQ option is present
+    RreqOption m_rreq; //!< the AODV-RPL RREQ option
+    bool m_hasRrep;    //!< true if the AODV-RPL RREP option is present
+    RrepOption m_rrep; //!< the AODV-RPL RREP option
+    bool m_hasArt;     //!< true if the AODV-RPL Target (ART) option is present
+    ArtOption m_art;   //!< the AODV-RPL Target (ART) option
 };
 
 /**
