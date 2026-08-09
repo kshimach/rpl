@@ -404,11 +404,265 @@ RplRoutingProtocol::HandleAodvRreq(const RplDioHeader& dio, Ipv6Address from, ui
                                         << " hop(s) from the OrigNode"
                                         << (dodag.aodv.isTarget ? ", and this node is it" : ""));
 
+    // RFC 9854 section 6.2.6: a TargNode that was not already in the
+    // RREQ-Instance "prepares and transmits an RREP-DIO". Answered once --
+    // a repeat copy of the same RREQ is turned away by the check above, so
+    // this cannot fire twice for one discovery.
+    if (dodag.aodv.isTarget)
+    {
+        SendAodvRrep(dodag, key);
+    }
+
     // Nothing sends the RREQ onward here: DioTrickleFire() already
     // multicasts this membership's DIO on its own schedule, and SendDio()
     // fills in the RREQ and ART options from the state just recorded. The
     // Trickle timer was reset by HandleDio() when the preferred parent was
     // chosen, so the propagation is already imminent.
+}
+
+void
+RplRoutingProtocol::SendAodvRrepTo(const DodagMembership& dodag,
+                                   const RplDioHeader& dio,
+                                   Ipv6Address nextHop)
+{
+    // One radio hop, so the message goes to the neighbour's link-local
+    // address: RouteOutput() never treats a global address as on-link, and
+    // sending an RREP to a global one would hand it to this node's preferred
+    // parent instead of to the neighbour the Address Vector names.
+    Ipv6Address linkLocal = LinkLocalOf(nextHop);
+    uint32_t interface = InterfaceForNeighbour(dodag, linkLocal);
+    if (interface == 0)
+    {
+        interface = m_ifcToSocket.empty() ? 0 : m_ifcToSocket.begin()->first;
+        if (interface == 0)
+        {
+            NS_LOG_WARN("No interface to send an RREP to " << nextHop << " on");
+            return;
+        }
+    }
+
+    Ptr<Packet> packet = Create<Packet>();
+    packet->AddHeader(dio);
+    SendRplMessageOn(interface, packet, RPL_CODE_DIO, linkLocal);
+    NS_LOG_INFO("Sent an RREP towards the OrigNode via " << nextHop);
+}
+
+void
+RplRoutingProtocol::SendAodvRrep(DodagMembership& dodag, DodagKey key)
+{
+    NS_LOG_FUNCTION(this << +key.instanceId << key.dodagId);
+
+    Ipv6Address ownAddress = GetGlobalAddressIn(dodag);
+    if (ownAddress.IsAny())
+    {
+        NS_LOG_LOGIC("No global address to answer an RREQ from yet");
+        return;
+    }
+
+    RplDioHeader rrep;
+    // RFC 9854 section 6.3.3: the RREP-InstanceID is the RREQ-InstanceID
+    // plus Delta. Delta stays 0 here -- it exists to break a collision with
+    // another discovery's RREP-Instance already active at this TargNode, and
+    // no RREP-Instance DODAG is ever built on a symmetric route for one to
+    // collide with.
+    rrep.SetInstanceId(key.instanceId);
+    rrep.SetVersionNumber(0);
+    rrep.SetRank(m_minHopRankIncrease);
+    rrep.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+    rrep.SetGrounded(true);
+    rrep.SetDtsn(0);
+    // "TargNode sets one of its IPv6 addresses in the DODAGID field of the
+    // RREP-DIO message" (RFC 9854 section 4.2).
+    rrep.SetDodagId(ownAddress);
+
+    RplDioHeader::RrepOption option;
+    option.gratuitous = false; // section 7's Gratuitous RREP is out of scope
+    option.hopByHop = false;   // "MUST be set to be the same as the H bit in the RREQ option"
+    option.compr = 0;
+    option.lifetime = dodag.aodv.lifetimeField;
+    option.rankLimit = dodag.aodv.rankLimit;
+    option.delta = 0;
+    // "for a symmetric route, it is the Address Vector when the RREQ-DIO
+    // arrives at the TargNode, unchanged during the transmission to the
+    // OrigNode" (RFC 9854 section 4.2). That vector already ends with this
+    // node, appended when the RREQ arrived.
+    option.addressVector = dodag.aodv.addressVector;
+    rrep.SetRrep(option);
+
+    // The ART option of an RREP names the OrigNode, not the target: it is
+    // what tells each router on the way back whether it is the OrigNode
+    // (RFC 9854 section 6.4.2), and it carries this node's own Sequence
+    // Number as the route's Dest SeqNo (section 6.3).
+    RplDioHeader::ArtOption art;
+    art.destSeqNo = m_aodvSeqNo;
+    art.prefixLength = 0;
+    art.target = key.dodagId; // the RREQ-Instance's DODAGID is the OrigNode
+    rrep.SetArt(art);
+
+    // The next hop back is the entry before this node's own in the Address
+    // Vector, or the OrigNode itself when this node is the only entry.
+    const std::vector<Ipv6Address>& hops = dodag.aodv.addressVector;
+    NS_ASSERT_MSG(!hops.empty(), "The TargNode is not in its own Address Vector");
+    Ipv6Address nextHop = hops.size() >= 2 ? hops[hops.size() - 2] : key.dodagId;
+
+    NS_LOG_INFO("Answering the RREQ for " << dodag.aodv.target << " with an RREP over "
+                                          << hops.size() << " hop(s)");
+    SendAodvRrepTo(dodag, rrep, nextHop);
+}
+
+void
+RplRoutingProtocol::HandleAodvRrep(const RplDioHeader& dio, Ipv6Address from, uint32_t interface)
+{
+    NS_LOG_FUNCTION(this << from << interface);
+
+    const RplDioHeader::RrepOption& rrep = dio.GetRrep();
+
+    // RFC 9854 section 4.2: "Exactly one RREP option MUST be present in an
+    // RREP-DIO message, otherwise, the message MUST be dropped", and section
+    // 4.3 the same for the one ART option an RREP carries.
+    if (!dio.HasArt())
+    {
+        NS_LOG_WARN("Dropping an RREP-DIO with no ART option");
+        return;
+    }
+    if (rrep.hopByHop || rrep.compr != 0)
+    {
+        NS_LOG_LOGIC("Dropping an RREP asking for hop-by-hop routing or address elision");
+        return;
+    }
+
+    // Section 6.3.3 in reverse: the RREQ-InstanceID is the RREP's own
+    // RPLInstanceID less Delta, wrapping the way the addition did.
+    uint8_t rreqInstanceId = static_cast<uint8_t>(dio.GetInstanceId() - rrep.delta);
+    Ipv6Address origNode = dio.GetArt().target;
+    DodagKey rreqKey{rreqInstanceId, origNode};
+
+    auto it = m_dodags.find(rreqKey);
+    if (it == m_dodags.end())
+    {
+        // Nothing here asked for this route. Not an error worth warning
+        // about: an RREP can outrace its own RREQ-Instance's 'L' deadline on
+        // a node that has already left.
+        NS_LOG_LOGIC("Dropping an RREP for RREQ-Instance " << +rreqInstanceId << " at " << origNode
+                                                           << ", which this node is not part of");
+        return;
+    }
+    DodagMembership& dodag = it->second;
+
+    // RFC 9854 section 6.4.2: "The router next checks if one of its
+    // addresses is included in the ART option. If it is included, this
+    // router is the OrigNode of the route discovery."
+    if (IsOwnAddress(origNode))
+    {
+        if (rrep.addressVector.empty())
+        {
+            NS_LOG_WARN("Dropping an RREP that carries no route at all");
+            return;
+        }
+
+        AodvRoute route;
+        route.hops = rrep.addressVector;
+        route.rreqInstanceId = rreqInstanceId;
+        route.destSeqNo = dio.GetArt().destSeqNo;
+        // "The lifetime is set according to DODAG configuration (i.e., not
+        // the L field)" (RFC 9854 section 6.4.3) -- the same PathLifetime
+        // and lifetime unit a DAO-derived route gets.
+        route.expire = Simulator::Now() + Seconds(m_pathLifetime * m_lifetimeUnit);
+
+        // The TargNode is the last entry of the Address Vector, which is
+        // what the route is keyed by.
+        Ipv6Address target = route.hops.back();
+        m_aodvRoutes[target] = route;
+
+        NS_LOG_INFO("Route discovery to " << target << " completed over " << route.hops.size()
+                                          << " hop(s), Dest SeqNo " << +route.destSeqNo);
+        return;
+    }
+
+    // An intermediate router: pass it on, unchanged, one hop further back.
+    // Nothing is recorded here -- RFC 9854 section 6.4.3 builds a route
+    // entry only when H=1, which is exactly what source routing exists to
+    // avoid.
+    //
+    // Section 6.4.1's "An intermediate router MUST discard an RREP if one of
+    // its addresses is present in the Address Vector" is deliberately NOT
+    // applied. On a symmetric route the Address Vector is the one the RREQ
+    // accumulated on the way out (section 4.2), so by construction it holds
+    // every intermediate router: read literally that rule would discard the
+    // RREP at the first hop back and no symmetric discovery could ever
+    // complete. It is a loop check for the asymmetric case, where the RREP
+    // floods and accumulates a vector of its own. @see design-constraints.md.
+    const std::vector<Ipv6Address>& hops = rrep.addressVector;
+    size_t ownIndex = hops.size();
+    for (size_t i = 0; i < hops.size(); i++)
+    {
+        if (IsOwnAddress(hops[i]))
+        {
+            ownIndex = i;
+            break;
+        }
+    }
+    if (ownIndex == hops.size())
+    {
+        NS_LOG_LOGIC("Dropping an RREP whose Address Vector does not run through this node");
+        return;
+    }
+
+    Ipv6Address nextHop = ownIndex >= 1 ? hops[ownIndex - 1] : origNode;
+    NS_LOG_INFO("Relaying an RREP for " << origNode << " onward via " << nextHop);
+    SendAodvRrepTo(dodag, dio, nextHop);
+}
+
+bool
+RplRoutingProtocol::GetAodvRoute(Ipv6Address target, std::vector<Ipv6Address>& hops) const
+{
+    hops.clear();
+    auto it = m_aodvRoutes.find(target);
+    if (it == m_aodvRoutes.end() || it->second.expire <= Simulator::Now())
+    {
+        return false;
+    }
+    hops = it->second.hops;
+    return true;
+}
+
+uint32_t
+RplRoutingProtocol::GetAodvRouteCount() const
+{
+    uint32_t count = 0;
+    Time now = Simulator::Now();
+    for (const auto& [target, route] : m_aodvRoutes)
+    {
+        if (route.expire > now)
+        {
+            count++;
+        }
+    }
+    return count;
+}
+
+bool
+RplRoutingProtocol::FindAodvRoute(Ipv6Address dst,
+                                  std::vector<Ipv6Address>& hops,
+                                  uint8_t& instanceId) const
+{
+    hops.clear();
+    auto it = m_aodvRoutes.find(dst);
+    if (it == m_aodvRoutes.end() || it->second.expire <= Simulator::Now())
+    {
+        return false;
+    }
+
+    // Converted to link-local, the same form ComputeSourceRoute() returns,
+    // so that PrepareOutgoingPacket()'s existing hops-to-Routing-Header
+    // recipe applies unchanged -- it is that function that puts the global
+    // destination back into the last entry.
+    for (const auto& hop : it->second.hops)
+    {
+        hops.push_back(LinkLocalOf(hop));
+    }
+    instanceId = it->second.rreqInstanceId;
+    return true;
 }
 
 bool

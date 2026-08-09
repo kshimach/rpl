@@ -1139,6 +1139,18 @@ RplRoutingProtocol::HandleDio(const RplDioHeader& dio,
         return;
     }
 
+    // An RREP-DIO is not an advertisement to join: on a symmetric route
+    // "the DODAG in RREP-Instance does not need to be built" (RFC 9854
+    // section 6.3.1), so it is a unicast carrying a finished route back
+    // towards the OrigNode. Handled and returned before any of the ordinary
+    // machinery below, which would otherwise have this node join a DODAG
+    // rooted at the TargNode.
+    if (dio.HasRrep())
+    {
+        HandleAodvRrep(dio, from, interface);
+        return;
+    }
+
     // RFC 9854 section 6.2.1 puts two checks ahead of joining an
     // RREQ-Instance, so they have to run before the join below rather than
     // in HandleAodvRreq() after it: this node's own address already in the
@@ -2660,6 +2672,27 @@ RplRoutingProtocol::RouteOutput(Ptr<Packet> p,
     // and the base fallback respectively.
     DodagMembership* dodag = GetBaseDodag();
     {
+        // A route an AODV-RPL discovery found, tried first: it was asked for
+        // explicitly, for this destination, and is by construction shorter
+        // than the path through the base DODAG's root that the fallbacks
+        // below would take.
+        std::vector<Ipv6Address> aodvHops;
+        uint8_t aodvInstanceId = 0;
+        if (FindAodvRoute(dst, aodvHops, aodvInstanceId))
+        {
+            NS_ASSERT(!aodvHops.empty());
+            NS_LOG_LOGIC("Source routing " << dst << " over an AODV-RPL route of "
+                                           << aodvHops.size() << " hop(s), first hop "
+                                           << aodvHops.front());
+            Ptr<Ipv6Route> route = RouteToNeighbour(aodvInstanceId, aodvHops.front(), dst);
+            if (route)
+            {
+                return route;
+            }
+        }
+    }
+
+    {
         std::vector<Ipv6Address> hops;
         if (DodagMembership* root = FindRootDodagFor(dst, hops))
         {
@@ -2760,8 +2793,10 @@ RplRoutingProtocol::PrepareOutgoingPacket(Ptr<Packet> packet, Ipv6Header& header
     // membership found here (if any) is reused below for the RPL Option
     // this same packet also needs, rather than resolving twice.
     std::vector<Ipv6Address> hops;
-    DodagMembership* originDodag = FindRootDodagFor(dst, hops);
-    if (originDodag && hops.size() > 1)
+    uint8_t aodvInstanceId = 0;
+    bool overAodvRoute = FindAodvRoute(dst, hops, aodvInstanceId);
+    DodagMembership* originDodag = overAodvRoute ? nullptr : FindRootDodagFor(dst, hops);
+    if ((overAodvRoute || originDodag) && hops.size() > 1)
     {
         std::vector<Ipv6Address> addresses(hops.begin() + 1, hops.end());
         // The last address is the packet's real final destination. Every
@@ -2811,6 +2846,34 @@ RplRoutingProtocol::PrepareOutgoingPacket(Ptr<Packet> packet, Ipv6Header& header
                         << dst << " with " << (hops.size() - 1) << " address(es), first hop "
                         << hops.front());
         }
+    }
+
+    if (overAodvRoute)
+    {
+        // No RPL Option on an AODV-RPL source-routed packet. RFC 6553
+        // section 4 allows leaving it off outright -- "A datagram including
+        // a Source Routing Header (SRH) does not need to include a RPL
+        // Option since both the source and intermediate routers ensure that
+        // the SRH does not contain loops" -- and here it would actively
+        // break the packet: on a symmetric route no RREP-Instance DODAG is
+        // built anywhere (RFC 9854 section 6.3.1), so a relay looking the
+        // RPI's RPLInstanceID up would find no membership,
+        // GetRankForInstance() would answer RPL_INFINITE_RANK, and
+        // RplIpv6OptionRpl::Process() would call every such packet rank
+        // inconsistent and drop it at the second hop.
+        //
+        // The IPv6 header's own Next Header has to be pointed at whatever
+        // was actually attached before returning. On the ordinary path that
+        // happens as a side effect of adding the Hop-by-Hop header below;
+        // skipping that block would otherwise leave the header still
+        // naming the upper-layer protocol while a Routing Header sits in
+        // front of it, and the first hop would hand the Routing Header's
+        // bytes to UDP.
+        header.SetNextHeader(innerNextHeader);
+        NS_LOG_LOGIC("Attached a Routing Header for " << dst
+                                                      << " with no RPL Option: an AODV-RPL "
+                                                         "source route needs none");
+        return;
     }
 
     if (!originDodag)

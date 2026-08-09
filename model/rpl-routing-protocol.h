@@ -516,6 +516,28 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
                               std::vector<Ipv6Address>& addressVector) const;
 
     /**
+     * @brief Get the source route an AODV-RPL discovery found to a target.
+     *
+     * The Address Vector the RREP brought back: every hop from the OrigNode
+     * outward, the TargNode itself last, as global addresses. Only the
+     * OrigNode of a discovery ever holds one -- an intermediate router on a
+     * source-routed (H=0) route keeps no per-destination state at all, which
+     * is the whole point of source routing.
+     *
+     * @param target the TargNode the route leads to
+     * @param [out] hops the route, first hop first and the target last
+     * @return true if a live route is held; expired ones are dropped and
+     *         reported as absent
+     */
+    bool GetAodvRoute(Ipv6Address target, std::vector<Ipv6Address>& hops) const;
+
+    /**
+     * @brief How many live AODV-RPL routes this node holds.
+     * @return the number of routes, expired ones excluded
+     */
+    uint32_t GetAodvRouteCount() const;
+
+    /**
      * @brief Whether this node is the TargNode of an RREQ-Instance it holds.
      * @param instanceId the RPLInstanceID of the RREQ-Instance
      * @param dodagId the DODAGID of the RREQ-Instance
@@ -776,6 +798,57 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      * @return true if the DIO must be dropped without joining
      */
     bool ShouldRefuseAodvRreq(const RplDioHeader& dio, Ipv6Address from) const;
+
+    /**
+     * @brief Act on an RREP-DIO travelling back towards the OrigNode.
+     *
+     * Never joined as a DODAG: on a symmetric route "the DODAG in
+     * RREP-Instance does not need to be built" (RFC 9854 section 6.3.1), so
+     * an RREP-DIO is a unicast carrying a finished route rather than an
+     * advertisement to join. HandleDio() therefore hands it here and returns
+     * without running any of its ordinary machinery. Implemented in
+     * model/rpl-aodv.cc.
+     *
+     * @param dio the DIO, carrying an RREP option and an ART option
+     * @param from the link-local address of the neighbour that sent it
+     * @param interface the interface it arrived on
+     */
+    void HandleAodvRrep(const RplDioHeader& dio, Ipv6Address from, uint32_t interface);
+
+    /**
+     * @brief Send the RREP that answers an RREQ this node is the target of.
+     * @param dodag the RREQ-Instance being answered
+     * @param key its key
+     */
+    void SendAodvRrep(DodagMembership& dodag, DodagKey key);
+
+    /**
+     * @brief Unicast an RREP-DIO one hop towards the OrigNode.
+     *
+     * The next hop is named by a global address out of the Address Vector,
+     * but the message goes to its link-local: it crosses exactly one radio
+     * hop, and RouteOutput() deliberately never treats a global address as
+     * on-link (@see its own comment on why that is right in general).
+     *
+     * @param dodag the RREQ-Instance the route belongs to, for its parent set
+     * @param dio the RREP-DIO to send
+     * @param nextHop the global address of the neighbour to send it to
+     */
+    void SendAodvRrepTo(const DodagMembership& dodag,
+                        const RplDioHeader& dio,
+                        Ipv6Address nextHop);
+
+    /**
+     * @brief Find the AODV-RPL source route to a destination, if one is held.
+     * @param dst the destination
+     * @param [out] hops the route as link-local addresses, the form
+     *              ComputeSourceRoute() also returns
+     * @param [out] instanceId the RREQ-InstanceID the route was found under
+     * @return true if a live route was found
+     */
+    bool FindAodvRoute(Ipv6Address dst,
+                       std::vector<Ipv6Address>& hops,
+                       uint8_t& instanceId) const;
 
     /**
      * @brief Arm the 'L' field's deadline for an RREQ-Instance.
@@ -1332,6 +1405,24 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     /// straight back into the instance it just left, and the OrigNode then
     /// finds itself an ordinary member of its own discovery.
     std::map<DodagKey, Time> m_aodvRejoinBlocked;
+
+    /// A route an AODV-RPL discovery found, held at the OrigNode.
+    struct AodvRoute
+    {
+        /// Every hop from the OrigNode outward, the TargNode last, as global
+        /// addresses -- the Address Vector exactly as the RREP delivered it.
+        std::vector<Ipv6Address> hops;
+        uint8_t rreqInstanceId{0}; //!< the RREQ-InstanceID it was found under
+        uint8_t destSeqNo{0};      //!< the TargNode's Sequence Number for it
+        Time expire;               //!< when it goes stale
+    };
+
+    /// Routes found by AODV-RPL, keyed by TargNode address. Held separately
+    /// from the RREQ-Instance that found them because the two have different
+    /// lifetimes: the instance is bounded by the RREQ option's 'L' field,
+    /// while "the lifetime is set according to DODAG configuration (i.e.,
+    /// not the L field)" (RFC 9854 section 6.4.3).
+    std::map<Ipv6Address, AodvRoute> m_aodvRoutes;
 
     // Policy attributes for the DAO/downward-route side, set once via
     // RplHelper and shared by whatever DODAG membership uses them. Nothing

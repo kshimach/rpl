@@ -31,6 +31,7 @@
 #include "ns3/socket.h"
 #include "ns3/tag.h"
 #include "ns3/test.h"
+#include "ns3/udp-socket-factory.h"
 #include "ns3/uinteger.h"
 
 #include <algorithm>
@@ -4904,6 +4905,175 @@ RplAodvRreqFloodTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief An AODV-RPL discovery completes end to end: the RREP comes back
+ *        along the Address Vector and the route it delivers carries data.
+ *
+ * The return half of RFC 9854 route discovery, on the same four-node line
+ * the outward half uses:
+ *
+ *     orig(0) ---- relay1(1) ---- relay2(2) ---- targ(3)
+ *
+ * The TargNode answers the RREQ with an RREP-DIO unicast back along the
+ * Address Vector (section 6.3.1); each relay passes it one hop further
+ * without recording anything, since a source-routed (H=0) route keeps no
+ * per-hop state; the OrigNode recognises its own address in the ART option
+ * (section 6.4.2) and keeps the vector as a source route.
+ *
+ * What this pins down beyond the bookkeeping is that the route works:
+ * a UDP datagram sent to the TargNode has to traverse both relays, which
+ * only happens if RouteOutput() picked the discovered route, if
+ * PrepareOutgoingPacket() turned it into a Routing Header, and if
+ * RplIpv6ExtensionSourceRouting::Process() walked it hop by hop.
+ */
+class RplAodvRrepCompletesTestCase : public TestCase
+{
+  public:
+    RplAodvRrepCompletesTestCase();
+
+  private:
+    void DoRun() override;
+
+    /**
+     * @brief Count a datagram delivered at the TargNode.
+     * @param socket the receiving socket
+     */
+    void CountDelivery(Ptr<Socket> socket);
+
+    /**
+     * @brief Send one datagram. A named method rather than the Socket::Send
+     *        overload set, which Simulator::Schedule() cannot resolve.
+     * @param socket the sending socket
+     */
+    void SendOne(Ptr<Socket> socket);
+
+    uint32_t m_delivered{0}; //!< datagrams that reached the TargNode
+    int m_sendResult{0};     //!< what Socket::Send() returned, -1 on refusal
+};
+
+RplAodvRrepCompletesTestCase::RplAodvRrepCompletesTestCase()
+    : TestCase("An AODV-RPL RREP returns a source route that carries data end to end")
+{
+}
+
+void
+RplAodvRrepCompletesTestCase::CountDelivery(Ptr<Socket> socket)
+{
+    Ptr<Packet> packet = socket->Recv();
+    while (packet)
+    {
+        m_delivered++;
+        packet = socket->Recv();
+    }
+}
+
+void
+RplAodvRrepCompletesTestCase::SendOne(Ptr<Socket> socket)
+{
+    m_sendResult = socket->Send(Create<Packet>(64));
+}
+
+void
+RplAodvRrepCompletesTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(4); // 0 = OrigNode and base root, 1 and 2 = relays, 3 = TargNode
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    auto blacklist = [&](uint32_t a, uint32_t b) {
+        Ptr<SimpleNetDevice> devA = DynamicCast<SimpleNetDevice>(devices.Get(a));
+        Ptr<SimpleNetDevice> devB = DynamicCast<SimpleNetDevice>(devices.Get(b));
+        channel->BlackList(devA, devB);
+        channel->BlackList(devB, devA);
+    };
+    blacklist(0, 2);
+    blacklist(0, 3);
+    blacklist(1, 3);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(250));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> orig = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> relay1 = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> relay2 = nodes.Get(2)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> targ = nodes.Get(3)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(targ->IsJoined(), true, "The base DODAG did not reach the far end");
+
+    Ipv6Address relay1Address = relay1->GetGlobalAddress();
+    Ipv6Address relay2Address = relay2->GetGlobalAddress();
+    Ipv6Address targAddress = targ->GetGlobalAddress();
+
+    NS_TEST_ASSERT_MSG_EQ(orig->GetAodvRouteCount(), 0, "A route exists before any discovery");
+
+    RplRoutingProtocol::DodagKey key = orig->DiscoverRoute(targAddress);
+    NS_TEST_ASSERT_MSG_NE(key.dodagId, Ipv6Address::GetAny(), "The discovery did not start");
+
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    // The OrigNode holds the whole path, TargNode last.
+    std::vector<Ipv6Address> hops;
+    NS_TEST_ASSERT_MSG_EQ(orig->GetAodvRoute(targAddress, hops),
+                          true,
+                          "The RREP never made it back to the OrigNode");
+    NS_TEST_ASSERT_MSG_EQ(hops.size(), 3, "The discovered route has the wrong length");
+    NS_TEST_ASSERT_MSG_EQ(hops[0], relay1Address, "Wrong first hop");
+    NS_TEST_ASSERT_MSG_EQ(hops[1], relay2Address, "Wrong second hop");
+    NS_TEST_ASSERT_MSG_EQ(hops[2], targAddress, "The route does not end at the TargNode");
+    NS_TEST_ASSERT_MSG_EQ(orig->GetAodvRouteCount(), 1, "Wrong number of routes");
+
+    // A source-routed route leaves nothing behind on the way: RFC 9854
+    // section 6.4.3 builds a per-hop route entry only for H=1.
+    NS_TEST_ASSERT_MSG_EQ(relay1->GetAodvRouteCount(), 0, "relay1 recorded a route it should not");
+    NS_TEST_ASSERT_MSG_EQ(relay2->GetAodvRouteCount(), 0, "relay2 recorded a route it should not");
+    NS_TEST_ASSERT_MSG_EQ(targ->GetAodvRouteCount(), 0, "The TargNode recorded a route");
+
+    // And the route works. Two hops of relaying, so this only arrives if the
+    // Routing Header was built from the discovered route and processed at
+    // each hop.
+    uint16_t port = 4242;
+    Ptr<Socket> receiver = Socket::CreateSocket(nodes.Get(3), UdpSocketFactory::GetTypeId());
+    receiver->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), port));
+    receiver->SetRecvCallback(MakeCallback(&RplAodvRrepCompletesTestCase::CountDelivery, this));
+
+    Ptr<Socket> sender = Socket::CreateSocket(nodes.Get(0), UdpSocketFactory::GetTypeId());
+    sender->Connect(Inet6SocketAddress(targAddress, port));
+    Simulator::Schedule(Seconds(1), &RplAodvRrepCompletesTestCase::SendOne, this, sender);
+
+    Simulator::Stop(Seconds(5));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_GT(m_sendResult, 0, "Socket::Send() refused the datagram outright");
+    NS_TEST_ASSERT_MSG_EQ(m_delivered,
+                          1,
+                          "The datagram never reached the TargNode over the discovered route");
+
+    receiver->Close();
+    sender->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Check which DIOs RplRoutingProtocol::HandleDio() acts on and which
  *        it turns away: a mode of operation it does not implement, another
  *        RPL instance or DODAG, a stale DODAG version, and the infinite
@@ -9111,6 +9281,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplReadRpiInstanceIdRejectsWrongOptionTypeTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvMopAcceptedTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRreqFloodTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplAodvRrepCompletesTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDioRejectionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplParentLossRejoinTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplInterfaceRestartTestCase, TestCase::Duration::QUICK);
