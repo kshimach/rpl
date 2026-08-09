@@ -3269,3 +3269,194 @@ RPI 付与部分と `FindDodagByInstance()`/`ReadRpiInstanceId()` の
 (64) や最大値 (127) が無改修のまま通ることを、テーブル駆動で確認。
 `./test.py -s rpl` 相当 (60 件) を 5 回連続実行して全件安定して PASS
 することを確認、4 つの既存シナリオも 0% packet loss を維持。
+
+## 35. AODV-RPL (RFC 9854) を H=0/S=1・単一ターゲットで実装
+
+30.4 節が挙げた優先順位のうち「マルチインスタンス対応」(31/32 節) と
+その中継一般化 (34 節) が済んだので、同節が次の着手先とした AODV-RPL の
+source routing (H=0) 側を実装した。コミットは 4 つ:
+`48b58da` (ワイヤフォーマット)、`4b237d4` (MOP 4 受け入れとガード)、
+`668195f` (RREQ の flood)、`2b7372f` (RREP の復路とデータ転送)。
+
+### 35.1 なぜ AODV-RPL を P2P-RPL より先にしたか
+
+両 RFC を通読して比較した結果、**必要な新規実装量が AODV-RPL の方が
+明確に少ない**と判断した。決め手は新規メッセージ型の有無:
+
+- AODV-RPL: 新規 ICMPv6 メッセージ型 **0 個**。RREQ も RREP も既存の
+  DIO メッセージにオプションを足すだけ (§6.3.1 の RREP も "the RREP-DIO
+  message is unicast" と DIO そのもの)。DAO も使わない (§1 明記)。
+  IANA 節も MOP 4 の再利用 + DIO オプション 3 個のみ。
+- P2P-RPL: P2P-DRO (0x04) と P2P-DRO-ACK (0x05) という新規メッセージ型
+  2 個が必要。新しい Header クラス 2 つと `RecvRpl()` の switch 追加、
+  専用の ACK 機構をゼロから作ることになる (DAO-ACK を最初に作った時と
+  同規模)。
+
+`RplDioHeader` の option TLV 機構がそのまま拡張点になり、`RplHelper` の
+`SetRoot()` 相当の新 API も要らない (`CreateLocalDodag()` が既にある)。
+
+### 35.2 スコープ: H=0 (source routing)・S=1 (対称)・ART 1 個
+
+この組み合わせだけで経路探索が end-to-end で完結する。§6.3.1 が
+「対称経路では RREP-Instance の DODAG を建てる必要が無い」と明記して
+いるため、RREP は Address Vector に沿った unicast だけで済み、2 つ目の
+DODAG 形成が不要になる。
+
+意図的な除外:
+
+- **H=1 (hop-by-hop)**: RFC の Terminology が "A hop-by-hop route is
+  created using RPL's storing mode" と定義しており、宛先ごとの next-hop
+  テーブルが必須。このモジュールには存在しない (30.4 節も「storing mode
+  完了後」としていた)。受信側は `ShouldRefuseAodvRreq()` で H=1 の RREQ を
+  明示的に拒否する (中途半端に扱わない)。
+- **S=0 (非対称)**: TargNode が自分を root とする 2 つ目の DODAG
+  (RREP-Instance) を建てて RREP を flood する必要がある。
+- **Gratuitous RREP (§7)**: MAY。
+- **複数 ART / §6.2.2 のターゲット集合の積集合ロジック**。
+- **Compr (アドレス省略)**: 送信は常に 0、受信も 0 以外は拒否。単一
+  プレフィクスのシミュレーションで節約が無意味な一方、部分バイト列からの
+  `Ipv6Address` 復元は誤りやすい。RFC は Compr を送信側の裁量としている
+  ので 0 固定は準拠。
+- **リンク対称性の判定 (§6.2.4 の S ビット更新)**: RFC 自身が
+  "It is beyond the scope of this document to specify the criteria used
+  when determining whether or not each link is symmetric" としており、
+  このモジュールには逆方向のリンクメトリックが無い (ETX は受信フレーム
+  からしか測っていない)。全リンクを対称として扱う — これは RFC 自身の
+  出発点 (§5 "Links are considered symmetric until indication to the
+  contrary is received") とも一致する。
+
+### 35.3 RFC 9854 の記述上の問題 3 件と採った判断
+
+**(A) RankLimit のビット幅が図と本文で矛盾する。** §4.1/§4.2 の本文は
+どちらも "RankLimit: 8-bit unsigned integer" と書くが、図のビット割り
+当てを数えると S/G(1) + H(1) + X(1) + Compr(4) + L(2) が bits 16-24 を
+占め、RankLimit に残るのは **bits 25-31 の 7 ビット**しかない。本文
+どおり 8 ビットにすると行が 33 ビットになり成立しない。図が唯一
+寸法整合する読み方なので図を採用し、API を 0..127 に制限した。実害は
+無い: RankLimit は `DAGRank()` (rank / MinHopRankIncrease) と比較する
+値で、16 ビット rank・MinHopRankIncrease 128 なら最大 511、現実的な
+ホップ数では 127 に遠く届かない。
+
+**(B) §6.4.1 の「Address Vector に自分がいたら RREP を破棄」は S=1 と
+両立しない。** H=0/S=1 では Address Vector は §6.2.5 で往路に各中継
+ノードが自分のアドレスを積んで作ったものなので、**構成上必ず全中継
+ノードが含まれる**。字義どおり適用すると復路 1 ホップ目で必ず破棄され、
+対称経路の探索が原理的に完了しない。この規定は RREP-DIO が flood
+しながら自分の Address Vector を積む**非対称 (S=0) 側のループ検出**を
+意図したものと読むのが唯一整合する。実装は S=1 の RREP でこのチェックを
+行わず、代わりに「自分が AV に含まれること」を中継すべき経路上にいる
+証拠として使う (含まれていなければ破棄する)。
+
+**(C) all-AODV-RPL-nodes の IPv6 マルチキャストアドレスが RFC に無い。**
+§9 (IANA Considerations) Table 2 は **IPv4 の 224.0.0.69 しか割り当てて
+いない**。AODV-RPL は DODAGID も Address Vector も IPv6 アドレスで本文は
+一貫して IPv6 前提なのに、IPv6 グループが定義されていない (RFC の欠落)。
+実装は既存の all-RPL-nodes (`ff02::1a`) をそのまま使う: RFC が IPv6
+グループを定義していない以上どのアドレスを選んでも独自拡張になり、
+それなら既存グループの再利用が最も副作用が少ない。RFC が別グループを
+求めた本来の目的 (§1 の「P2P-RPL や core RPL と衝突しない」) は、受信側の
+MOP 判定と新オプション型で実質的に達成される。副次的な利点として
+`StartInterface()`/`StopInterface()` のマルチキャスト登録に一切手を
+入れずに済んだ。
+
+### 35.4 実装中に見つかった、RFC が要求していて効き目が大きい規定
+
+**REJOIN_REENABLE (§4.1、既定 15 分) が無いと探索が終わらない。**
+'L' フィールドの期限で instance を抜けても、周囲の隣接ノードはまだ同じ
+RREQ-DIO を Trickle で撒いているので、抜けた瞬間に再 join してしまい
+instance が永久に死なない。最悪なのは OrigNode で、**自分の探索に
+ordinary member として再 join し、自分自身を root とする DODAG の中で
+preferred parent を取り、自分の DODAGID を自分から遠ざける向きに
+routing する**という状態になった (実際に `SendNoPathDao()` →
+`LeaveDodag(poison)` → 未束縛 Timer の `Schedule()` で assert 死する
+ところまで観測)。RFC の "Once a node leaves an RREQ-Instance, it MUST
+NOT rejoin the same RREQ-Instance for at least ... REJOIN_REENABLE" が
+まさにこれを防ぐための規定だった。加えて「DODAGID が自分のアドレスで
+ある RREQ は最初から拒否する」チェックも入れ、同じ穴を反対側から塞いだ。
+
+**`SendNoPathDao()` にも MOP ガードが要る。** 34 節で `SendDao()` には
+入れたが No-Path 側を見落としていた。探索の終息時はまさに「最後の親を
+失う」場面であり、そこで No-Path DAO が出ていた。AODV-RPL は DAO を
+一切使わない (§1) ので No-Path DAO も出してはいけない。
+
+### 35.5 既存流儀からの逸脱 2 件
+
+1. **オプションを入れ子構造体で持つ**: 既存の 4 つの DIO オプションは
+   フラットなスカラーメンバーだが、RREQ/RREP は 6-7 個のスカラー +
+   可変長ベクタを持つ。3 セット分をばらけたメンバーで足すより読めると
+   判断し、`RplDioHeader` の中に `RreqOption`/`RrepOption`/`ArtOption`
+   を置いた。
+2. **1 クラスのメソッドを 2 つの翻訳単位に分ける**:
+   `model/rpl-aodv.cc` は `RplRoutingProtocol` のメソッドを実装する。
+   探索は `m_dodags`・`SendDio()`・`CreateLocalDodag()`・
+   `SelectPreferredParent()`・Trickle タイマーという private の塊に
+   依存しており、別クラスにすると広いアクセス面か friend が要る。
+   `rpl-routing-protocol.cc` が既に約 3000 行あるため分割した。
+   標準 C++ だが ns-3 で一般的な書き方ではない点は認識の上での選択。
+
+### 35.6 可変長 DIO オプションの検証
+
+RREQ/RREP はこのモジュール初の可変長 DIO オプションで、既存の
+`length == <X>_OPTION_LENGTH` という完全一致ガードが使えない。代わりに
+「3 バイトの固定部 + 16 バイト単位の Address Vector」という**形状
+チェック** (`length >= 3 && (length - 3) % 16 == 0`) を使う。外側の
+ループが既に `i.GetRemainingSize() < length` を見ているので、「オプション
+内部の長さフィールドを信用しない」規律は維持される。エントリ数の
+別途の上限は不要: Opt Data Len が 8 ビットなので `3 + 16n <= 255` が
+ワイヤフォーマット自身の側で n を 15 に抑える。
+
+### 35.7 データ転送で踏んだ落とし穴
+
+**H=0 のデータパケットに RPI を付けてはいけない。** RFC 6553 §4 が
+"A datagram including a Source Routing Header (SRH) does not need to
+include a RPL Option since both the source and intermediate routers
+ensure that the SRH does not contain loops" と明示的に許しているが、
+ここでは付けると**実害がある**: S=1 では RREP-Instance の DODAG を
+どこにも建てないので、中継ノードで `GetRankForInstance()` が
+`RPL_INFINITE_RANK` を返し、`RplIpv6OptionRpl::Process()` の
+`inconsistent = senderRank <= ownRank` が常に真になって 2 ホップ目で
+落とされる。
+
+**RPI を省くと Next Header を自分で設定する必要がある。**
+`PrepareOutgoingPacket()` は IPv6 ヘッダの Next Header を
+`IPV6_EXT_HOP_BY_HOP` に書き換える処理を **RPI 付与ブロックの中**で
+行っており、そこを早期 return で飛ばすと、SRH のバイト列は付いている
+のにヘッダは上位層プロトコル (UDP=17) を指したままになる。結果、
+1 ホップ目が SRH のバイト列を UDP として上位に渡し、パケットが消える
+(実際にこれで疎通テストが落ち、`NS_LOG` で "Next Header 17" のまま
+送出されていることを確認して特定した)。早期 return の前に
+`header.SetNextHeader(innerNextHeader)` を明示する。
+
+### 35.8 テストと検証
+
+新規テスト 4 件:
+
+- `RplDioHeaderTestCase` に 3 段追加 (RREQ/RREP/ART のバイト数増分と
+  往復、'L' がオクテットをまたぐこと、全ビット最大値での相互干渉)。
+- `RplDioOptionEdgeTestCase` に可変長固有のケース (形状に合わない長さ、
+  空 AV、1 エントリ、ART の完全一致長、パケット長超過)。
+- `RplAodvMopAcceptedTestCase`: MOP 4 が join され、かつ DAO を送らず
+  DIS に答えず base スロットを奪わないこと。DAO は
+  `IsDaoAckPendingIn()` ではなく**ワイヤ上のパケット数**で数える —
+  同フラグは `DaoRetry()` が再送を使い切ると false に戻るので、事後に
+  読む形のテストは送っていても通ってしまう。ガード 2 つを無効化すると
+  `m_daoCount=1` で落ちることを確認済み。
+- `RplAodvRreqFloodTestCase`: 4 ノード線形で Address Vector が 1 ホップ
+  ごとに 1 エントリずつ正しい順序で積まれること、ART の対象ノードだけが
+  自分を target と認識すること、'L' 期限で全員が抜けること、base DODAG が
+  無傷であること。
+- `RplAodvRrepCompletesTestCase`: RREP が復路を戻って OrigNode が 3 ホップの
+  経路を得ること、中継ノードには何も残らないこと (H=0 の要点)、そして
+  **その経路で実際に UDP データグラムが TargNode まで届くこと**。
+
+`./test.py -s rpl` 相当を 5 回連続実行して全件安定して PASS
+(実測 61 件、うち AODV-RPL 由来の新規テストケースが 3 件。残りの
+新規検証はいずれも既存テストケースへの追加なのでケース数には出ない)。
+4 つの既存シナリオも 0% packet loss を維持。
+
+**過去の節の件数表記について**: 33.8・34.5・34.7 節などに書いた
+「N 件」は当時の記憶や概算に基づくもので、今回 61 件を実測して
+逆算すると少なくとも 34.7 節の「60 件」は誤り (正しくは 58 件) だった。
+件数は実装の性質を表す数字ではないので過去の節は書き換えないが、
+**権威ある値は常にスイートの実行結果**であり、文書中の数字を根拠に
+してはいけない。
