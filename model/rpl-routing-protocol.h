@@ -475,6 +475,54 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      */
     Ipv6Address GetGlobalAddress() const;
 
+    // AODV-RPL (RFC 9854). Implemented in model/rpl-aodv.cc, not
+    // model/rpl-routing-protocol.cc. Scoped to source-routed symmetric
+    // discovery (H=0, S=1) for a single target; @see design-constraints.md
+    // for what that leaves out and why.
+
+    /**
+     * @brief Start an AODV-RPL route discovery towards a target.
+     *
+     * Forms a new RREQ-Instance -- a local RPL Instance rooted at this node,
+     * RFC 9854 section 6.1 -- and starts Trickle-pacing RREQ-DIOs into it.
+     * The discovery runs on its own from there; its result, once the RREP
+     * comes back, is read with GetAodvRoute().
+     *
+     * This node's own Sequence Number is incremented first, per section 6.1,
+     * so that routes left over from an earlier discovery are recognised as
+     * stale.
+     *
+     * @param target the address to find a route to
+     * @return the key of the RREQ-Instance, or a key whose dodagId is any()
+     *         if the discovery could not be started (no global address to
+     *         root it at, or no Local RPLInstanceID left to allocate)
+     */
+    DodagKey DiscoverRoute(Ipv6Address target);
+
+    /**
+     * @brief Get the Address Vector an RREQ-Instance has accumulated.
+     *
+     * The route the RREQ-DIO took to reach this node, as this node would
+     * propagate it onward -- its own address included (RFC 9854 section
+     * 6.2.5). Exposed for tests and for inspecting a discovery in progress.
+     *
+     * @param instanceId the RPLInstanceID of the RREQ-Instance
+     * @param dodagId the DODAGID of the RREQ-Instance, i.e. the OrigNode
+     * @param [out] addressVector the accumulated route, OrigNode side first
+     * @return true if this node is part of that RREQ-Instance
+     */
+    bool GetAodvAddressVector(uint8_t instanceId,
+                              Ipv6Address dodagId,
+                              std::vector<Ipv6Address>& addressVector) const;
+
+    /**
+     * @brief Whether this node is the TargNode of an RREQ-Instance it holds.
+     * @param instanceId the RPLInstanceID of the RREQ-Instance
+     * @param dodagId the DODAGID of the RREQ-Instance
+     * @return true if one of this node's addresses is the instance's target
+     */
+    bool IsAodvTarget(uint8_t instanceId, Ipv6Address dodagId) const;
+
   protected:
     void DoInitialize() override;
     void DoDispose() override;
@@ -590,6 +638,43 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
 
         /// The root only: which parent each node reports sitting under.
         std::map<Ipv6Address, TopologyEntry> topology;
+
+        /**
+         * @brief AODV-RPL (RFC 9854) state, meaningful only while
+         *        mop == RPL_MOP_P2P_ROUTE_DISCOVERY.
+         *
+         * Kept inside DodagMembership rather than in a map of its own
+         * alongside m_dodags: an RREQ-Instance is created and destroyed
+         * through exactly the same CreateDodagMembership()/JoinDodag() and
+         * LeaveDodag() path as any other membership, and a parallel
+         * container would add an erase discipline to keep in step with it
+         * for no gain. This struct is already a union of concerns -- the six
+         * DAO fields and topology above mean nothing to AODV-RPL either.
+         */
+        struct AodvRreqState
+        {
+            /// The 'S' bit this node would put on an RREQ-DIO it propagates,
+            /// i.e. whether every hop back to the OrigNode has met the
+            /// Objective Function so far (RFC 9854 section 6.2.4's "S bit of
+            /// the RREQ-Instance").
+            bool symmetric{true};
+            uint8_t origSeqNo{0}; //!< Orig SeqNo of the RREQ that formed this
+            uint8_t rankLimit{0}; //!< RankLimit, 0 meaning no limit
+            uint8_t lifetimeField{0}; //!< the 'L' field this instance was opened with
+            Ipv6Address target;   //!< the single ART target being looked for
+            /// The route the RREQ-DIO took to get here, OrigNode-side first,
+            /// as this node would propagate it: its own address is already
+            /// appended (RFC 9854 section 6.2.5).
+            std::vector<Ipv6Address> addressVector;
+            bool isOrigin{false}; //!< this node started the discovery
+            bool isTarget{false}; //!< this node is the TargNode being looked for
+            /// When the 'L' field's deadline takes this node out of the
+            /// instance (RFC 9854 section 4.1). Never armed for the
+            /// unlimited encoding.
+            Timer expiry{Timer::CANCEL_ON_DESTROY};
+        };
+
+        AodvRreqState aodv; //!< AODV-RPL state; untouched unless mop is 4
     };
 
     /**
@@ -662,6 +747,61 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
                    uint32_t interface,
                    uint16_t linkEtx,
                    uint8_t lql);
+
+    /**
+     * @brief Act on the AODV-RPL options of a DIO that carries them.
+     *
+     * Called from HandleDio() once the ordinary DODAG machinery has run, so
+     * the membership this DIO belongs to already exists and this node's rank
+     * and preferred parent in it are already settled. Implemented in
+     * model/rpl-aodv.cc.
+     *
+     * @param dio the DIO, carrying an RREQ option and an ART option
+     * @param from the link-local address of the neighbour that sent it
+     * @param interface the interface it arrived on
+     */
+    void HandleAodvRreq(const RplDioHeader& dio, Ipv6Address from, uint32_t interface);
+
+    /**
+     * @brief Whether an AODV-RPL DIO should be refused before it is joined.
+     *
+     * The checks RFC 9854 section 6.2.1 puts ahead of joining the
+     * RREQ-Instance, which therefore have to run before HandleDio()'s own
+     * join: this node's address already in the Address Vector (the route
+     * would loop), and a rank that would reach or exceed the RankLimit.
+     * Implemented in model/rpl-aodv.cc.
+     *
+     * @param dio the DIO to judge
+     * @param from the link-local address of the neighbour that sent it
+     * @return true if the DIO must be dropped without joining
+     */
+    bool ShouldRefuseAodvRreq(const RplDioHeader& dio, Ipv6Address from) const;
+
+    /**
+     * @brief Arm the 'L' field's deadline for an RREQ-Instance.
+     *
+     * A no-op for RFC 9854 section 4.1's "no time limit imposed" encoding.
+     * Re-armed rather than left alone when a later copy of the same RREQ
+     * arrives, so the deadline is measured from when this node last had
+     * reason to believe the discovery was still live.
+     *
+     * @param dodag the membership to arm
+     * @param key its key, which the expiry callback needs to find it again
+     */
+    void ArmAodvExpiry(DodagMembership& dodag, DodagKey key);
+
+    /**
+     * @brief Leave an RREQ-Instance whose 'L' field has run out.
+     * @param key the RREQ-Instance to leave
+     */
+    void AodvInstanceExpired(DodagKey key);
+
+    /**
+     * @brief Whether an address is one of this node's own.
+     * @param address the address to look for
+     * @return true if some interface of this node holds it
+     */
+    bool IsOwnAddress(Ipv6Address address) const;
 
     /**
      * @brief Join the DODAG advertised by a DIO, adopting its configuration.
@@ -1169,6 +1309,29 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     bool m_hasBaseDodag{false}; //!< whether m_baseDodagKey currently names a real entry
     //!< key of the base DODAG, meaningful only if m_hasBaseDodag
     DodagKey m_baseDodagKey{0, Ipv6Address::GetAny()};
+
+    /// This node's own Sequence Number (RFC 9854 section 6.1, the RFC 6550
+    /// section 7.2 lollipop counter): incremented at the start of each route
+    /// discovery this node originates, so that routes an earlier one left
+    /// behind can be told apart from the current one's.
+    uint8_t m_aodvSeqNo{0};
+    /// Imin of the Trickle timer pacing RREQ-DIOs. Separate from
+    /// DioIntervalMin because a route discovery has to finish inside its own
+    /// 'L' field, which is 16 seconds at the shortest, while the base
+    /// DODAG's Imin is chosen for steady-state upkeep instead.
+    Time m_aodvDioIntervalMin;
+    uint8_t m_aodvDioIntervalDoublings; //!< doublings for the RREQ-DIO Trickle timer
+    uint8_t m_aodvRankLimit;   //!< RankLimit put on RREQ-DIOs, 0 meaning no limit
+    uint8_t m_aodvLifetime;    //!< the 'L' field put on RREQ-DIOs, 0..3
+    /// REJOIN_REENABLE (RFC 9854 section 2): how long after leaving an
+    /// RREQ-Instance a node is barred from rejoining the same one.
+    Time m_aodvRejoinReenable;
+    /// When each recently-left RREQ-Instance may be joined again. Without
+    /// it, a discovery never really ends: the RREQ-DIOs a neighbour is still
+    /// Trickle-pacing pull the node -- the OrigNode very much included --
+    /// straight back into the instance it just left, and the OrigNode then
+    /// finds itself an ordinary member of its own discovery.
+    std::map<DodagKey, Time> m_aodvRejoinBlocked;
 
     // Policy attributes for the DAO/downward-route side, set once via
     // RplHelper and shared by whatever DODAG membership uses them. Nothing

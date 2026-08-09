@@ -4704,6 +4704,206 @@ RplAodvMopAcceptedTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief An AODV-RPL route discovery floods an RREQ outward, each hop
+ *        appending its own address to the Address Vector.
+ *
+ * The first half of RFC 9854's route discovery: DiscoverRoute() at the
+ * OrigNode forms an RREQ-Instance rooted at itself (section 6.1) and
+ * Trickle-paces RREQ-DIOs into it; every router that hears one joins,
+ * appends the address of the interface it heard it on (section 6.2.5), and
+ * propagates. What comes back the other way is a later increment's business.
+ *
+ * A four-node line, so the Address Vector has to grow by exactly one entry
+ * per hop and the far end has to be reached through two routers that were
+ * never told about the discovery in advance:
+ *
+ *     orig(0) ---- relay1(1) ---- relay2(2) ---- targ(3)
+ *
+ * Non-adjacent pairs are blacklisted, RplDodagFormationTestCase's own
+ * line-topology recipe. Every node also belongs to an ordinary base DODAG
+ * rooted at node 0 -- AODV-RPL runs alongside core RPL rather than instead
+ * of it (RFC 9854 section 1) -- which is also what gives each node the
+ * global address its Address Vector entry has to be.
+ */
+class RplAodvRreqFloodTestCase : public TestCase
+{
+  public:
+    RplAodvRreqFloodTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplAodvRreqFloodTestCase::RplAodvRreqFloodTestCase()
+    : TestCase("An AODV-RPL RREQ floods outward, each hop appending itself to the Address Vector")
+{
+}
+
+void
+RplAodvRreqFloodTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(4); // 0 = OrigNode and base root, 1 and 2 = relays, 3 = TargNode
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    auto blacklist = [&](uint32_t a, uint32_t b) {
+        Ptr<SimpleNetDevice> devA = DynamicCast<SimpleNetDevice>(devices.Get(a));
+        Ptr<SimpleNetDevice> devB = DynamicCast<SimpleNetDevice>(devices.Get(b));
+        channel->BlackList(devA, devB);
+        channel->BlackList(devB, devA);
+    };
+    blacklist(0, 2);
+    blacklist(0, 3);
+    blacklist(1, 3);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    // The base DODAG across all three hops first, so every node has SLAACed
+    // the global address its Address Vector entry has to be.
+    // RplDodagFormationTestCase's own budget for two hops, with margin.
+    Simulator::Stop(Seconds(250));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> orig = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> relay1 = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> relay2 = nodes.Get(2)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> targ = nodes.Get(3)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(targ->IsJoined(), true, "The base DODAG did not reach the far end");
+
+    Ipv6Address relay1Address = relay1->GetGlobalAddress();
+    Ipv6Address relay2Address = relay2->GetGlobalAddress();
+    Ipv6Address targAddress = targ->GetGlobalAddress();
+    NS_TEST_ASSERT_MSG_NE(targAddress, Ipv6Address::GetAny(), "The TargNode has no address");
+
+    RplRoutingProtocol::DodagKey key = orig->DiscoverRoute(targAddress);
+    NS_TEST_ASSERT_MSG_NE(key.dodagId, Ipv6Address::GetAny(), "The discovery did not start");
+    NS_TEST_ASSERT_MSG_EQ(key.dodagId,
+                          orig->GetGlobalAddress(),
+                          "The RREQ-Instance is not rooted at the OrigNode's own address");
+    // RFC 6550 section 5.1's Local RPLInstanceID: the top bit set to mark it
+    // Local, the 'D' flag below it clear in a control message.
+    NS_TEST_ASSERT_MSG_NE(key.instanceId & RPL_LOCAL_INSTANCE_FLAG,
+                          0,
+                          "The RREQ-Instance did not get a Local RPLInstanceID");
+    NS_TEST_ASSERT_MSG_EQ(key.instanceId & RPL_LOCAL_INSTANCE_D_FLAG,
+                          0,
+                          "The Local RPLInstanceID's 'D' flag is set in a control message");
+
+    // Three hops of Trickle-paced RREQ-DIOs at AodvDioIntervalMin (128 ms,
+    // doubling), well inside the 16 seconds the default 'L' field allows.
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(orig->IsJoinedTo(key.instanceId, key.dodagId),
+                          true,
+                          "The OrigNode is not in its own RREQ-Instance");
+    NS_TEST_ASSERT_MSG_EQ(relay1->IsJoinedTo(key.instanceId, key.dodagId),
+                          true,
+                          "relay1 did not join the RREQ-Instance");
+    NS_TEST_ASSERT_MSG_EQ(relay2->IsJoinedTo(key.instanceId, key.dodagId),
+                          true,
+                          "relay2 did not join the RREQ-Instance: the RREQ was not propagated "
+                          "past the first hop");
+    NS_TEST_ASSERT_MSG_EQ(targ->IsJoinedTo(key.instanceId, key.dodagId),
+                          true,
+                          "The TargNode never heard the RREQ");
+
+    // The Address Vector grows by exactly one entry per hop, in order, and
+    // holds global addresses -- it becomes a source route later, so a
+    // link-local entry would be unusable from more than one hop away.
+    std::vector<Ipv6Address> addressVector;
+
+    NS_TEST_ASSERT_MSG_EQ(orig->GetAodvAddressVector(key.instanceId, key.dodagId, addressVector),
+                          true,
+                          "The OrigNode has no Address Vector");
+    NS_TEST_ASSERT_MSG_EQ(addressVector.size(),
+                          0,
+                          "The OrigNode put itself in its own Address Vector; RFC 9854 section "
+                          "6.2.5 has only intermediate routers append to it");
+
+    NS_TEST_ASSERT_MSG_EQ(relay1->GetAodvAddressVector(key.instanceId, key.dodagId, addressVector),
+                          true,
+                          "relay1 has no Address Vector");
+    NS_TEST_ASSERT_MSG_EQ(addressVector.size(), 1, "relay1's Address Vector is the wrong length");
+    NS_TEST_ASSERT_MSG_EQ(addressVector[0], relay1Address, "relay1 did not append its own address");
+
+    NS_TEST_ASSERT_MSG_EQ(relay2->GetAodvAddressVector(key.instanceId, key.dodagId, addressVector),
+                          true,
+                          "relay2 has no Address Vector");
+    NS_TEST_ASSERT_MSG_EQ(addressVector.size(), 2, "relay2's Address Vector is the wrong length");
+    NS_TEST_ASSERT_MSG_EQ(addressVector[0], relay1Address, "relay2 lost the hop before it");
+    NS_TEST_ASSERT_MSG_EQ(addressVector[1], relay2Address, "relay2 did not append its own address");
+
+    NS_TEST_ASSERT_MSG_EQ(targ->GetAodvAddressVector(key.instanceId, key.dodagId, addressVector),
+                          true,
+                          "The TargNode has no Address Vector");
+    NS_TEST_ASSERT_MSG_EQ(addressVector.size(), 3, "The TargNode's Address Vector is the wrong length");
+    NS_TEST_ASSERT_MSG_EQ(addressVector[0], relay1Address, "The first hop is wrong at the TargNode");
+    NS_TEST_ASSERT_MSG_EQ(addressVector[1], relay2Address, "The second hop is wrong at the TargNode");
+    NS_TEST_ASSERT_MSG_EQ(addressVector[2], targAddress, "The TargNode did not append its own address");
+
+    // Only the node the ART option names knows itself to be the target.
+    NS_TEST_ASSERT_MSG_EQ(targ->IsAodvTarget(key.instanceId, key.dodagId),
+                          true,
+                          "The TargNode did not recognise itself in the ART option");
+    NS_TEST_ASSERT_MSG_EQ(relay1->IsAodvTarget(key.instanceId, key.dodagId),
+                          false,
+                          "relay1 thinks it is the target");
+    NS_TEST_ASSERT_MSG_EQ(relay2->IsAodvTarget(key.instanceId, key.dodagId),
+                          false,
+                          "relay2 thinks it is the target");
+
+    // The base DODAG is untouched by any of this: it is a separate RPL
+    // Instance and keeps its own rank and parent (RFC 9854 section 1,
+    // "AODV-RPL can be operated whether or not ... RPL is also running").
+    NS_TEST_ASSERT_MSG_EQ(targ->IsJoined(), true, "The base DODAG membership was disturbed");
+    NS_TEST_ASSERT_MSG_EQ(targ->GetDodagId(),
+                          orig->GetGlobalAddress(),
+                          "The base DODAG's own DODAGID changed");
+    NS_TEST_ASSERT_MSG_EQ(targ->GetDodagCount(), 2, "The TargNode holds the wrong number of DODAGs");
+
+    // The 'L' field takes every node back out again. The default is 1, which
+    // RFC 9854 section 4.1 tabulates as 16 seconds, measured from when each
+    // node last heard the discovery was live.
+    Simulator::Stop(Seconds(30));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(relay1->IsJoinedTo(key.instanceId, key.dodagId),
+                          false,
+                          "relay1 stayed in the RREQ-Instance past its 'L' deadline");
+    NS_TEST_ASSERT_MSG_EQ(targ->IsJoinedTo(key.instanceId, key.dodagId),
+                          false,
+                          "The TargNode stayed in the RREQ-Instance past its 'L' deadline");
+    NS_TEST_ASSERT_MSG_EQ(orig->IsJoinedTo(key.instanceId, key.dodagId),
+                          false,
+                          "The OrigNode stayed in its own RREQ-Instance past its 'L' deadline");
+    // Leaving the discovery must not have taken the base DODAG with it.
+    NS_TEST_ASSERT_MSG_EQ(targ->IsJoined(), true, "Leaving the RREQ-Instance dropped the base DODAG");
+    NS_TEST_ASSERT_MSG_EQ(targ->GetDodagCount(), 1, "Only the base DODAG should be left");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Check which DIOs RplRoutingProtocol::HandleDio() acts on and which
  *        it turns away: a mode of operation it does not implement, another
  *        RPL instance or DODAG, a stale DODAG version, and the infinite
@@ -8910,6 +9110,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplNonBaseRootDownwardPacketTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplReadRpiInstanceIdRejectsWrongOptionTypeTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvMopAcceptedTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplAodvRreqFloodTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDioRejectionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplParentLossRejoinTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplInterfaceRestartTestCase, TestCase::Duration::QUICK);

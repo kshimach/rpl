@@ -2,6 +2,7 @@ build_lib(
   LIBNAME rpl
   SOURCE_FILES
     helper/rpl-helper.cc
+    model/rpl-aodv.cc
     model/rpl-header.cc
     model/rpl-packet-info-option.cc
     model/rpl-routing-protocol.cc

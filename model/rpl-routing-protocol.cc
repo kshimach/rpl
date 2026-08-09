@@ -225,7 +225,44 @@ RplRoutingProtocol::GetTypeId()
                           "Prefix length, in bits, of RootPrefix.",
                           UintegerValue(64),
                           MakeUintegerAccessor(&RplRoutingProtocol::m_rootPrefixLength),
-                          MakeUintegerChecker<uint8_t>(1, 128));
+                          MakeUintegerChecker<uint8_t>(1, 128))
+            .AddAttribute("AodvDioIntervalMin",
+                          "Imin of the Trickle timer pacing AODV-RPL RREQ-DIOs (RFC 9854). "
+                          "Deliberately far shorter than DioIntervalMin: a route discovery has "
+                          "to reach its target and be answered inside the RREQ option's own 'L' "
+                          "field, 16 seconds at the shortest.",
+                          TimeValue(MilliSeconds(128)),
+                          MakeTimeAccessor(&RplRoutingProtocol::m_aodvDioIntervalMin),
+                          MakeTimeChecker())
+            .AddAttribute("AodvDioIntervalDoublings",
+                          "Number of doublings between Imin and Imax of the RREQ-DIO Trickle "
+                          "timer.",
+                          UintegerValue(4),
+                          MakeUintegerAccessor(&RplRoutingProtocol::m_aodvDioIntervalDoublings),
+                          MakeUintegerChecker<uint8_t>())
+            .AddAttribute("AodvRankLimit",
+                          "RankLimit advertised in RREQ-DIOs (RFC 9854 section 4.1): the upper "
+                          "bound on DAGRank() a router may reach and still join the discovery, "
+                          "which is what stops an RREQ flooding the whole network. 0 means no "
+                          "limit.",
+                          UintegerValue(8),
+                          MakeUintegerAccessor(&RplRoutingProtocol::m_aodvRankLimit),
+                          MakeUintegerChecker<uint8_t>(0, RPL_AODV_RANK_LIMIT_MASK))
+            .AddAttribute("AodvLifetime",
+                          "The 'L' field of RREQ-DIOs (RFC 9854 section 4.1), how long a node "
+                          "stays in the RREQ-Instance: 0 no limit, 1 for 16 s, 2 for 64 s, 3 for "
+                          "256 s.",
+                          UintegerValue(1),
+                          MakeUintegerAccessor(&RplRoutingProtocol::m_aodvLifetime),
+                          MakeUintegerChecker<uint8_t>(0, RPL_AODV_LIFETIME_MASK))
+            .AddAttribute("AodvRejoinReenable",
+                          "REJOIN_REENABLE (RFC 9854 section 2): how long after leaving an "
+                          "RREQ-Instance a node refuses to rejoin the same one. Without it a "
+                          "discovery never ends, since a neighbour still Trickle-pacing the old "
+                          "RREQ-DIOs pulls the node back in immediately.",
+                          TimeValue(Minutes(15)),
+                          MakeTimeAccessor(&RplRoutingProtocol::m_aodvRejoinReenable),
+                          MakeTimeChecker());
     return tid;
 }
 
@@ -926,6 +963,34 @@ RplRoutingProtocol::SendDio(DodagMembership& dodag, Ipv6Address dst, uint32_t in
                           dodag.prefixPreferredLifetime);
     }
 
+    if (dodag.mop == RPL_MOP_P2P_ROUTE_DISCOVERY && !dodag.aodv.target.IsAny())
+    {
+        // An RREQ-DIO (RFC 9854 section 4.1): "Exactly one RREQ option MUST
+        // be present in an RREQ-DIO message", and section 4.3 "An RREQ-DIO
+        // message MUST carry at least one ART option". Both are rebuilt from
+        // the membership's own state on every transmission, so a router
+        // propagates the Address Vector it recorded on the way in -- its own
+        // address already appended by HandleAodvRreq().
+        RplDioHeader::RreqOption rreq;
+        rreq.symmetric = dodag.aodv.symmetric;
+        rreq.hopByHop = false; // source routed; H=1 is out of scope
+        rreq.compr = 0;        // no prefix elision
+        rreq.lifetime = dodag.aodv.lifetimeField;
+        rreq.rankLimit = dodag.aodv.rankLimit;
+        rreq.origSeqNo = dodag.aodv.origSeqNo;
+        rreq.addressVector = dodag.aodv.addressVector;
+        dio.SetRreq(rreq);
+
+        RplDioHeader::ArtOption art;
+        // The TargNode's own Sequence Number is not known until its RREP
+        // arrives; RFC 9854 section 4.3 has the RREQ carry 0 for "no known
+        // information about the Sequence Number of TargNode".
+        art.destSeqNo = 0;
+        art.prefixLength = 0; // the field holds an address, not a prefix
+        art.target = dodag.aodv.target;
+        dio.SetArt(art);
+    }
+
     Ptr<Packet> packet = Create<Packet>();
     packet->AddHeader(dio);
 
@@ -1074,6 +1139,15 @@ RplRoutingProtocol::HandleDio(const RplDioHeader& dio,
         return;
     }
 
+    // RFC 9854 section 6.2.1 puts two checks ahead of joining an
+    // RREQ-Instance, so they have to run before the join below rather than
+    // in HandleAodvRreq() after it: this node's own address already in the
+    // Address Vector, and a rank that would reach the RankLimit.
+    if (dio.HasRreq() && ShouldRefuseAodvRreq(dio, from))
+    {
+        return;
+    }
+
     auto existingIt = m_dodags.find(dioKey);
     DodagMembership* existing = existingIt != m_dodags.end() ? &existingIt->second : nullptr;
 
@@ -1211,6 +1285,16 @@ RplRoutingProtocol::HandleDio(const RplDioHeader& dio,
         {
             it->second.dioTrickle.Reset();
         }
+    }
+
+    // Last, so the AODV-RPL side sees a membership whose rank and preferred
+    // parent are already settled -- RFC 9854 section 6.2.5 has the router
+    // append the address of the interface it heard the RREQ on, which is
+    // only meaningful once that parent is chosen. Re-resolved by key for the
+    // same reason the Trickle reset above is.
+    if (dio.HasRreq() && m_dodags.find(dioKey) != m_dodags.end())
+    {
+        HandleAodvRreq(dio, from, interface);
     }
 }
 
@@ -1506,6 +1590,15 @@ void
 RplRoutingProtocol::SendNoPathDao(DodagMembership& dodag, Ipv6Address viaParent)
 {
     NS_LOG_FUNCTION(this << viaParent);
+
+    if (dodag.mop == RPL_MOP_P2P_ROUTE_DISCOVERY)
+    {
+        // The same reason SendDao() refuses: AODV-RPL uses no DAO of any
+        // kind (RFC 9854 section 1), a No-Path DAO included. Reached
+        // whenever a route-discovery instance loses its last parent, which
+        // is exactly what happens as the discovery winds down.
+        return;
+    }
 
     Ipv6Address target = GetGlobalAddressIn(dodag);
     Ipv6Address parent = GlobalAddressOf(dodag, viaParent);
