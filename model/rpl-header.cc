@@ -167,6 +167,27 @@ RplDioHeader::Print(std::ostream& os) const
     }
 }
 
+uint8_t
+RplDioHeader::ElidedPrefixLength(const std::vector<Ipv6Address>& addressVector) const
+{
+    if (addressVector.empty())
+    {
+        return 0;
+    }
+    uint8_t dodagIdBuf[16];
+    m_dodagId.Serialize(dodagIdBuf);
+    for (const auto& address : addressVector)
+    {
+        uint8_t addressBuf[16];
+        address.Serialize(addressBuf);
+        if (!std::equal(dodagIdBuf, dodagIdBuf + 8, addressBuf))
+        {
+            return 0;
+        }
+    }
+    return 8;
+}
+
 uint32_t
 RplDioHeader::GetSerializedSize() const
 {
@@ -175,10 +196,14 @@ RplDioHeader::GetSerializedSize() const
            (m_hasLql ? LQL_OPTION_SIZE : 0) +
            (m_hasPrefixInfo ? PREFIX_INFO_OPTION_SIZE : 0) +
            (m_hasRreq ? 2 + AODV_RREQ_OPTION_BASE_LENGTH +
-                            m_rreq.addressVector.size() * AODV_ADDRESS_VECTOR_ENTRY_SIZE
+                            m_rreq.addressVector.size() *
+                                (AODV_ADDRESS_VECTOR_ENTRY_SIZE -
+                                 ElidedPrefixLength(m_rreq.addressVector))
                       : 0) +
            (m_hasRrep ? 2 + AODV_RREP_OPTION_BASE_LENGTH +
-                            m_rrep.addressVector.size() * AODV_ADDRESS_VECTOR_ENTRY_SIZE
+                            m_rrep.addressVector.size() *
+                                (AODV_ADDRESS_VECTOR_ENTRY_SIZE -
+                                 ElidedPrefixLength(m_rrep.addressVector))
                       : 0) +
            (m_hasArt ? AODV_ART_OPTION_SIZE : 0);
 }
@@ -273,13 +298,14 @@ RplDioHeader::Serialize(Buffer::Iterator start) const
     // second, which is why neither can be written with a single mask.
     if (m_hasRreq)
     {
+        uint8_t rreqCompr = ElidedPrefixLength(m_rreq.addressVector);
         start.WriteU8(RPL_OPTION_AODV_RREQ);
-        start.WriteU8(static_cast<uint8_t>(AODV_RREQ_OPTION_BASE_LENGTH +
-                                           m_rreq.addressVector.size() *
-                                               AODV_ADDRESS_VECTOR_ENTRY_SIZE));
+        start.WriteU8(static_cast<uint8_t>(
+            AODV_RREQ_OPTION_BASE_LENGTH +
+            m_rreq.addressVector.size() * (AODV_ADDRESS_VECTOR_ENTRY_SIZE - rreqCompr)));
         start.WriteU8(static_cast<uint8_t>((m_rreq.symmetric ? RPL_AODV_S_FLAG : 0) |
                                            (m_rreq.hopByHop ? RPL_AODV_H_FLAG : 0) |
-                                           ((m_rreq.compr << RPL_AODV_COMPR_SHIFT) &
+                                           ((rreqCompr << RPL_AODV_COMPR_SHIFT) &
                                             RPL_AODV_COMPR_MASK) |
                                            ((m_rreq.lifetime >> 1) & AODV_LIFETIME_HIGH_BIT)));
         start.WriteU8(static_cast<uint8_t>(((m_rreq.lifetime & 0x01) ? AODV_LIFETIME_LOW_BIT : 0) |
@@ -289,19 +315,20 @@ RplDioHeader::Serialize(Buffer::Iterator start) const
         {
             uint8_t addressBuf[16];
             address.Serialize(addressBuf);
-            start.Write(addressBuf, 16);
+            start.Write(addressBuf + rreqCompr, 16 - rreqCompr);
         }
     }
 
     if (m_hasRrep)
     {
+        uint8_t rrepCompr = ElidedPrefixLength(m_rrep.addressVector);
         start.WriteU8(RPL_OPTION_AODV_RREP);
-        start.WriteU8(static_cast<uint8_t>(AODV_RREP_OPTION_BASE_LENGTH +
-                                           m_rrep.addressVector.size() *
-                                               AODV_ADDRESS_VECTOR_ENTRY_SIZE));
+        start.WriteU8(static_cast<uint8_t>(
+            AODV_RREP_OPTION_BASE_LENGTH +
+            m_rrep.addressVector.size() * (AODV_ADDRESS_VECTOR_ENTRY_SIZE - rrepCompr)));
         start.WriteU8(static_cast<uint8_t>((m_rrep.gratuitous ? RPL_AODV_G_FLAG : 0) |
                                            (m_rrep.hopByHop ? RPL_AODV_H_FLAG : 0) |
-                                           ((m_rrep.compr << RPL_AODV_COMPR_SHIFT) &
+                                           ((rrepCompr << RPL_AODV_COMPR_SHIFT) &
                                             RPL_AODV_COMPR_MASK) |
                                            ((m_rrep.lifetime >> 1) & AODV_LIFETIME_HIGH_BIT)));
         start.WriteU8(static_cast<uint8_t>(((m_rrep.lifetime & 0x01) ? AODV_LIFETIME_LOW_BIT : 0) |
@@ -313,7 +340,7 @@ RplDioHeader::Serialize(Buffer::Iterator start) const
         {
             uint8_t addressBuf[16];
             address.Serialize(addressBuf);
-            start.Write(addressBuf, 16);
+            start.Write(addressBuf + rrepCompr, 16 - rrepCompr);
         }
     }
 
@@ -457,59 +484,93 @@ RplDioHeader::Deserialize(Buffer::Iterator start)
         }
         // The AODV-RPL RREQ/RREP options (RFC 9854 sections 4.1, 4.2) are the
         // only variable-length options here, so they cannot use the exact
-        // `length == <X>_OPTION_LENGTH` guard every option above does. The
-        // shape check below is the equivalent: a fixed part plus a whole
-        // number of Address Vector entries. It is still the option's own
-        // declared length that is being checked rather than trusted -- the
-        // loop already refused a length longer than the packet, and no
-        // arithmetic below reads past what this check accounts for.
+        // `length == <X>_OPTION_LENGTH` guard every option above does. It is
+        // still the option's own declared length that is being checked
+        // rather than trusted -- the loop already refused a length longer
+        // than the packet, and no arithmetic below reads past what this
+        // check accounts for.
         //
-        // No separate bound on the entry count is needed: length is eight
-        // bits, so 3 + 16n <= 255 caps n at 15 on the wire
-        // (AODV_ADDRESS_VECTOR_MAX_ENTRIES), whatever a sender intended.
-        else if (type == RPL_OPTION_AODV_RREQ && length >= AODV_RREQ_OPTION_BASE_LENGTH &&
-                 (length - AODV_RREQ_OPTION_BASE_LENGTH) % AODV_ADDRESS_VECTOR_ENTRY_SIZE == 0)
+        // The shape check itself needs Compr, which is inside the option's
+        // own content rather than in type/length -- unlike every guard
+        // above, this cannot be decided before reading part of the option,
+        // so the length/entry-count check moves inside the branch instead,
+        // with the same "declared length trusted, but validated, then
+        // skipped over if it does not check out" recovery the metric
+        // container option above uses for its own sub-validation.
+        else if (type == RPL_OPTION_AODV_RREQ && length >= AODV_RREQ_OPTION_BASE_LENGTH)
         {
-            m_hasRreq = true;
             uint8_t flags = i.ReadU8();
             uint8_t limits = i.ReadU8();
+            uint8_t compr = (flags & RPL_AODV_COMPR_MASK) >> RPL_AODV_COMPR_SHIFT;
+            uint8_t entrySize = static_cast<uint8_t>(AODV_ADDRESS_VECTOR_ENTRY_SIZE - compr);
+            uint8_t remaining = static_cast<uint8_t>(length - AODV_RREQ_OPTION_BASE_LENGTH);
+            uint8_t entries = static_cast<uint8_t>(remaining / entrySize);
+            if (remaining % entrySize != 0 || entries > AODV_ADDRESS_VECTOR_MAX_ENTRIES)
+            {
+                NS_LOG_LOGIC("Skipping a malformed AODV-RPL RREQ option (Compr "
+                            << +compr << ", length " << +length << ")");
+                // flags and limits (2 bytes) already read of length's total;
+                // Orig SeqNo has not been, unlike remaining above (which
+                // subtracts the full 3-byte base for the entries math).
+                i.Next(static_cast<uint8_t>(length - 2));
+                continue;
+            }
+            m_hasRreq = true;
             m_rreq.symmetric = (flags & RPL_AODV_S_FLAG) != 0;
             m_rreq.hopByHop = (flags & RPL_AODV_H_FLAG) != 0;
-            m_rreq.compr = (flags & RPL_AODV_COMPR_MASK) >> RPL_AODV_COMPR_SHIFT;
+            m_rreq.compr = compr;
             m_rreq.lifetime = static_cast<uint8_t>(((flags & AODV_LIFETIME_HIGH_BIT) << 1) |
                                                    ((limits & AODV_LIFETIME_LOW_BIT) ? 1 : 0));
             m_rreq.rankLimit = limits & RPL_AODV_RANK_LIMIT_MASK;
             m_rreq.origSeqNo = i.ReadU8();
             m_rreq.addressVector.clear();
-            uint8_t entries = static_cast<uint8_t>((length - AODV_RREQ_OPTION_BASE_LENGTH) /
-                                                   AODV_ADDRESS_VECTOR_ENTRY_SIZE);
+            // RFC 9854 section 4.1: the elided octets are shared with the
+            // DODAGID, already deserialized above (the DIO's fixed fields
+            // precede its options on the wire).
+            uint8_t dodagIdBuf[16];
+            m_dodagId.Serialize(dodagIdBuf);
             for (uint8_t entry = 0; entry < entries; entry++)
             {
-                uint8_t addressBuf[16];
-                i.Read(addressBuf, 16);
+                uint8_t addressBuf[16] = {0};
+                std::copy(dodagIdBuf, dodagIdBuf + compr, addressBuf);
+                i.Read(addressBuf + compr, entrySize);
                 m_rreq.addressVector.push_back(Ipv6Address::Deserialize(addressBuf));
             }
         }
-        else if (type == RPL_OPTION_AODV_RREP && length >= AODV_RREP_OPTION_BASE_LENGTH &&
-                 (length - AODV_RREP_OPTION_BASE_LENGTH) % AODV_ADDRESS_VECTOR_ENTRY_SIZE == 0)
+        else if (type == RPL_OPTION_AODV_RREP && length >= AODV_RREP_OPTION_BASE_LENGTH)
         {
-            m_hasRrep = true;
             uint8_t flags = i.ReadU8();
             uint8_t limits = i.ReadU8();
+            uint8_t compr = (flags & RPL_AODV_COMPR_MASK) >> RPL_AODV_COMPR_SHIFT;
+            uint8_t entrySize = static_cast<uint8_t>(AODV_ADDRESS_VECTOR_ENTRY_SIZE - compr);
+            uint8_t remaining = static_cast<uint8_t>(length - AODV_RREP_OPTION_BASE_LENGTH);
+            uint8_t entries = static_cast<uint8_t>(remaining / entrySize);
+            if (remaining % entrySize != 0 || entries > AODV_ADDRESS_VECTOR_MAX_ENTRIES)
+            {
+                NS_LOG_LOGIC("Skipping a malformed AODV-RPL RREP option (Compr "
+                            << +compr << ", length " << +length << ")");
+                // flags and limits (2 bytes) already read of length's total;
+                // Delta has not been, unlike remaining above (which
+                // subtracts the full 3-byte base for the entries math).
+                i.Next(static_cast<uint8_t>(length - 2));
+                continue;
+            }
+            m_hasRrep = true;
             m_rrep.gratuitous = (flags & RPL_AODV_G_FLAG) != 0;
             m_rrep.hopByHop = (flags & RPL_AODV_H_FLAG) != 0;
-            m_rrep.compr = (flags & RPL_AODV_COMPR_MASK) >> RPL_AODV_COMPR_SHIFT;
+            m_rrep.compr = compr;
             m_rrep.lifetime = static_cast<uint8_t>(((flags & AODV_LIFETIME_HIGH_BIT) << 1) |
                                                    ((limits & AODV_LIFETIME_LOW_BIT) ? 1 : 0));
             m_rrep.rankLimit = limits & RPL_AODV_RANK_LIMIT_MASK;
             m_rrep.delta = (i.ReadU8() & RPL_AODV_DELTA_MASK) >> RPL_AODV_DELTA_SHIFT;
             m_rrep.addressVector.clear();
-            uint8_t entries = static_cast<uint8_t>((length - AODV_RREP_OPTION_BASE_LENGTH) /
-                                                   AODV_ADDRESS_VECTOR_ENTRY_SIZE);
+            uint8_t dodagIdBuf[16];
+            m_dodagId.Serialize(dodagIdBuf);
             for (uint8_t entry = 0; entry < entries; entry++)
             {
-                uint8_t addressBuf[16];
-                i.Read(addressBuf, 16);
+                uint8_t addressBuf[16] = {0};
+                std::copy(dodagIdBuf, dodagIdBuf + compr, addressBuf);
+                i.Read(addressBuf + compr, entrySize);
                 m_rrep.addressVector.push_back(Ipv6Address::Deserialize(addressBuf));
             }
         }

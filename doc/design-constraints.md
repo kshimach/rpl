@@ -3313,10 +3313,9 @@ DODAG 形成が不要になる。
   (RREP-Instance) を建てて RREP を flood する必要がある。
 - **Gratuitous RREP (§7)**: MAY。
 - **複数 ART / §6.2.2 のターゲット集合の積集合ロジック**。
-- **Compr (アドレス省略)**: 送信は常に 0、受信も 0 以外は拒否。単一
-  プレフィクスのシミュレーションで節約が無意味な一方、部分バイト列からの
-  `Ipv6Address` 復元は誤りやすい。RFC は Compr を送信側の裁量としている
-  ので 0 固定は準拠。
+- ~~**Compr (アドレス省略)**: 送信は常に 0、受信も 0 以外は拒否。~~
+  後日 §35.15 で実装した (`RplSourceRoutingHeader` の CmprI/CmprE と
+  同じ手法が使えると分かったため)。
 - **リンク対称性の判定 (§6.2.4 の S ビット更新)**: RFC 自身が
   "It is beyond the scope of this document to specify the criteria used
   when determining whether or not each link is symmetric" としており、
@@ -3721,3 +3720,99 @@ GetSerializedSize 全て)。加えて `DodagMembership::AodvRreqState`
 探す必要が出た (制御トラフィックのコストが実際に問題になる)
 シナリオが出てきたら、まず `RplDioHeader` の ART を配列化する
 ところから着手する。
+
+### 35.15 Compr (アドレス省略) を実装
+
+§35.11 の 5 番目の項目。§35.2 では「単一プレフィクスのシミュレーションで
+節約が無意味な一方、部分バイト列からの `Ipv6Address` 復元は誤りやすい」
+として送信 0 固定・受信 0 以外拒否としていたが、実装してみると
+どちらの懸念も的外れだったと分かった。
+
+**「復元が誤りやすい」という懸念が外れた理由**: RFC 9854 §4.1/§4.2 は
+「elided な各アドレスの先頭バイト列は DODAGID と共有している」と規定
+している。この DODAGID は Compr を含む同じ RREQ/RREP オプションが
+載っている、まさにその DIO 自身の固定フィールドであり、
+`RplDioHeader::Deserialize()` が RREQ/RREP オプションを読む時点で
+既に (先に読んだ) `m_dodagId` として手元にある。「復元に外部コンテキストが
+要る」という直感は誤りで、これは 16 節で見つかった
+`RplSourceRoutingHeader` の CmprI/CmprE (fe80:: 定数から復元) と
+まったく同じ構造の話だった — 違いは、参照元が固定定数ではなく
+「同じパケット内の別フィールド」というだけ。
+
+**「節約が無意味」という懸念について**: シミュレーション内での
+バイト数節約という動機は今も薄いが、それとは別に**相互運用性**の
+問題があった。他の実装が Compr != 0 で送ってきた場合、旧実装は
+`ShouldRefuseAodvRreq()`/`HandleAodvRrep()` で機械的に拒否しており、
+このモジュールが AODV-RPL の relay/target として一切機能しなかった。
+実装してみると「節約が無意味」だった動機とは独立に、この受信側の
+非対応自体が直す価値のある欠落だった。
+
+**設計**: `RplSourceRoutingHeader::Cmpri()`/`Cmpre()` の流儀をそのまま
+踏襲する — `RplDioHeader::ElidedPrefixLength(addressVector)` という
+private const メソッドを新設し、Address Vector の**全エントリ**が
+DODAGID の先頭 8 バイトと一致するかどうかだけを見て、8 か 0 の
+二値を都度計算する (キャッシュしない)。`RreqOption::compr`/
+`RrepOption::compr` フィールド自体は残すが、送信側の意味を変えた:
+`Serialize()` は呼び出し側が `SetRreq()`/`SetRrep()` に渡した `compr` を
+一切見ず、アドレス自体から計算し直した値を書く。RFC が Compr を
+「送信側の裁量」としている以上、「安全なら常に省略する」という
+判断は準拠の範囲内 — CmprI/CmprE が実運用で常に 0 か 8 にしかならない
+のと同じ理屈。受信側 (`Deserialize()`) は逆に、ワイヤ上の Compr
+(0-15 のどんな値でも) をそのまま信頼して復元する。
+
+**副作用として直したもの**: `ShouldRefuseAodvRreq()` の
+「Compr != 0 なら拒否」と `HandleAodvRrep()` の同等チェックを削除した
+— `Deserialize()` が既に透過的にフルアドレスへ復元しているので、
+これらのチェックは意味を失っていた (副作用ゼロで安全に消せる古い
+ガード、という意味で 35.10 で見つけたクラッシュとは対照的な話)。
+
+**ワイヤフォーマット側の変更点**: `GetSerializedSize()`/`Serialize()`/
+`Deserialize()` の Address Vector 部分すべてで、1 エントリのサイズが
+固定 16 バイトから `16 - Compr` バイトに変わった。`Deserialize()` 側は
+既存の「型・長さの組み合わせで判定する」ガード方式 (他のオプションが
+使う `length == 固定値` の形) が使えなくなった — Compr はオプションの
+中身を読まないと分からないため、他のオプションと違って「ガード条件
+だけで妥当性を判定してから分岐に入る」という書き方ができない。
+かわりに、flags を読んで Compr を取り出した後に妥当性 (剰余 0・
+エントリ数が上限以下) を確認し、不正なら
+(mcType 不明時の DAG Metric Container オプションが既にやっている
+「宣言された残りバイト数をそのまま読み飛ばす」のと同じ形で)
+`i.Next()` で残りを読み飛ばして次のオプションへ進む、という構成に
+変えた。
+
+**踏んだバグ**: 最初の実装では、この「読み飛ばす」際のバイト数を
+`AODV_RREQ_OPTION_BASE_LENGTH` (=3、flags/limits/OrigSeqNo の 3 バイト
+分) を使って計算していたが、不正発覚時点では flags/limits の 2 バイト
+しかまだ読んでいない (OrigSeqNo はその後で読む予定だった) — 1 バイト
+分ずれたまま次のオプションへ進み、以降のオプション境界が全てずれる
+バグだった。テストで顕在化する前に気づいたので回帰テストへの反映は
+無いが、「まだ読んでいないフィールド分だけずれる」という classic な
+off-by-one として記録しておく。RREP 側 (Delta 1 バイト) も同型。
+
+**検証**: 既存の `RplDioHeaderTestCase` はもともと DODAGID
+(`2001:1::1`) と共有プレフィクスを持つ Address Vector エントリ
+(`2001:1::1`/`2001:1::2`) を使っていたため、この変更で実際に
+圧縮が効くようになり、想定バイト数と Compr の期待値をそのまま
+更新した (37→21 バイト等)。「S/H が最大値でも隣のビットへ漏れない」
+ことを確認する既存のビット詰め込みテストは、Address Vector が
+空なので Compr は常に 0 になる形へ意味が変わった (もともとの
+「Compr=15 が壊れず往復する」という主張自体が、Serialize() が
+Compr を自分で計算し直す新しい契約と矛盾するため)。
+
+新規に追加したのは 2 件:
+- `RplAodvComprMixedAddressVectorTestCase`: Address Vector の 1 エントリ
+  だけ別プレフィクスだと、全エントリの圧縮が (先頭だけでなく) 丸ごと
+  無効になることを確認 (`ElidedPrefixLength()` が全エントリを見ている
+  ことの回帰)。
+- `RplDioOptionEdgeTestCase` に追加したケース: このモジュール自身は
+  Compr=8 しか送らないが、Compr=8 の生バイト列を手作りして
+  `Deserialize()` に渡し、DODAGID の先頭 8 バイトが正しく前置される
+  ことを確認 (「このモジュールが送らない値でも受信は正しく解釈する」
+  という相互運用性の主張を直接検証する)。
+
+`ElidedPrefixLength()` を一時的に無効化 (常に 0 を返す) した状態で
+既存テストの一部が想定通り落ちることを確認済み。62+7 件全 PASS
+(3 回連続)。`rpl-aodv-mesh` シナリオ (ns3-editor 側) を実際に
+`./ns3 run` し、圧縮が実際に効いた状態でも AODV-RPL 経路探索が
+問題なく完了することを確認した (RREQ/RREP が実際に圧縮された
+ワイヤを流れる、この節で最初に動かした唯一の end-to-end 確認)。

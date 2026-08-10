@@ -358,19 +358,20 @@ RplDioHeaderTestCase::DoRun()
     NS_TEST_ASSERT_MSG_EQ(received.GetPrefix(), Ipv6Address("fd00::"), "Wrong ULA prefix");
 
     // The AODV-RPL RREQ option (RFC 9854 section 4.1), carried alongside
-    // everything already on the DIO above. Two Address Vector entries, so
-    // 2 (Type+Length) + 3 (the fixed part) + 2 * 16.
+    // everything already on the DIO above. Two Address Vector entries that
+    // share their first 8 octets with the DODAGID set above (2001:1::1), so
+    // Serialize() elides them (@see RplDioHeader::ElidedPrefixLength()):
+    // 2 (Type+Length) + 3 (the fixed part) + 2 * (16 - 8).
     NS_TEST_ASSERT_MSG_EQ(dio.HasRreq(), false, "There is no RREQ option yet");
     RplDioHeader::RreqOption rreq;
     rreq.symmetric = true;
     rreq.hopByHop = false;
-    rreq.compr = 0;
     rreq.lifetime = 2; // 64 seconds
     rreq.rankLimit = 5;
     rreq.origSeqNo = 42;
     rreq.addressVector = {Ipv6Address("2001:1::1"), Ipv6Address("2001:1::2")};
     dio.SetRreq(rreq);
-    NS_TEST_ASSERT_MSG_EQ(dio.GetSerializedSize(), 121, "The RREQ option adds 37 bytes");
+    NS_TEST_ASSERT_MSG_EQ(dio.GetSerializedSize(), 105, "The RREQ option adds 21 bytes");
 
     packet = Create<Packet>();
     packet->AddHeader(dio);
@@ -379,7 +380,10 @@ RplDioHeaderTestCase::DoRun()
     NS_TEST_ASSERT_MSG_EQ(received.HasRreq(), true, "The RREQ option was lost");
     NS_TEST_ASSERT_MSG_EQ(received.GetRreq().symmetric, true, "Wrong 'S' flag");
     NS_TEST_ASSERT_MSG_EQ(received.GetRreq().hopByHop, false, "Wrong 'H' flag");
-    NS_TEST_ASSERT_MSG_EQ(received.GetRreq().compr, 0, "Wrong Compr");
+    NS_TEST_ASSERT_MSG_EQ(received.GetRreq().compr,
+                          8,
+                          "Wrong Compr: both Address Vector entries share the DODAGID's prefix, "
+                          "so Serialize() should have elided it");
     // 'L' straddles the two flag octets, so a wrong shift on either side
     // shows up here and nowhere else.
     NS_TEST_ASSERT_MSG_EQ(received.GetRreq().lifetime, 2, "Wrong 'L' field");
@@ -408,7 +412,7 @@ RplDioHeaderTestCase::DoRun()
     rrep.delta = 6;
     dio.SetRrep(rrep);
     NS_TEST_ASSERT_MSG_EQ(dio.GetSerializedSize(),
-                          126,
+                          110,
                           "The RREP option with an empty Address Vector adds 5 bytes");
 
     packet = Create<Packet>();
@@ -436,7 +440,7 @@ RplDioHeaderTestCase::DoRun()
     art.prefixLength = 0;
     art.target = Ipv6Address("2001:2::9");
     dio.SetArt(art);
-    NS_TEST_ASSERT_MSG_EQ(dio.GetSerializedSize(), 146, "The ART option adds 20 bytes");
+    NS_TEST_ASSERT_MSG_EQ(dio.GetSerializedSize(), 130, "The ART option adds 20 bytes");
 
     packet = Create<Packet>();
     packet->AddHeader(dio);
@@ -454,6 +458,11 @@ RplDioHeaderTestCase::DoRun()
     // them bleed into a neighbour. RankLimit at 127 is its own 7-bit
     // maximum, which is the field RFC 9854's prose and figure disagree
     // about (@see design-constraints.md) -- 127 is what the figure allows.
+    // compr is set here too, but Serialize() ignores it and computes its
+    // own from the (empty) Address Vector and the DODAGID instead (@see
+    // ElidedPrefixLengthTestCase for that behaviour); 0 is what an empty
+    // Address Vector always elides, so this is really exercising the other
+    // fields' bit-packing, not Compr's.
     RplDioHeader packed;
     RplDioHeader::RreqOption dense;
     dense.symmetric = true;
@@ -468,10 +477,77 @@ RplDioHeaderTestCase::DoRun()
     packet->RemoveHeader(received);
     NS_TEST_ASSERT_MSG_EQ(received.GetRreq().symmetric, true, "'S' was lost when every bit was set");
     NS_TEST_ASSERT_MSG_EQ(received.GetRreq().hopByHop, true, "'H' was lost when every bit was set");
-    NS_TEST_ASSERT_MSG_EQ(received.GetRreq().compr, 15, "Compr was truncated at its maximum");
+    NS_TEST_ASSERT_MSG_EQ(received.GetRreq().compr,
+                          0,
+                          "Serialize() should have computed its own Compr (0, an empty Address "
+                          "Vector elides nothing) rather than sending the caller's 15");
     NS_TEST_ASSERT_MSG_EQ(received.GetRreq().lifetime, 3, "'L' was truncated at its maximum");
     NS_TEST_ASSERT_MSG_EQ(received.GetRreq().rankLimit, 127, "RankLimit was truncated at its 7-bit maximum");
     NS_TEST_ASSERT_MSG_EQ(received.GetRreq().origSeqNo, 255, "Orig SeqNo was truncated");
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief Compr elision is all-or-nothing: one Address Vector entry that
+ *        does not share the DODAGID's first 8 octets is enough to leave
+ *        every entry uncompressed.
+ *
+ * RplDioHeaderTestCase already covers the all-entries-match case (Compr 8,
+ * every entry 8 octets on the wire) as part of its own round trip. This is
+ * the other half: RplDioHeader::ElidedPrefixLength() has to actually check
+ * every entry, not just the first, or a mismatched later one would be
+ * reconstructed wrong on the far end.
+ */
+class RplAodvComprMixedAddressVectorTestCase : public TestCase
+{
+  public:
+    RplAodvComprMixedAddressVectorTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplAodvComprMixedAddressVectorTestCase::RplAodvComprMixedAddressVectorTestCase()
+    : TestCase("A mismatched Address Vector entry disables Compr for the whole RREQ")
+{
+}
+
+void
+RplAodvComprMixedAddressVectorTestCase::DoRun()
+{
+    RplDioHeader dio;
+    dio.SetRank(256);
+    dio.SetDodagId(Ipv6Address("2001:1::1")); // first 8 octets: 2001:0001:0000:0000
+
+    RplDioHeader::RreqOption rreq;
+    rreq.symmetric = true;
+    rreq.hopByHop = false;
+    rreq.lifetime = 0;
+    rreq.rankLimit = 0;
+    rreq.origSeqNo = 1;
+    // The first entry shares the DODAGID's prefix; the second is under a
+    // completely different one and must veto compression for both.
+    rreq.addressVector = {Ipv6Address("2001:1::42"), Ipv6Address("fd00:9::1")};
+    dio.SetRreq(rreq);
+
+    // 2 (Type+Length) + 3 (base) + 2 * 16 (nothing elided).
+    NS_TEST_ASSERT_MSG_EQ(dio.GetSerializedSize(), 24 + 2 + 3 + 32, "Compression was not vetoed");
+
+    Ptr<Packet> packet = Create<Packet>();
+    packet->AddHeader(dio);
+    RplDioHeader received;
+    packet->RemoveHeader(received);
+
+    NS_TEST_ASSERT_MSG_EQ(received.GetRreq().compr, 0, "Wrong Compr");
+    NS_TEST_ASSERT_MSG_EQ(received.GetRreq().addressVector.size(), 2, "Wrong vector size");
+    NS_TEST_ASSERT_MSG_EQ(received.GetRreq().addressVector[0],
+                          Ipv6Address("2001:1::42"),
+                          "Wrong first Address Vector entry");
+    NS_TEST_ASSERT_MSG_EQ(received.GetRreq().addressVector[1],
+                          Ipv6Address("fd00:9::1"),
+                          "Wrong second Address Vector entry");
 }
 
 /**
@@ -1091,6 +1167,38 @@ RplDioOptionEdgeTestCase::DoRun()
                               false,
                               "An RREQ claiming more bytes than the packet holds was parsed");
         NS_TEST_ASSERT_MSG_EQ(received.GetRank(), 256, "It also ate part of the base object");
+    }
+
+    // A hand-built RREQ using Compr = 8 (RFC 9854 section 4.1), the way a
+    // real interoperating sender might even though this module's own
+    // Serialize() only ever emits 0 or 8 -- so a positive, deliberately
+    // chosen 8 here still stands in for "some other implementation's
+    // choice", not just this module's own. RoundTrip()'s DODAGID is
+    // 2001:1::1, whose first 8 octets are 20:01:00:01:00:00:00:00; the
+    // entry's remaining 8 octets on the wire are arbitrary bytes standing
+    // in for the rest of a real address.
+    {
+        const uint8_t compressed[13] = {RPL_OPTION_AODV_RREQ,
+                                        11, // 3 (base) + 1 * (16 - 8)
+                                        0x90, // S=1, Compr=8 ((8 << 1) & 0x1E)
+                                        0x05, // RankLimit 5
+                                        42,   // Orig SeqNo
+                                        0xAA,
+                                        0xBB,
+                                        0xCC,
+                                        0xDD,
+                                        0xEE,
+                                        0xFF,
+                                        0x00,
+                                        0x01};
+        RplDioHeader received = RoundTrip(compressed, sizeof(compressed));
+        NS_TEST_ASSERT_MSG_EQ(received.HasRreq(), true, "A Compr=8 RREQ option was rejected");
+        NS_TEST_ASSERT_MSG_EQ(received.GetRreq().compr, 8, "Wrong Compr");
+        NS_TEST_ASSERT_MSG_EQ(received.GetRreq().addressVector.size(), 1, "Wrong vector size");
+        NS_TEST_ASSERT_MSG_EQ(received.GetRreq().addressVector[0],
+                              Ipv6Address("2001:1::aabb:ccdd:eeff:1"),
+                              "The DODAGID's first 8 octets were not prepended correctly");
+        NS_TEST_ASSERT_MSG_EQ(received.GetRank(), 256, "The option ate part of the base object");
     }
 }
 
@@ -9852,6 +9960,7 @@ RplTestSuite::RplTestSuite()
 {
     AddTestCase(new RplDisHeaderTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDioHeaderTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplAodvComprMixedAddressVectorTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDioBoundaryTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDioUnknownOptionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDioTruncatedOptionTestCase, TestCase::Duration::QUICK);

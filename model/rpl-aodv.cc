@@ -235,15 +235,11 @@ RplRoutingProtocol::ShouldRefuseAodvRreq(const RplDioHeader& dio, Ipv6Address fr
         return true;
     }
 
-    // Compr is only ever sent as 0 here, and a nonzero one would mean the
-    // Address Vector's entries have had prefix octets elided that this
-    // implementation never puts back.
-    if (rreq.compr != 0)
-    {
-        NS_LOG_LOGIC("Refusing an RREQ with Compr " << +rreq.compr
-                                                    << ": address elision is not implemented");
-        return true;
-    }
+    // No Compr check here: RplDioHeader::Deserialize() already reconstructs
+    // full addresses from whatever Compr the sender used (RFC 9854 section
+    // 4.1's "elided octets are shared with the IPv6 address in the
+    // DODAGID"), so rreq.addressVector below is always full addresses
+    // regardless of what was actually on the wire.
 
     // RFC 9854 section 6.2.1: "When H=0 in the incoming RREQ, the router
     // MUST drop the RREQ-DIO if one of its addresses is present in the
@@ -500,7 +496,8 @@ RplRoutingProtocol::SendAodvRrep(DodagMembership& dodag, DodagKey key)
     RplDioHeader::RrepOption option;
     option.gratuitous = false; // section 7's Gratuitous RREP is out of scope
     option.hopByHop = false;   // "MUST be set to be the same as the H bit in the RREQ option"
-    option.compr = 0;
+    // compr left at its default: RplDioHeader::Serialize() computes its own
+    // from the addresses below and m_dodagId, ignoring this field.
     option.lifetime = dodag.aodv.lifetimeField;
     option.rankLimit = dodag.aodv.rankLimit;
     option.delta = 0;
@@ -547,11 +544,14 @@ RplRoutingProtocol::HandleAodvRrep(const RplDioHeader& dio, Ipv6Address from, ui
         NS_LOG_WARN("Dropping an RREP-DIO with no ART option");
         return;
     }
-    if (rrep.hopByHop || rrep.compr != 0)
+    if (rrep.hopByHop)
     {
-        NS_LOG_LOGIC("Dropping an RREP asking for hop-by-hop routing or address elision");
+        NS_LOG_LOGIC("Dropping an RREP asking for hop-by-hop routing");
         return;
     }
+    // No Compr check here, matching ShouldRefuseAodvRreq(): rrep.addressVector
+    // is already full addresses regardless of what Compr the wire used (@see
+    // RplDioHeader::Deserialize()).
 
     // Section 6.3.3 in reverse: the RREQ-InstanceID is the RREP's own
     // RPLInstanceID less Delta, wrapping the way the addition did.

@@ -987,7 +987,8 @@ RplRoutingProtocol::SendDio(DodagMembership& dodag, Ipv6Address dst, uint32_t in
         RplDioHeader::RreqOption rreq;
         rreq.symmetric = dodag.aodv.symmetric;
         rreq.hopByHop = false; // source routed; H=1 is out of scope
-        rreq.compr = 0;        // no prefix elision
+        // compr left at its default: RplDioHeader::Serialize() computes its
+        // own from the addresses below and this DIO's own DODAGID.
         rreq.lifetime = dodag.aodv.lifetimeField;
         rreq.rankLimit = dodag.aodv.rankLimit;
         rreq.origSeqNo = dodag.aodv.origSeqNo;

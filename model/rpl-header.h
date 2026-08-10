@@ -357,14 +357,23 @@ class RplDioHeader : public Header
      *
      * The Address Vector accumulates, hop by hop on the way out, the route
      * the RREQ-DIO has taken (RFC 9854 section 6.2.5), OrigNode-side first.
-     * Its entries are full 128-bit addresses: this implementation always
-     * sends Compr == 0, so no prefix octets are ever elided.
+     * addressVector here always holds full 128-bit addresses regardless of
+     * what came off (or goes onto) the wire: Serialize() computes its own
+     * Compr fresh from the addresses and the DODAGID (@see
+     * RplDioHeader::ElidedPrefixLength()) and Deserialize() reconstructs
+     * full addresses before this struct is ever populated, the same
+     * "compressed only on the wire" contract RplSourceRoutingHeader's
+     * Cmpri()/Cmpre() keep for the Routing Header's own addresses.
      */
     struct RreqOption
     {
         bool symmetric{true};   //!< 'S': the route so far is symmetric (section 5)
         bool hopByHop{false};   //!< 'H': 1 hop-by-hop, 0 source routed
-        uint8_t compr{0};       //!< 'Compr', 4 bits: elided prefix octets
+        /// 'Compr', 4 bits: elided prefix octets. Read from the wire on
+        /// Deserialize(); Serialize() ignores this and computes its own,
+        /// so setting it before calling SetRreq() has no effect on what is
+        /// sent (@see RplDioHeader::ElidedPrefixLength()).
+        uint8_t compr{0};
         uint8_t lifetime{0};    //!< 'L', 2 bits: @see RplAodvLifetimeSeconds()
         uint8_t rankLimit{0};   //!< 'RankLimit', 7 bits, 0 meaning no limit
         uint8_t origSeqNo{0};   //!< 'Orig SeqNo': the OrigNode's Sequence Number
@@ -382,7 +391,9 @@ class RplDioHeader : public Header
     {
         bool gratuitous{false}; //!< 'G': a Gratuitous RREP (section 7)
         bool hopByHop{false};   //!< 'H', matching the RREQ's own
-        uint8_t compr{0};       //!< 'Compr', 4 bits
+        /// 'Compr', 4 bits. Same Serialize()-computes-its-own-value
+        /// contract as RreqOption::compr.
+        uint8_t compr{0};
         uint8_t lifetime{0};    //!< 'L', 2 bits
         uint8_t rankLimit{0};   //!< 'RankLimit', 7 bits, 0 meaning no limit
         uint8_t delta{0};       //!< 'Delta', 6 bits: RREP-InstanceID - RREQ-InstanceID
@@ -500,9 +511,9 @@ class RplDioHeader : public Header
     static constexpr uint8_t PREFIX_INFO_OPTION_LENGTH = PREFIX_INFO_OPTION_SIZE - 2;
     static constexpr uint8_t PREFIX_INFO_L_FLAG = 0x80; //!< 'L' (on-link) flag
     static constexpr uint8_t PREFIX_INFO_A_FLAG = 0x40; //!< 'A' (autonomous) flag
-    /// Bytes one Address Vector entry takes on the wire. Sixteen, not
-    /// 16 - Compr: this implementation always sends Compr == 0 (@see
-    /// RreqOption) and refuses to parse a nonzero one.
+    /// An uncompressed Address Vector entry's size on the wire; an actual
+    /// entry, after Compr elision, is this minus ElidedPrefixLength()'s
+    /// result. Also AODV_ADDRESS_VECTOR_MAX_ENTRIES' own unit.
     static constexpr uint8_t AODV_ADDRESS_VECTOR_ENTRY_SIZE = 16;
     /// The part of the RREQ option's length field that is there whatever the
     /// Address Vector holds: the two octets carrying S/H/X/Compr/L/RankLimit,
@@ -523,6 +534,24 @@ class RplDioHeader : public Header
     static constexpr uint8_t AODV_LIFETIME_HIGH_BIT = 0x01;
     /// Mask of the 'L' field's low bit in the second octet.
     static constexpr uint8_t AODV_LIFETIME_LOW_BIT = 0x80;
+
+    /**
+     * @brief How many leading octets an RREQ/RREP Address Vector can elide.
+     *
+     * RFC 9854 sections 4.1/4.2: "the octets elided are shared with the
+     * IPv6 address in the DODAGID". Mirrors RplSourceRoutingHeader::
+     * Cmpri()/Cmpre() (@see design-constraints.md section 16): computed
+     * fresh from the current addresses on every call rather than cached,
+     * and a plain 0-or-8 choice -- an Address Vector entry and m_dodagId
+     * are always global addresses under this simulation's one shared
+     * prefix, so either every entry shares its first 8 octets with
+     * m_dodagId or none usefully do.
+     *
+     * @param addressVector the Address Vector about to be serialized
+     * @return 8 if every entry shares its first 8 octets with m_dodagId, 0
+     *         otherwise (including when addressVector is empty)
+     */
+    uint8_t ElidedPrefixLength(const std::vector<Ipv6Address>& addressVector) const;
 
     uint8_t m_instanceId;    //!< RPLInstanceID
     uint8_t m_versionNumber; //!< DODAG version number
