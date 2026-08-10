@@ -476,9 +476,9 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     Ipv6Address GetGlobalAddress() const;
 
     // AODV-RPL (RFC 9854). Implemented in model/rpl-aodv.cc, not
-    // model/rpl-routing-protocol.cc. Scoped to source-routed symmetric
-    // discovery (H=0, S=1) for a single target; @see design-constraints.md
-    // for what that leaves out and why.
+    // model/rpl-routing-protocol.cc. Scoped to source-routed discovery
+    // (H=0) for a single target, symmetric or asymmetric; @see
+    // design-constraints.md for what that leaves out and why.
 
     /**
      * @brief Start an AODV-RPL route discovery towards a target.

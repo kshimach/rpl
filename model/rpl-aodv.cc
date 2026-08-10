@@ -11,7 +11,9 @@
  * rpl-routing-protocol.cc is already some three thousand lines. @see
  * design-constraints.md.
  *
- * Scope: source-routed (H=0), symmetric (S=1) discovery for a single target.
+ * Scope: source-routed (H=0) discovery for a single target, symmetric (S=1)
+ * or asymmetric (S=0). Hop-by-hop routes (H=1) need storing mode, which
+ * this module does not have at all. @see design-constraints.md.
  */
 
 #include "rpl-conf.h"

@@ -3270,7 +3270,11 @@ RPI 付与部分と `FindDodagByInstance()`/`ReadRpiInstanceId()` の
 `./test.py -s rpl` 相当 (60 件) を 5 回連続実行して全件安定して PASS
 することを確認、4 つの既存シナリオも 0% packet loss を維持。
 
-## 35. AODV-RPL (RFC 9854) を H=0/S=1・単一ターゲットで実装
+## 35. AODV-RPL (RFC 9854) を H=0・単一ターゲットで実装
+
+> 節の見出しはもともと「H=0/S=1・単一ターゲット」だった。S=0 (非対称) は
+> §35.16 で後から実装したので、S=1 の限定は現在の記述には当てはまらない。
+> 以下 §35.1〜§35.8 は当初の S=1 のみの実装を記録したものとして読むこと。
 
 30.4 節が挙げた優先順位のうち「マルチインスタンス対応」(31/32 節) と
 その中継一般化 (34 節) が済んだので、同節が次の着手先とした AODV-RPL の
@@ -3309,8 +3313,9 @@ DODAG 形成が不要になる。
   テーブルが必須。このモジュールには存在しない (30.4 節も「storing mode
   完了後」としていた)。受信側は `ShouldRefuseAodvRreq()` で H=1 の RREQ を
   明示的に拒否する (中途半端に扱わない)。
-- **S=0 (非対称)**: TargNode が自分を root とする 2 つ目の DODAG
-  (RREP-Instance) を建てて RREP を flood する必要がある。
+- ~~**S=0 (非対称)**: TargNode が自分を root とする 2 つ目の DODAG
+  (RREP-Instance) を建てて RREP を flood する必要がある。~~
+  後日 §35.16 で実装した。
 - **Gratuitous RREP (§7)**: MAY。
 - **複数 ART / §6.2.2 のターゲット集合の積集合ロジック**。
 - ~~**Compr (アドレス省略)**: 送信は常に 0、受信も 0 以外は拒否。~~
@@ -3816,3 +3821,108 @@ Compr を自分で計算し直す新しい契約と矛盾するため)。
 `./ns3 run` し、圧縮が実際に効いた状態でも AODV-RPL 経路探索が
 問題なく完了することを確認した (RREQ/RREP が実際に圧縮された
 ワイヤを流れる、この節で最初に動かした唯一の end-to-end 確認)。
+
+### 35.16 S=0 (非対称経路) を実装 — AODV-RPL 残件の最後
+
+§35.11 で立てた残件リストの 6 番目、最後の項目。S=1 では TargNode が
+RREQ の Address Vector に沿って RREP を unicast し、RREP 用の DODAG は
+建てない (§6.3.1)。S=0 では往路をそのまま復路に使えないので、TargNode が
+**自分を root とする 2 つ目の DODAG (RREP-Instance)** を建てて RREP-DIO を
+multicast で flood し、中継ノードがそれに join しながら**RREP 自身の
+Address Vector** を積み上げる (§6.3.2 / §6.4)。コミットは 4 つ:
+`f0e1efa` (S ビットを落とす属性)、`bf4976f` (TargNode の RREP-Instance
+形成と flood)、`aab12a8` (中継の join と AV 積み上げ)、`dc0a019`
+(OrigNode での経路確定)。
+
+#### リンク非対称の検出は実装できない — 属性で代替した
+
+RFC §5 自身が判定基準を scope 外と明記しているが、それ以前に**この
+モジュールでは付録 A の例示手法が実装不能**であることを確認した:
+
+- `LinkEtxFromPacket()` は受信パケットの `LrWpanLqiTag` から ETX を導出
+- `LinkLqlFromPacket()` は受信パケットの `LrWpanRssiTag` から LQL を導出
+- 送信側メトリック (ACK/再送回数ベース) はモジュールに存在しない
+
+付録 A は「送信方向 ETX」と「受信 RSSI から推定した受信方向 ETX」を
+比較する手法だが、このモジュールの 2 つの指標はどちらも受信方向を
+測っており、比較しても非対称性は分からない。
+
+そこで `AodvForceAsymmetric` 属性 (既定 false) を追加し、true の
+ルータが伝播する RREQ の S ビットを無条件に 0 に落とすようにした。
+RFC が判定基準を実装依存としている以上この選択自体は準拠の範囲内で、
+これが無いと S=0 の経路は純 ns-3 シミュレーション内で到達不能な
+コードパスになる (他実装から S=0 が届く場合しか動かない)。既定
+false なので既存シナリオの挙動は一切変わらない。
+
+なお OrigNode 自身は常に S=1 で発信する (§6.1 がそう定めている) —
+S を落とすのは中継ルータの役割で、OrigNode の属性値は自分の RREQ には
+影響しない。
+
+#### 対称/非対称の判別は「どう届いたか」で行う (実装中に方針変更)
+
+RREP オプションには S ビットが無い ('G' は Gratuitous 用で別物) ので、
+受信側は何かで対称/非対称を判別する必要がある。当初は**対になる
+RREQ-Instance に記録済みの `aodv.symmetric` を引く**設計にしたが、
+これは 1 ノードだけで破綻する: **OrigNode の値は常に true**。§6.1 に
+より OrigNode は S=1 で発信し、S を落とすのは下流のルータだけなので、
+OrigNode 自身の記録は更新されない。結果、RREP-DIO が OrigNode に
+届いた時点で symmetric 扱いされ、join 経路へ落ちずに終わる。
+
+増分 3 のテストが「中継 2 台は全て PASS、OrigNode の assertion だけ
+FAIL」という形で顕在化させた。判別基準を**受信時の宛先が multicast
+だったか**に変更した — これは RFC 自身が両者を区別している当の要素
+(§6.3.1 は next hop への unicast、§6.3.2 は all-AODV-RPL-nodes への
+multicast) であり、OrigNode でも正しく効く。`HandleDio()` に
+`toMulticast` 引数を追加した。`HandleDis()` が既に
+`ipv6Header.GetDestination().IsMulticast()` を受け取っていたので、
+ファイル内の既存の流儀にも合っている。
+
+#### Address Vector の向きが逆になる
+
+今回いちばん間違えやすい点。S=1 の AV は RREQ が OrigNode 側から
+積み上げたものをそのまま持ち帰るので、OrigNode はそのまま使える
+(§4.2)。S=0 の AV は RREP の flood が**逆向きに**積み上げたものなので、
+OrigNode に届いた時点で `[relay2, relay1, orig]` (TargNode 側が先頭)。
+`AodvRoute::hops` の規約は「OrigNode から見て外向き、TargNode が末尾」
+なので、**自分自身の末尾エントリを除いて逆順にし、TargNode を末尾に
+足す** → `[relay1, relay2, targ]`。
+
+逆順にして良い根拠は、これが RREP-Instance だから: 各ルータは
+「TargNode 方向のリンクが OF を満たす」ことを条件に join している
+(§6.4.1) ので、その向きこそデータが流れる向きになる。
+
+回帰テスト `RplAodvAsymmetricRouteCompletesTestCase` は hops の中身だけ
+でなく**実際に UDP を流して届くこと**まで確認する — 逆順に格納しても
+エントリ数 3 の「もっともらしい経路」にはなるので、送ってみないと
+区別できない。逆順ループを外すと hop の assertion が入れ替わり
+`m_delivered` が 0 になることを確認済み。
+
+#### §6.4.1 の「AV に自分がいたら破棄」がここで初めて意味を持つ
+
+§35.9 で「S=1 には適用しない」と判断した規定 (S=1 の AV は RREQ が
+積んだもので、構成上どの中継ノードも必ず含まれるため、字義どおり
+適用すると復路 1 ホップ目で必ず破棄されてしまう) を、S=0 では
+**適用する**。S=0 の AV は RREP 自身が flood しながら積んだものなので、
+そこに自分がいる = ループ。当時の「これは非対称ケースのループ検出の
+ための規定と読むのが唯一整合する」という判断がそのまま裏付けられた形。
+
+#### スコープ外 (この節でも実装しなかったもの)
+
+- **リンク非対称の自動検出**: 上記の通り実装不能。
+- **RREP_WAIT_TIME (§6.3)**: 「より良い rank の経路を待つ」ための
+  遅延。MAY であり正しさには影響しない。
+- **RREQ-Instance に属さないノードへの RREP flood**: RREP-DIO を
+  受け取っても対になる RREQ-Instance を知らないノードは、従来どおり
+  破棄する。RREQ が flood した範囲＝ OrigNode と TargNode の間の
+  ノード集合なので実害は無く、flood 範囲を限定する効果もある。
+- **H=1** は従来通り対象外 (storing mode 依存)。
+
+#### 検証
+
+`RplAodvForcedAsymmetricSBitTestCase` (S ビットの伝播、cleared が
+下流で維持されること)、`RplAodvAsymmetricRrepInstanceTestCase`
+(TargNode が RREP-Instance を建てる・Delta ペアリング・multicast に
+出る)、`RplAodvAsymmetricRrepFloodTestCase` (中継の join と AV の
+積み上がり順)、`RplAodvAsymmetricRouteCompletesTestCase`
+(逆順格納と end-to-end 疎通) の 4 件を追加。各増分で「修正を外すと
+落ちる」ことを確認済み。全件 PASS (3 回連続)。
