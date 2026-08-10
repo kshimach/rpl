@@ -3906,6 +3906,34 @@ OrigNode に届いた時点で `[relay2, relay1, orig]` (TargNode 側が先頭)�
 そこに自分がいる = ループ。当時の「これは非対称ケースのループ検出の
 ための規定と読むのが唯一整合する」という判断がそのまま裏付けられた形。
 
+#### REJOIN_REENABLE を RREP-Instance にも効かせる (実装後の監査で発見)
+
+4 増分すべて通った後、「RREQ-Instance には REJOIN_REENABLE と
+『自分が root のインスタンスを拒否』の 2 つのガードがあるのに、
+RREP-Instance の join 経路には無い」ことに気づいた。§35.10 の
+クラッシュと同じ形の穴に見えたので、推測で塞がずに**再現テストを
+書いて確かめた**。
+
+最初に書いた「L 期限後に全ノードが RREP-Instance を離れる」という
+確認は**そのまま PASS してしまった** — 4 ノード線形では全ノードの
+expiry がミリ秒差で揃うため、flood が自然消滅して拒否ロジックが
+一度も試されない。そこで、全員が離れた後に**架空の隣接ノードから
+RREP-DIO を 1 通注入する**確認を足したところ、TargNode が自分が
+root だった RREP-Instance に**ただの一般ノードとして再 join する**
+ことを確認できた (`actual="1" limit="0"`)。穴は実在した。
+
+**修正**: 2 つのガードを `ShouldRefuseAodvInstance(key, from)` に
+括り出し、`ShouldRefuseAodvRreq()` と `HandleDio()` の RREP 経路の
+両方から呼ぶようにした。`HandleDio()` の `isRoot` チェックは
+membership が**存在する間**しか効かない (LeaveDodag() が消した後は
+`m_dodags.find()` が空振りする) ので、期限切れ後の窓を塞ぐのは
+この「自分のアドレスが DODAGID なら拒否」の方。
+
+§35.10 のクラッシュ自体は既にグローバルに修正済み (`m_disTimer` を
+root でも必ず arm する) なので今回は実害がクラッシュではなく無駄な
+flood に留まるが、同じ穴を 2 つ目の instance 種別で開けたまま残す
+理由も無い。
+
 #### スコープ外 (この節でも実装しなかったもの)
 
 - **リンク非対称の自動検出**: 上記の通り実装不能。

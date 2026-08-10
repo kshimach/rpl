@@ -5618,6 +5618,85 @@ RplAodvAsymmetricRrepFloodTestCase::DoRun()
     NS_TEST_ASSERT_MSG_EQ(relay1->IsJoined(), true, "The base DODAG membership was lost");
     NS_TEST_ASSERT_MSG_EQ(relay1->GetDodagId(), origAddress, "The base DODAG's DODAGID changed");
 
+    // The 'L' field takes everyone back out of the RREP-Instance too, and
+    // REJOIN_REENABLE has to keep them out: neighbours are still
+    // Trickle-pacing RREP-DIOs for it as each node's own deadline passes, so
+    // without the bar they rejoin immediately and the instance never dies.
+    // The TargNode is the worst case, exactly as the OrigNode is on the RREQ
+    // side -- once its own membership is erased, nothing else stops it
+    // rejoining a DODAG rooted at its own address as an ordinary member
+    // (@see design-constraints.md section 35.10 for what that led to there).
+    Simulator::Stop(Seconds(30));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(relay2->IsJoinedTo(rrepKey.instanceId, rrepKey.dodagId),
+                          false,
+                          "relay2 stayed in the RREP-Instance past its 'L' deadline");
+    NS_TEST_ASSERT_MSG_EQ(relay1->IsJoinedTo(rrepKey.instanceId, rrepKey.dodagId),
+                          false,
+                          "relay1 stayed in the RREP-Instance past its 'L' deadline");
+    NS_TEST_ASSERT_MSG_EQ(orig->IsJoinedTo(rrepKey.instanceId, rrepKey.dodagId),
+                          false,
+                          "The OrigNode stayed in the RREP-Instance past its 'L' deadline");
+    NS_TEST_ASSERT_MSG_EQ(targ->IsJoinedTo(rrepKey.instanceId, rrepKey.dodagId),
+                          false,
+                          "The TargNode stayed in its own RREP-Instance past its 'L' deadline");
+
+    // Only the base DODAG should be left anywhere.
+    NS_TEST_ASSERT_MSG_EQ(targ->GetDodagCount(), 1, "The TargNode holds more than the base DODAG");
+    NS_TEST_ASSERT_MSG_EQ(relay1->GetDodagCount(), 1, "relay1 holds more than the base DODAG");
+    NS_TEST_ASSERT_MSG_EQ(orig->IsJoined(), true, "The OrigNode lost its base DODAG");
+
+    // A straggler RREP-DIO for the instance everyone has just left. Every
+    // node above expired within milliseconds of each other, so the flood
+    // died out on its own rather than by anything refusing it; this puts
+    // the refusal itself under test. Delivered straight in, addressed to
+    // all-RPL-nodes so it reads as the section 6.3.2 flood it would be
+    // (@see the ns3-debug-pitfalls note on why injection beats a real send
+    // for this), and sourced from a fabricated neighbour so nothing else
+    // has to be kept alive to produce it.
+    RplDioHeader straggler;
+    straggler.SetInstanceId(rrepKey.instanceId);
+    straggler.SetVersionNumber(0);
+    straggler.SetRank(RPL_MIN_HOPRANKINC);
+    straggler.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+    straggler.SetDodagId(rrepKey.dodagId); // the TargNode's own address
+    straggler.SetDtsn(0);
+    straggler.SetDagConfiguration(0,
+                                  8,
+                                  RPL_DIO_REDUNDANCY,
+                                  RPL_MAX_RANKINC,
+                                  RPL_MIN_HOPRANKINC,
+                                  RPL_OCP_OF0,
+                                  RPL_DEFAULT_LIFETIME,
+                                  RPL_DEFAULT_LIFETIME_UNIT);
+    RplDioHeader::RrepOption stragglerRrep;
+    stragglerRrep.gratuitous = false;
+    stragglerRrep.hopByHop = false;
+    stragglerRrep.lifetime = 1;
+    stragglerRrep.rankLimit = 0;
+    stragglerRrep.delta = static_cast<uint8_t>(rrepKey.instanceId - rreqKey.instanceId);
+    stragglerRrep.addressVector = {};
+    straggler.SetRrep(stragglerRrep);
+    RplDioHeader::ArtOption stragglerArt;
+    stragglerArt.destSeqNo = 1;
+    stragglerArt.prefixLength = 0;
+    stragglerArt.target = origAddress;
+    straggler.SetArt(stragglerArt);
+
+    DeliverRawRplMessage<RplDioHeader>(nodes.Get(3),
+                                       1,
+                                       straggler,
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       Ipv6Address("fe80::c0ff:ee"),
+                                       Ipv6Address(RPL_ALL_NODES_MULTICAST));
+
+    NS_TEST_ASSERT_MSG_EQ(targ->IsJoinedTo(rrepKey.instanceId, rrepKey.dodagId),
+                          false,
+                          "The TargNode rejoined its own former RREP-Instance as an ordinary "
+                          "member: REJOIN_REENABLE (RFC 9854 section 4.1) has to bar an "
+                          "RREP-Instance the same way it bars an RREQ-Instance");
+
     Simulator::Destroy();
 }
 

@@ -195,35 +195,50 @@ RplRoutingProtocol::AodvInstanceExpired(DodagKey key)
 }
 
 bool
+RplRoutingProtocol::ShouldRefuseAodvInstance(DodagKey key, Ipv6Address from) const
+{
+    // RFC 9854 section 4.1's REJOIN_REENABLE. This is what actually ends a
+    // discovery: a node that has served out its 'L' field is still
+    // surrounded by neighbours Trickle-pacing the same DIO, and without this
+    // it rejoins at once and the instance never dies. The node that rooted
+    // the instance is the worst case -- it would rejoin its own discovery as
+    // an ordinary member, take a preferred parent in a DODAG rooted at
+    // itself, and route its own DODAGID away from itself.
+    // Expired entries are swept by the callers' non-const counterparts;
+    // this only reads.
+    auto blocked = m_aodvRejoinBlocked.find(key);
+    if (blocked != m_aodvRejoinBlocked.end() && Simulator::Now() < blocked->second)
+    {
+        NS_LOG_LOGIC("Refusing instance " << +key.instanceId << " at " << key.dodagId
+                                          << ", left too recently to rejoin");
+        return true;
+    }
+
+    // A DIO naming this node as the instance's own root, heard back from a
+    // neighbour propagating it. Refused even before the instance expires:
+    // joining a DODAG rooted at this node's own address would make it a
+    // member of its own discovery. (While the membership still exists
+    // HandleDio()'s isRoot check catches this first; this is what covers
+    // the window after it has been erased.)
+    if (IsOwnAddress(key.dodagId))
+    {
+        NS_LOG_LOGIC("Refusing this node's own instance, heard back from " << from);
+        return true;
+    }
+
+    return false;
+}
+
+bool
 RplRoutingProtocol::ShouldRefuseAodvRreq(const RplDioHeader& dio, Ipv6Address from) const
 {
     const RplDioHeader::RreqOption& rreq = dio.GetRreq();
     DodagKey key{dio.GetInstanceId(), dio.GetDodagId()};
 
-    // RFC 9854 section 4.1's REJOIN_REENABLE. This is what actually ends a
-    // discovery: a node that has served out its 'L' field is still
-    // surrounded by neighbours Trickle-pacing the same RREQ-DIO, and
-    // without this it rejoins at once and the instance never dies. The
-    // OrigNode is the worst case -- it would rejoin its own discovery as an
-    // ordinary member, take a preferred parent in a DODAG rooted at itself,
-    // and route its own DODAGID away from itself.
-    // Expired entries are swept in HandleAodvRreq(), which is not const;
-    // this only reads.
-    auto blocked = m_aodvRejoinBlocked.find(key);
-    if (blocked != m_aodvRejoinBlocked.end() && Simulator::Now() < blocked->second)
+    // The two checks an RREQ-Instance and an RREP-Instance need alike: the
+    // rejoin bar, and this node's own instance heard back.
+    if (ShouldRefuseAodvInstance(key, from))
     {
-        NS_LOG_LOGIC("Refusing an RREQ for instance " << +key.instanceId << " at " << key.dodagId
-                                                      << ", left too recently to rejoin");
-        return true;
-    }
-
-    // An RREQ-DIO naming this node as the OrigNode, heard back from a
-    // neighbour propagating it. Refused even before the instance expires:
-    // joining a DODAG rooted at this node's own address would make it a
-    // member of its own discovery.
-    if (IsOwnAddress(dio.GetDodagId()))
-    {
-        NS_LOG_LOGIC("Refusing this node's own RREQ, heard back from " << from);
         return true;
     }
 
@@ -789,6 +804,11 @@ RplRoutingProtocol::HandleAodvRrepInstance(const RplDioHeader& dio,
     NS_LOG_FUNCTION(this << from << interface);
 
     DodagKey key{dio.GetInstanceId(), dio.GetDodagId()};
+
+    // The rejoin bar for this key has run out, or HandleDio() would not have
+    // let the join through. Dropping it here keeps the map from growing
+    // without bound, the same way HandleAodvRreq() does for its own.
+    m_aodvRejoinBlocked.erase(key);
 
     auto it = m_dodags.find(key);
     if (it == m_dodags.end())

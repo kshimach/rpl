@@ -1237,6 +1237,17 @@ RplRoutingProtocol::HandleDio(const RplDioHeader& dio,
         return;
     }
 
+    // An asymmetric RREP-Instance needs the same rejoin bar for the same
+    // reason, and equally has to have it before the join: once its own
+    // membership has been erased at its 'L' deadline, nothing else stops a
+    // TargNode being pulled back into a DODAG rooted at its own address by
+    // a straggling RREP-DIO -- the isRoot check above only covers the
+    // window while the membership still exists.
+    if (dio.HasRrep() && ShouldRefuseAodvInstance(dioKey, from))
+    {
+        return;
+    }
+
     auto existingIt = m_dodags.find(dioKey);
     DodagMembership* existing = existingIt != m_dodags.end() ? &existingIt->second : nullptr;
 

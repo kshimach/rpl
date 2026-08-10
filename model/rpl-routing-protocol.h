@@ -869,6 +869,21 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     bool ShouldRefuseAodvRreq(const RplDioHeader& dio, Ipv6Address from) const;
 
     /**
+     * @brief The refusals an RREQ-Instance and an RREP-Instance share.
+     *
+     * RFC 9854 section 4.1's REJOIN_REENABLE bar, plus a DIO for an instance
+     * this node itself rooted heard back from a neighbour. Both matter to
+     * either kind of instance, and both cover the same window: after the
+     * membership has been erased at its 'L' deadline, when HandleDio()'s own
+     * isRoot check no longer has anything to look at.
+     *
+     * @param key the instance's key
+     * @param from the link-local address of the neighbour that sent the DIO
+     * @return true if the DIO must be dropped without joining
+     */
+    bool ShouldRefuseAodvInstance(DodagKey key, Ipv6Address from) const;
+
+    /**
      * @brief Act on an RREP-DIO travelling back towards the OrigNode.
      *
      * Never joined as a DODAG: on a symmetric route "the DODAG in
