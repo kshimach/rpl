@@ -4025,3 +4025,190 @@ RREP-Instance ... rooted at itself」— RREP-Instance は RREQ-Instance
 知っているか」は条件に無い。つまり実装は最初から RFC に忠実で、
 記述の方を直せば済む問題だった。誤った記述を削除し、この節に
 訂正として残す。
+
+## 36. P2P-RPL (RFC 6997) を H=0・単一 Target で実装
+
+§30/§35.1 で「AODV-RPL の方が新規メッセージ型 0 個で実装量が明確に
+少ないので先に着手する」と判断した、その次の項目。AODV-RPL
+(§35.11〜§35.17) が完了したのを受けて着手した。P2P-RPL は新規
+ICMPv6 メッセージ型を 2 個要求する (P2P-DRO・P2P-DRO-ACK) が、今回
+実装したのは P2P-DRO まで — P2P-DRO-ACK と、それが要る A/S フラグは
+見送った。コミットは 4 つ: 増分1 (P2P-RDO ワイヤフォーマットと
+P2P-DRO メッセージ)、増分2 (`DiscoverP2pRoute()` — Origin の一時
+DAG 形成と flood 開始)、増分3 (`HandleDio()` の P2P 分岐と
+`ShouldRefuseP2pRdo()` — flood と Target 認識)、増分4+5+6
+(`SendP2pDro()`・`HandleP2pDro()` — Target の応答生成、中継、
+Origin での経路確定と end-to-end 疎通、まとめて 2 コミット)。
+
+### 36.1 MOP=4 を AODV-RPL と共有する設計 (§35.3 (C) で既に確認済み)
+
+RFC 9854 冒頭: "AODV-RPL uses the 'P2P Route Discovery Mode of
+Operation' (MOP == 4) ... there is no conflict with P2P-RPL, a
+previous document using the same MOP." — P2P-RPL と AODV-RPL は同じ
+MOP 値を、別のオプション型 (P2P-RDO は 0x0a、AODV-RPL の RREQ/RREP/ART
+は 0x0B/0x0C/0x0D) で区別しながら共存する設計になっている。実装は
+`HandleDio()` の `dio.HasP2pRdo()`/`dio.HasRreq()`/`dio.HasRrep()`
+という排他的な分岐でこれをそのまま反映した。マルチキャストグループも
+共有 (`ff02::1a`, `RPL_ALL_NODES_MULTICAST`) — §35.3 (C) で AODV-RPL
+側が既に「別グループを求めた本来の目的は受信側の MOP 判定 + 新
+オプション型で達成される」と判断しており、今回はその設計が実際に
+機能することを P2P-RPL 側からも確認した形になる。
+
+### 36.2 スコープ
+
+**含めた**: H=0 (Source Route) のみ、Target 1 個、N=0 (経路 1 本のみ)、
+R は受信した値をそのまま尊重 (Origin 役としては常に R=1 を送る)。
+
+**見送った** (AODV-RPL の H=1 見送りと同じ理由 — この段階から把握
+していたので、AODV-RPL のときのように後から見つけて追加増分で塞ぐ
+のではなく最初から対象外にできた):
+
+- **H=1 (Hop-by-hop Route)**: §9.6 が要求する「経路ごとの転送状態を
+  中継ルータに保存する」という、この モジュールに全く無い
+  storing-mode 相当の新規サブシステムを要求する。
+- **複数 Target (RPL Target Option)・複数 Source Route (N>0)**:
+  AODV-RPL の複数 ART 見送り (§35.14) と同型の判断。
+- **P2P-DRO-ACK (code 0x05) と Target 側の再送**
+  (`P2P_DRO_ACK_WAIT_TIME`/`MAX_P2P_DRO_RETRANSMISSIONS`)、**Stop (S)
+  フラグによる早期終了**: DAO-ACK の再送機構
+  (`daoRetryEvent`/`daoRetriesLeft`)を転用できる見込みは計画段階で
+  立てたが、今回は未着手。
+- **Metric Container による制約**: OF0 の rank (MaxRank) 制約のみ
+  対応。RFC 自身が「OF0 なら Metric Container 不要」と明記している。
+- **Secure P2P-RPL 一式**、**双方向到達性の実測判定 (§9.3 の
+  SHOULD)**: 後者は AODV-RPL のリンク非対称検出と同じ理由 (受信方向の
+  指標しか持たない) で実装不能と確認済み。
+
+### 36.3 P2P-RDO のシリアライズを共有関数に切り出した
+
+P2P-RDO (§7) は P2P mode DIO と P2P-DRO の**両方**が運ぶ唯一の
+オプション ("A P2P mode DIO and a P2P-DRO message MUST carry exactly
+one P2P-RDO")。AODV-RPL の RREQ/RREP/ART はいずれも DIO の中だけで
+完結するのに対し、P2P-RDO は 2 種類の別々のメッセージクラス
+(`RplDioHeader`・新設 `RplP2pDroHeader`) から使われる。Compr 計算・
+Address Vector の長さ計算をクラスごとに複製すると、このモジュールが
+実際に複数回踏んだ「宣言長と実体の食い違い」系のバグ (design-
+constraints.md 各所) を再現しかねないので、`P2pRdoOption` 構造体と
+`P2pRdoSerializedSize()`/`P2pRdoSerialize()`/`P2pRdoDeserialize()`を
+名前空間スコープの自由関数として 1 か所だけに実装し、両クラスから
+呼ぶ設計にした。
+
+ビット幅は RFC の図を文字数で座標計算して確認した (§35.3 (A) の
+RankLimit 7/8 ビット食い違いを見つけたのと同じ手法) — MaxRank/NH は
+AODV-RPL の RankLimit (7 ビット) と違って **6 ビット**、P2P-RDO の
+Address Vector 最大エントリ数も AODV-RPL の 15 (`AODV_ADDRESS_
+VECTOR_MAX_ENTRIES`) と違って **14** (`RPL_P2P_ADDRESS_VECTOR_MAX_
+ENTRIES`) — P2P-RDO は TargetAddr を ART のような別オプションでなく
+同じオプション内に持つので、固定部が 1 エントリ分広い。
+
+### 36.4 P2P-DRO の Address Vector は Target 自身を含まない — AODV-RPL の RREP とは違う除外規則
+
+§8.2: "the Address vector MUST contain a complete route ... such
+that ... the last element contains the IPv6 address of the router
+**next to the Target**" — Target 自身は最後のエントリに含まれない。
+これは AODV-RPL の RREP オプションとは異なる: `SendAodvRrep()`
+(症状的経路, S=1) はコメントで明言している通り「その vector は
+TargNode で終わっており、そのまま送る」で TargNode 自身の末尾
+エントリを**含んだまま**送る (RFC 9854 §4.2 に同種の除外規定が無い)。
+
+Target 自身の `dodag.p2p.addressVector` は
+(中継ルータと同じ流儀で) 自分自身を末尾に追加した状態
+(`[relay1, relay2, targ]`) なので、`SendP2pDro()` はこの末尾 1
+エントリを落として `[relay1, relay2]` を P2P-RDO に積む。この
+トリミングを外す実験をして `RplP2pDroGeneratedTestCase` が
+「末尾エントリが 1 つ多い」形で確実に落ちることを確認済み。
+
+### 36.5 P2P-DRO の中継は「その場で転送」— DIO のように蓄積しない
+
+P2P-DRO の Address Vector は Target が 1 回だけ組み立てた**固定
+スナップショット**で、中継ルータは NH をデクリメントして転送する
+だけ (§9.6 に「追加する」という記述が無い、DIO 側 §9.4 の
+「追加しなければならない」との対比で明らか)。そのため Origin は
+受け取った vector をそのまま (Target を末尾に追加するだけで)
+`AodvRoute`/`P2pRoute::hops` の規約 (「Origin から見て外向き、Target
+が末尾」) として使える — **逆順にする必要が無い**。AODV-RPL の
+非対称 RREP-Instance (§35.16) は逆に flood しながら**蓄積**する
+方式なので OrigNode 側で逆順にする必要があった、その違いがそのまま
+実装の単純さの差になっている。
+
+### 36.6 見つけたバグ・設計修正
+
+- **`P2pDioRedundancy` の既定値を 1 → 0 に変更**: RFC 6997 §9.2 は
+  k=1 を推奨するが、それは「親からの変化の無い再送は consistent
+  でも inconsistent でもない」という §9.2 独自の判定基準を前提に
+  している。このモジュールの汎用 Trickle consistency hit
+  (`HandleDio()`、core RPL・AODV-RPL と共有) は同じ DODAG への
+  DIO を無差別に consistent 扱いするので、k=1 のままだと「親の
+  ただの再送を聞いただけ」でルータ自身の最初の (最も重要な)
+  再送が抑制されてしまう。4 ノード線形の flood テストが 10 秒の
+  予算内に収まらない形で発覚した。この節独自の consistent 判定を
+  実装するのは今回のスコープ外とし、このモジュールの他の Trickle
+  タイマ全部と同じ k=0 (抑制しない) に揃えた。
+- **`P2pDioIntervalDoublings` の既定値を 8 → 4 に変更**:
+  「RFC が Imax を Imin の何桁も上にしろと言っている」という理由で
+  8 にしたが、このモジュールは「同じ preferred parent から届く
+  DIO のたびに 'L' の期限を再アーム (`ArmP2pExpiry()`) する」設計
+  (AODV-RPL の `ArmAodvExpiry()` と同じ流儀) なので、Imax が大きい
+  ほど「ゆっくり成長する Trickle 間隔がストラグラーの再送を
+  ひたすら 'L' の期限に上乗せし続ける」効果が多段中継で複合してしまう。
+  AODV-RPL の `AodvDioIntervalDoublings` と同じ 4 に合わせた。
+- **自分自身の DODAGID を拒否するガードを最初から追加**
+  (`ShouldRefuseP2pRdo()`): RFC 6997 は REJOIN_REENABLE 相当の
+  規定を一切持たないが、「'L' の期限で離脱した後、ストラグラーの
+  DIO が自分自身の temporary DAG に一般メンバーとして引き戻す」
+  というハザードは AODV-RPL が §35.16 の監査で実際に踏んだ穴
+  (`ShouldRefuseAodvInstance()`) と構造的に同一。今回は経験済みの
+  バグなので、監査で見つけ直すのではなく実装時から塞いだ。
+
+### 36.7 テストを書く過程で見つけた、実装ではなくテスト自体の落とし穴 2 件
+
+`RplP2pRouteCompletesTestCase` の 4 ノード線形はチャネルのブラック
+リストのおかげで「複数ルータが同じ P2P-DRO 送信を同時に聞く」場面が
+一度も起きず、NH 位置チェックとループチェックをそれぞれ丸ごと
+無効化しても素通りしてしまう (確認済み)。これを埋めるために単一
+ノード + 捏造パケットで書いた `RplP2pDroRelayTestCase` の作成中に
+以下 2 つを発見・修正した:
+
+- **`NS_TEST_ASSERT_MSG_EQ` はアサーション失敗時に `actual` 式を
+  もう一度評価する** (`src/core/model/test.h`):
+  比較に 1 回、失敗メッセージの組み立てに (ストリームへの `<<`
+  として) もう 1 回。`TryRelay()` は毎回新しい捏造 P2P-DRO を配送し
+  実際に中継送信させることもある副作用付きの関数なので、
+  マクロに直接渡すと**失敗した瞬間に新しい sequence 番号で
+  丸ごと再実行される** — 最初の呼び出しの失敗を報告しようとした
+  瞬間に、全く別の (たまたま成功する) 呼び出しの結果で
+  上書きされてしまい、原因究明が長引いた。`bool relayed = TryRelay(...);`
+  と一度ローカル変数に受けてからアサーションに渡す形に修正。
+  このセッションの他の `TryJoin()`/`TryRelay()` 系テスト
+  (`RplAodvRrepInstanceRankLimitTestCase` 等) も同じ形でマクロに
+  直接渡しているが、それらの副作用は「新しい sequence 番号で
+  無害な別メンバーシップを作るだけ」なので二重評価が結果を
+  変えず、これまで表面化しなかった。
+- **DODAG Configuration option を省略した捏造 DIO で `JoinDodag()`
+  すると Trickle が Imin=0 で暴走する**: `JoinDodag()` は DIO に
+  DODAG Configuration option がある時だけ `dodag.dioIntervalMin`
+  等を上書きする。テストの join 用捏造 DIO にこれを付け忘れると
+  `dodag.dioIntervalMin` が構造体のデフォルト構築値 (ゼロ) の
+  ままになり、Trickle タイマが遅延ゼロで自分自身を再スケジュール
+  し続けて CPU 100% で応答が返らなくなる (テストランナーが
+  シミュレーション時刻を全く進めないまま張り付く形で発覚)。
+  このモジュール自身が送る DIO は `SendDio()` が DODAG
+  Configuration option を無条件に付けるので実際のトラフィックでは
+  絶対に踏まない経路だが、手組みの捏造 DIO は明示的に付けないと
+  この穴に落ちる。捏造 DIO に `SetDagConfiguration(...)` を追加
+  して解消。
+
+### 36.8 検証
+
+`RplP2pDiscoverRouteTestCase` (増分2、Origin が送出する DIO の固定値)、
+`RplP2pFloodTestCase` (増分3、4 ノード線形での flood と Address
+Vector 蓄積、AODV-RPL の `RplAodvRreqFloodTestCase` 相当)、
+`RplP2pMaxRankTestCase` (増分3、MaxRank 境界値と Target への緩和)、
+`RplP2pDroGeneratedTestCase` (増分4、Target が送る P2P-DRO の固定値と
+末尾トリミング)、`RplP2pRouteCompletesTestCase` (増分5+6、経路確定と
+実際の UDP 疎通、AODV-RPL の `RplAodvAsymmetricRouteCompletesTestCase`
+相当)、`RplP2pDroRelayTestCase` (増分5+6、単一ノード+捏造パケットに
+よる NH 位置チェックとループチェックの直接検証) を追加。各増分で
+「チェックを外すと落ちる (または実際にクラッシュする)」ことを
+確認してから採用し、最終的に rpl スイート全件を 5 回連続 PASS
+させて確定。
