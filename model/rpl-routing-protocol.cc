@@ -276,7 +276,45 @@ RplRoutingProtocol::GetTypeId()
                           "path reachable in a simulation at all.",
                           BooleanValue(false),
                           MakeBooleanAccessor(&RplRoutingProtocol::m_aodvForceAsymmetric),
-                          MakeBooleanChecker());
+                          MakeBooleanChecker())
+            .AddAttribute("P2pDioIntervalMin",
+                          "Imin of the Trickle timer pacing P2P-RPL P2P mode DIOs (RFC 6997). "
+                          "Default matches the RFC's own recommended default DODAG "
+                          "Configuration Option (section 6.1): DIOIntervalMin 6, i.e. 64 ms.",
+                          TimeValue(MilliSeconds(64)),
+                          MakeTimeAccessor(&RplRoutingProtocol::m_p2pDioIntervalMin),
+                          MakeTimeChecker())
+            .AddAttribute("P2pDioIntervalDoublings",
+                          "Number of doublings between Imin and Imax of the P2P mode DIO "
+                          "Trickle timer. RFC 6997 section 9.2 only says Imax should be 'several "
+                          "orders of magnitude higher than Imin' and is 'unlikely to be "
+                          "critical', since a temporary DAG rarely lives long enough for the "
+                          "timer to grow much; 8 doublings (Imax 16.384 s) comfortably clears "
+                          "that bar without approaching the shortest 'L' encoding (1 s).",
+                          UintegerValue(8),
+                          MakeUintegerAccessor(&RplRoutingProtocol::m_p2pDioIntervalDoublings),
+                          MakeUintegerChecker<uint8_t>())
+            .AddAttribute("P2pDioRedundancy",
+                          "Redundancy constant k of the P2P mode DIO Trickle timer. RFC 6997 "
+                          "section 9.2: 'The recommended value...is 1.'",
+                          UintegerValue(1),
+                          MakeUintegerAccessor(&RplRoutingProtocol::m_p2pDioRedundancy),
+                          MakeUintegerChecker<uint8_t>())
+            .AddAttribute("P2pMaxRank",
+                          "MaxRank advertised in P2P mode DIOs (RFC 6997 section 7): the upper "
+                          "bound on DAGRank() a router may reach and still join the temporary "
+                          "DAG, which is what stops a P2P-RPL discovery flooding the whole "
+                          "network. 0 means no limit.",
+                          UintegerValue(8),
+                          MakeUintegerAccessor(&RplRoutingProtocol::m_p2pMaxRank),
+                          MakeUintegerChecker<uint8_t>(0, RPL_P2P_MAX_RANK_MASK))
+            .AddAttribute("P2pLifetime",
+                          "The 'L' field of P2P mode DIOs (RFC 6997 section 7), how long a "
+                          "router stays in the temporary DAG: 0 for 1 s, 1 for 4 s, 2 for 16 s, "
+                          "3 for 64 s.",
+                          UintegerValue(2),
+                          MakeUintegerAccessor(&RplRoutingProtocol::m_p2pLifetime),
+                          MakeUintegerChecker<uint8_t>(0, 3));
     return tid;
 }
 
@@ -1050,6 +1088,25 @@ RplRoutingProtocol::SendDio(DodagMembership& dodag, Ipv6Address dst, uint32_t in
         art.prefixLength = 0; // the field holds an address, not a prefix
         art.target = dodag.aodv.target;
         dio.SetArt(art);
+    }
+    else if (dodag.mop == RPL_MOP_P2P_ROUTE_DISCOVERY && !dodag.p2p.target.IsAny())
+    {
+        // A P2P mode DIO (RFC 6997 section 6): "MUST carry one (and only
+        // one) P2P Route Discovery Option." Rebuilt from the membership's
+        // own state on every transmission, the same reason the AODV-RPL
+        // branches above are -- a router propagates the Address Vector it
+        // recorded on the way in, its own address already appended.
+        P2pRdoOption rdo;
+        rdo.reply = dodag.p2p.reply;
+        rdo.hopByHop = dodag.p2p.hopByHop; // always false; H=1 is out of scope
+        rdo.numRoutes = 0; // exactly one Source Route; N > 0 is out of scope
+        // compr left at its default: P2pRdoSerialize() computes its own
+        // from target/addressVector and this DIO's own DODAGID.
+        rdo.lifetime = dodag.p2p.lifetimeField;
+        rdo.maxRankOrNh = dodag.p2p.maxRank;
+        rdo.target = dodag.p2p.target;
+        rdo.addressVector = dodag.p2p.addressVector;
+        dio.SetP2pRdo(rdo);
     }
 
     Ptr<Packet> packet = Create<Packet>();

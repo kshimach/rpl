@@ -571,6 +571,28 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      */
     bool FindAodvRrepInstance(Ipv6Address origNode, DodagKey& key) const;
 
+    // P2P-RPL (RFC 6997). Implemented in model/rpl-p2p.cc, not
+    // model/rpl-routing-protocol.cc, the same split rpl-aodv.cc keeps for
+    // AODV-RPL. Scoped to source-routed discovery (H=0) for a single Target
+    // and a single Source Route; @see design-constraints.md for what that
+    // leaves out and why.
+
+    /**
+     * @brief Start a P2P-RPL route discovery towards a target.
+     *
+     * Forms a temporary DAG -- a local RPL Instance rooted at this node, RFC
+     * 6997 section 6.1 -- and starts Trickle-pacing P2P mode DIOs into it.
+     * The discovery runs on its own from there; its result, once a P2P-DRO
+     * comes back, will be read with GetP2pRoute() (@see later increments;
+     * not implemented yet).
+     *
+     * @param target the address to find a route to
+     * @return the key of the temporary DAG, or a key whose dodagId is any()
+     *         if the discovery could not be started (no global address to
+     *         root it at, or no Local RPLInstanceID left to allocate)
+     */
+    DodagKey DiscoverP2pRoute(Ipv6Address target);
+
   protected:
     void DoInitialize() override;
     void DoDispose() override;
@@ -758,6 +780,40 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
         };
 
         AodvRreqState aodv; //!< AODV-RPL state; untouched unless mop is 4
+
+        /**
+         * @brief P2P-RPL (RFC 6997) state, meaningful only while this
+         *        membership is a temporary DAG rather than an AODV-RPL one
+         *        (mop == RPL_MOP_P2P_ROUTE_DISCOVERY and target is set).
+         *
+         * A separate struct from AodvRreqState rather than a shared one:
+         * unlike AODV-RPL's RREQ- and RREP-Instance, which really are the
+         * same shape playing two roles within one protocol, AODV-RPL and
+         * P2P-RPL are two independent protocols that only happen to share
+         * the "P2P Route Discovery" Mode of Operation value (RFC 9854's own
+         * introduction: "there is no conflict with P2P-RPL, a previous
+         * document using the same MOP"; @see design-constraints.md). A
+         * DodagMembership formed for one never populates the other.
+         */
+        struct P2pState
+        {
+            bool isOrigin{false}; //!< this node started the discovery
+            bool isTarget{false}; //!< this node is (one of) the Target(s) being looked for
+            Ipv6Address target;   //!< the Target being looked for (RFC 6997 section 7's TargetAddr)
+            uint8_t maxRank{0};   //!< MaxRank, 0 meaning no limit
+            uint8_t lifetimeField{0}; //!< the 'L' field this temporary DAG was opened with
+            bool reply{true};         //!< 'R': whether the Target should send a P2P-DRO back
+            bool hopByHop{false};     //!< 'H': always false; H=1 is out of scope
+            /// The route accumulated so far in the Forward direction
+            /// (Origin-side first), as this node would propagate it: its own
+            /// address is already appended (RFC 6997 section 9.4).
+            std::vector<Ipv6Address> addressVector;
+            /// When the 'L' field's deadline takes this node out of the
+            /// temporary DAG (RFC 6997 section 7).
+            Timer expiry{Timer::CANCEL_ON_DESTROY};
+        };
+
+        P2pState p2p; //!< P2P-RPL state; untouched unless this membership is a temporary DAG
     };
 
     /**
@@ -1012,6 +1068,23 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      * @param key the RREQ-Instance to leave
      */
     void AodvInstanceExpired(DodagKey key);
+
+    /**
+     * @brief Arm the 'L' field's deadline for a P2P-RPL temporary DAG.
+     *
+     * Unlike ArmAodvExpiry(), never a no-op: RFC 6997 section 7's 'L' field
+     * has no "unlimited" encoding, every value names a real duration.
+     *
+     * @param dodag the membership to arm
+     * @param key its key, which the expiry callback needs to find it again
+     */
+    void ArmP2pExpiry(DodagMembership& dodag, DodagKey key);
+
+    /**
+     * @brief Leave a P2P-RPL temporary DAG whose 'L' field has run out.
+     * @param key the temporary DAG to leave
+     */
+    void P2pInstanceExpired(DodagKey key);
 
     /**
      * @brief Whether an address is one of this node's own.
@@ -1571,6 +1644,40 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     /// while "the lifetime is set according to DODAG configuration (i.e.,
     /// not the L field)" (RFC 9854 section 6.4.3).
     std::map<Ipv6Address, AodvRoute> m_aodvRoutes;
+
+    /// Imin of the Trickle timer pacing P2P mode DIOs. RFC 6997 section 6.1's
+    /// own default DODAG Configuration Option: DIOIntervalMin 6, i.e. 64 ms.
+    Time m_p2pDioIntervalMin;
+    uint8_t m_p2pDioIntervalDoublings; //!< doublings for the P2P mode DIO Trickle timer
+    /// Redundancy constant k for P2P mode DIOs. RFC 6997 section 9.2
+    /// recommends 1, unlike this module's own default of 0 (never suppress)
+    /// used for the base DODAG and AODV-RPL alike: P2P-RPL's own Trickle
+    /// rules (section 9.2) are built around a router suppressing a DIO that
+    /// does not improve on what it would already advertise, which k=0 would
+    /// defeat outright.
+    uint8_t m_p2pDioRedundancy;
+    uint8_t m_p2pMaxRank; //!< MaxRank put on P2P mode DIOs, 0 meaning no limit
+    uint8_t m_p2pLifetime; //!< the 'L' field put on P2P mode DIOs, 0..3
+
+    /// A route P2P-RPL found, held at the Origin.
+    struct P2pRoute
+    {
+        /// Every hop from the Origin outward, the Target last, as global
+        /// addresses -- the Address Vector exactly as the P2P-DRO delivered
+        /// it (RFC 6997 section 8.2: "the first element...contains the IPv6
+        /// address of the router next to the Origin").
+        std::vector<Ipv6Address> hops;
+        uint8_t instanceId{0}; //!< the temporary DAG's RPLInstanceID it was found under
+        Time expire;           //!< when it goes stale
+    };
+
+    /// Routes found by P2P-RPL, keyed by Target address. Held separately
+    /// from the temporary DAG that found it for the same reason
+    /// m_aodvRoutes is: the DAG's own membership is bounded by the P2P-RDO's
+    /// 'L' field, while the route's lifetime instead comes from the DODAG
+    /// Configuration Option's Default Lifetime/Lifetime Unit (RFC 6997
+    /// sections 9.6, 9.7).
+    std::map<Ipv6Address, P2pRoute> m_p2pRoutes;
 
     // Policy attributes for the DAO/downward-route side, set once via
     // RplHelper and shared by whatever DODAG membership uses them. Nothing

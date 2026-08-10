@@ -4,6 +4,7 @@ build_lib(
     helper/rpl-helper.cc
     model/rpl-aodv.cc
     model/rpl-header.cc
+    model/rpl-p2p.cc
     model/rpl-packet-info-option.cc
     model/rpl-routing-protocol.cc
     model/rpl-source-routing-extension.cc

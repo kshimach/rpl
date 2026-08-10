@@ -7133,6 +7133,152 @@ RplAodvRoutesInPrintedTablesTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief A P2P-RPL route discovery forms a temporary DAG at the Origin and
+ *        floods a P2P mode DIO carrying the fixed values RFC 6997 section
+ *        6.1 requires.
+ *
+ * The first half of RFC 6997's route discovery (increment 2 of this
+ * module's P2P-RPL support): DiscoverP2pRoute() forms the temporary DAG and
+ * Trickle-paces P2P mode DIOs into it. Nothing processes the DIO on the
+ * receiving end yet -- HandleDio() does not special-case P2P-RPL until a
+ * later increment -- so this only pins down what the Origin itself sends,
+ * captured off the wire by a monitor socket on a second node the same way
+ * RplAodvAsymmetricRrepInstanceTestCase captures an RREP-DIO.
+ */
+class RplP2pDiscoverRouteTestCase : public TestCase
+{
+  public:
+    RplP2pDiscoverRouteTestCase();
+
+  private:
+    void DoRun() override;
+
+    /// @brief Capture a P2P mode DIO seen at the monitor.
+    /// @param socket the monitoring socket
+    void CaptureDio(Ptr<Socket> socket);
+
+    bool m_seenP2pDio{false}; //!< a DIO carrying a P2P-RDO was seen
+    RplDioHeader m_captured;  //!< the last one seen
+};
+
+RplP2pDiscoverRouteTestCase::RplP2pDiscoverRouteTestCase()
+    : TestCase("A P2P-RPL route discovery forms a temporary DAG and floods a P2P mode DIO")
+{
+}
+
+void
+RplP2pDiscoverRouteTestCase::CaptureDio(Ptr<Socket> socket)
+{
+    Address sender;
+    Ptr<Packet> packet = socket->RecvFrom(sender);
+    if (!packet)
+    {
+        return;
+    }
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ipv6Header);
+    Icmpv6Header icmpv6Header;
+    packet->RemoveHeader(icmpv6Header);
+    if (icmpv6Header.GetType() != ICMPV6_RPL || icmpv6Header.GetCode() != RPL_CODE_DIO)
+    {
+        return;
+    }
+    RplDioHeader dio;
+    packet->RemoveHeader(dio);
+    if (dio.HasP2pRdo())
+    {
+        m_seenP2pDio = true;
+        m_captured = dio;
+    }
+}
+
+void
+RplP2pDiscoverRouteTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2); // 0 = Origin and base root, 1 = a real neighbour to monitor from
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.AssignWithoutAddress(devices);
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    Simulator::Stop(Seconds(2));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> orig = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+
+    Ptr<Socket> monitor = Socket::CreateSocket(nodes.Get(1), Ipv6RawSocketFactory::GetTypeId());
+    monitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    monitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    monitor->BindToNetDevice(nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+    monitor->SetRecvCallback(MakeCallback(&RplP2pDiscoverRouteTestCase::CaptureDio, this));
+
+    // A fabricated address: increment 3 onward is what makes a real Target
+    // process and reply to this, not this increment's concern.
+    Ipv6Address target("2001:9::99");
+    RplRoutingProtocol::DodagKey key = orig->DiscoverP2pRoute(target);
+    NS_TEST_ASSERT_MSG_NE(key.dodagId, Ipv6Address::GetAny(), "The discovery did not start");
+    NS_TEST_ASSERT_MSG_EQ(key.dodagId,
+                          orig->GetGlobalAddress(),
+                          "The temporary DAG is not rooted at the Origin's own address");
+    NS_TEST_ASSERT_MSG_EQ(key.instanceId & RPL_LOCAL_INSTANCE_FLAG,
+                          RPL_LOCAL_INSTANCE_FLAG,
+                          "The temporary DAG's RPLInstanceID is not a Local one");
+    NS_TEST_ASSERT_MSG_EQ(key.instanceId & RPL_LOCAL_INSTANCE_D_FLAG,
+                          0,
+                          "The temporary DAG's Local RPLInstanceID has its 'D' flag set");
+
+    Simulator::Stop(Seconds(2));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(m_seenP2pDio, true, "No P2P mode DIO was ever flooded");
+    NS_TEST_ASSERT_MSG_EQ(m_captured.GetInstanceId(), key.instanceId, "Wrong RPLInstanceID");
+    NS_TEST_ASSERT_MSG_EQ(m_captured.GetVersionNumber(),
+                          0,
+                          "Version must always be zero (RFC 6997 section 6.1)");
+    NS_TEST_ASSERT_MSG_EQ(m_captured.GetGrounded(),
+                          true,
+                          "'G' must always be set (RFC 6997 section 6.1)");
+    NS_TEST_ASSERT_MSG_EQ(m_captured.GetMop(), RPL_MOP_P2P_ROUTE_DISCOVERY, "Wrong MOP");
+    NS_TEST_ASSERT_MSG_EQ(m_captured.GetPreference(),
+                          0,
+                          "Prf must always be zero (RFC 6997 section 6.1)");
+    NS_TEST_ASSERT_MSG_EQ(m_captured.GetDtsn(),
+                          0,
+                          "DTSN must always be zero (RFC 6997 section 6.1)");
+    NS_TEST_ASSERT_MSG_EQ(m_captured.GetDodagId(), key.dodagId, "Wrong DODAGID");
+    NS_TEST_ASSERT_MSG_EQ(m_captured.HasDagConfiguration(),
+                          true,
+                          "A P2P mode DIO must carry a DODAG Configuration option");
+    NS_TEST_ASSERT_MSG_EQ(m_captured.GetMaxRankIncrease(),
+                          0,
+                          "MaxRankIncrease must always be zero (RFC 6997 section 6.1)");
+    NS_TEST_ASSERT_MSG_EQ(m_captured.HasP2pRdo(), true, "No P2P-RDO");
+    NS_TEST_ASSERT_MSG_EQ(m_captured.GetP2pRdo().reply, true, "Wrong 'R' flag");
+    NS_TEST_ASSERT_MSG_EQ(m_captured.GetP2pRdo().hopByHop, false, "Wrong 'H' flag");
+    NS_TEST_ASSERT_MSG_EQ(m_captured.GetP2pRdo().numRoutes, 0, "Wrong 'N' field");
+    NS_TEST_ASSERT_MSG_EQ(m_captured.GetP2pRdo().target, target, "Wrong TargetAddr");
+    NS_TEST_ASSERT_MSG_EQ(m_captured.GetP2pRdo().addressVector.size(),
+                          0,
+                          "The Origin's own Address Vector should start empty");
+
+    monitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Check which DIOs RplRoutingProtocol::HandleDio() acts on and which
  *        it turns away: a mode of operation it does not implement, another
  *        RPL instance or DODAG, a stale DODAG version, and the infinite
@@ -11353,6 +11499,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplAodvRrepInstanceAddressVectorFullTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRrepDuplicateRelayedOnceTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRoutesInPrintedTablesTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pDiscoverRouteTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDioRejectionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplParentLossRejoinTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplInterfaceRestartTestCase, TestCase::Duration::QUICK);
