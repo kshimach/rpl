@@ -405,6 +405,109 @@ RplRoutingProtocol::SendP2pDro(DodagMembership& dodag, DodagKey key)
                                                    << rdo.addressVector.size() << " hop(s)");
 }
 
+void
+RplRoutingProtocol::HandleP2pDro(const RplP2pDroHeader& dro, Ipv6Address from, uint32_t interface)
+{
+    NS_LOG_FUNCTION(this << from << interface);
+
+    if (!dro.HasP2pRdo())
+    {
+        NS_LOG_WARN("Dropping a P2P-DRO with no P2P-RDO option");
+        return;
+    }
+
+    DodagKey key{dro.GetInstanceId(), dro.GetDodagId()};
+    auto it = m_dodags.find(key);
+    if (it == m_dodags.end())
+    {
+        // RFC 6997 sections 9.6/9.7: "MUST discard the received P2P-DRO...
+        // if it...no longer belongs to the temporary DAG identified by the
+        // RPLInstanceID and the DODAGID fields."
+        NS_LOG_LOGIC("Dropping a P2P-DRO for a temporary DAG this node is not part of");
+        return;
+    }
+    DodagMembership& dodag = it->second;
+    const P2pRdoOption& rdo = dro.GetP2pRdo();
+
+    if (dodag.p2p.isOrigin)
+    {
+        // RFC 6997 section 9.7. rdo.addressVector is the fixed snapshot the
+        // Target built once (SendP2pDro()), already running Origin-outward
+        // -- unlike AODV-RPL's asymmetric RREP-Instance, whose own vector
+        // accumulates hop by hop during the flood back and so needs
+        // reversing at the OrigNode, this needs none (@see
+        // design-constraints.md).
+        P2pRoute route;
+        route.hops = rdo.addressVector;
+        route.hops.push_back(rdo.target);
+        route.instanceId = dodag.instanceId;
+        // "The lifetime is set according to DODAG configuration (i.e., not
+        // the L field)" -- RFC 9854 section 6.4.3's wording for the AODV-RPL
+        // analogue, and the same PathLifetime/lifetime unit a DAO-derived
+        // route gets; RFC 6997 has no equivalent sentence of its own but
+        // the same reasoning applies (the temporary DAG's own 'L' bounds
+        // discovery, not the route it finds).
+        route.expire = Simulator::Now() + Seconds(m_pathLifetime * m_lifetimeUnit);
+        m_p2pRoutes[rdo.target] = route;
+
+        NS_LOG_INFO("P2P-RPL route discovery to " << rdo.target << " completed over "
+                                                   << route.hops.size() << " hop(s)");
+        return;
+    }
+
+    // An Intermediate Router: only the one router named at the Address
+    // Vector's current NH position acts (RFC 6997 section 9.6); every other
+    // one that also happens to hear the multicast has nothing to do here.
+    // NH is 1-indexed ("Address[NH]"); out-of-range values (including 0,
+    // which never names a valid entry) are simply not this node's turn.
+    if (rdo.maxRankOrNh == 0 || rdo.maxRankOrNh > rdo.addressVector.size() ||
+        !IsOwnAddress(rdo.addressVector[rdo.maxRankOrNh - 1]))
+    {
+        NS_LOG_LOGIC("Not named at the current NH position, ignoring this P2P-DRO");
+        return;
+    }
+
+    // RFC 6997 section 9.6: "To prevent loops, the router MUST discard the
+    // P2P-DRO message with no further processing if the Address vector in
+    // the P2P-RDO includes multiple IPv6 addresses assigned to the
+    // router's interfaces."
+    uint32_t ownCount = 0;
+    for (const auto& hop : rdo.addressVector)
+    {
+        if (IsOwnAddress(hop))
+        {
+            ownCount++;
+        }
+    }
+    if (ownCount > 1)
+    {
+        NS_LOG_LOGIC("Dropping a P2P-DRO whose Address Vector names this router more than once");
+        return;
+    }
+
+    // "The router MUST decrement the NH field inside the P2P-RDO and send
+    // the P2P-DRO message further via link-local multicast" -- unchanged
+    // otherwise; H=1's Hop-by-hop routing state (the bullets in between,
+    // in section 9.6's own text) is out of scope.
+    P2pRdoOption relayedRdo = rdo;
+    relayedRdo.maxRankOrNh = static_cast<uint8_t>(rdo.maxRankOrNh - 1);
+
+    RplP2pDroHeader relayed;
+    relayed.SetInstanceId(dro.GetInstanceId());
+    relayed.SetStop(dro.GetStop());
+    relayed.SetAckRequested(dro.GetAckRequested());
+    relayed.SetSequence(dro.GetSequence());
+    relayed.SetDodagId(dro.GetDodagId());
+    relayed.SetP2pRdo(relayedRdo);
+
+    Ptr<Packet> packet = Create<Packet>();
+    packet->AddHeader(relayed);
+    SendRplMessageMulticast(packet, RPL_CODE_P2P_DRO, Ipv6Address(RPL_ALL_NODES_MULTICAST));
+
+    NS_LOG_INFO("Relaying a P2P-DRO for " << rdo.target << " onward, NH now "
+                                          << +relayedRdo.maxRankOrNh);
+}
+
 bool
 RplRoutingProtocol::GetP2pAddressVector(uint8_t instanceId,
                                         Ipv6Address dodagId,
@@ -425,6 +528,58 @@ RplRoutingProtocol::IsP2pTarget(uint8_t instanceId, Ipv6Address dodagId) const
 {
     auto it = m_dodags.find(DodagKey{instanceId, dodagId});
     return it != m_dodags.end() && it->second.p2p.isTarget;
+}
+
+bool
+RplRoutingProtocol::GetP2pRoute(Ipv6Address target, std::vector<Ipv6Address>& hops) const
+{
+    hops.clear();
+    auto it = m_p2pRoutes.find(target);
+    if (it == m_p2pRoutes.end() || it->second.expire <= Simulator::Now())
+    {
+        return false;
+    }
+    hops = it->second.hops;
+    return true;
+}
+
+uint32_t
+RplRoutingProtocol::GetP2pRouteCount() const
+{
+    uint32_t count = 0;
+    Time now = Simulator::Now();
+    for (const auto& [target, route] : m_p2pRoutes)
+    {
+        if (route.expire > now)
+        {
+            count++;
+        }
+    }
+    return count;
+}
+
+bool
+RplRoutingProtocol::FindP2pRoute(Ipv6Address dst,
+                                 std::vector<Ipv6Address>& hops,
+                                 uint8_t& instanceId) const
+{
+    hops.clear();
+    auto it = m_p2pRoutes.find(dst);
+    if (it == m_p2pRoutes.end() || it->second.expire <= Simulator::Now())
+    {
+        return false;
+    }
+
+    // Converted to link-local, the same form ComputeSourceRoute() returns,
+    // so that PrepareOutgoingPacket()'s existing hops-to-Routing-Header
+    // recipe applies unchanged -- it is that function that puts the global
+    // destination back into the last entry.
+    for (const auto& hop : it->second.hops)
+    {
+        hops.push_back(LinkLocalOf(hop));
+    }
+    instanceId = it->second.instanceId;
+    return true;
 }
 
 } // namespace rpl

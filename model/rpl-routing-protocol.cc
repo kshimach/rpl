@@ -884,6 +884,13 @@ RplRoutingProtocol::RecvRpl(Ptr<Socket> socket)
         HandleDaoAck(daoAck, from);
         break;
     }
+    case RPL_CODE_P2P_DRO: {
+        RplP2pDroHeader dro;
+        packet->RemoveHeader(dro);
+        NS_LOG_INFO("Received a P2P-DRO from " << from << ": " << dro);
+        HandleP2pDro(dro, from, interface);
+        break;
+    }
     default:
         NS_LOG_WARN("Unsupported RPL message code " << +icmpv6Header.GetCode() << " from " << from);
         break;
@@ -2883,6 +2890,24 @@ RplRoutingProtocol::RouteOutput(Ptr<Packet> p,
     }
 
     {
+        // A route P2P-RPL discovered, the same priority and reasoning as the
+        // AODV-RPL block just above.
+        std::vector<Ipv6Address> p2pHops;
+        uint8_t p2pInstanceId = 0;
+        if (FindP2pRoute(dst, p2pHops, p2pInstanceId))
+        {
+            NS_ASSERT(!p2pHops.empty());
+            NS_LOG_LOGIC("Source routing " << dst << " over a P2P-RPL route of " << p2pHops.size()
+                                           << " hop(s), first hop " << p2pHops.front());
+            Ptr<Ipv6Route> route = RouteToNeighbour(p2pInstanceId, p2pHops.front(), dst);
+            if (route)
+            {
+                return route;
+            }
+        }
+    }
+
+    {
         std::vector<Ipv6Address> hops;
         if (DodagMembership* root = FindRootDodagFor(dst, hops))
         {
@@ -2985,8 +3010,11 @@ RplRoutingProtocol::PrepareOutgoingPacket(Ptr<Packet> packet, Ipv6Header& header
     std::vector<Ipv6Address> hops;
     uint8_t aodvInstanceId = 0;
     bool overAodvRoute = FindAodvRoute(dst, hops, aodvInstanceId);
-    DodagMembership* originDodag = overAodvRoute ? nullptr : FindRootDodagFor(dst, hops);
-    if ((overAodvRoute || originDodag) && hops.size() > 1)
+    uint8_t p2pInstanceId = 0;
+    bool overP2pRoute = !overAodvRoute && FindP2pRoute(dst, hops, p2pInstanceId);
+    DodagMembership* originDodag =
+        (overAodvRoute || overP2pRoute) ? nullptr : FindRootDodagFor(dst, hops);
+    if ((overAodvRoute || overP2pRoute || originDodag) && hops.size() > 1)
     {
         std::vector<Ipv6Address> addresses(hops.begin() + 1, hops.end());
         // The last address is the packet's real final destination. Every
@@ -3038,19 +3066,26 @@ RplRoutingProtocol::PrepareOutgoingPacket(Ptr<Packet> packet, Ipv6Header& header
         }
     }
 
-    if (overAodvRoute)
+    if (overAodvRoute || overP2pRoute)
     {
-        // No RPL Option on an AODV-RPL source-routed packet. RFC 6553
-        // section 4 allows leaving it off outright -- "A datagram including
-        // a Source Routing Header (SRH) does not need to include a RPL
-        // Option since both the source and intermediate routers ensure that
-        // the SRH does not contain loops" -- and here it would actively
-        // break the packet: on a symmetric route no RREP-Instance DODAG is
-        // built anywhere (RFC 9854 section 6.3.1), so a relay looking the
-        // RPI's RPLInstanceID up would find no membership,
-        // GetRankForInstance() would answer RPL_INFINITE_RANK, and
-        // RplIpv6OptionRpl::Process() would call every such packet rank
-        // inconsistent and drop it at the second hop.
+        // No RPL Option on an AODV-RPL or P2P-RPL source-routed packet. RFC
+        // 6553 section 4 allows leaving it off outright -- "A datagram
+        // including a Source Routing Header (SRH) does not need to include
+        // a RPL Option since both the source and intermediate routers
+        // ensure that the SRH does not contain loops" -- and here it would
+        // actively break the packet: a P2P route runs sideways between two
+        // arbitrary nodes rather than down from a common root, so the RPI's
+        // rank-consistency check does not describe it at all, and no DODAG
+        // built for either protocol's own discovery stays around to
+        // validate against once the discovery itself has finished (RFC
+        // 9854 section 6.3.1 for a symmetric AODV-RPL route; RFC 6997
+        // section 12 covers only the H=1 Hop-by-hop Route case, silent on
+        // H=0 precisely because Source Routing Header alone is already
+        // sufficient). A relay looking the RPI's RPLInstanceID up would
+        // find no membership, GetRankForInstance() would answer
+        // RPL_INFINITE_RANK, and RplIpv6OptionRpl::Process() would call
+        // every such packet rank inconsistent and drop it at the second
+        // hop.
         //
         // The IPv6 header's own Next Header has to be pointed at whatever
         // was actually attached before returning. On the ordinary path that
@@ -3060,9 +3095,9 @@ RplRoutingProtocol::PrepareOutgoingPacket(Ptr<Packet> packet, Ipv6Header& header
         // front of it, and the first hop would hand the Routing Header's
         // bytes to UDP.
         header.SetNextHeader(innerNextHeader);
-        NS_LOG_LOGIC("Attached a Routing Header for " << dst
-                                                      << " with no RPL Option: an AODV-RPL "
-                                                         "source route needs none");
+        NS_LOG_LOGIC("Attached a Routing Header for "
+                    << dst << " with no RPL Option: an AODV-RPL or P2P-RPL source route needs "
+                              "none");
         return;
     }
 

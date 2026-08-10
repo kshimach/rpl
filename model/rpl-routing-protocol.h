@@ -36,6 +36,7 @@ namespace rpl
 class RplDioHeader;
 class RplDaoHeader;
 class RplDaoAckHeader;
+class RplP2pDroHeader;
 
 /**
  * @ingroup rpl
@@ -618,6 +619,26 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      */
     bool IsP2pTarget(uint8_t instanceId, Ipv6Address dodagId) const;
 
+    /**
+     * @brief Get the source route a P2P-RPL discovery found to a target.
+     *
+     * The P2P-RPL counterpart of GetAodvRoute(): every hop from the Origin
+     * outward, the Target itself last, as global addresses. Only the
+     * Origin of a discovery ever holds one.
+     *
+     * @param target the Target the route leads to
+     * @param [out] hops the route, first hop first and the target last
+     * @return true if a live route is held; expired ones are dropped and
+     *         reported as absent
+     */
+    bool GetP2pRoute(Ipv6Address target, std::vector<Ipv6Address>& hops) const;
+
+    /**
+     * @brief How many live P2P-RPL routes this node holds.
+     * @return the number of routes, expired ones excluded
+     */
+    uint32_t GetP2pRouteCount() const;
+
   protected:
     void DoInitialize() override;
     void DoDispose() override;
@@ -1113,6 +1134,34 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     void SendP2pDro(DodagMembership& dodag, DodagKey key);
 
     /**
+     * @brief Act on a received P2P-DRO: relay it onward, or store the route
+     *        it carries if this node is the Origin it names.
+     *
+     * RFC 6997 sections 9.6 (Intermediate Router) and 9.7 (Origin). Unlike a
+     * DIO, a P2P-DRO is never joined as a DODAG -- it is looked up by
+     * (RPLInstanceID, DODAGID) against a temporary DAG membership this node
+     * already holds, and discarded if there is none (the node is not part
+     * of the discovery this P2P-DRO belongs to).
+     *
+     * For an Intermediate Router: only the router named at the Address
+     * Vector's current NH position acts (every other one that also happens
+     * to hear the multicast has nothing to do); it decrements NH and
+     * re-multicasts, unchanged otherwise. H=1's Hop-by-hop routing state is
+     * out of scope (@see design-constraints.md).
+     *
+     * For the Origin: the Address Vector is a fixed snapshot the Target
+     * built once (SendP2pDro()), already Origin-outward -- unlike AODV-RPL's
+     * asymmetric RREP-Instance, whose own vector accumulates hop by hop
+     * during the flood back and so needs reversing at the OrigNode, this
+     * needs none.
+     *
+     * @param dro the P2P-DRO just received
+     * @param from the neighbour it came from, a link-local address
+     * @param interface the interface it arrived on
+     */
+    void HandleP2pDro(const RplP2pDroHeader& dro, Ipv6Address from, uint32_t interface);
+
+    /**
      * @brief Unicast an RREP-DIO one hop towards the OrigNode.
      *
      * The next hop is named by a global address out of the Address Vector,
@@ -1139,6 +1188,19 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     bool FindAodvRoute(Ipv6Address dst,
                        std::vector<Ipv6Address>& hops,
                        uint8_t& instanceId) const;
+
+    /**
+     * @brief Find the P2P-RPL source route to a destination, if one is held.
+     * @param dst the destination
+     * @param [out] hops the route as link-local addresses, the form
+     *              ComputeSourceRoute() also returns
+     * @param [out] instanceId the temporary DAG's RPLInstanceID the route
+     *              was found under
+     * @return true if a live route was found
+     */
+    bool FindP2pRoute(Ipv6Address dst,
+                      std::vector<Ipv6Address>& hops,
+                      uint8_t& instanceId) const;
 
     /**
      * @brief Arm the 'L' field's deadline for an RREQ-Instance.

@@ -7665,6 +7665,14 @@ RplP2pDroGeneratedTestCase::CaptureDro(Ptr<Socket> socket)
     {
         return;
     }
+    if (m_seenDro)
+    {
+        // Only the first one, straight from the Target: relay2 is itself a
+        // full RPL node, so once HandleP2pDro() exists it relays this same
+        // P2P-DRO onward (NH decremented) and the monitor would otherwise
+        // see that copy too and overwrite m_captured with it.
+        return;
+    }
     m_seenDro = true;
     packet->RemoveHeader(m_captured);
 }
@@ -7769,6 +7777,425 @@ RplP2pDroGeneratedTestCase::DoRun()
                           "Wrong second Address Vector entry: should be the router next to the "
                           "Target");
     NS_TEST_ASSERT_MSG_EQ(m_captured.GetP2pRdo().maxRankOrNh, 2, "Wrong NH");
+
+    monitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief A P2P-RPL discovery completes end to end: the P2P-DRO relays back
+ *        along the trimmed Address Vector, the Origin stores an
+ *        Origin-outward route from it, and the route carries data.
+ *
+ * The increment 5/6 counterpart of RplAodvAsymmetricRouteCompletesTestCase,
+ * on the same four-node line:
+ *
+ *     orig(0) ---- relay1(1) ---- relay2(2) ---- targ(3)
+ *
+ * The Target answers with a P2P-DRO carrying [relay1, relay2] (its own
+ * trailing entry already trimmed, RplP2pDroGeneratedTestCase's own
+ * concern); each relay named at the Address Vector's current NH position
+ * decrements NH and re-multicasts without recording anything, since H=0
+ * keeps no per-hop state; the Origin recognises its own address in the
+ * P2P-DRO's DODAGID field and stores the vector as a route, appending the
+ * Target -- no reversal needed, unlike AODV-RPL's asymmetric RREP-Instance,
+ * because the P2P-DRO's vector is a fixed snapshot rather than something
+ * accumulated hop by hop during the relay back.
+ *
+ * What this pins down beyond the bookkeeping is that the route works: a UDP
+ * datagram sent to the Target has to traverse both relays, which only
+ * happens if RouteOutput() picked the discovered route, if
+ * PrepareOutgoingPacket() turned it into a Routing Header, and if
+ * RplIpv6ExtensionSourceRouting::Process() walked it hop by hop.
+ */
+class RplP2pRouteCompletesTestCase : public TestCase
+{
+  public:
+    RplP2pRouteCompletesTestCase();
+
+  private:
+    void DoRun() override;
+
+    /// @brief Count a datagram delivered at the Target.
+    /// @param socket the receiving socket
+    void CountDelivery(Ptr<Socket> socket);
+
+    /// @brief Send one datagram, as a named method Simulator::Schedule() can
+    ///        resolve (Socket::Send is overloaded).
+    /// @param socket the sending socket
+    void SendOne(Ptr<Socket> socket);
+
+    uint32_t m_delivered{0}; //!< datagrams that reached the Target
+    int m_sendResult{0};     //!< what Socket::Send() returned, -1 on refusal
+};
+
+RplP2pRouteCompletesTestCase::RplP2pRouteCompletesTestCase()
+    : TestCase("A P2P-RPL P2P-DRO returns a source route that carries data end to end")
+{
+}
+
+void
+RplP2pRouteCompletesTestCase::CountDelivery(Ptr<Socket> socket)
+{
+    Ptr<Packet> packet = socket->Recv();
+    while (packet)
+    {
+        m_delivered++;
+        packet = socket->Recv();
+    }
+}
+
+void
+RplP2pRouteCompletesTestCase::SendOne(Ptr<Socket> socket)
+{
+    m_sendResult = socket->Send(Create<Packet>(64));
+}
+
+void
+RplP2pRouteCompletesTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(4); // 0 = Origin and base root, 1 and 2 = relays, 3 = Target
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    auto blacklist = [&](uint32_t a, uint32_t b) {
+        Ptr<SimpleNetDevice> devA = DynamicCast<SimpleNetDevice>(devices.Get(a));
+        Ptr<SimpleNetDevice> devB = DynamicCast<SimpleNetDevice>(devices.Get(b));
+        channel->BlackList(devA, devB);
+        channel->BlackList(devB, devA);
+    };
+    blacklist(0, 2);
+    blacklist(0, 3);
+    blacklist(1, 3);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(250));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> orig = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> relay1 = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> relay2 = nodes.Get(2)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> targ = nodes.Get(3)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(targ->IsJoined(), true, "The base DODAG did not reach the far end");
+
+    Ipv6Address relay1Address = relay1->GetGlobalAddress();
+    Ipv6Address relay2Address = relay2->GetGlobalAddress();
+    Ipv6Address targAddress = targ->GetGlobalAddress();
+
+    NS_TEST_ASSERT_MSG_EQ(orig->GetP2pRouteCount(), 0, "A route exists before any discovery");
+
+    RplRoutingProtocol::DodagKey key = orig->DiscoverP2pRoute(targAddress);
+    NS_TEST_ASSERT_MSG_NE(key.dodagId, Ipv6Address::GetAny(), "The discovery did not start");
+
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    std::vector<Ipv6Address> hops;
+    NS_TEST_ASSERT_MSG_EQ(orig->GetP2pRoute(targAddress, hops),
+                          true,
+                          "The P2P-DRO never produced a route at the Origin");
+    NS_TEST_ASSERT_MSG_EQ(hops.size(), 3, "The discovered route has the wrong length");
+    NS_TEST_ASSERT_MSG_EQ(hops[0],
+                          relay1Address,
+                          "The route starts at the wrong end: relay1 is the Origin's own "
+                          "neighbour, so it has to come first");
+    NS_TEST_ASSERT_MSG_EQ(hops[1], relay2Address, "Wrong second hop");
+    NS_TEST_ASSERT_MSG_EQ(hops[2], targAddress, "The route does not end at the Target");
+    NS_TEST_ASSERT_MSG_EQ(orig->GetP2pRouteCount(), 1, "Wrong number of routes");
+
+    // Source routing keeps no per-hop state.
+    NS_TEST_ASSERT_MSG_EQ(relay1->GetP2pRouteCount(), 0, "relay1 recorded a route it should not");
+    NS_TEST_ASSERT_MSG_EQ(relay2->GetP2pRouteCount(), 0, "relay2 recorded a route it should not");
+
+    // And it works. A route stored backwards would still have three entries
+    // and still look like a path; only actually sending over it tells the
+    // difference.
+    uint16_t port = 4243;
+    Ptr<Socket> receiver = Socket::CreateSocket(nodes.Get(3), UdpSocketFactory::GetTypeId());
+    receiver->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), port));
+    receiver->SetRecvCallback(MakeCallback(&RplP2pRouteCompletesTestCase::CountDelivery, this));
+
+    Ptr<Socket> sender = Socket::CreateSocket(nodes.Get(0), UdpSocketFactory::GetTypeId());
+    sender->Connect(Inet6SocketAddress(targAddress, port));
+    Simulator::Schedule(Seconds(1), &RplP2pRouteCompletesTestCase::SendOne, this, sender);
+
+    Simulator::Stop(Seconds(5));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_GT(m_sendResult, 0, "Socket::Send() refused the datagram outright");
+    NS_TEST_ASSERT_MSG_EQ(m_delivered,
+                          1,
+                          "The datagram never reached the Target over the P2P-RPL route");
+
+    receiver->Close();
+    sender->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief A P2P-DRO is relayed only by the router named at the Address
+ *        Vector's current NH position, and not at all if that would be a
+ *        loop.
+ *
+ * RplP2pRouteCompletesTestCase's four-node line, with its channel
+ * blacklisting, never lets more than one router hear a given P2P-DRO
+ * transmission at a time, so it cannot tell the NH-position gate and the
+ * loop check in HandleP2pDro() apart from "this instance simply is not
+ * named anywhere nearby" -- confirmed by probing both checks away in turn
+ * and finding that test still passes either way. This drives fabricated
+ * P2P-DROs straight at one node instead (DeliverRawRplMessage(), bypassing
+ * the channel for input only -- a relay this node actually sends still
+ * goes out for real, caught by a monitor socket on a second, real
+ * neighbour, the same pattern RplP2pDroGeneratedTestCase uses).
+ */
+class RplP2pDroRelayTestCase : public TestCase
+{
+  public:
+    RplP2pDroRelayTestCase();
+
+  private:
+    void DoRun() override;
+
+    /// @brief Capture a relayed P2P-DRO seen at the monitor.
+    /// @param socket the monitoring socket
+    void CaptureDro(Ptr<Socket> socket);
+
+    /**
+     * @brief Join the node under test as an ordinary relay of a fresh
+     *        fabricated temporary DAG, then deliver one fabricated P2P-DRO
+     *        to it and report whether it relayed.
+     *
+     * @param node the node under test
+     * @param ownIndices which 0-based Address Vector positions should hold
+     *                   this node's own address (empty for none, one entry
+     *                   for the ordinary case, two for the loop case)
+     * @param nh the P2P-DRO's own NH field
+     * @return true if a relayed copy was captured at the monitor
+     */
+    bool TryRelay(Ptr<Node> node, const std::vector<uint32_t>& ownIndices, uint8_t nh);
+
+    bool m_seenRelay{false}; //!< a relayed P2P-DRO was captured
+    uint8_t m_seenNh{0};     //!< its own NH field
+};
+
+RplP2pDroRelayTestCase::RplP2pDroRelayTestCase()
+    : TestCase("A P2P-DRO is relayed only by the router at the current NH position, once")
+{
+}
+
+void
+RplP2pDroRelayTestCase::CaptureDro(Ptr<Socket> socket)
+{
+    Address sender;
+    Ptr<Packet> packet = socket->RecvFrom(sender);
+    if (!packet)
+    {
+        return;
+    }
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ipv6Header);
+    Icmpv6Header icmpv6Header;
+    packet->RemoveHeader(icmpv6Header);
+    if (icmpv6Header.GetType() != ICMPV6_RPL || icmpv6Header.GetCode() != RPL_CODE_P2P_DRO)
+    {
+        return;
+    }
+    m_seenRelay = true;
+    RplP2pDroHeader relayed;
+    packet->RemoveHeader(relayed);
+    m_seenNh = relayed.GetP2pRdo().maxRankOrNh;
+}
+
+bool
+RplP2pDroRelayTestCase::TryRelay(Ptr<Node> node,
+                                 const std::vector<uint32_t>& ownIndices,
+                                 uint8_t nh)
+{
+    static uint16_t sequence = 0;
+    sequence++;
+    // A fresh Origin address per call: distinct each time so no earlier
+    // sub-case's membership can interfere with this one's.
+    std::ostringstream originSuffix;
+    originSuffix << "2001:9::" << sequence << ":1";
+    Ipv6Address origin(originSuffix.str().c_str());
+    Ipv6Address neighbour("fe80::a");
+
+    static constexpr uint8_t INSTANCE = 0x81;
+
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+
+    // A P2P-DRO is only ever acted on if a matching temporary DAG
+    // membership already exists (RFC 6997 sections 9.6/9.7), so join one
+    // first, as an ordinary relay (the fabricated Target is never this
+    // node).
+    RplDioHeader joinDio;
+    joinDio.SetInstanceId(INSTANCE);
+    joinDio.SetVersionNumber(0);
+    joinDio.SetRank(RPL_MIN_HOPRANKINC);
+    joinDio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+    joinDio.SetGrounded(true);
+    joinDio.SetDodagId(origin);
+    joinDio.SetDtsn(0);
+    // Without a DODAG Configuration option, JoinDodag() leaves
+    // dodag.dioIntervalMin at its raw default-constructed zero rather than
+    // RFC 6997 section 6.1's own stated default DODAG Configuration Option
+    // (64 ms) -- a real DIO from this module always attaches one
+    // (SendDio() does so unconditionally), so this never comes up in
+    // practice, but a fixture built by hand has to supply it explicitly or
+    // the resulting Trickle timer schedules itself at Imin 0 and spins.
+    joinDio.SetDagConfiguration(4, 6, 0, 0, RPL_MIN_HOPRANKINC, RPL_OCP_OF0, 0xFF, 0xFFFF);
+    P2pRdoOption joinRdo;
+    joinRdo.reply = true;
+    joinRdo.hopByHop = false;
+    joinRdo.maxRankOrNh = 0; // no limit
+    joinRdo.target = Ipv6Address("2001:9::dead:1"); // never this node
+    joinDio.SetP2pRdo(joinRdo);
+    DeliverRawRplMessage<RplDioHeader>(node,
+                                       1,
+                                       joinDio,
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       neighbour,
+                                       Ipv6Address(RPL_ALL_NODES_MULTICAST));
+    NS_ASSERT_MSG(rpl->IsJoinedTo(INSTANCE, origin), "Failed to set up this sub-case's fixture");
+
+    // The P2P-DRO under test: a 3-entry Address Vector, with this node's
+    // own address substituted in at the requested positions and arbitrary
+    // fabricated addresses elsewhere.
+    RplP2pDroHeader dro;
+    dro.SetInstanceId(INSTANCE);
+    dro.SetDodagId(origin);
+    P2pRdoOption rdo;
+    rdo.reply = false;
+    rdo.hopByHop = false;
+    rdo.target = Ipv6Address("2001:9::dead:2"); // the fabricated Target
+    for (uint32_t i = 0; i < 3; i++)
+    {
+        if (std::find(ownIndices.begin(), ownIndices.end(), i) != ownIndices.end())
+        {
+            rdo.addressVector.push_back(rpl->GetGlobalAddress());
+        }
+        else
+        {
+            std::ostringstream hopSuffix;
+            hopSuffix << "2001:9::" << sequence << ":" << (10 + i);
+            rdo.addressVector.push_back(Ipv6Address(hopSuffix.str().c_str()));
+        }
+    }
+    rdo.maxRankOrNh = nh;
+    dro.SetP2pRdo(rdo);
+
+    m_seenRelay = false;
+    DeliverRawRplMessage<RplP2pDroHeader>(node,
+                                          1,
+                                          dro,
+                                          static_cast<uint8_t>(RPL_CODE_P2P_DRO),
+                                          neighbour,
+                                          Ipv6Address(RPL_ALL_NODES_MULTICAST));
+
+    // DeliverRawRplMessage() delivers synchronously, but a relay this node
+    // decides to send goes out through SimpleChannel::Send(), which
+    // schedules delivery via Simulator::ScheduleWithContext() rather than
+    // calling the receiving device directly -- so it needs a further
+    // Simulator::Run() to actually reach the monitor.
+    Simulator::Stop(Seconds(1));
+    Simulator::Run();
+
+    return m_seenRelay;
+}
+
+void
+RplP2pDroRelayTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2); // 0 = the router under test, 1 = a real neighbour to monitor from
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.AssignWithoutAddress(devices);
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    Simulator::Stop(Seconds(2));
+    Simulator::Run();
+
+    Ptr<Node> node = nodes.Get(0);
+
+    Ptr<Socket> monitor = Socket::CreateSocket(nodes.Get(1), Ipv6RawSocketFactory::GetTypeId());
+    monitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    monitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    monitor->BindToNetDevice(nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+    monitor->SetRecvCallback(MakeCallback(&RplP2pDroRelayTestCase::CaptureDro, this));
+
+    // Named at NH (index 1, 0-based, i.e. Address[2] 1-indexed): relays,
+    // NH decremented to 1.
+    //
+    // The result of each TryRelay() call is captured into a local first
+    // rather than passed to NS_TEST_ASSERT_MSG_EQ() directly:
+    // NS_TEST_ASSERT_MSG_EQ() re-evaluates its "actual" argument a second
+    // time to build the failure message when the assertion does not hold
+    // (src/core/model/test.h), and TryRelay() is not idempotent -- it
+    // delivers a fresh fabricated P2P-DRO and may cause a real relay
+    // transmission -- so evaluating it twice on a failing sub-case would
+    // run the fixture-and-delivery sequence again under a new sequence
+    // number, corrupting the very failure this assertion is trying to
+    // report. Found by that exact symptom: an early draft of this test
+    // passed TryRelay(...) straight to the macro and, on the first
+    // sub-case's failure, silently ran a second, differently-numbered
+    // delivery that (successfully) relayed, leaving m_captured holding
+    // that second delivery's content instead of the first's.
+    bool relayedAtNh = TryRelay(node, {1}, 2);
+    NS_TEST_ASSERT_MSG_EQ(relayedAtNh, true, "The router named at the current NH position did not relay");
+    NS_TEST_ASSERT_MSG_EQ(m_seenNh, 1, "NH was not decremented correctly");
+
+    // Not named at NH (present in the vector, but at a different position
+    // than NH names): not this node's turn, must not relay.
+    bool relayedWrongPosition = TryRelay(node, {0}, 2);
+    NS_TEST_ASSERT_MSG_EQ(relayedWrongPosition,
+                          false,
+                          "A router not named at the current NH position relayed anyway");
+
+    // Not in the vector at all: nothing to do.
+    bool relayedAbsent = TryRelay(node, {}, 2);
+    NS_TEST_ASSERT_MSG_EQ(relayedAbsent, false, "A router absent from the Address Vector relayed anyway");
+
+    // Named at NH, but also present a second time elsewhere: RFC 6997
+    // section 9.6's loop check, "the Address vector...includes multiple
+    // IPv6 addresses assigned to the router's interfaces."
+    bool relayedWithLoop = TryRelay(node, {0, 1}, 2);
+    NS_TEST_ASSERT_MSG_EQ(relayedWithLoop,
+                          false,
+                          "A router named at the current NH position, but also present a second "
+                          "time elsewhere in the Address Vector, relayed anyway");
 
     monitor->Close();
     Simulator::Destroy();
@@ -12002,6 +12429,8 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplP2pFloodTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pMaxRankTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pDroGeneratedTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pRouteCompletesTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pDroRelayTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDioRejectionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplParentLossRejoinTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplInterfaceRestartTestCase, TestCase::Duration::QUICK);
