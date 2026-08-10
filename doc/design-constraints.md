@@ -3939,10 +3939,6 @@ flood に留まるが、同じ穴を 2 つ目の instance 種別で開けたま�
 - **リンク非対称の自動検出**: 上記の通り実装不能。
 - **RREP_WAIT_TIME (§6.3)**: 「より良い rank の経路を待つ」ための
   遅延。MAY であり正しさには影響しない。
-- **RREQ-Instance に属さないノードへの RREP flood**: RREP-DIO を
-  受け取っても対になる RREQ-Instance を知らないノードは、従来どおり
-  破棄する。RREQ が flood した範囲＝ OrigNode と TargNode の間の
-  ノード集合なので実害は無く、flood 範囲を限定する効果もある。
 - **H=1** は従来通り対象外 (storing mode 依存)。
 
 #### 検証
@@ -4007,3 +4003,25 @@ RankLimit 以上でも拒否 — ただし ART の target が自分自身
 各チェックを個別に無効化してテストが期待どおりの assertion
 メッセージで落ちることを確認してから復元し、rpl スイート全件を
 3 回連続 PASS させて確定。コミットは `121f05a`。
+
+#### 訂正: 「RREQ-Instance を知らないノードは RREP flood を破棄する」という §35.16 の記述は誤りだった
+
+§35.16 執筆時点の「スコープ外」節に、RREP-Instance flood は対になる
+RREQ-Instance を知らないノードでは「従来どおり破棄する」という記述が
+あったが、これはコードの実際の挙動と食い違っていた。`HandleAodvRrepInstance()`
+も、その前段の `ShouldRefuseAodvRrep()`/`ShouldRefuseAodvInstance()` も、
+受信ノードが対になる RREQ-Instance に参加済みかどうかを一切参照しない
+— 見ているのは RREP-Instance 自身の DodagKey (TargNode のアドレス)
+だけである。誤りに気づいたのは、この判定が S=1 の `HandleAodvRrep()`
+(§6.4.2 の ART 照合で対になる RREQ-Instance の membership を
+`m_dodags.find(rreqKey)` で引き、無ければ破棄する) にはあるが、
+S=0 の join 経路には同じ形の照合が無いことをコードで確認した時。
+
+RFC 9854 を読み直すと、これは元々バグではなく元の記述の方が誤り
+だったと分かる。§6.3.2 は「TargNode MUST build a DODAG in the
+RREP-Instance ... rooted at itself」— RREP-Instance は RREQ-Instance
+とは独立した、正真正銘の DODAG であり、§6.4.1 が join の条件として
+挙げるのは OF 充足度と RankLimit だけで、「対になる RREQ-Instance を
+知っているか」は条件に無い。つまり実装は最初から RFC に忠実で、
+記述の方を直せば済む問題だった。誤った記述を削除し、この節に
+訂正として残す。
