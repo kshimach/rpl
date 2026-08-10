@@ -3609,3 +3609,45 @@ RREQ を注入)、続けて同一の RREP-DIO を 2 回連続で注入。peer �
 確認する。ガードを `if (false && dodag.aodv.rrepHandled)` で無効化
 すると `test="m_dioCount (actual) == 1 (limit)" ... actual="2"` で
 確実に落ちることを確認済み。修正を戻すと 63+1 件全 PASS (3 回連続)。
+
+### 35.12 AODV-RPL 経路を `PrintRoutingTable()`/`PrintRoutingTableJson()` に表示
+
+§35.11 の続き、2 番目の項目。`DiscoverRoute()` が見つけた経路
+(`m_aodvRoutes`) は、これまでどちらの出力関数からも見えなかった —
+`PrintRoutingTable()` は DAO 由来のトポロジー (root 限定、non-storing
+mode) しか見ておらず、`PrintRoutingTableJson()` には対応するキーが
+無かった。ns3-editor の「RPL テーブル」タブ (JSON を消費する側) が
+AODV-RPL 経路を表示できなかったのはこれが原因で、MANUAL.md にも
+既知の制約として記録していた。
+
+**設計判断**: `m_aodvRoutes` は `GetBaseDodag()` が返す `dodag` (base
+DODAG membership) とは独立したノード単位の状態 — base DODAG に
+参加していなくても (`dodag == nullptr` でも) 過去に発見した経路は
+残りうる。そのため `PrintRoutingTableJson()` 側は `dodag` の有無で
+早期 return する分岐と通常分岐の両方で同じ内容を書けるよう、
+書き込みロジックを 1 個のラムダ (`writeAodvRoutes`) に切り出して
+両方から呼んだ。既存の JSON 出力方針 (「join していないノードも
+join しているノードと同じキー集合を返す」、`RplSnapshot` 側の
+ドキュメントコメントが明記しているのと同じ考え方) を保つため、
+`aodvRoutes` キーは常に出す (経路が無ければ空配列)。
+
+`PrintRoutingTable()` (人間可読) 側は DAO トポロジーと違い root 限定
+にしない — `DiscoverRoute()` は root かどうかに関係なくどのノードでも
+呼べるため。期限切れのエントリは `GetAodvRouteCount()` と同じ
+`expire <= now` の判定で読み飛ばす (`m_aodvRoutes` 自体からの
+`erase()` はまだ行わない、既存の他アクセサと同じ流儀)。
+
+**実装しなかったこと**: `route.expire` が `PathLifetime` を
+「無限」を意味する 255 に設定していても実際には有限の時刻にしかならない
+(DAO 側の `Time::Max()` 相当の特別扱いが無い) 点は、今回の表示対応の
+スコープ外として手を付けていない — 表示ロジックはこの前提のまま
+素直に秒数を出す。
+
+**検証**: 回帰テスト `RplAodvRoutesInPrintedTablesTestCase` を追加。
+2 ノード (root=OrigNode、peer=TargNode) で実際に `DiscoverRoute()` を
+実行し、OrigNode 側の `PrintRoutingTable()` に "AODV-RPL routes:" と
+TargNode のアドレスが出ること、`PrintRoutingTableJson()` の
+`aodvRoutes` 配列が埋まっていること、TargNode 側は H=0 なので
+`aodvRoutes:[]` のまま (経路情報を持たない) ことを確認。追加前の
+コードに対して実行すると 3 つとも `actual="0"` で確実に落ちることを
+確認済み。修正を戻すと 63+2 件全 PASS (3 回連続)。

@@ -5566,6 +5566,114 @@ RplAodvRrepDuplicateRelayedOnceTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief An AODV-RPL route the OrigNode discovered shows up in both
+ *        PrintRoutingTable() and PrintRoutingTableJson(), and only there --
+ *        not at the TargNode, which keeps no per-hop state of its own for a
+ *        source-routed (H=0) discovery.
+ *
+ * Neither printer used to mention AODV-RPL routes at all: PrintRoutingTable()
+ * only ever walked the DAO-derived topology (root-only, non-storing mode),
+ * and PrintRoutingTableJson() had no key for it, so ns3-editor's "RPL
+ * table" tab (and anything else consuming the JSON) had no way to show a
+ * discovery's result. m_aodvRoutes is node-level state independent of
+ * GetBaseDodag(), so it is written in both the joined and not-joined JSON
+ * shapes.
+ */
+class RplAodvRoutesInPrintedTablesTestCase : public TestCase
+{
+  public:
+    RplAodvRoutesInPrintedTablesTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplAodvRoutesInPrintedTablesTestCase::RplAodvRoutesInPrintedTablesTestCase()
+    : TestCase("AODV-RPL discovered routes appear in PrintRoutingTable() and its JSON form")
+{
+}
+
+void
+RplAodvRoutesInPrintedTablesTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2); // 0 = OrigNode and base root, 1 = TargNode, one hop away
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    interfaces.SetForwarding(0, true);
+    interfaces.SetForwarding(1, true);
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> orig = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> targ = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(targ->IsJoined(), true, "The base DODAG did not reach the peer");
+    Ipv6Address targAddress = targ->GetGlobalAddress();
+
+    RplRoutingProtocol::DodagKey key = orig->DiscoverRoute(targAddress);
+    NS_TEST_ASSERT_MSG_NE(key.dodagId, Ipv6Address::GetAny(), "The discovery did not start");
+
+    Simulator::Stop(Seconds(5));
+    Simulator::Run();
+
+    std::vector<Ipv6Address> hops;
+    NS_TEST_ASSERT_MSG_EQ(orig->GetAodvRoute(targAddress, hops),
+                          true,
+                          "The RREP never made it back to the OrigNode");
+
+    std::ostringstream targetLine;
+    targetLine << targAddress;
+
+    std::ostringstream text;
+    orig->PrintRoutingTable(Create<OutputStreamWrapper>(&text));
+    std::string dump = text.str();
+    NS_TEST_ASSERT_MSG_EQ(dump.find("AODV-RPL routes:") != std::string::npos,
+                          true,
+                          "The text routing table did not mention the discovered route: " << dump);
+    NS_TEST_ASSERT_MSG_EQ(dump.find(targetLine.str()) != std::string::npos,
+                          true,
+                          "The text routing table did not name the TargNode: " << dump);
+
+    std::ostringstream json;
+    orig->PrintRoutingTableJson(Create<OutputStreamWrapper>(&json));
+    std::string line = json.str();
+    NS_TEST_ASSERT_MSG_EQ(line.find("\"aodvRoutes\":[{") != std::string::npos,
+                          true,
+                          "The JSON snapshot's aodvRoutes array is empty: " << line);
+    NS_TEST_ASSERT_MSG_EQ(line.find(targetLine.str()) != std::string::npos,
+                          true,
+                          "The JSON snapshot did not name the TargNode: " << line);
+
+    // Source routing (H=0) leaves no per-hop state at the TargNode (RFC 9854
+    // section 6.4.3 builds a route entry only for H=1).
+    std::ostringstream targJson;
+    targ->PrintRoutingTableJson(Create<OutputStreamWrapper>(&targJson));
+    NS_TEST_ASSERT_MSG_EQ(targJson.str().find("\"aodvRoutes\":[]") != std::string::npos,
+                          true,
+                          "The TargNode recorded an AODV-RPL route it should not have: "
+                              << targJson.str());
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Check which DIOs RplRoutingProtocol::HandleDio() acts on and which
  *        it turns away: a mode of operation it does not implement, another
  *        RPL instance or DODAG, a stale DODAG version, and the infinite
@@ -9777,6 +9885,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplAodvRrepCompletesTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplRootJoinsForeignRreqInstanceParentLossTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRrepDuplicateRelayedOnceTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplAodvRoutesInPrintedTablesTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDioRejectionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplParentLossRejoinTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplInterfaceRestartTestCase, TestCase::Duration::QUICK);

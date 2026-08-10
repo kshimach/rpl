@@ -3257,6 +3257,25 @@ RplRoutingProtocol::PrintRoutingTable(Ptr<OutputStreamWrapper> stream, Time::Uni
         }
     }
 
+    // Not root-gated like the DAO topology above: an AODV-RPL (RFC 9854)
+    // route is discovered and held at whichever node called DiscoverRoute(),
+    // which need not be the root at all.
+    if (!m_aodvRoutes.empty())
+    {
+        *os << "  AODV-RPL routes:" << std::endl;
+        Time now = Now();
+        for (const auto& [target, route] : m_aodvRoutes)
+        {
+            if (route.expire <= now)
+            {
+                continue;
+            }
+            *os << "    " << target << " over " << route.hops.size() << " hop(s), first via "
+                << route.hops.front() << ", RREQ-Instance " << +route.rreqInstanceId
+                << ", expires in " << (route.expire - now).As(unit) << std::endl;
+        }
+    }
+
     os->copyfmt(oldState);
 }
 
@@ -3273,6 +3292,37 @@ RplRoutingProtocol::PrintRoutingTableJson(Ptr<OutputStreamWrapper> stream) const
     // dots. That is what lets this get away without a JSON library.
     auto quoted = [os](const Ipv6Address& address) { *os << '"' << address << '"'; };
 
+    // AODV-RPL (RFC 9854) routes are node-level state, independent of the
+    // base DODAG membership dodag below (GetBaseDodag() can come back null
+    // while m_aodvRoutes still holds routes discovered earlier), so this is
+    // written the same way in both the joined and not-joined branches.
+    auto writeAodvRoutes = [&]() {
+        *os << "\"aodvRoutes\":[";
+        bool firstRoute = true;
+        Time now = Now();
+        for (const auto& [target, route] : m_aodvRoutes)
+        {
+            if (route.expire <= now)
+            {
+                continue;
+            }
+            *os << (firstRoute ? "" : ",") << "{\"target\":";
+            quoted(target);
+            *os << ",\"hops\":[";
+            bool firstHop = true;
+            for (const auto& hop : route.hops)
+            {
+                *os << (firstHop ? "" : ",");
+                quoted(hop);
+                firstHop = false;
+            }
+            *os << "],\"rreqInstance\":" << +route.rreqInstanceId
+                << ",\"expiresIn\":" << (route.expire - now).GetSeconds() << "}";
+            firstRoute = false;
+        }
+        *os << "]";
+    };
+
     *os << "{\"node\":" << m_ipv6->GetObject<Node>()->GetId()
         << ",\"time\":" << Now().GetSeconds() << ",\"role\":\""
         << (m_isRoot ? "root" : "router") << "\",\"joined\":";
@@ -3286,8 +3336,9 @@ RplRoutingProtocol::PrintRoutingTableJson(Ptr<OutputStreamWrapper> stream) const
         // fields either way rather than branching on "joined" first.
         *os << ",\"dodagId\":null,\"instance\":null,\"version\":null,\"ocp\":null"
                ",\"rank\":null,\"pathEtx\":null,\"preferredParent\":null"
-               ",\"parents\":[],\"topology\":[]}"
-            << std::endl;
+               ",\"parents\":[],\"topology\":[],";
+        writeAodvRoutes();
+        *os << "}" << std::endl;
         os->copyfmt(oldState);
         return;
     }
@@ -3371,7 +3422,9 @@ RplRoutingProtocol::PrintRoutingTableJson(Ptr<OutputStreamWrapper> stream) const
         *os << "}";
         first = false;
     }
-    *os << "]}" << std::endl;
+    *os << "],";
+    writeAodvRoutes();
+    *os << "}" << std::endl;
 
     os->copyfmt(oldState);
 }
