@@ -309,6 +309,104 @@ RplRoutingProtocol::ShouldRefuseAodvRreq(const RplDioHeader& dio, Ipv6Address fr
     return false;
 }
 
+bool
+RplRoutingProtocol::ShouldRefuseAodvRrep(const RplDioHeader& dio, Ipv6Address from) const
+{
+    DodagKey key{dio.GetInstanceId(), dio.GetDodagId()};
+
+    // The two checks an RREQ-Instance and an RREP-Instance need alike: the
+    // rejoin bar, and this node's own instance heard back.
+    if (ShouldRefuseAodvInstance(key, from))
+    {
+        return true;
+    }
+
+    // RFC 9854 section 4.3: an RREP-DIO carries exactly one ART option, and
+    // it is what names the OrigNode this RREP-Instance is aimed at.
+    if (!dio.HasArt())
+    {
+        NS_LOG_WARN("Refusing an RREP-DIO with no ART option");
+        return true;
+    }
+
+    const RplDioHeader::RrepOption& rrep = dio.GetRrep();
+    if (rrep.hopByHop)
+    {
+        NS_LOG_LOGIC("Refusing an RREP asking for hop-by-hop routing");
+        return true;
+    }
+
+    // RFC 9854 section 6.4.1: "An intermediate router MUST discard an RREP
+    // if one of its addresses is present in the Address Vector". On an
+    // asymmetric route the Address Vector is the RREP's own, accumulated as
+    // it floods, so a repeat that already ran through here is a loop. (On a
+    // symmetric route the vector is the RREQ's, which by construction holds
+    // every intermediate router, so the same rule is deliberately not
+    // applied there. @see HandleAodvRrep() and design-constraints.md.)
+    for (const auto& hop : rrep.addressVector)
+    {
+        if (IsOwnAddress(hop))
+        {
+            NS_LOG_LOGIC("Refusing an RREP whose Address Vector already holds " << hop);
+            return true;
+        }
+    }
+
+    // RFC 9854 section 6.4.1: "If the S bit of the RREQ-Instance is set to
+    // 0, the router MUST determine whether the downward direction of the
+    // link ... satisfies the OF and whether the router's Rank would not
+    // exceed the RankLimit. If these are true, the router joins the DODAG
+    // of the RREP-Instance." This module is always in that S=0 branch here
+    // -- a symmetric route's RREP never reaches this function at all
+    // (HandleDio() calls HandleAodvRrep() for it instead). The computation
+    // mirrors ShouldRefuseAodvRreq()'s exactly (section 4.2 defines the RREP
+    // option's own RankLimit "similarly to RankLimit in the RREQ message"),
+    // with isOrigin standing in for isTarget: it is the OrigNode that
+    // section 4.1's text relaxes the bound for ("TargNode can join ... at a
+    // Rank ... less than or equal to the RankLimit"), the RREP-Instance's
+    // equivalent of the RREQ-Instance's TargNode.
+    //
+    // Checked here rather than in HandleAodvRrepInstance(), even though the
+    // RFC discusses it in the same breath as the Address Vector check just
+    // above: unlike that one, this has to run before HandleDio()'s own
+    // join, the same reason ShouldRefuseAodvRreq()'s own RankLimit check
+    // does. HandleDio() calls JoinDodag() unconditionally for a DodagKey it
+    // has no membership for yet, before HandleAodvRrepInstance() ever runs
+    // -- refusing there would stop this function's caller from populating
+    // dodag.aodv, but the ordinary DODAG membership JoinDodag() already
+    // created would stay behind regardless, leaving the node joined in
+    // every way IsJoinedTo() can see, just without the SendDio() branch
+    // (@see the isRrepInstance check there) that would ever advertise
+    // anything useful into it.
+    if (rrep.rankLimit != RPL_AODV_RANK_LIMIT_INFINITE)
+    {
+        uint16_t minHopRankIncrease =
+            dio.HasDagConfiguration() ? dio.GetMinHopRankIncrease() : m_minHopRankIncrease;
+        NS_ASSERT_MSG(minHopRankIncrease > 0, "MinHopRankIncrease of zero would divide by zero");
+
+        uint16_t advertisedDagRank = dio.GetRank() / minHopRankIncrease;
+        if (advertisedDagRank >= rrep.rankLimit)
+        {
+            NS_LOG_LOGIC("Refusing an RREP-Instance DIO advertising DAGRank "
+                        << advertisedDagRank << ", at or past the RankLimit "
+                        << +rrep.rankLimit);
+            return true;
+        }
+
+        uint16_t ownDagRank = static_cast<uint16_t>(advertisedDagRank + 1);
+        bool isOrigin = IsOwnAddress(dio.GetArt().target);
+        if (isOrigin ? (ownDagRank > rrep.rankLimit) : (ownDagRank >= rrep.rankLimit))
+        {
+            NS_LOG_LOGIC("Refusing an RREP-Instance DIO that would put this node at DAGRank "
+                         << ownDagRank << ", past the RankLimit " << +rrep.rankLimit);
+            return true;
+        }
+    }
+
+    NS_LOG_LOGIC("Accepting an RREP-Instance DIO from " << from);
+    return false;
+}
+
 void
 RplRoutingProtocol::HandleAodvRreq(const RplDioHeader& dio, Ipv6Address from, uint32_t interface)
 {
@@ -819,44 +917,16 @@ RplRoutingProtocol::HandleAodvRrepInstance(const RplDioHeader& dio,
 
     const RplDioHeader::RrepOption& rrep = dio.GetRrep();
 
-    // RFC 9854 section 4.3: an RREP-DIO carries exactly one ART option, and
-    // it is what names the OrigNode this RREP-Instance is aimed at. Checked
-    // here rather than before the join for the same reason HandleAodvRreq()
-    // checks its own: the DIO was a valid DIO, so the DODAG side of it
-    // stands even when its AODV-RPL content is unusable.
-    if (!dio.HasArt())
-    {
-        NS_LOG_WARN("Ignoring the AODV-RPL content of an RREP-DIO with no ART option");
-        return;
-    }
-    if (rrep.hopByHop)
-    {
-        NS_LOG_LOGIC("Ignoring an RREP asking for hop-by-hop routing");
-        return;
-    }
+    // Every check that has to run before HandleDio()'s own join --
+    // structural validity, the loop check, and the RankLimit -- is in
+    // ShouldRefuseAodvRrep() instead, called from there. This function only
+    // ever runs once that join has already happened.
 
     // The TargNode rooting this instance has nothing to learn from its own
     // flood coming back around.
     if (dodag.aodv.isRrepInstance && dodag.aodv.isTarget)
     {
         return;
-    }
-
-    // RFC 9854 section 6.4.1: "An intermediate router MUST discard an RREP
-    // if one of its addresses is present in the Address Vector". This is
-    // where that rule finally means something -- on an asymmetric route the
-    // Address Vector is the RREP's own, accumulated as it floods, so a
-    // repeat that already ran through here is a loop. (On a symmetric route
-    // the vector is the RREQ's, which by construction holds every
-    // intermediate router, so the same rule is deliberately not applied
-    // there. @see HandleAodvRrep() and design-constraints.md.)
-    for (const auto& hop : rrep.addressVector)
-    {
-        if (IsOwnAddress(hop))
-        {
-            NS_LOG_LOGIC("Dropping an RREP whose Address Vector already holds " << hop);
-            return;
-        }
     }
 
     // First arrival: record what this instance is. Re-recorded on a later,

@@ -1237,13 +1237,15 @@ RplRoutingProtocol::HandleDio(const RplDioHeader& dio,
         return;
     }
 
-    // An asymmetric RREP-Instance needs the same rejoin bar for the same
-    // reason, and equally has to have it before the join: once its own
+    // An asymmetric RREP-Instance needs the RREQ-Instance's own set of
+    // pre-join checks for the same reasons: the rejoin bar (once its own
     // membership has been erased at its 'L' deadline, nothing else stops a
     // TargNode being pulled back into a DODAG rooted at its own address by
     // a straggling RREP-DIO -- the isRoot check above only covers the
-    // window while the membership still exists.
-    if (dio.HasRrep() && ShouldRefuseAodvInstance(dioKey, from))
+    // window while the membership still exists), the loop check, and the
+    // RankLimit (RFC 9854 section 6.4.1 gates joining the RREP-Instance DODAG
+    // on it exactly as section 6.2.1 gates joining the RREQ-Instance one).
+    if (dio.HasRrep() && ShouldRefuseAodvRrep(dio, from))
     {
         return;
     }

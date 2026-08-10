@@ -884,6 +884,24 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     bool ShouldRefuseAodvInstance(DodagKey key, Ipv6Address from) const;
 
     /**
+     * @brief Whether an RREP-Instance DIO should be refused before it is
+     *        joined.
+     *
+     * The RREP-Instance counterpart of ShouldRefuseAodvRreq(): the checks
+     * RFC 9854 section 6.4.1 puts ahead of joining the RREP-Instance DODAG,
+     * which therefore have to run before HandleDio()'s own join exactly as
+     * the RREQ side's do -- this node's address already in the Address
+     * Vector (the route would loop), and a rank that would reach or exceed
+     * the RankLimit, relaxed by one step for the OrigNode the way the RREQ
+     * side relaxes it for the TargNode.
+     *
+     * @param dio the RREP-DIO to judge
+     * @param from the link-local address of the neighbour that sent it
+     * @return true if the DIO must be dropped without joining
+     */
+    bool ShouldRefuseAodvRrep(const RplDioHeader& dio, Ipv6Address from) const;
+
+    /**
      * @brief Act on an RREP-DIO travelling back towards the OrigNode.
      *
      * Never joined as a DODAG: on a symmetric route "the DODAG in

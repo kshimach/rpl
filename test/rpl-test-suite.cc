@@ -6191,6 +6191,217 @@ RplRootJoinsForeignRreqInstanceParentLossTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief A router only joins an RREP-Instance if its own Rank would stay
+ *        within the RankLimit, with the OrigNode's bound relaxed by one
+ *        step, mirroring the RREQ-Instance's own RankLimit check.
+ *
+ * RFC 9854 section 6.4.1: "If the S bit of the RREQ-Instance is set to 0,
+ * the router MUST determine whether the downward direction of the link ...
+ * satisfies the OF and whether the router's Rank would not exceed the
+ * RankLimit. If these are true, the router joins the DODAG of the
+ * RREP-Instance." Section 4.2 defines the RREP option's own RankLimit field
+ * "similarly to RankLimit in the RREQ message", whose section 4.1 spells the
+ * asymmetric relaxation out: "TargNode can join the RREQ-Instance at a Rank
+ * ... less than or equal to the RankLimit. Any other node MUST NOT join ...
+ * if its own Rank would be equal to or higher than the RankLimit." Found
+ * with `/protocol-test-matrix`'s Phase 0 re-read after the S=0 work landed:
+ * HandleAodvRrepInstance() had no RankLimit check of any kind, while
+ * ShouldRefuseAodvRreq() already had the RREQ-Instance's own equivalent.
+ *
+ * One node under test, already an ordinary member of a fabricated
+ * RREQ-Instance (RankLimit 3), fed fabricated RREP-DIOs for the paired
+ * RREP-Instance at the boundary. With MinHopRankIncrease at its default
+ * (128) and a RankLimit of 3, DAGRank 2 (rank 256) is the exact edge: a
+ * relay's own resulting DAGRank would be 3, at the limit and so refused;
+ * for the node the RREP-Instance is addressed to (the ART option's target,
+ * i.e. this node acting as OrigNode) that same DAGRank 3 is exactly the
+ * relaxed bound and so accepted -- the two cases fabricated identically
+ * except for which address the ART option names.
+ */
+class RplAodvRrepInstanceRankLimitTestCase : public TestCase
+{
+  public:
+    RplAodvRrepInstanceRankLimitTestCase();
+
+  private:
+    void DoRun() override;
+
+    /**
+     * @brief Fabricate a paired RREQ-Instance, then feed one RREP-DIO into
+     *        it and report whether the RREP-Instance was joined.
+     *
+     * A fresh OrigNode/TargNode pair per call, so the sub-cases cannot
+     * contaminate each other's state.
+     *
+     * @param rrepRank the Rank the fabricated RREP-DIO advertises
+     * @param asOrigin whether the ART option should name this node (the
+     *                 relaxed bound) or a fake address (the strict one)
+     * @return true if the node ended up joined to the RREP-Instance
+     */
+    bool TryJoin(Ptr<Node> node, Ipv6Address nodeLinkLocal, uint16_t rrepRank, bool asOrigin);
+};
+
+RplAodvRrepInstanceRankLimitTestCase::RplAodvRrepInstanceRankLimitTestCase()
+    : TestCase("An RREP-Instance is only joined within its RankLimit, relaxed for the OrigNode")
+{
+}
+
+bool
+RplAodvRrepInstanceRankLimitTestCase::TryJoin(Ptr<Node> node,
+                                              Ipv6Address nodeLinkLocal,
+                                              uint16_t rrepRank,
+                                              bool asOrigin)
+{
+    static uint16_t sequence = 0;
+    sequence++;
+    // A fresh pair per call: fabricated addresses of convenience, distinct
+    // each time so no earlier sub-case's membership or REJOIN_REENABLE
+    // entry can interfere with this one's.
+    std::ostringstream origSuffix;
+    origSuffix << "2001:9::" << sequence << ":1";
+    std::ostringstream targSuffix;
+    targSuffix << "2001:9::" << sequence << ":99";
+    Ipv6Address origNode(origSuffix.str().c_str());
+    Ipv6Address targNode(targSuffix.str().c_str());
+    Ipv6Address neighbour("fe80::a");
+
+    static constexpr uint8_t RREQ_INSTANCE = 0x81;
+    static constexpr uint8_t DELTA = 0; // RREP-InstanceID == RREQ-InstanceID
+
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+
+    // An ordinary RREQ-Instance membership, well within its own RankLimit,
+    // to pair the RREP-Instance against. Its own Rank does not matter to
+    // this test -- only that the membership exists so HandleAodvRrepInstance()
+    // can look it up.
+    RplDioHeader rreqDio;
+    rreqDio.SetInstanceId(RREQ_INSTANCE);
+    rreqDio.SetVersionNumber(0);
+    rreqDio.SetRank(RPL_MIN_HOPRANKINC);
+    rreqDio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+    rreqDio.SetDodagId(origNode);
+    rreqDio.SetDtsn(0);
+    RplDioHeader::RreqOption rreq;
+    rreq.symmetric = false; // irrelevant here, but honest: this test is S=0 throughout
+    rreq.hopByHop = false;
+    rreq.lifetime = 0; // no limit, keeps this test's timing simple
+    rreq.rankLimit = 3;
+    rreq.origSeqNo = 1;
+    rreq.addressVector = {};
+    rreqDio.SetRreq(rreq);
+    RplDioHeader::ArtOption rreqArt;
+    rreqArt.destSeqNo = 0;
+    rreqArt.prefixLength = 0;
+    rreqArt.target = targNode;
+    rreqDio.SetArt(rreqArt);
+    DeliverRawRplMessage<RplDioHeader>(node,
+                                       1,
+                                       rreqDio,
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       neighbour,
+                                       nodeLinkLocal);
+
+    // The RREP-DIO under test.
+    RplDioHeader rrepDio;
+    rrepDio.SetInstanceId(static_cast<uint8_t>(RREQ_INSTANCE + DELTA));
+    rrepDio.SetVersionNumber(0);
+    rrepDio.SetRank(rrepRank);
+    rrepDio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+    rrepDio.SetDodagId(targNode);
+    rrepDio.SetDtsn(0);
+    RplDioHeader::RrepOption rrep;
+    rrep.gratuitous = false;
+    rrep.hopByHop = false;
+    rrep.lifetime = 0;
+    rrep.rankLimit = 3;
+    rrep.delta = DELTA;
+    rrep.addressVector = {};
+    rrepDio.SetRrep(rrep);
+    RplDioHeader::ArtOption rrepArt;
+    rrepArt.destSeqNo = 1;
+    rrepArt.prefixLength = 0;
+    rrepArt.target = asOrigin ? rpl->GetGlobalAddress() : origNode;
+    rrepDio.SetArt(rrepArt);
+    // Multicast, not nodeLinkLocal: HandleDio() uses the destination address
+    // alone to tell an RREP-Instance's flood (section 6.3.2) apart from a
+    // symmetric route's unicast reply (section 6.3.1), and only the former
+    // reaches the join path this test is about.
+    DeliverRawRplMessage<RplDioHeader>(node,
+                                       1,
+                                       rrepDio,
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       neighbour,
+                                       Ipv6Address(RPL_ALL_NODES_MULTICAST));
+
+    return rpl->IsJoinedTo(static_cast<uint8_t>(RREQ_INSTANCE + DELTA), targNode);
+}
+
+void
+RplAodvRrepInstanceRankLimitTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(1);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.AssignWithoutAddress(devices);
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    Simulator::Stop(Seconds(2));
+    Simulator::Run();
+
+    Ptr<Node> node = nodes.Get(0);
+    Ipv6Address nodeLinkLocal = node->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    // Comfortably under the limit (DAGRank 1, own DAGRank 2 < 3): joined
+    // whichever role this node plays.
+    NS_TEST_ASSERT_MSG_EQ(TryJoin(node, nodeLinkLocal, RPL_MIN_HOPRANKINC, false),
+                          true,
+                          "A relay well within the RankLimit was refused");
+    NS_TEST_ASSERT_MSG_EQ(TryJoin(node, nodeLinkLocal, RPL_MIN_HOPRANKINC, true),
+                          true,
+                          "The OrigNode well within the RankLimit was refused");
+
+    // The exact boundary (DAGRank 2, own DAGRank 3 == the RankLimit): an
+    // ordinary relay must not join, the OrigNode must.
+    uint16_t boundaryRank = static_cast<uint16_t>(2 * RPL_MIN_HOPRANKINC);
+    NS_TEST_ASSERT_MSG_EQ(TryJoin(node, nodeLinkLocal, boundaryRank, false),
+                          false,
+                          "An ordinary relay joined at exactly the RankLimit: "
+                          "RFC 9854 section 4.1 relaxes that bound for the OrigNode only");
+    NS_TEST_ASSERT_MSG_EQ(TryJoin(node, nodeLinkLocal, boundaryRank, true),
+                          true,
+                          "The OrigNode was refused at exactly the RankLimit, where section "
+                          "4.1's relaxation should have let it in");
+
+    // The sender's own advertised DAGRank already at the limit: refused
+    // outright, no relaxation for anyone (RFC 9854 section 4.1's first
+    // sentence has no exception in it).
+    uint16_t pastLimitRank = static_cast<uint16_t>(3 * RPL_MIN_HOPRANKINC);
+    NS_TEST_ASSERT_MSG_EQ(TryJoin(node, nodeLinkLocal, pastLimitRank, false),
+                          false,
+                          "A relay joined past the RankLimit");
+    NS_TEST_ASSERT_MSG_EQ(TryJoin(node, nodeLinkLocal, pastLimitRank, true),
+                          false,
+                          "The OrigNode joined past the RankLimit: the relaxation only ever "
+                          "applies to this node's own resulting DAGRank, never to the sender's "
+                          "already-too-high one");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief A duplicate physical delivery of the same RREP-DIO is relayed only
  *        once by an intermediate router.
  *
@@ -10720,6 +10931,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplAodvAsymmetricRouteCompletesTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRrepCompletesTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplRootJoinsForeignRreqInstanceParentLossTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplAodvRrepInstanceRankLimitTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRrepDuplicateRelayedOnceTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRoutesInPrintedTablesTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDioRejectionTestCase, TestCase::Duration::QUICK);
