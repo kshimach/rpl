@@ -593,6 +593,31 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      */
     DodagKey DiscoverP2pRoute(Ipv6Address target);
 
+    /**
+     * @brief Get the Address Vector a P2P-RPL temporary DAG has accumulated.
+     *
+     * The route the P2P mode DIO took to reach this node, as this node
+     * would propagate it onward -- its own address included (RFC 6997
+     * section 9.4). Exposed for tests and for inspecting a discovery in
+     * progress, the P2P-RPL counterpart of GetAodvAddressVector().
+     *
+     * @param instanceId the RPLInstanceID of the temporary DAG
+     * @param dodagId the DODAGID of the temporary DAG, i.e. the Origin
+     * @param [out] addressVector the accumulated route, Origin side first
+     * @return true if this node is part of that temporary DAG
+     */
+    bool GetP2pAddressVector(uint8_t instanceId,
+                             Ipv6Address dodagId,
+                             std::vector<Ipv6Address>& addressVector) const;
+
+    /**
+     * @brief Whether this node is the Target of a temporary DAG it holds.
+     * @param instanceId the RPLInstanceID of the temporary DAG
+     * @param dodagId the DODAGID of the temporary DAG
+     * @return true if one of this node's addresses is the instance's Target
+     */
+    bool IsP2pTarget(uint8_t instanceId, Ipv6Address dodagId) const;
+
   protected:
     void DoInitialize() override;
     void DoDispose() override;
@@ -958,6 +983,31 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     bool ShouldRefuseAodvRrep(const RplDioHeader& dio, Ipv6Address from) const;
 
     /**
+     * @brief Whether a P2P mode DIO should be refused before it is joined.
+     *
+     * RFC 6997's own set of pre-join checks, gathered in one place for the
+     * same reason ShouldRefuseAodvRrep() gathers AODV-RPL's: this node's
+     * address already in the Address Vector (section 9.4, a loop), a rank
+     * that would reach or exceed the MaxRank (section 7, relaxed by one
+     * step for the Target the way AODV-RPL's RankLimit relaxes for the
+     * TargNode/OrigNode), a nonzero MaxRankIncrease (section 6.1: "A
+     * received P2P mode DIO MUST be discarded if the MaxRankIncrease
+     * parameter...is not zero"), and this node's own address as the
+     * DODAGID -- P2P-RPL has no REJOIN_REENABLE of its own (RFC 6997 does
+     * not mention rejoining at all), but the underlying hazard
+     * ShouldRefuseAodvInstance() guards against is structural, not a policy
+     * choice from that RFC: after this node's own temporary DAG membership
+     * has been erased at its 'L' deadline, nothing else stops a straggling
+     * DIO pulling it back in as an ordinary member of a DODAG rooted at its
+     * own address.
+     *
+     * @param dio the P2P mode DIO to judge
+     * @param from the link-local address of the neighbour that sent it
+     * @return true if the DIO must be dropped without joining
+     */
+    bool ShouldRefuseP2pRdo(const RplDioHeader& dio, Ipv6Address from) const;
+
+    /**
      * @brief Act on an RREP-DIO travelling back towards the OrigNode.
      *
      * Never joined as a DODAG: on a symmetric route "the DODAG in
@@ -1021,6 +1071,24 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      * @param interface the interface it arrived on
      */
     void HandleAodvRrepInstance(const RplDioHeader& dio, Ipv6Address from, uint32_t interface);
+
+    /**
+     * @brief Take a P2P mode DIO, once the DODAG machinery has already
+     *        joined it.
+     *
+     * The P2P-RPL counterpart of HandleAodvRreq(), called from the same
+     * position in HandleDio() and for the same reason: RFC 6997 section 9.4
+     * has the router append the address of the interface it heard the DIO
+     * on, which is only meaningful once this membership's preferred parent
+     * has been settled. Recognising this node as the Target (section 9.3)
+     * happens here too; actually generating a P2P-DRO in response is a
+     * later increment's job (@see design-constraints.md).
+     *
+     * @param dio the P2P mode DIO just processed
+     * @param from the neighbour it came from, a link-local address
+     * @param interface the interface it arrived on
+     */
+    void HandleP2pRdo(const RplDioHeader& dio, Ipv6Address from, uint32_t interface);
 
     /**
      * @brief Unicast an RREP-DIO one hop towards the OrigNode.
@@ -1650,11 +1718,12 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     Time m_p2pDioIntervalMin;
     uint8_t m_p2pDioIntervalDoublings; //!< doublings for the P2P mode DIO Trickle timer
     /// Redundancy constant k for P2P mode DIOs. RFC 6997 section 9.2
-    /// recommends 1, unlike this module's own default of 0 (never suppress)
-    /// used for the base DODAG and AODV-RPL alike: P2P-RPL's own Trickle
-    /// rules (section 9.2) are built around a router suppressing a DIO that
-    /// does not improve on what it would already advertise, which k=0 would
-    /// defeat outright.
+    /// recommends 1, but this module's generic Trickle consistency hit
+    /// (shared with core RPL and AODV-RPL) does not implement that
+    /// section's own nuanced "consistent" definition, so k=1 ends up
+    /// suppressing a router's own first, most useful retransmission
+    /// whenever it hears its parent's unchanged one first; @see the
+    /// P2pDioRedundancy attribute and design-constraints.md.
     uint8_t m_p2pDioRedundancy;
     uint8_t m_p2pMaxRank; //!< MaxRank put on P2P mode DIOs, 0 meaning no limit
     uint8_t m_p2pLifetime; //!< the 'L' field put on P2P mode DIOs, 0..3

@@ -7279,6 +7279,334 @@ RplP2pDiscoverRouteTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief A P2P-RPL route discovery floods a P2P mode DIO outward, each hop
+ *        appending its own address to the Address Vector, and the Target
+ *        recognises itself.
+ *
+ * The increment 3 counterpart of RplAodvRreqFloodTestCase, on the same
+ * four-node line:
+ *
+ *     orig(0) ---- relay1(1) ---- relay2(2) ---- targ(3)
+ *
+ * DiscoverP2pRoute() at the Origin forms a temporary DAG rooted at itself
+ * (RFC 6997 section 6.1) and Trickle-paces P2P mode DIOs into it; every
+ * router that hears one joins (ShouldRefuseP2pRdo() having let it through),
+ * appends the address of the interface it heard it on (section 9.4), and
+ * propagates -- except the Target, which recognises itself and stops
+ * (section 9.5). Actually replying is a later increment's business.
+ */
+class RplP2pFloodTestCase : public TestCase
+{
+  public:
+    RplP2pFloodTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplP2pFloodTestCase::RplP2pFloodTestCase()
+    : TestCase("A P2P mode DIO floods outward, each hop appending itself to the Address Vector")
+{
+}
+
+void
+RplP2pFloodTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(4); // 0 = Origin and base root, 1 and 2 = relays, 3 = Target
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    auto blacklist = [&](uint32_t a, uint32_t b) {
+        Ptr<SimpleNetDevice> devA = DynamicCast<SimpleNetDevice>(devices.Get(a));
+        Ptr<SimpleNetDevice> devB = DynamicCast<SimpleNetDevice>(devices.Get(b));
+        channel->BlackList(devA, devB);
+        channel->BlackList(devB, devA);
+    };
+    blacklist(0, 2);
+    blacklist(0, 3);
+    blacklist(1, 3);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    // The base DODAG across all three hops first, so every node has SLAACed
+    // the global address its Address Vector entry has to be.
+    Simulator::Stop(Seconds(250));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> orig = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> relay1 = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> relay2 = nodes.Get(2)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> targ = nodes.Get(3)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(targ->IsJoined(), true, "The base DODAG did not reach the far end");
+
+    Ipv6Address relay1Address = relay1->GetGlobalAddress();
+    Ipv6Address relay2Address = relay2->GetGlobalAddress();
+    Ipv6Address targAddress = targ->GetGlobalAddress();
+    NS_TEST_ASSERT_MSG_NE(targAddress, Ipv6Address::GetAny(), "The Target has no address");
+
+    RplRoutingProtocol::DodagKey key = orig->DiscoverP2pRoute(targAddress);
+    NS_TEST_ASSERT_MSG_NE(key.dodagId, Ipv6Address::GetAny(), "The discovery did not start");
+
+    // Three hops of Trickle-paced P2P mode DIOs at P2pDioIntervalMin
+    // (64 ms, doubling), well inside the default 'L' field's 16 seconds.
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(orig->IsJoinedTo(key.instanceId, key.dodagId),
+                          true,
+                          "The Origin is not in its own temporary DAG");
+    NS_TEST_ASSERT_MSG_EQ(relay1->IsJoinedTo(key.instanceId, key.dodagId),
+                          true,
+                          "relay1 did not join the temporary DAG");
+    NS_TEST_ASSERT_MSG_EQ(relay2->IsJoinedTo(key.instanceId, key.dodagId),
+                          true,
+                          "relay2 did not join the temporary DAG: the DIO was not propagated "
+                          "past the first hop");
+    NS_TEST_ASSERT_MSG_EQ(targ->IsJoinedTo(key.instanceId, key.dodagId),
+                          true,
+                          "The Target never heard the P2P mode DIO");
+
+    std::vector<Ipv6Address> addressVector;
+
+    NS_TEST_ASSERT_MSG_EQ(orig->GetP2pAddressVector(key.instanceId, key.dodagId, addressVector),
+                          true,
+                          "The Origin has no Address Vector");
+    NS_TEST_ASSERT_MSG_EQ(addressVector.size(),
+                          0,
+                          "The Origin put itself in its own Address Vector; RFC 6997 section 7 "
+                          "says the Origin and Target addresses MUST NOT be included");
+
+    NS_TEST_ASSERT_MSG_EQ(relay1->GetP2pAddressVector(key.instanceId, key.dodagId, addressVector),
+                          true,
+                          "relay1 has no Address Vector");
+    NS_TEST_ASSERT_MSG_EQ(addressVector.size(), 1, "relay1's Address Vector is the wrong length");
+    NS_TEST_ASSERT_MSG_EQ(addressVector[0], relay1Address, "relay1 did not append its own address");
+
+    NS_TEST_ASSERT_MSG_EQ(relay2->GetP2pAddressVector(key.instanceId, key.dodagId, addressVector),
+                          true,
+                          "relay2 has no Address Vector");
+    NS_TEST_ASSERT_MSG_EQ(addressVector.size(), 2, "relay2's Address Vector is the wrong length");
+    NS_TEST_ASSERT_MSG_EQ(addressVector[0], relay1Address, "relay2 lost the hop before it");
+    NS_TEST_ASSERT_MSG_EQ(addressVector[1], relay2Address, "relay2 did not append its own address");
+
+    NS_TEST_ASSERT_MSG_EQ(targ->GetP2pAddressVector(key.instanceId, key.dodagId, addressVector),
+                          true,
+                          "The Target has no Address Vector");
+    NS_TEST_ASSERT_MSG_EQ(addressVector.size(), 3, "The Target's Address Vector is the wrong length");
+    NS_TEST_ASSERT_MSG_EQ(addressVector[0], relay1Address, "The first hop is wrong at the Target");
+    NS_TEST_ASSERT_MSG_EQ(addressVector[1], relay2Address, "The second hop is wrong at the Target");
+    NS_TEST_ASSERT_MSG_EQ(addressVector[2], targAddress, "The Target did not append its own address");
+
+    // Only the node the P2P-RDO's TargetAddr names knows itself to be the
+    // Target.
+    NS_TEST_ASSERT_MSG_EQ(targ->IsP2pTarget(key.instanceId, key.dodagId),
+                          true,
+                          "The Target did not recognise itself in the P2P-RDO");
+    NS_TEST_ASSERT_MSG_EQ(relay1->IsP2pTarget(key.instanceId, key.dodagId),
+                          false,
+                          "relay1 thinks it is the Target");
+    NS_TEST_ASSERT_MSG_EQ(relay2->IsP2pTarget(key.instanceId, key.dodagId),
+                          false,
+                          "relay2 thinks it is the Target");
+
+    // The base DODAG is untouched: a separate RPL Instance with its own
+    // rank and parent.
+    NS_TEST_ASSERT_MSG_EQ(targ->IsJoined(), true, "The base DODAG membership was disturbed");
+    NS_TEST_ASSERT_MSG_EQ(targ->GetDodagCount(), 2, "The Target holds the wrong number of DODAGs");
+
+    // The 'L' field takes every node back out again: the default P2pLifetime
+    // attribute value (2) is RFC 6997 section 7's 16-second encoding.
+    Simulator::Stop(Seconds(30));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(relay1->IsJoinedTo(key.instanceId, key.dodagId),
+                          false,
+                          "relay1 stayed in the temporary DAG past its 'L' deadline");
+    NS_TEST_ASSERT_MSG_EQ(targ->IsJoinedTo(key.instanceId, key.dodagId),
+                          false,
+                          "The Target stayed in the temporary DAG past its 'L' deadline");
+    NS_TEST_ASSERT_MSG_EQ(orig->IsJoinedTo(key.instanceId, key.dodagId),
+                          false,
+                          "The Origin stayed in its own temporary DAG past its 'L' deadline");
+    NS_TEST_ASSERT_MSG_EQ(targ->IsJoined(),
+                          true,
+                          "Leaving the temporary DAG dropped the base DODAG");
+    NS_TEST_ASSERT_MSG_EQ(targ->GetDodagCount(), 1, "Only the base DODAG should be left");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief A P2P mode DIO is only joined if the router's own resulting
+ *        DAGRank would stay within the MaxRank, relaxed by one step for the
+ *        Target, mirroring AODV-RPL's own RankLimit boundary test.
+ *
+ * RFC 6997 section 7: "An Intermediate Router MUST NOT join a temporary DAG
+ * ... if the integer portion of its rank would be equal to or higher ...
+ * than the MaxRank limit. A Target can join the temporary DAG at a rank
+ * whose integer portion is equal to the MaxRank." One node under test, fed
+ * fabricated P2P mode DIOs directly (no paired instance to set up first,
+ * unlike AODV-RPL's RREP-Instance: a P2P-RDO's join check depends only on
+ * the DIO itself).
+ */
+class RplP2pMaxRankTestCase : public TestCase
+{
+  public:
+    RplP2pMaxRankTestCase();
+
+  private:
+    void DoRun() override;
+
+    /**
+     * @brief Fabricate one P2P mode DIO and report whether it was joined.
+     *
+     * A fresh DODAGID per call, so the sub-cases cannot contaminate each
+     * other's state.
+     *
+     * @param node the node under test
+     * @param dioRank the Rank the fabricated DIO advertises
+     * @param asTarget whether the P2P-RDO's TargetAddr should name this
+     *                 node (the relaxed bound) or a fake address (the
+     *                 strict one)
+     * @return true if the node ended up joined to the temporary DAG
+     */
+    bool TryJoin(Ptr<Node> node, uint16_t dioRank, bool asTarget);
+};
+
+RplP2pMaxRankTestCase::RplP2pMaxRankTestCase()
+    : TestCase("A P2P mode DIO is only joined within its MaxRank, relaxed for the Target")
+{
+}
+
+bool
+RplP2pMaxRankTestCase::TryJoin(Ptr<Node> node, uint16_t dioRank, bool asTarget)
+{
+    static uint16_t sequence = 0;
+    sequence++;
+    // A fresh Origin address per call: distinct each time so no earlier
+    // sub-case's membership can interfere with this one's.
+    std::ostringstream originSuffix;
+    originSuffix << "2001:9::" << sequence << ":1";
+    Ipv6Address origin(originSuffix.str().c_str());
+    Ipv6Address neighbour("fe80::a");
+
+    static constexpr uint8_t INSTANCE = 0x81;
+
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+
+    RplDioHeader dio;
+    dio.SetInstanceId(INSTANCE);
+    dio.SetVersionNumber(0);
+    dio.SetRank(dioRank);
+    dio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+    dio.SetGrounded(true);
+    dio.SetDodagId(origin);
+    dio.SetDtsn(0);
+    P2pRdoOption rdo;
+    rdo.reply = true;
+    rdo.hopByHop = false;
+    rdo.numRoutes = 0;
+    rdo.lifetime = 0; // 1 second; timing is not this test's concern
+    rdo.maxRankOrNh = 3;
+    // A harmless placeholder no one is, when this node is not meant to be
+    // the Target: the Origin's own address is convenient and already fresh.
+    rdo.target = asTarget ? rpl->GetGlobalAddress() : origin;
+    rdo.addressVector = {};
+    dio.SetP2pRdo(rdo);
+
+    DeliverRawRplMessage<RplDioHeader>(node,
+                                       1,
+                                       dio,
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       neighbour,
+                                       Ipv6Address(RPL_ALL_NODES_MULTICAST));
+
+    return rpl->IsJoinedTo(INSTANCE, origin);
+}
+
+void
+RplP2pMaxRankTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(1);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.AssignWithoutAddress(devices);
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    Simulator::Stop(Seconds(2));
+    Simulator::Run();
+
+    Ptr<Node> node = nodes.Get(0);
+
+    // Comfortably under the limit (DAGRank 1, own DAGRank 2 < 3): joined
+    // whichever role this node plays.
+    NS_TEST_ASSERT_MSG_EQ(TryJoin(node, RPL_MIN_HOPRANKINC, false),
+                          true,
+                          "An ordinary router well within MaxRank was refused");
+    NS_TEST_ASSERT_MSG_EQ(TryJoin(node, RPL_MIN_HOPRANKINC, true),
+                          true,
+                          "The Target well within MaxRank was refused");
+
+    // The exact boundary (DAGRank 2, own DAGRank 3 == the MaxRank): an
+    // ordinary router must not join, the Target must.
+    uint16_t boundaryRank = static_cast<uint16_t>(2 * RPL_MIN_HOPRANKINC);
+    NS_TEST_ASSERT_MSG_EQ(TryJoin(node, boundaryRank, false),
+                          false,
+                          "An ordinary router joined at exactly the MaxRank: RFC 6997 section 7 "
+                          "relaxes that bound for the Target only");
+    NS_TEST_ASSERT_MSG_EQ(TryJoin(node, boundaryRank, true),
+                          true,
+                          "The Target was refused at exactly the MaxRank, where section 7's "
+                          "relaxation should have let it in");
+
+    // The sender's own advertised DAGRank already at the limit: refused
+    // outright, no relaxation for anyone.
+    uint16_t pastLimitRank = static_cast<uint16_t>(3 * RPL_MIN_HOPRANKINC);
+    NS_TEST_ASSERT_MSG_EQ(TryJoin(node, pastLimitRank, false),
+                          false,
+                          "An ordinary router joined past the MaxRank");
+    NS_TEST_ASSERT_MSG_EQ(TryJoin(node, pastLimitRank, true),
+                          false,
+                          "The Target joined past the MaxRank: the relaxation only ever applies "
+                          "to this node's own resulting DAGRank, never to the sender's "
+                          "already-too-high one");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Check which DIOs RplRoutingProtocol::HandleDio() acts on and which
  *        it turns away: a mode of operation it does not implement, another
  *        RPL instance or DODAG, a stale DODAG version, and the infinite
@@ -11500,6 +11828,8 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplAodvRrepDuplicateRelayedOnceTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRoutesInPrintedTablesTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pDiscoverRouteTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pFloodTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pMaxRankTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDioRejectionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplParentLossRejoinTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplInterfaceRestartTestCase, TestCase::Duration::QUICK);

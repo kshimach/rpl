@@ -163,5 +163,214 @@ RplRoutingProtocol::P2pInstanceExpired(DodagKey key)
     LeaveDodag(key, false);
 }
 
+bool
+RplRoutingProtocol::ShouldRefuseP2pRdo(const RplDioHeader& dio, Ipv6Address from) const
+{
+    DodagKey key{dio.GetInstanceId(), dio.GetDodagId()};
+
+    // The structural counterpart of ShouldRefuseAodvInstance()'s own
+    // self-DODAGID check, without the REJOIN_REENABLE bar: RFC 6997 does
+    // not mention rejoining a temporary DAG, but once this node's own
+    // membership has been erased at its 'L' deadline (P2pInstanceExpired()),
+    // nothing else stops a straggling DIO pulling it back in as an
+    // ordinary member of a DODAG rooted at its own address -- the isRoot
+    // check in HandleDio() only covers the window while the membership
+    // still exists.
+    if (IsOwnAddress(key.dodagId))
+    {
+        NS_LOG_LOGIC("Refusing this node's own temporary DAG, heard back from " << from);
+        return true;
+    }
+
+    // RFC 6997 section 6.1: "A received P2P mode DIO MUST be discarded if
+    // the MaxRankIncrease parameter inside the DODAG Configuration Option
+    // is not zero." No option present at all falls back to the "default
+    // DODAG Configuration Option" section 6.1 itself defines, whose own
+    // MaxRankIncrease is 0 -- so only an explicit nonzero value refuses.
+    if (dio.HasDagConfiguration() && dio.GetMaxRankIncrease() != 0)
+    {
+        NS_LOG_LOGIC("Refusing a P2P mode DIO with a nonzero MaxRankIncrease from " << from);
+        return true;
+    }
+
+    const P2pRdoOption& rdo = dio.GetP2pRdo();
+
+    // RFC 6997 section 9.4: "if adding its IPv6 address to the route in the
+    // Address vector inside the P2P-RDO would result in the route
+    // containing multiple addresses belonging to this router" -- a loop.
+    // Checked here, before the join below, for the same reason
+    // ShouldRefuseAodvRrep()'s own Address Vector loop check is: the
+    // generic join HandleDio() performs happens regardless of what a
+    // post-join handler decides, so anything meant to prevent it has to run
+    // first.
+    for (const auto& hop : rdo.addressVector)
+    {
+        if (IsOwnAddress(hop))
+        {
+            NS_LOG_LOGIC("Refusing a P2P mode DIO whose Address Vector already holds " << hop);
+            return true;
+        }
+    }
+
+    // RFC 6997 section 7: "An Intermediate Router MUST NOT join a temporary
+    // DAG...if the integer portion of its rank would be equal to or
+    // higher...than the MaxRank limit. A Target can join the temporary DAG
+    // at a rank whose integer portion is equal to the MaxRank." The same
+    // relaxation-for-the-far-end shape as AODV-RPL's own RankLimit (@see
+    // ShouldRefuseAodvRreq()), with "is this node the Target" standing in
+    // for "is this node the TargNode/OrigNode" there -- this router is the
+    // Target if one of its own addresses is the TargetAddr the P2P-RDO
+    // names (multiple Targets via RPL Target options are out of scope,
+    // @see design-constraints.md).
+    if (rdo.maxRankOrNh != RPL_P2P_MAX_RANK_INFINITE)
+    {
+        uint16_t minHopRankIncrease =
+            dio.HasDagConfiguration() ? dio.GetMinHopRankIncrease() : m_minHopRankIncrease;
+        NS_ASSERT_MSG(minHopRankIncrease > 0, "MinHopRankIncrease of zero would divide by zero");
+
+        uint16_t advertisedDagRank = dio.GetRank() / minHopRankIncrease;
+        if (advertisedDagRank >= rdo.maxRankOrNh)
+        {
+            NS_LOG_LOGIC("Refusing a P2P mode DIO advertising DAGRank "
+                        << advertisedDagRank << ", at or past the MaxRank " << +rdo.maxRankOrNh);
+            return true;
+        }
+
+        uint16_t ownDagRank = static_cast<uint16_t>(advertisedDagRank + 1);
+        bool isTarget = IsOwnAddress(rdo.target);
+        if (isTarget ? (ownDagRank > rdo.maxRankOrNh) : (ownDagRank >= rdo.maxRankOrNh))
+        {
+            NS_LOG_LOGIC("Refusing a P2P mode DIO that would put this node at DAGRank "
+                        << ownDagRank << ", past the MaxRank " << +rdo.maxRankOrNh);
+            return true;
+        }
+    }
+
+    NS_LOG_LOGIC("Accepting a P2P mode DIO from " << from);
+    return false;
+}
+
+void
+RplRoutingProtocol::HandleP2pRdo(const RplDioHeader& dio, Ipv6Address from, uint32_t interface)
+{
+    NS_LOG_FUNCTION(this << from << interface);
+
+    DodagKey key{dio.GetInstanceId(), dio.GetDodagId()};
+
+    auto it = m_dodags.find(key);
+    if (it == m_dodags.end())
+    {
+        return;
+    }
+    DodagMembership& dodag = it->second;
+
+    // The Origin hearing its own P2P mode DIO come back around, re-flooded
+    // by a router that appended itself: nothing to do. Its own Address
+    // Vector is the authoritative empty one.
+    if (dodag.p2p.isOrigin)
+    {
+        return;
+    }
+
+    const P2pRdoOption& rdo = dio.GetP2pRdo();
+
+    // A Target that already recognised itself has nothing further to learn
+    // from a later copy -- an unconditional repeat check, the same as
+    // HandleAodvRreq()'s own dodag.aodv.isTarget one.
+    if (dodag.p2p.isTarget)
+    {
+        NS_LOG_LOGIC("Already the Target of temporary DAG " << +key.instanceId
+                                                             << ", ignoring a repeat");
+        return;
+    }
+
+    // An intermediate router's Address Vector must track its preferred
+    // parent, not just whichever copy of the DIO arrived first -- the same
+    // reasoning and the same recipe as HandleAodvRreq()'s own.
+    if (!dodag.p2p.addressVector.empty() && from != dodag.preferredParent)
+    {
+        NS_LOG_LOGIC("Already part of temporary DAG " << +key.instanceId
+                                                       << " via a better parent than " << from
+                                                       << ", ignoring this copy");
+        return;
+    }
+
+    dodag.p2p.target = rdo.target;
+    dodag.p2p.maxRank = rdo.maxRankOrNh;
+    dodag.p2p.lifetimeField = rdo.lifetime;
+    dodag.p2p.reply = rdo.reply;
+    dodag.p2p.hopByHop = rdo.hopByHop;
+    dodag.p2p.isTarget = IsOwnAddress(rdo.target);
+
+    // RFC 6997 section 9.4: "the intermediate router MUST add a unicast
+    // IPv6 address of the receiving interface...to the route in the Address
+    // vector." A global address, since the vector becomes a Source Route
+    // later.
+    Ipv6Address ownAddress = GetGlobalAddressIn(dodag);
+    if (ownAddress.IsAny())
+    {
+        NS_LOG_LOGIC("No global address to put in the Address Vector yet");
+        return;
+    }
+
+    dodag.p2p.addressVector = rdo.addressVector;
+    if (dodag.p2p.addressVector.size() >= RPL_P2P_ADDRESS_VECTOR_MAX_ENTRIES)
+    {
+        NS_LOG_WARN("The Address Vector is full at "
+                    << dodag.p2p.addressVector.size() << " entries; leaving temporary DAG "
+                    << +key.instanceId);
+        LeaveDodag(key, false);
+        return;
+    }
+    dodag.p2p.addressVector.push_back(ownAddress);
+
+    ArmP2pExpiry(dodag, key);
+
+    NS_LOG_INFO("Joined temporary DAG " << +key.instanceId << " at " << key.dodagId
+                                        << " looking for " << dodag.p2p.target << ", "
+                                        << dodag.p2p.addressVector.size()
+                                        << " hop(s) from the Origin"
+                                        << (dodag.p2p.isTarget ? ", and this node is it" : ""));
+
+    // RFC 6997 section 9.5: "A Target MUST NOT forward a P2P mode DIO any
+    // further if no other Targets are to be discovered" -- true here
+    // unconditionally, since multiple Targets via RPL Target options are
+    // out of scope (@see design-constraints.md). Replying with a P2P-DRO is
+    // a later increment's job; for now this just stops the propagation an
+    // Intermediate Router gets below, rather than leaving the Target's own
+    // Trickle timer (already reset by HandleDio() when the preferred parent
+    // was chosen) to re-flood the DIO exactly like an ordinary relay would.
+    if (dodag.p2p.isTarget)
+    {
+        return;
+    }
+
+    // Nothing sends the DIO onward here: DioTrickleFire() already
+    // multicasts this membership's DIO on its own schedule, and SendDio()
+    // fills in the P2P-RDO from the state just recorded.
+}
+
+bool
+RplRoutingProtocol::GetP2pAddressVector(uint8_t instanceId,
+                                        Ipv6Address dodagId,
+                                        std::vector<Ipv6Address>& addressVector) const
+{
+    addressVector.clear();
+    auto it = m_dodags.find(DodagKey{instanceId, dodagId});
+    if (it == m_dodags.end())
+    {
+        return false;
+    }
+    addressVector = it->second.p2p.addressVector;
+    return true;
+}
+
+bool
+RplRoutingProtocol::IsP2pTarget(uint8_t instanceId, Ipv6Address dodagId) const
+{
+    auto it = m_dodags.find(DodagKey{instanceId, dodagId});
+    return it != m_dodags.end() && it->second.p2p.isTarget;
+}
+
 } // namespace rpl
 } // namespace ns3

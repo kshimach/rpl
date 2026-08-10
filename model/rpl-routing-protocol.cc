@@ -287,17 +287,32 @@ RplRoutingProtocol::GetTypeId()
             .AddAttribute("P2pDioIntervalDoublings",
                           "Number of doublings between Imin and Imax of the P2P mode DIO "
                           "Trickle timer. RFC 6997 section 9.2 only says Imax should be 'several "
-                          "orders of magnitude higher than Imin' and is 'unlikely to be "
-                          "critical', since a temporary DAG rarely lives long enough for the "
-                          "timer to grow much; 8 doublings (Imax 16.384 s) comfortably clears "
-                          "that bar without approaching the shortest 'L' encoding (1 s).",
-                          UintegerValue(8),
+                          "orders of magnitude higher than Imin', without a specific number -- "
+                          "kept modest (matching AODV-RPL's own AodvDioIntervalDoublings) rather "
+                          "than large: this module re-arms a temporary DAG membership's own 'L' "
+                          "deadline on every DIO received from the same preferred parent, so a "
+                          "large Imax lets a slow-growing Trickle interval keep pushing that "
+                          "deadline out for far longer than 'L' names, compounding across each "
+                          "hop of a multi-hop discovery. 4 doublings (Imax 1.024 s) keeps this "
+                          "well clear of the shortest 'L' encoding (1 s) without that effect.",
+                          UintegerValue(4),
                           MakeUintegerAccessor(&RplRoutingProtocol::m_p2pDioIntervalDoublings),
                           MakeUintegerChecker<uint8_t>())
             .AddAttribute("P2pDioRedundancy",
                           "Redundancy constant k of the P2P mode DIO Trickle timer. RFC 6997 "
-                          "section 9.2: 'The recommended value...is 1.'",
-                          UintegerValue(1),
+                          "section 9.2 recommends 1, but that assumes a router only counts a "
+                          "DIO as 'consistent' by section 9.2's own nuanced rule (a parent's "
+                          "unchanged re-announcement counts as neither consistent nor "
+                          "inconsistent, and has no effect on suppression). This module's "
+                          "generic Trickle consistency hit (HandleDio(), shared with core RPL "
+                          "and AODV-RPL) is not that selective -- it treats every DIO for the "
+                          "same DODAG as consistent -- so k=1 here ends up suppressing a "
+                          "router's own first, most useful retransmission whenever it happens "
+                          "to hear its parent's own periodic one first. Defaulting to 0 (never "
+                          "suppress), the same choice this module makes everywhere else, until "
+                          "section 9.2's own distinction is implemented; @see "
+                          "design-constraints.md.",
+                          UintegerValue(0),
                           MakeUintegerAccessor(&RplRoutingProtocol::m_p2pDioRedundancy),
                           MakeUintegerChecker<uint8_t>())
             .AddAttribute("P2pMaxRank",
@@ -1307,6 +1322,16 @@ RplRoutingProtocol::HandleDio(const RplDioHeader& dio,
         return;
     }
 
+    // P2P-RPL's own temporary DAG (RFC 6997), an independent protocol that
+    // only shares the Mode of Operation value with AODV-RPL -- @see
+    // ShouldRefuseP2pRdo()'s own doc comment for why its checks (the same
+    // self-instance guard, loop check and MaxRank the AODV-RPL branches
+    // above have, plus MaxRankIncrease) have to run before the join too.
+    if (dio.HasP2pRdo() && ShouldRefuseP2pRdo(dio, from))
+    {
+        return;
+    }
+
     auto existingIt = m_dodags.find(dioKey);
     DodagMembership* existing = existingIt != m_dodags.end() ? &existingIt->second : nullptr;
 
@@ -1463,6 +1488,15 @@ RplRoutingProtocol::HandleDio(const RplDioHeader& dio,
     if (dio.HasRrep() && m_dodags.find(dioKey) != m_dodags.end())
     {
         HandleAodvRrepInstance(dio, from, interface);
+    }
+
+    // P2P-RPL's own equivalent, in the same position and for the same
+    // reason: section 9.4 has the router append the address of the
+    // interface it heard the P2P mode DIO on, which only means anything
+    // once this membership's preferred parent is settled.
+    if (dio.HasP2pRdo() && m_dodags.find(dioKey) != m_dodags.end())
+    {
+        HandleP2pRdo(dio, from, interface);
     }
 }
 
