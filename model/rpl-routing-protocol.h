@@ -690,6 +690,13 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
             std::vector<Ipv6Address> addressVector;
             bool isOrigin{false}; //!< this node started the discovery
             bool isTarget{false}; //!< this node is the TargNode being looked for
+            /// RFC 9854 section 6.4: "a router that already belongs to the
+            /// RREP-Instance SHOULD drop the RREP-DIO". A symmetric route
+            /// never forms an RREP-Instance DODAG to check membership
+            /// against (section 6.3.1), so this stands in for it -- set the
+            /// first time this RREQ-Instance's RREP is handled here, either
+            /// consumed (OrigNode) or relayed onward (intermediate router).
+            bool rrepHandled{false};
             /// When the 'L' field's deadline takes this node out of the
             /// instance (RFC 9854 section 4.1). Never armed for the
             /// unlimited encoding.

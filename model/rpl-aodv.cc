@@ -571,6 +571,23 @@ RplRoutingProtocol::HandleAodvRrep(const RplDioHeader& dio, Ipv6Address from, ui
     }
     DodagMembership& dodag = it->second;
 
+    // RFC 9854 section 6.4: "a router that already belongs to the
+    // RREP-Instance SHOULD drop the RREP-DIO". This module never forms an
+    // RREP-Instance DODAG for a symmetric route (section 6.3.1), so there is
+    // no membership to check; dodag.aodv.rrepHandled stands in for it.
+    // Without this, a duplicate physical delivery of the same RREP-DIO
+    // (link-layer retransmission, for example) got relayed again at every
+    // intermediate hop -- harmless on its own since the Address Vector is
+    // fixed-length so it does not amplify, but pure waste, and at the
+    // OrigNode it just overwrote m_aodvRoutes[target] with identical data.
+    if (dodag.aodv.rrepHandled)
+    {
+        NS_LOG_LOGIC("Already handled an RREP for RREQ-Instance "
+                    << +rreqInstanceId << " at " << origNode << ", dropping a repeat");
+        return;
+    }
+    dodag.aodv.rrepHandled = true;
+
     // RFC 9854 section 6.4.2: "The router next checks if one of its
     // addresses is included in the ART option. If it is included, this
     // router is the OrigNode of the route discovery."

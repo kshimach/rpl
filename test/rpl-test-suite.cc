@@ -5360,6 +5360,212 @@ RplRootJoinsForeignRreqInstanceParentLossTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief A duplicate physical delivery of the same RREP-DIO is relayed only
+ *        once by an intermediate router.
+ *
+ * RFC 9854 section 6.4's own dedup rule ("a router that already belongs to
+ * the RREP-Instance SHOULD drop the RREP-DIO") assumes an RREP-Instance
+ * DODAG to check membership against, which a symmetric route never forms
+ * (section 6.3.1). HandleAodvRrep() had no dedup of its own, so a second
+ * physical delivery of the same RREP-DIO (e.g. a link-layer retransmission)
+ * got relayed a second time. Harmless by itself -- the Address Vector is
+ * fixed-length, so it does not amplify hop by hop -- but pure waste.
+ *
+ * One node under test, already an intermediate router in a fabricated
+ * RREQ-Instance (joined via an RREQ heard from a real peer), fed the same
+ * fabricated RREP-DIO twice. The peer doubles as the "next hop back" the
+ * RREP should relay to, so its own monitor socket can count how many times
+ * the relay actually went out.
+ */
+class RplAodvRrepDuplicateRelayedOnceTestCase : public TestCase
+{
+  public:
+    RplAodvRrepDuplicateRelayedOnceTestCase();
+
+  private:
+    void DoRun() override;
+
+    /// @brief Count a DIO seen at the monitor.
+    /// @param socket the monitoring socket
+    void CountDio(Ptr<Socket> socket);
+
+    uint32_t m_dioCount{0}; //!< DIOs seen at the monitor
+};
+
+RplAodvRrepDuplicateRelayedOnceTestCase::RplAodvRrepDuplicateRelayedOnceTestCase()
+    : TestCase("A duplicate RREP-DIO delivery is relayed only once")
+{
+}
+
+void
+RplAodvRrepDuplicateRelayedOnceTestCase::CountDio(Ptr<Socket> socket)
+{
+    Address sender;
+    Ptr<Packet> packet = socket->RecvFrom(sender);
+    if (!packet)
+    {
+        return;
+    }
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ipv6Header);
+    Icmpv6Header icmpv6Header;
+    packet->RemoveHeader(icmpv6Header);
+    if (icmpv6Header.GetType() == ICMPV6_RPL && icmpv6Header.GetCode() == RPL_CODE_DIO)
+    {
+        m_dioCount++;
+    }
+}
+
+void
+RplAodvRrepDuplicateRelayedOnceTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2); // 0 = the node under test, 1 = a real peer/next hop
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    interfaces.SetForwarding(0, true);
+    interfaces.SetForwarding(1, true);
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    // Long enough for the peer to join the base DODAG and SLAAC an address,
+    // same reasoning and timing as RplAodvMopAcceptedTestCase.
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    Ptr<Node> node = nodes.Get(0);
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> peer = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(peer->IsJoined(), true, "The peer never joined the base DODAG");
+    Ipv6Address peerGlobal = peer->GetGlobalAddress();
+    NS_TEST_ASSERT_MSG_NE(peerGlobal, Ipv6Address::GetAny(), "The peer has no global address yet");
+
+    Ipv6Address nodeLinkLocal = node->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address peerLinkLocal = nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    static constexpr uint8_t RREQ_INSTANCE = 0x81;
+    Ipv6Address origNode("2001:9::1");  // fake OrigNode, not a real node
+    Ipv6Address targNode("2001:9::99"); // fake TargNode, not a real node
+
+    // The node under test joins as an intermediate router, one hop past the
+    // peer: the peer already put its own address in the Address Vector
+    // before forwarding, exactly what an RREQ that genuinely came through
+    // the peer would carry.
+    RplDioHeader rreqDio;
+    rreqDio.SetInstanceId(RREQ_INSTANCE);
+    rreqDio.SetVersionNumber(0);
+    rreqDio.SetRank(RPL_MIN_HOPRANKINC);
+    rreqDio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+    rreqDio.SetDodagId(origNode);
+    rreqDio.SetDtsn(0);
+    rreqDio.SetDagConfiguration(0,
+                                20,
+                                RPL_DIO_REDUNDANCY,
+                                RPL_MAX_RANKINC,
+                                RPL_MIN_HOPRANKINC,
+                                RPL_OCP_OF0,
+                                RPL_DEFAULT_LIFETIME,
+                                RPL_DEFAULT_LIFETIME_UNIT);
+    RplDioHeader::RreqOption rreq;
+    rreq.symmetric = true;
+    rreq.hopByHop = false;
+    rreq.compr = 0;
+    rreq.lifetime = 0; // no limit, keeps this test's timing simple
+    rreq.rankLimit = 0;
+    rreq.origSeqNo = 1;
+    rreq.addressVector = {peerGlobal};
+    rreqDio.SetRreq(rreq);
+    RplDioHeader::ArtOption rreqArt;
+    rreqArt.destSeqNo = 0;
+    rreqArt.prefixLength = 0;
+    rreqArt.target = targNode;
+    rreqDio.SetArt(rreqArt);
+    DeliverRawRplMessage<RplDioHeader>(node,
+                                       1,
+                                       rreqDio,
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       peerLinkLocal,
+                                       nodeLinkLocal);
+
+    std::vector<Ipv6Address> addressVector;
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetAodvAddressVector(RREQ_INSTANCE, origNode, addressVector),
+                          true,
+                          "Did not join the fabricated RREQ-Instance");
+    NS_TEST_ASSERT_MSG_EQ(addressVector.size(), 2, "Wrong Address Vector size after joining");
+    NS_TEST_ASSERT_MSG_EQ(addressVector[0], peerGlobal, "Wrong hop recorded before this node");
+
+    // Watching from the peer, which is exactly the "next hop back" the RREP
+    // relay below should unicast to (hops[ownIndex - 1] in the fixed Address
+    // Vector), same reasoning as RplAodvMopAcceptedTestCase's monitor.
+    Ptr<Socket> monitor = Socket::CreateSocket(nodes.Get(1), Ipv6RawSocketFactory::GetTypeId());
+    monitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    monitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    monitor->BindToNetDevice(nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+    monitor->SetRecvCallback(MakeCallback(&RplAodvRrepDuplicateRelayedOnceTestCase::CountDio, this));
+
+    RplDioHeader rrepDio;
+    rrepDio.SetInstanceId(RREQ_INSTANCE); // Delta 0
+    rrepDio.SetVersionNumber(0);
+    rrepDio.SetRank(RPL_MIN_HOPRANKINC);
+    rrepDio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+    rrepDio.SetDodagId(targNode);
+    rrepDio.SetDtsn(0);
+    RplDioHeader::RrepOption rrep;
+    rrep.gratuitous = false;
+    rrep.hopByHop = false;
+    rrep.compr = 0;
+    rrep.lifetime = 0;
+    rrep.rankLimit = 0;
+    rrep.delta = 0;
+    rrep.addressVector = addressVector; // the same fixed vector formed above
+    rrepDio.SetRrep(rrep);
+    RplDioHeader::ArtOption rrepArt;
+    rrepArt.destSeqNo = 1;
+    rrepArt.prefixLength = 0;
+    rrepArt.target = origNode;
+    rrepDio.SetArt(rrepArt);
+
+    // Delivered twice, as if the same physical frame had been received (and
+    // handed up to RPL) more than once. Neither delivery's "from" matters to
+    // HandleAodvRrep(), which reads the fixed Address Vector rather than the
+    // sender -- a fake downstream neighbour is fine.
+    Ipv6Address fakeDownstream("fe80::66");
+    for (int i = 0; i < 2; i++)
+    {
+        DeliverRawRplMessage<RplDioHeader>(node,
+                                           1,
+                                           rrepDio,
+                                           static_cast<uint8_t>(RPL_CODE_DIO),
+                                           fakeDownstream,
+                                           nodeLinkLocal);
+    }
+
+    Simulator::Stop(Seconds(1));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(m_dioCount,
+                          1,
+                          "The duplicate RREP-DIO was relayed more than once (or not at all)");
+
+    monitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Check which DIOs RplRoutingProtocol::HandleDio() acts on and which
  *        it turns away: a mode of operation it does not implement, another
  *        RPL instance or DODAG, a stale DODAG version, and the infinite
@@ -9570,6 +9776,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplAodvRreqFloodTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRrepCompletesTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplRootJoinsForeignRreqInstanceParentLossTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplAodvRrepDuplicateRelayedOnceTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDioRejectionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplParentLossRejoinTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplInterfaceRestartTestCase, TestCase::Duration::QUICK);

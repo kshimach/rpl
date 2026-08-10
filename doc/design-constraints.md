@@ -3523,7 +3523,7 @@ S=1 では RREP-Instance の DODAG がそもそも形成されないためこの
 Vector は不変長なので増幅は起きず (中継のたびに hop 数が増える
 仕組みではない)、OrigNode 側の経路保存も同一内容での上書きで冪等
 なので、実害の無い冗長送信に留まる — 修正の優先度は低いと判断し
-今回は見送った。
+今回は見送った (後日 §35.11 で対応)。
 
 ### 35.10 base DODAG の root が他の RREQ-Instance の親を失うとクラッシュする
 
@@ -3575,3 +3575,37 @@ Imax は約 2.048 秒、その 2 倍) 待つと、root 自身の Trickle 再評�
 「親を失った」経路を踏む。修正を外すとこのテストは (アサーション失敗
 ではなく) プロセスごと `NS_FATAL` で落ちることを確認済み (`git stash`
 で修正だけを外して確認)。修正を戻すと 62+1 件全 PASS (3 回連続)。
+
+### 35.11 RREP 重複中継の重複排除 (§35.9 で見送った項目への対応)
+
+§35.9 で「実害が薄い」として見送っていた、同一 RREP-DIO が重複して
+物理的に届いた場合の中継側の重複排除に対応した。優先度を下げて残して
+いた項目群 (RREP 重複排除・`PrintRoutingTable`/`PrintRoutingTableJson`
+での AODV 経路表示・Gratuitous RREP・複数 ART・Compr・S=0 非対称) を
+サイズの小さい順に着手する方針で、まずこれから。
+
+**RFC の要求と、このモジュールでの読み替え**: §6.4 冒頭が「a router that
+already belongs to the RREP-Instance SHOULD drop the RREP-DIO」と、
+重複排除そのものを規定している。ただし判定基準の「RREP-Instance に
+属しているか」は RREP-Instance 用の DODAG が形成されている前提で、
+S=1 (今回のスコープ) では §6.3.1 の通りその DODAG は建てない。RFC の
+字義どおりの判定はそのままでは使えない。
+
+**実装**: 判定基準を「その RREQ-Instance の membership
+(`DodagMembership::aodv`) で、この RREP をすでに処理したか」に
+読み替えた。新しいフラグ `AodvRreqState::rrepHandled` を
+`rpl-routing-protocol.h` に追加し、`HandleAodvRrep()` の先頭
+(ART・H・Compr の構造検証を終え、対応する RREQ-Instance の
+membership を引いた直後) でチェック・セットする。OrigNode 側の
+消費 (`m_aodvRoutes` への保存) と中継側の転送、両方をこの 1 箇所で
+まとめて防げる — RFC の「RREP-Instance に属していれば drop」が
+本来どちらのケースも一括りに扱っていたのと同じ形。
+
+**検証**: 回帰テスト `RplAodvRrepDuplicateRelayedOnceTestCase` を
+追加。実ノード2台 (root + peer) の構成で、node 0 を架空の
+RREQ-Instance の中継ノードとして join させ (peer 経由で受信した体の
+RREQ を注入)、続けて同一の RREP-DIO を 2 回連続で注入。peer 側に
+置いた監視ソケットで DIO 受信回数を数え、中継が 1 回だけ出ることを
+確認する。ガードを `if (false && dodag.aodv.rrepHandled)` で無効化
+すると `test="m_dioCount (actual) == 1 (limit)" ... actual="2"` で
+確実に落ちることを確認済み。修正を戻すと 63+1 件全 PASS (3 回連続)。
