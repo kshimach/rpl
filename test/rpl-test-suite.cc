@@ -6402,6 +6402,149 @@ RplAodvRrepInstanceRankLimitTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief A router leaves rather than joins an RREP-Instance whose Address
+ *        Vector already has no room left for its own entry.
+ *
+ * The RREP option's Address Vector shares the RREQ option's own 8-bit Opt
+ * Data Len, which bounds it at AODV_ADDRESS_VECTOR_MAX_ENTRIES (15) entries
+ * (@see RplDioHeader). HandleAodvRrepInstance() checks the received vector's
+ * size before appending this router's own address to it; without that
+ * check, a vector already at 15 entries would grow to 16 and hit
+ * RplDioHeader::Serialize()'s NS_ASSERT_MSG bounding it, crashing the next
+ * time this instance's Trickle timer fires SendDio(). RankLimit normally
+ * stops a discovery long before the vector could ever get this long, so
+ * reaching this case in practice means RankLimit was configured away
+ * (RPL_AODV_RANK_LIMIT_INFINITE), which is what this test fabricates.
+ *
+ * One node under test, fed a fabricated RREP-DIO for a fresh RREP-Instance
+ * each call, with a fabricated Address Vector of a chosen length -- 14
+ * entries (room for one more) versus 15 (none left).
+ */
+class RplAodvRrepInstanceAddressVectorFullTestCase : public TestCase
+{
+  public:
+    RplAodvRrepInstanceAddressVectorFullTestCase();
+
+  private:
+    void DoRun() override;
+
+    /**
+     * @brief Feed one fabricated RREP-DIO, with an Address Vector of the
+     *        given length, and report whether the RREP-Instance was joined.
+     *
+     * @param node the node under test
+     * @param vectorEntries how many fabricated hops to put in the RREP's
+     *                      Address Vector before delivery
+     * @return true if the node ended up joined to the RREP-Instance
+     */
+    bool TryJoin(Ptr<Node> node, uint8_t vectorEntries);
+};
+
+RplAodvRrepInstanceAddressVectorFullTestCase::RplAodvRrepInstanceAddressVectorFullTestCase()
+    : TestCase("An RREP-Instance whose Address Vector is already full is left, not joined")
+{
+}
+
+bool
+RplAodvRrepInstanceAddressVectorFullTestCase::TryJoin(Ptr<Node> node, uint8_t vectorEntries)
+{
+    static uint16_t sequence = 0;
+    sequence++;
+    // A fresh DODAGID (TargNode address) per call: distinct each time so no
+    // earlier sub-case's membership or REJOIN_REENABLE entry interferes.
+    std::ostringstream targSuffix;
+    targSuffix << "2001:a::" << sequence << ":99";
+    Ipv6Address targNode(targSuffix.str().c_str());
+    Ipv6Address origNode("2001:a::dead:1"); // never this node: an ordinary relay throughout
+    Ipv6Address neighbour("fe80::a");
+
+    static constexpr uint8_t RREP_INSTANCE = 0x81;
+
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+
+    RplDioHeader rrepDio;
+    rrepDio.SetInstanceId(RREP_INSTANCE);
+    rrepDio.SetVersionNumber(0);
+    rrepDio.SetRank(RPL_MIN_HOPRANKINC);
+    rrepDio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+    rrepDio.SetDodagId(targNode);
+    rrepDio.SetDtsn(0);
+
+    RplDioHeader::RrepOption rrep;
+    rrep.gratuitous = false;
+    rrep.hopByHop = false;
+    rrep.lifetime = 0;
+    rrep.rankLimit = RPL_AODV_RANK_LIMIT_INFINITE; // out of the way: this test is about the AV
+    rrep.delta = 0;
+    for (uint8_t i = 0; i < vectorEntries; i++)
+    {
+        std::ostringstream hopSuffix;
+        hopSuffix << "2001:a::" << sequence << ":" << +i;
+        rrep.addressVector.push_back(Ipv6Address(hopSuffix.str().c_str()));
+    }
+    rrepDio.SetRrep(rrep);
+
+    RplDioHeader::ArtOption art;
+    art.destSeqNo = 1;
+    art.prefixLength = 0;
+    art.target = origNode;
+    rrepDio.SetArt(art);
+
+    // Multicast: an RREP-Instance flood, section 6.3.2, not a symmetric
+    // unicast reply -- @see the RankLimit test case just above for why this
+    // destination is what selects the join path under test.
+    DeliverRawRplMessage<RplDioHeader>(node,
+                                       1,
+                                       rrepDio,
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       neighbour,
+                                       Ipv6Address(RPL_ALL_NODES_MULTICAST));
+
+    return rpl->IsJoinedTo(RREP_INSTANCE, targNode);
+}
+
+void
+RplAodvRrepInstanceAddressVectorFullTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(1);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.AssignWithoutAddress(devices);
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    Simulator::Stop(Seconds(2));
+    Simulator::Run();
+
+    Ptr<Node> node = nodes.Get(0);
+
+    NS_TEST_ASSERT_MSG_EQ(
+        TryJoin(node, RplDioHeader::AODV_ADDRESS_VECTOR_MAX_ENTRIES - 1),
+        true,
+        "A relay was refused an RREP-Instance whose Address Vector still had room for its own "
+        "entry");
+    NS_TEST_ASSERT_MSG_EQ(
+        TryJoin(node, RplDioHeader::AODV_ADDRESS_VECTOR_MAX_ENTRIES),
+        false,
+        "A relay joined an RREP-Instance whose Address Vector was already full, with no room "
+        "left to append its own entry");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief A duplicate physical delivery of the same RREP-DIO is relayed only
  *        once by an intermediate router.
  *
@@ -10932,6 +11075,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplAodvRrepCompletesTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplRootJoinsForeignRreqInstanceParentLossTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRrepInstanceRankLimitTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplAodvRrepInstanceAddressVectorFullTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRrepDuplicateRelayedOnceTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRoutesInPrintedTablesTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDioRejectionTestCase, TestCase::Duration::QUICK);
