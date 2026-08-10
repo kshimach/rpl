@@ -453,6 +453,49 @@ RplDioHeaderTestCase::DoRun()
     NS_TEST_ASSERT_MSG_EQ(received.HasRrep(), true, "An earlier option was lost");
     NS_TEST_ASSERT_MSG_EQ(received.GetRank(), 384, "An option ate part of the base object");
 
+    // The P2P Route Discovery Option (RFC 6997 section 7), carried alongside
+    // everything already on the DIO above. TargetAddr and the one Address
+    // Vector entry both share their first 8 octets with the DODAGID set
+    // above (2001:1::1), so Serialize() elides them the same way it does the
+    // AODV-RPL RREQ/RREP options' own Address Vectors -- except RFC 6997
+    // section 7 elides Compr octets "from the Target field and the Address
+    // vector" alike, unlike RFC 9854's ART option, which is a separate
+    // option never elided: 2 (Type+Length) + 2 (flags+L/MaxRank) +
+    // 2 * (16 - 8).
+    NS_TEST_ASSERT_MSG_EQ(dio.HasP2pRdo(), false, "There is no P2P-RDO yet");
+    P2pRdoOption rdo;
+    rdo.reply = true;
+    rdo.hopByHop = false;
+    rdo.numRoutes = 0;
+    rdo.lifetime = 2; // 16 seconds
+    rdo.maxRankOrNh = 10;
+    rdo.target = Ipv6Address("2001:1::9");
+    rdo.addressVector = {Ipv6Address("2001:1::5")};
+    dio.SetP2pRdo(rdo);
+    NS_TEST_ASSERT_MSG_EQ(dio.GetSerializedSize(), 150, "The P2P-RDO adds 20 bytes");
+
+    packet = Create<Packet>();
+    packet->AddHeader(dio);
+    packet->RemoveHeader(received);
+
+    NS_TEST_ASSERT_MSG_EQ(received.HasP2pRdo(), true, "The P2P-RDO was lost");
+    NS_TEST_ASSERT_MSG_EQ(received.GetP2pRdo().reply, true, "Wrong 'R' flag");
+    NS_TEST_ASSERT_MSG_EQ(received.GetP2pRdo().hopByHop, false, "Wrong 'H' flag");
+    NS_TEST_ASSERT_MSG_EQ(received.GetP2pRdo().numRoutes, 0, "Wrong 'N' field");
+    NS_TEST_ASSERT_MSG_EQ(received.GetP2pRdo().compr,
+                          8,
+                          "Wrong Compr: TargetAddr and the Address Vector entry both share the "
+                          "DODAGID's prefix, so Serialize() should have elided it");
+    NS_TEST_ASSERT_MSG_EQ(received.GetP2pRdo().lifetime, 2, "Wrong 'L' field");
+    NS_TEST_ASSERT_MSG_EQ(received.GetP2pRdo().maxRankOrNh, 10, "Wrong MaxRank/NH");
+    NS_TEST_ASSERT_MSG_EQ(received.GetP2pRdo().target, Ipv6Address("2001:1::9"), "Wrong TargetAddr");
+    NS_TEST_ASSERT_MSG_EQ(received.GetP2pRdo().addressVector.size(), 1, "Wrong Address Vector size");
+    NS_TEST_ASSERT_MSG_EQ(received.GetP2pRdo().addressVector[0],
+                          Ipv6Address("2001:1::5"),
+                          "Wrong Address Vector entry");
+    NS_TEST_ASSERT_MSG_EQ(received.HasArt(), true, "An earlier option was lost");
+    NS_TEST_ASSERT_MSG_EQ(received.GetRank(), 384, "An option ate part of the base object");
+
     // 'S'/'G' and 'H' share their octet with Compr and the high bit of 'L':
     // a DIO that sets every one of them at its maximum must not have any of
     // them bleed into a neighbour. RankLimit at 127 is its own 7-bit
@@ -484,6 +527,42 @@ RplDioHeaderTestCase::DoRun()
     NS_TEST_ASSERT_MSG_EQ(received.GetRreq().lifetime, 3, "'L' was truncated at its maximum");
     NS_TEST_ASSERT_MSG_EQ(received.GetRreq().rankLimit, 127, "RankLimit was truncated at its 7-bit maximum");
     NS_TEST_ASSERT_MSG_EQ(received.GetRreq().origSeqNo, 255, "Orig SeqNo was truncated");
+
+    // The same extreme-bits check for the P2P-RDO's own flag octet and
+    // 'L'/MaxRank-NH octet, alongside the RREQ set above on the same DIO.
+    // compr is set to 15 here too, but ignored the same way: 'packed' keeps
+    // its default (unset) "::" DODAGID, and a concrete target address does
+    // not share "::"'s all-zero prefix, so Serialize() computes 0 regardless
+    // of what the caller put in rdo.compr.
+    P2pRdoOption denseRdo;
+    denseRdo.reply = true;
+    denseRdo.hopByHop = true;
+    denseRdo.numRoutes = 3;    // 2-bit maximum
+    denseRdo.compr = 15;       // ignored, Serialize() computes its own
+    denseRdo.lifetime = 3;     // 2-bit maximum
+    denseRdo.maxRankOrNh = 63; // 6-bit maximum
+    denseRdo.target = Ipv6Address("2001:9::1");
+    packed.SetP2pRdo(denseRdo);
+    packet = Create<Packet>();
+    packet->AddHeader(packed);
+    packet->RemoveHeader(received);
+    NS_TEST_ASSERT_MSG_EQ(received.GetP2pRdo().reply, true, "'R' was lost when every bit was set");
+    NS_TEST_ASSERT_MSG_EQ(received.GetP2pRdo().hopByHop, true, "'H' was lost when every bit was set");
+    NS_TEST_ASSERT_MSG_EQ(received.GetP2pRdo().numRoutes, 3, "'N' was truncated at its 2-bit maximum");
+    NS_TEST_ASSERT_MSG_EQ(received.GetP2pRdo().compr,
+                          0,
+                          "Serialize() should have computed its own Compr (0, TargetAddr does not "
+                          "share '::' DODAGID's prefix) rather than sending the caller's 15");
+    NS_TEST_ASSERT_MSG_EQ(received.GetP2pRdo().lifetime, 3, "'L' was truncated at its 2-bit maximum");
+    NS_TEST_ASSERT_MSG_EQ(received.GetP2pRdo().maxRankOrNh,
+                          63,
+                          "MaxRank/NH was truncated at its 6-bit maximum");
+    NS_TEST_ASSERT_MSG_EQ(received.GetP2pRdo().target,
+                          Ipv6Address("2001:9::1"),
+                          "TargetAddr was corrupted");
+    NS_TEST_ASSERT_MSG_EQ(received.GetRreq().symmetric,
+                          true,
+                          "The RREQ option set earlier on 'packed' was lost");
 }
 
 /**
@@ -1200,6 +1279,102 @@ RplDioOptionEdgeTestCase::DoRun()
                               "The DODAGID's first 8 octets were not prepended correctly");
         NS_TEST_ASSERT_MSG_EQ(received.GetRank(), 256, "The option ate part of the base object");
     }
+
+    // The P2P-RDO (RFC 6997 section 7) is variable-length like the AODV-RPL
+    // RREQ/RREP options above, but its shape check differs: TargetAddr
+    // shares the option with the Address Vector rather than living in a
+    // separate option, so the fixed part is 2 bytes (flags + L/MaxRank) and
+    // a well-formed option needs at least one (16 - Compr)-sized block (for
+    // TargetAddr) plus a whole number of further ones. These lengths are not
+    // of that shape at Compr 0 (16-byte blocks) and must be skipped whole.
+    for (uint8_t badLength :
+        {uint8_t(0), uint8_t(1), uint8_t(3), uint8_t(10), uint8_t(17), uint8_t(19)})
+    {
+        std::vector<uint8_t> options;
+        options.push_back(RPL_OPTION_P2P_RDO);
+        options.push_back(badLength);
+        options.insert(options.end(), badLength, 0);
+
+        const uint8_t etx[8] =
+            {RPL_OPTION_DAG_METRIC_CONTAINER, 6, RPL_DAG_MC_ETX, 0, 0, 2, 0x01, 0x40};
+        options.insert(options.end(), etx, etx + sizeof(etx));
+
+        RplDioHeader received = RoundTrip(options.data(), options.size());
+        NS_TEST_ASSERT_MSG_EQ(received.HasP2pRdo(),
+                              false,
+                              "A P2P-RDO of length " << +badLength << ", which cannot hold at "
+                                                     << "least a TargetAddr, was parsed anyway");
+        NS_TEST_ASSERT_MSG_EQ(received.HasMetricContainer(),
+                              true,
+                              "The option after a length-" << +badLength
+                                                            << " P2P-RDO was never reached");
+        NS_TEST_ASSERT_MSG_EQ(received.GetPathEtx(), 320, "The following option was misparsed");
+    }
+
+    // The smallest valid shape: TargetAddr only, no Address Vector entries
+    // (18 bytes at Compr 0: 2 fixed + one 16-byte block for TargetAddr).
+    {
+        std::vector<uint8_t> options = {RPL_OPTION_P2P_RDO, 18, 0x00, 0x05};
+        options.insert(options.end(), 16, 0xAB);
+        RplDioHeader received = RoundTrip(options.data(), options.size());
+        NS_TEST_ASSERT_MSG_EQ(received.HasP2pRdo(), true, "A target-only P2P-RDO was rejected");
+        NS_TEST_ASSERT_MSG_EQ(received.GetP2pRdo().addressVector.size(), 0, "Wrong vector size");
+        NS_TEST_ASSERT_MSG_EQ(received.GetP2pRdo().maxRankOrNh, 5, "Wrong MaxRank/NH");
+        NS_TEST_ASSERT_MSG_EQ(received.GetRank(), 256, "The option ate part of the base object");
+    }
+
+    // A P2P-RDO whose declared length runs past the end of the packet: the
+    // loop's own remaining-size check has to stop the walk before the
+    // TargetAddr read below it ever runs.
+    {
+        const uint8_t truncated[6] = {RPL_OPTION_P2P_RDO, 51, 0x00, 0x0A, 0, 0};
+        RplDioHeader received = RoundTrip(truncated, sizeof(truncated));
+        NS_TEST_ASSERT_MSG_EQ(received.HasP2pRdo(),
+                              false,
+                              "A P2P-RDO claiming more bytes than the packet holds was parsed");
+        NS_TEST_ASSERT_MSG_EQ(received.GetRank(), 256, "It also ate part of the base object");
+    }
+
+    // A hand-built P2P-RDO using Compr = 8, with both TargetAddr and one
+    // Address Vector entry compressed -- RFC 6997 section 7 elides both
+    // alike, unlike RFC 9854's ART option (@see the RREQ Compr=8 case
+    // above).
+    {
+        const uint8_t compressed[20] = {RPL_OPTION_P2P_RDO,
+                                        18, // 2 (flags+L/MaxRank) + 2 * (16 - 8)
+                                        0x08, // R=0, H=0, N=0, Compr=8
+                                        0x0A, // L=0, MaxRank=10
+                                        0x00,
+                                        0x00,
+                                        0x00,
+                                        0x00,
+                                        0x00,
+                                        0x00,
+                                        0x00,
+                                        0x09, // TargetAddr suffix
+                                        0xAA,
+                                        0xBB,
+                                        0xCC,
+                                        0xDD,
+                                        0xEE,
+                                        0xFF,
+                                        0x00,
+                                        0x01}; // Address Vector entry suffix
+        RplDioHeader received = RoundTrip(compressed, sizeof(compressed));
+        NS_TEST_ASSERT_MSG_EQ(received.HasP2pRdo(), true, "A Compr=8 P2P-RDO was rejected");
+        NS_TEST_ASSERT_MSG_EQ(received.GetP2pRdo().compr, 8, "Wrong Compr");
+        NS_TEST_ASSERT_MSG_EQ(received.GetP2pRdo().maxRankOrNh, 10, "Wrong MaxRank/NH");
+        NS_TEST_ASSERT_MSG_EQ(received.GetP2pRdo().target,
+                              Ipv6Address("2001:1::9"),
+                              "The DODAGID's first 8 octets were not prepended to TargetAddr "
+                              "correctly");
+        NS_TEST_ASSERT_MSG_EQ(received.GetP2pRdo().addressVector.size(), 1, "Wrong vector size");
+        NS_TEST_ASSERT_MSG_EQ(received.GetP2pRdo().addressVector[0],
+                              Ipv6Address("2001:1::aabb:ccdd:eeff:1"),
+                              "The DODAGID's first 8 octets were not prepended to the Address "
+                              "Vector entry correctly");
+        NS_TEST_ASSERT_MSG_EQ(received.GetRank(), 256, "The option ate part of the base object");
+    }
 }
 
 /**
@@ -1282,6 +1457,105 @@ RplDaoHeaderTestCase::DoRun()
     NS_TEST_ASSERT_MSG_EQ(receivedAck.GetSequence(), 77, "Wrong DAO sequence");
     NS_TEST_ASSERT_MSG_EQ(receivedAck.GetStatus(), 0, "Wrong status");
     NS_TEST_ASSERT_MSG_EQ(receivedAck.GetDodagId(), Ipv6Address("2001:1::1"), "Wrong DODAGID");
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief P2P-DRO serialization (RFC 6997 section 8): the base object's own
+ *        bit-packed S/A/Seq octet, and the one P2P-RDO it carries.
+ */
+class RplP2pDroHeaderTestCase : public TestCase
+{
+  public:
+    RplP2pDroHeaderTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplP2pDroHeaderTestCase::RplP2pDroHeaderTestCase()
+    : TestCase("P2P-DRO serialization")
+{
+}
+
+void
+RplP2pDroHeaderTestCase::DoRun()
+{
+    RplP2pDroHeader dro;
+    dro.SetInstanceId(9);
+    dro.SetStop(false);
+    dro.SetAckRequested(true);
+    dro.SetSequence(2);
+    dro.SetDodagId(Ipv6Address("2001:1::1")); // the Origin
+
+    NS_TEST_ASSERT_MSG_EQ(dro.GetSerializedSize(), 20, "The P2P-DRO base object is 20 bytes");
+    NS_TEST_ASSERT_MSG_EQ(dro.HasP2pRdo(), false, "There is no P2P-RDO yet");
+
+    Ptr<Packet> packet = Create<Packet>();
+    packet->AddHeader(dro);
+
+    RplP2pDroHeader received;
+    packet->RemoveHeader(received);
+
+    NS_TEST_ASSERT_MSG_EQ(received.GetInstanceId(), 9, "Wrong RPLInstanceID");
+    NS_TEST_ASSERT_MSG_EQ(received.GetStop(), false, "The 'S' flag leaked");
+    NS_TEST_ASSERT_MSG_EQ(received.GetAckRequested(), true, "Wrong 'A' flag");
+    NS_TEST_ASSERT_MSG_EQ(received.GetSequence(), 2, "Wrong Seq");
+    NS_TEST_ASSERT_MSG_EQ(received.GetDodagId(), Ipv6Address("2001:1::1"), "Wrong DODAGID");
+    NS_TEST_ASSERT_MSG_EQ(received.HasP2pRdo(), false, "A P2P-RDO appeared from nowhere");
+
+    // Now with the one P2P-RDO a P2P-DRO MUST carry (RFC 6997 section 8),
+    // the Address Vector this time being the whole discovered route back to
+    // the Origin -- reusing P2pRdoOption and its Compr elision exactly as
+    // the P2P mode DIO side does, since RFC 6997 section 8.2 defines this
+    // occurrence of the option "as defined in Section 7".
+    P2pRdoOption rdo;
+    rdo.reply = false; // section 8.2: "MUST be set to zero on transmission"
+    rdo.hopByHop = false;
+    rdo.maxRankOrNh = 2; // the NH index, not a MaxRank, inside a P2P-DRO
+    rdo.target = Ipv6Address("2001:1::9"); // the Target that generated this P2P-DRO
+    rdo.addressVector = {Ipv6Address("2001:1::2"), Ipv6Address("2001:1::3")};
+    dro.SetP2pRdo(rdo);
+    // 20 (base) + 2 (Type+Length) + 2 (flags+L/MaxRank) + 3 * (16 - 8): the
+    // target and both entries share the DODAGID's first 8 octets.
+    NS_TEST_ASSERT_MSG_EQ(dro.GetSerializedSize(), 20 + 2 + 2 + 3 * 8, "The P2P-RDO adds 28 bytes");
+
+    packet = Create<Packet>();
+    packet->AddHeader(dro);
+    packet->RemoveHeader(received);
+
+    NS_TEST_ASSERT_MSG_EQ(received.HasP2pRdo(), true, "The P2P-RDO was lost");
+    NS_TEST_ASSERT_MSG_EQ(received.GetP2pRdo().reply, false, "Wrong 'R' flag");
+    NS_TEST_ASSERT_MSG_EQ(received.GetP2pRdo().compr,
+                          8,
+                          "Wrong Compr: TargetAddr and both Address Vector entries share the "
+                          "DODAGID's prefix");
+    NS_TEST_ASSERT_MSG_EQ(received.GetP2pRdo().maxRankOrNh, 2, "Wrong NH index");
+    NS_TEST_ASSERT_MSG_EQ(received.GetP2pRdo().target, Ipv6Address("2001:1::9"), "Wrong TargetAddr");
+    NS_TEST_ASSERT_MSG_EQ(received.GetP2pRdo().addressVector.size(), 2, "Wrong Address Vector size");
+    NS_TEST_ASSERT_MSG_EQ(received.GetP2pRdo().addressVector[0],
+                          Ipv6Address("2001:1::2"),
+                          "Wrong first Address Vector entry");
+    NS_TEST_ASSERT_MSG_EQ(received.GetP2pRdo().addressVector[1],
+                          Ipv6Address("2001:1::3"),
+                          "Wrong second Address Vector entry");
+    NS_TEST_ASSERT_MSG_EQ(received.GetInstanceId(), 9, "An option ate part of the base object");
+    NS_TEST_ASSERT_MSG_EQ(received.GetAckRequested(), true, "An option ate part of the base object");
+
+    // 'S'/'A'/Seq share one octet: the Stop flag set with Seq at its 2-bit
+    // maximum must not bleed into the reserved bits around them.
+    RplP2pDroHeader packed;
+    packed.SetStop(true);
+    packed.SetAckRequested(false);
+    packed.SetSequence(3);
+    packet = Create<Packet>();
+    packet->AddHeader(packed);
+    packet->RemoveHeader(received);
+    NS_TEST_ASSERT_MSG_EQ(received.GetStop(), true, "'S' was lost");
+    NS_TEST_ASSERT_MSG_EQ(received.GetAckRequested(), false, "'A' leaked when 'S' was set");
+    NS_TEST_ASSERT_MSG_EQ(received.GetSequence(), 3, "Seq was truncated at its 2-bit maximum");
 }
 
 /**
@@ -11044,6 +11318,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplDioUnknownMetricTypeTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDioOptionEdgeTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDaoHeaderTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pDroHeaderTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDaoBoundaryTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplSourceRoutingHeaderTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplSourceRoutingCompressionTestCase, TestCase::Duration::QUICK);

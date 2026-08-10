@@ -26,6 +26,87 @@ namespace rpl
 /**
  * @ingroup rpl
  *
+ * @brief The P2P Route Discovery Option (P2P-RDO), RFC 6997 section 7.
+ *
+ * Unlike the AODV-RPL RREQ/RREP/ART options, which only ever appear inside a
+ * DIO, a P2P-RDO is carried by two different messages: a P2P mode DIO
+ * (RplDioHeader, RFC 6997 section 6) and a P2P-DRO (RplP2pDroHeader, RFC 6997
+ * section 8) -- "A P2P mode DIO and a P2P-DRO message MUST carry exactly one
+ * P2P-RDO" (section 7). It is therefore a free-standing struct with its own
+ * P2pRdoSerializedSize()/P2pRdoSerialize()/P2pRdoDeserialize() rather than a
+ * private nested type of either message class: duplicating the Compr and
+ * Address Vector length arithmetic into two classes would risk exactly the
+ * kind of declared-length-vs-actual-content mismatch bugs found elsewhere in
+ * this module (@see design-constraints.md).
+ *
+ * addressVector, like the AODV-RPL options' own, always holds full 128-bit
+ * addresses regardless of what came off (or goes onto) the wire --
+ * P2pRdoSerialize() computes its own Compr fresh from target, addressVector
+ * and the caller's dodagId, and P2pRdoDeserialize() reconstructs full
+ * addresses before returning.
+ */
+struct P2pRdoOption
+{
+    bool reply{true};      //!< 'R': the Target(s) may send P2P-DRO messages back
+    bool hopByHop{false};  //!< 'H': 1 hop-by-hop, 0 source routed (only H=0 is implemented)
+    /// 'N', 2 bits: one plus this many Source Routes are requested per
+    /// Target. Always sent as 0 (exactly one route) and ignored on receipt;
+    /// @see design-constraints.md for why more are out of scope.
+    uint8_t numRoutes{0};
+    /// 'Compr', 4 bits: elided prefix octets, shared by TargetAddr and every
+    /// Address Vector entry alike (RFC 6997 section 7). Read from the wire on
+    /// P2pRdoDeserialize(); P2pRdoSerialize() ignores this and computes its
+    /// own, so setting it before calling has no effect on what is sent.
+    uint8_t compr{0};
+    uint8_t lifetime{0}; //!< 'L', 2 bits: @see RplP2pLifetimeSeconds()
+    /// 'MaxRank/NH', 6 bits: MaxRank inside a P2P mode DIO (0 meaning no
+    /// limit), or the Address Vector's next-hop index inside a P2P-DRO.
+    uint8_t maxRankOrNh{0};
+    Ipv6Address target;                     //!< 'TargetAddr'
+    std::vector<Ipv6Address> addressVector; //!< 'Address[1..n]'
+};
+
+/**
+ * @brief Serialized size of a P2pRdoOption, type and length bytes included.
+ * @param rdo the option
+ * @param dodagId the DODAGID of the enclosing message, against which Compr
+ *                elision is computed
+ * @return the size in octets
+ */
+uint32_t P2pRdoSerializedSize(const P2pRdoOption& rdo, Ipv6Address dodagId);
+
+/**
+ * @brief Serialize a P2pRdoOption, type and length bytes included.
+ * @param i where to write; advanced past the option on return
+ * @param rdo the option
+ * @param dodagId the DODAGID of the enclosing message, against which Compr
+ *                elision is computed
+ */
+void P2pRdoSerialize(Buffer::Iterator& i, const P2pRdoOption& rdo, Ipv6Address dodagId);
+
+/**
+ * @brief Deserialize a P2pRdoOption whose type byte has already been read.
+ *
+ * Same "declared length trusted, but validated before being acted on"
+ * contract as RplDioHeader::Deserialize()'s own AODV-RPL option branches: on
+ * a malformed option (length too short for the Compr it declares, or an
+ * Address Vector entry count the length cannot evenly hold), this leaves i
+ * exactly length bytes past the type/length pair and returns false without
+ * touching rdo, so the caller's own option loop can skip past it unharmed.
+ *
+ * @param i positioned right after the option's length byte; advanced past
+ *          the option's declared length on return, success or not
+ * @param length the option's declared length (Option Length field)
+ * @param dodagId the DODAGID of the enclosing message, against which Compr
+ *                elision is resolved
+ * @param rdo the option, populated on success
+ * @return true if the option was well-formed
+ */
+bool P2pRdoDeserialize(Buffer::Iterator& i, uint8_t length, Ipv6Address dodagId, P2pRdoOption& rdo);
+
+/**
+ * @ingroup rpl
+ *
  * @brief DODAG Information Solicitation, RFC 6550 section 6.2.
  *
  * The base object is two reserved bytes; the Solicited Information option is
@@ -473,6 +554,27 @@ class RplDioHeader : public Header
      */
     const ArtOption& GetArt() const;
 
+    /**
+     * @brief Whether the P2P Route Discovery Option (P2P-RDO) is present.
+     * @return true if the option is present
+     */
+    bool HasP2pRdo() const;
+    /**
+     * @brief Attach a P2P-RDO (RFC 6997 section 7).
+     *
+     * A P2P mode DIO MUST carry exactly one; a second call replaces the
+     * first.
+     *
+     * @param rdo the option; its Address Vector must hold at most
+     *            RPL_P2P_ADDRESS_VECTOR_MAX_ENTRIES entries
+     */
+    void SetP2pRdo(const P2pRdoOption& rdo);
+    /**
+     * @brief Get the P2P-RDO.
+     * @return the option, default-constructed if none is present
+     */
+    const P2pRdoOption& GetP2pRdo() const;
+
     /// How many Address Vector entries an RREQ/RREP option can carry. Not a
     /// policy choice: the option's own Opt Data Len is eight bits, so with a
     /// 3-byte fixed part and 16 bytes per entry (Compr is always 0 here) the
@@ -593,6 +695,142 @@ class RplDioHeader : public Header
     RrepOption m_rrep; //!< the AODV-RPL RREP option
     bool m_hasArt;     //!< true if the AODV-RPL Target (ART) option is present
     ArtOption m_art;   //!< the AODV-RPL Target (ART) option
+
+    bool m_hasP2pRdo;    //!< true if the P2P Route Discovery Option is present
+    P2pRdoOption m_p2pRdo; //!< the P2P Route Discovery Option
+};
+
+/**
+ * @ingroup rpl
+ *
+ * @brief P2P Discovery Reply Object (P2P-DRO), RFC 6997 section 8.
+ *
+ * Unlike a DIO, DAO or DAO-ACK, a P2P-DRO is a message type of its own
+ * (ICMPv6 code 0x04) rather than a variant of an existing one: a Target
+ * sends it, over link-local multicast, to carry a discovered route back to
+ * the Origin -- identified by this message's own DODAGID field, copied from
+ * the P2P mode DIO (RplDioHeader) that found the route. It MUST carry
+ * exactly one P2P-RDO (@see P2pRdoOption), the same option a P2P mode DIO
+ * carries, which is why P2pRdoOption's own (de)serialization is shared
+ * between the two classes rather than duplicated here.
+ *
+ * The Version field is always zero (RFC 6997 section 8: "a temporary DAG
+ * always has value zero for the Version") and so is not exposed as a
+ * settable field; Serialize() always writes it as zero and Deserialize()
+ * reads and discards it, the same treatment RplDioHeader gives the DIO base
+ * object's own always-zero Flags/Reserved bytes.
+ */
+class RplP2pDroHeader : public Header
+{
+  public:
+    /**
+     * @brief Get the type ID.
+     * @return the object TypeId
+     */
+    static TypeId GetTypeId();
+
+    RplP2pDroHeader();
+
+    TypeId GetInstanceTypeId() const override;
+    void Print(std::ostream& os) const override;
+    uint32_t GetSerializedSize() const override;
+    void Serialize(Buffer::Iterator start) const override;
+    uint32_t Deserialize(Buffer::Iterator start) override;
+
+    /**
+     * @brief Set the RPLInstanceID of the temporary DAG used for discovery.
+     * @param instanceId the RPLInstanceID
+     */
+    void SetInstanceId(uint8_t instanceId);
+    /**
+     * @brief Get the RPLInstanceID of the temporary DAG used for discovery.
+     * @return the RPLInstanceID
+     */
+    uint8_t GetInstanceId() const;
+
+    /**
+     * @brief Set the 'Stop' flag.
+     *
+     * RFC 6997 section 8: a Target sets this to say the P2P-RPL route
+     * discovery is over, so routers should stop generating or processing
+     * DIOs for this temporary DAG (but keep processing P2P-DRO messages).
+     *
+     * @param stop true to set the flag
+     */
+    void SetStop(bool stop);
+    /**
+     * @brief Get the 'Stop' flag.
+     * @return true if set
+     */
+    bool GetStop() const;
+
+    /**
+     * @brief Set the 'Ack Required' (A) flag: ask the Origin to reply with a
+     *        P2P-DRO-ACK.
+     * @param ackRequested true to set the flag
+     */
+    void SetAckRequested(bool ackRequested);
+    /**
+     * @brief Get the 'Ack Required' (A) flag.
+     * @return true if set
+     */
+    bool GetAckRequested() const;
+
+    /**
+     * @brief Set the sequence number that pairs this P2P-DRO with the
+     *        P2P-DRO-ACK sent in response.
+     * @param sequence the 'Seq' field, 2 bits
+     */
+    void SetSequence(uint8_t sequence);
+    /**
+     * @brief Get the sequence number.
+     * @return the 'Seq' field
+     */
+    uint8_t GetSequence() const;
+
+    /**
+     * @brief Set the DODAGID: the temporary DAG's root, the Origin.
+     * @param dodagId the DODAGID
+     */
+    void SetDodagId(Ipv6Address dodagId);
+    /**
+     * @brief Get the DODAGID.
+     * @return the DODAGID
+     */
+    Ipv6Address GetDodagId() const;
+
+    /**
+     * @brief Whether the P2P-RDO is present.
+     *
+     * RFC 6997 section 8: "A received P2P-DRO message MUST be discarded if
+     * it does not contain exactly one P2P-RDO" -- tracked rather than
+     * assumed, the same way HasArt() lets HandleAodvRrep() check for an RREP
+     * missing its own required option.
+     *
+     * @return true if the option is present
+     */
+    bool HasP2pRdo() const;
+    /**
+     * @brief Attach the P2P-RDO.
+     * @param rdo the option; its Address Vector must hold at most
+     *            RPL_P2P_ADDRESS_VECTOR_MAX_ENTRIES entries
+     */
+    void SetP2pRdo(const P2pRdoOption& rdo);
+    /**
+     * @brief Get the P2P-RDO.
+     * @return the option, default-constructed if none is present
+     */
+    const P2pRdoOption& GetP2pRdo() const;
+
+  private:
+    uint8_t m_instanceId;  //!< RPLInstanceID
+    bool m_stop;           //!< 'S' flag
+    bool m_ackRequested;   //!< 'A' flag
+    uint8_t m_sequence;    //!< 'Seq', 2 bits
+    Ipv6Address m_dodagId; //!< DODAGID
+
+    bool m_hasP2pRdo;    //!< true if the P2P-RDO is present
+    P2pRdoOption m_p2pRdo; //!< the P2P-RDO
 };
 
 /**

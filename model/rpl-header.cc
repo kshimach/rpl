@@ -69,6 +69,146 @@ RplDisHeader::Deserialize(Buffer::Iterator start)
     return i.GetDistanceFrom(start);
 }
 
+namespace
+{
+
+/**
+ * @brief How many leading octets a P2P-RDO's TargetAddr and Address Vector
+ *        can elide, RFC 6997 section 7's Compr field.
+ *
+ * Mirrors RplDioHeader::ElidedPrefixLength()'s 0-or-8 heuristic (@see
+ * design-constraints.md), extended to also require TargetAddr itself to
+ * share the prefix: unlike the AODV-RPL RREQ/RREP options, whose ART option
+ * carries the target address separately and always in full, RFC 6997
+ * section 7 elides Compr octets "from the Target field and the Address
+ * vector" alike.
+ *
+ * @param target the option's TargetAddr
+ * @param addressVector the option's Address Vector
+ * @param dodagId the DODAGID of the enclosing message
+ * @return 8 if target and every addressVector entry share their first 8
+ *         octets with dodagId, 0 otherwise
+ */
+uint8_t
+P2pElidedPrefixLength(Ipv6Address target,
+                      const std::vector<Ipv6Address>& addressVector,
+                      Ipv6Address dodagId)
+{
+    uint8_t dodagIdBuf[16];
+    dodagId.Serialize(dodagIdBuf);
+
+    uint8_t targetBuf[16];
+    target.Serialize(targetBuf);
+    if (!std::equal(dodagIdBuf, dodagIdBuf + 8, targetBuf))
+    {
+        return 0;
+    }
+    for (const auto& address : addressVector)
+    {
+        uint8_t addressBuf[16];
+        address.Serialize(addressBuf);
+        if (!std::equal(dodagIdBuf, dodagIdBuf + 8, addressBuf))
+        {
+            return 0;
+        }
+    }
+    return 8;
+}
+
+} // namespace
+
+uint32_t
+P2pRdoSerializedSize(const P2pRdoOption& rdo, Ipv6Address dodagId)
+{
+    uint8_t compr = P2pElidedPrefixLength(rdo.target, rdo.addressVector, dodagId);
+    uint8_t entrySize = static_cast<uint8_t>(16 - compr);
+    // Type + Length (2) + flags + L/MaxRank (2) + TargetAddr and each
+    // Address Vector entry, all entrySize octets after Compr elision.
+    return 4 + (1 + rdo.addressVector.size()) * entrySize;
+}
+
+void
+P2pRdoSerialize(Buffer::Iterator& i, const P2pRdoOption& rdo, Ipv6Address dodagId)
+{
+    uint8_t compr = P2pElidedPrefixLength(rdo.target, rdo.addressVector, dodagId);
+    uint8_t entrySize = static_cast<uint8_t>(16 - compr);
+    uint8_t length =
+        static_cast<uint8_t>(2 + (1 + rdo.addressVector.size()) * entrySize);
+
+    i.WriteU8(RPL_OPTION_P2P_RDO);
+    i.WriteU8(length);
+    i.WriteU8(static_cast<uint8_t>(
+        (rdo.reply ? RPL_P2P_R_FLAG : 0) | (rdo.hopByHop ? RPL_P2P_H_FLAG : 0) |
+        ((rdo.numRoutes << RPL_P2P_N_SHIFT) & RPL_P2P_N_MASK) | (compr & RPL_P2P_COMPR_MASK)));
+    i.WriteU8(static_cast<uint8_t>(
+        ((rdo.lifetime << RPL_P2P_LIFETIME_SHIFT) & RPL_P2P_LIFETIME_MASK) |
+        (rdo.maxRankOrNh & RPL_P2P_MAX_RANK_MASK)));
+
+    uint8_t targetBuf[16];
+    rdo.target.Serialize(targetBuf);
+    i.Write(targetBuf + compr, entrySize);
+
+    for (const auto& address : rdo.addressVector)
+    {
+        uint8_t addressBuf[16];
+        address.Serialize(addressBuf);
+        i.Write(addressBuf + compr, entrySize);
+    }
+}
+
+bool
+P2pRdoDeserialize(Buffer::Iterator& i, uint8_t length, Ipv6Address dodagId, P2pRdoOption& rdo)
+{
+    if (length < 2)
+    {
+        // Not even the flags/L-MaxRank bytes fit; nothing of the declared
+        // span has been consumed yet, so consume it all now for the caller.
+        i.Next(length);
+        return false;
+    }
+    uint8_t flags = i.ReadU8();
+    uint8_t limits = i.ReadU8();
+    uint8_t compr = flags & RPL_P2P_COMPR_MASK;
+    uint8_t entrySize = static_cast<uint8_t>(16 - compr);
+    uint8_t remaining = static_cast<uint8_t>(length - 2);
+    uint8_t blocks = static_cast<uint8_t>(remaining / entrySize);
+    if (remaining % entrySize != 0 || blocks < 1 ||
+        static_cast<uint8_t>(blocks - 1) > RPL_P2P_ADDRESS_VECTOR_MAX_ENTRIES)
+    {
+        NS_LOG_LOGIC("Skipping a malformed P2P-RDO (Compr " << +compr << ", length " << +length
+                                                             << ")");
+        // flags/limits (2 bytes) already consumed of length's total.
+        i.Next(static_cast<uint8_t>(length - 2));
+        return false;
+    }
+    uint8_t entries = static_cast<uint8_t>(blocks - 1);
+
+    rdo.reply = (flags & RPL_P2P_R_FLAG) != 0;
+    rdo.hopByHop = (flags & RPL_P2P_H_FLAG) != 0;
+    rdo.numRoutes = (flags & RPL_P2P_N_MASK) >> RPL_P2P_N_SHIFT;
+    rdo.compr = compr;
+    rdo.lifetime = (limits & RPL_P2P_LIFETIME_MASK) >> RPL_P2P_LIFETIME_SHIFT;
+    rdo.maxRankOrNh = limits & RPL_P2P_MAX_RANK_MASK;
+
+    uint8_t dodagIdBuf[16];
+    dodagId.Serialize(dodagIdBuf);
+
+    uint8_t targetBuf[16] = {0};
+    std::copy(dodagIdBuf, dodagIdBuf + compr, targetBuf);
+    i.Read(targetBuf + compr, entrySize);
+    rdo.target = Ipv6Address::Deserialize(targetBuf);
+
+    rdo.addressVector.clear();
+    for (uint8_t entry = 0; entry < entries; entry++)
+    {
+        uint8_t addressBuf[16] = {0};
+        std::copy(dodagIdBuf, dodagIdBuf + compr, addressBuf);
+        i.Read(addressBuf + compr, entrySize);
+        rdo.addressVector.push_back(Ipv6Address::Deserialize(addressBuf));
+    }
+    return true;
+}
+
 NS_OBJECT_ENSURE_REGISTERED(RplDioHeader);
 
 RplDioHeader::RplDioHeader()
@@ -103,7 +243,8 @@ RplDioHeader::RplDioHeader()
       m_prefixPreferredLifetime(0),
       m_hasRreq(false),
       m_hasRrep(false),
-      m_hasArt(false)
+      m_hasArt(false),
+      m_hasP2pRdo(false)
 {
 }
 
@@ -165,6 +306,12 @@ RplDioHeader::Print(std::ostream& os) const
         os << " ART " << m_art.target << "/" << +m_art.prefixLength << " DestSeqNo "
            << +m_art.destSeqNo;
     }
+    if (m_hasP2pRdo)
+    {
+        os << " P2P-RDO" << (m_p2pRdo.reply ? " R" : "") << (m_p2pRdo.hopByHop ? " H" : "")
+           << " Target " << m_p2pRdo.target << " MaxRank " << +m_p2pRdo.maxRankOrNh << " AV "
+           << m_p2pRdo.addressVector.size();
+    }
 }
 
 uint8_t
@@ -205,7 +352,8 @@ RplDioHeader::GetSerializedSize() const
                                 (AODV_ADDRESS_VECTOR_ENTRY_SIZE -
                                  ElidedPrefixLength(m_rrep.addressVector))
                       : 0) +
-           (m_hasArt ? AODV_ART_OPTION_SIZE : 0);
+           (m_hasArt ? AODV_ART_OPTION_SIZE : 0) +
+           (m_hasP2pRdo ? P2pRdoSerializedSize(m_p2pRdo, m_dodagId) : 0);
 }
 
 void
@@ -355,6 +503,11 @@ RplDioHeader::Serialize(Buffer::Iterator start) const
         m_art.target.Serialize(targetBuf);
         start.Write(targetBuf, 16);
     }
+
+    if (m_hasP2pRdo)
+    {
+        P2pRdoSerialize(start, m_p2pRdo, m_dodagId);
+    }
 }
 
 uint32_t
@@ -388,6 +541,7 @@ RplDioHeader::Deserialize(Buffer::Iterator start)
     m_hasRreq = false;
     m_hasRrep = false;
     m_hasArt = false;
+    m_hasP2pRdo = false;
     while (!i.IsEnd())
     {
         uint8_t type = i.ReadU8();
@@ -584,6 +738,15 @@ RplDioHeader::Deserialize(Buffer::Iterator start)
             uint8_t targetBuf[16];
             i.Read(targetBuf, 16);
             m_art.target = Ipv6Address::Deserialize(targetBuf);
+        }
+        else if (type == RPL_OPTION_P2P_RDO)
+        {
+            // P2pRdoDeserialize() itself validates length against Compr and
+            // the Address Vector entry count, and always leaves i exactly
+            // length bytes further along, success or not -- the same
+            // "declared length trusted, but validated" contract the AODV-RPL
+            // RREQ/RREP branches above follow.
+            m_hasP2pRdo = P2pRdoDeserialize(i, length, m_dodagId, m_p2pRdo);
         }
         else
         {
@@ -953,6 +1116,254 @@ const RplDioHeader::ArtOption&
 RplDioHeader::GetArt() const
 {
     return m_art;
+}
+
+bool
+RplDioHeader::HasP2pRdo() const
+{
+    return m_hasP2pRdo;
+}
+
+void
+RplDioHeader::SetP2pRdo(const P2pRdoOption& rdo)
+{
+    NS_ASSERT_MSG(rdo.addressVector.size() <= RPL_P2P_ADDRESS_VECTOR_MAX_ENTRIES,
+                  "The Address Vector does not fit the P2P-RDO's 8-bit Opt Data Len");
+    NS_ASSERT_MSG(rdo.numRoutes <= (RPL_P2P_N_MASK >> RPL_P2P_N_SHIFT),
+                  "N does not fit its 2-bit field");
+    NS_ASSERT_MSG(rdo.lifetime <= (RPL_P2P_LIFETIME_MASK >> RPL_P2P_LIFETIME_SHIFT),
+                  "L does not fit its 2-bit field");
+    NS_ASSERT_MSG(rdo.maxRankOrNh <= RPL_P2P_MAX_RANK_MASK,
+                  "MaxRank/NH does not fit its 6-bit field");
+    m_hasP2pRdo = true;
+    m_p2pRdo = rdo;
+}
+
+const P2pRdoOption&
+RplDioHeader::GetP2pRdo() const
+{
+    return m_p2pRdo;
+}
+
+NS_OBJECT_ENSURE_REGISTERED(RplP2pDroHeader);
+
+RplP2pDroHeader::RplP2pDroHeader()
+    : m_instanceId(RPL_DEFAULT_INSTANCE),
+      m_stop(false),
+      m_ackRequested(false),
+      m_sequence(0),
+      m_dodagId(Ipv6Address::GetAny()),
+      m_hasP2pRdo(false)
+{
+}
+
+TypeId
+RplP2pDroHeader::GetTypeId()
+{
+    static TypeId tid = TypeId("ns3::rpl::RplP2pDroHeader")
+                            .SetParent<Header>()
+                            .SetGroupName("Rpl")
+                            .AddConstructor<RplP2pDroHeader>();
+    return tid;
+}
+
+TypeId
+RplP2pDroHeader::GetInstanceTypeId() const
+{
+    return GetTypeId();
+}
+
+void
+RplP2pDroHeader::Print(std::ostream& os) const
+{
+    os << "P2P-DRO instance " << +m_instanceId << " DODAGID " << m_dodagId;
+    if (m_stop)
+    {
+        os << " stop";
+    }
+    if (m_ackRequested)
+    {
+        os << " ackRequested Seq " << +m_sequence;
+    }
+    if (m_hasP2pRdo)
+    {
+        os << " P2P-RDO" << (m_p2pRdo.reply ? " R" : "") << (m_p2pRdo.hopByHop ? " H" : "")
+           << " Target " << m_p2pRdo.target << " AV " << m_p2pRdo.addressVector.size();
+    }
+}
+
+uint32_t
+RplP2pDroHeader::GetSerializedSize() const
+{
+    return 20 + (m_hasP2pRdo ? P2pRdoSerializedSize(m_p2pRdo, m_dodagId) : 0);
+}
+
+void
+RplP2pDroHeader::Serialize(Buffer::Iterator start) const
+{
+    start.WriteU8(m_instanceId);
+    start.WriteU8(0); // Version, RFC 6997 section 8: always zero
+
+    uint8_t flags = static_cast<uint8_t>((m_stop ? RPL_P2P_DRO_S_FLAG : 0) |
+                                         (m_ackRequested ? RPL_P2P_DRO_A_FLAG : 0) |
+                                         ((m_sequence << RPL_P2P_DRO_SEQ_SHIFT) &
+                                          RPL_P2P_DRO_SEQ_MASK));
+    start.WriteU8(flags);
+    start.WriteU8(0); // Reserved
+
+    uint8_t buf[16];
+    m_dodagId.Serialize(buf);
+    start.Write(buf, 16);
+
+    if (m_hasP2pRdo)
+    {
+        P2pRdoSerialize(start, m_p2pRdo, m_dodagId);
+    }
+}
+
+uint32_t
+RplP2pDroHeader::Deserialize(Buffer::Iterator start)
+{
+    Buffer::Iterator i = start;
+
+    m_instanceId = i.ReadU8();
+    i.ReadU8(); // Version, always zero, not checked on receipt
+
+    uint8_t flags = i.ReadU8();
+    m_stop = (flags & RPL_P2P_DRO_S_FLAG) != 0;
+    m_ackRequested = (flags & RPL_P2P_DRO_A_FLAG) != 0;
+    m_sequence = (flags & RPL_P2P_DRO_SEQ_MASK) >> RPL_P2P_DRO_SEQ_SHIFT;
+    i.ReadU8(); // Reserved
+
+    uint8_t buf[16];
+    i.Read(buf, 16);
+    m_dodagId = Ipv6Address::Deserialize(buf);
+
+    // A P2P-DRO is the last thing in the packet, same as a DIO, so the end
+    // of the buffer is the end of the option list.
+    m_hasP2pRdo = false;
+    while (!i.IsEnd())
+    {
+        uint8_t type = i.ReadU8();
+        if (type == RPL_OPTION_PAD1)
+        {
+            continue;
+        }
+        if (i.IsEnd())
+        {
+            NS_LOG_WARN("Truncated RPL option " << +type << ", stopping");
+            break;
+        }
+        uint8_t length = i.ReadU8();
+        if (i.GetRemainingSize() < length)
+        {
+            NS_LOG_WARN("Truncated RPL option "
+                        << +type << " (declared length " << +length << ", only "
+                        << i.GetRemainingSize() << " bytes remain), stopping");
+            break;
+        }
+
+        if (type == RPL_OPTION_P2P_RDO)
+        {
+            m_hasP2pRdo = P2pRdoDeserialize(i, length, m_dodagId, m_p2pRdo);
+        }
+        else
+        {
+            NS_LOG_LOGIC("Skipping RPL option " << +type << " of length " << +length);
+            i.Next(length);
+        }
+    }
+
+    return i.GetDistanceFrom(start);
+}
+
+void
+RplP2pDroHeader::SetInstanceId(uint8_t instanceId)
+{
+    m_instanceId = instanceId;
+}
+
+uint8_t
+RplP2pDroHeader::GetInstanceId() const
+{
+    return m_instanceId;
+}
+
+void
+RplP2pDroHeader::SetStop(bool stop)
+{
+    m_stop = stop;
+}
+
+bool
+RplP2pDroHeader::GetStop() const
+{
+    return m_stop;
+}
+
+void
+RplP2pDroHeader::SetAckRequested(bool ackRequested)
+{
+    m_ackRequested = ackRequested;
+}
+
+bool
+RplP2pDroHeader::GetAckRequested() const
+{
+    return m_ackRequested;
+}
+
+void
+RplP2pDroHeader::SetSequence(uint8_t sequence)
+{
+    NS_ASSERT_MSG(sequence <= (RPL_P2P_DRO_SEQ_MASK >> RPL_P2P_DRO_SEQ_SHIFT),
+                  "Seq does not fit its 2-bit field");
+    m_sequence = sequence;
+}
+
+uint8_t
+RplP2pDroHeader::GetSequence() const
+{
+    return m_sequence;
+}
+
+void
+RplP2pDroHeader::SetDodagId(Ipv6Address dodagId)
+{
+    m_dodagId = dodagId;
+}
+
+Ipv6Address
+RplP2pDroHeader::GetDodagId() const
+{
+    return m_dodagId;
+}
+
+bool
+RplP2pDroHeader::HasP2pRdo() const
+{
+    return m_hasP2pRdo;
+}
+
+void
+RplP2pDroHeader::SetP2pRdo(const P2pRdoOption& rdo)
+{
+    NS_ASSERT_MSG(rdo.addressVector.size() <= RPL_P2P_ADDRESS_VECTOR_MAX_ENTRIES,
+                  "The Address Vector does not fit the P2P-RDO's 8-bit Opt Data Len");
+    NS_ASSERT_MSG(rdo.numRoutes <= (RPL_P2P_N_MASK >> RPL_P2P_N_SHIFT),
+                  "N does not fit its 2-bit field");
+    NS_ASSERT_MSG(rdo.lifetime <= (RPL_P2P_LIFETIME_MASK >> RPL_P2P_LIFETIME_SHIFT),
+                  "L does not fit its 2-bit field");
+    NS_ASSERT_MSG(rdo.maxRankOrNh <= RPL_P2P_MAX_RANK_MASK,
+                  "MaxRank/NH does not fit its 6-bit field");
+    m_hasP2pRdo = true;
+    m_p2pRdo = rdo;
+}
+
+const P2pRdoOption&
+RplP2pDroHeader::GetP2pRdo() const
+{
+    return m_p2pRdo;
 }
 
 NS_OBJECT_ENSURE_REGISTERED(RplDaoHeader);

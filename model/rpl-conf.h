@@ -30,6 +30,7 @@ enum RplMessageCode : uint8_t
     RPL_CODE_DIO = 0x01,     //!< DODAG Information Object
     RPL_CODE_DAO = 0x02,     //!< Destination Advertisement Object
     RPL_CODE_DAO_ACK = 0x03, //!< DAO Acknowledgement
+    RPL_CODE_P2P_DRO = 0x04, //!< P2P Discovery Reply Object (RFC 6997, section 8)
     RPL_CODE_SEC_DIS = 0x80, //!< Secure DIS (not implemented)
     RPL_CODE_SEC_DIO = 0x81, //!< Secure DIO (not implemented)
     RPL_CODE_SEC_DAO = 0x82, //!< Secure DAO (not implemented)
@@ -49,6 +50,7 @@ enum RplOptionType : uint8_t
     RPL_OPTION_SOLICITED_INFO = 7,
     RPL_OPTION_PREFIX_INFO = 8,
     RPL_OPTION_TARGET_DESC = 9,
+    RPL_OPTION_P2P_RDO = 0x0A,   //!< P2P Route Discovery Option (RFC 6997, section 7)
     RPL_OPTION_AODV_RREQ = 0x0B, //!< AODV-RPL Route Request (RFC 9854, section 4.1)
     RPL_OPTION_AODV_RREP = 0x0C, //!< AODV-RPL Route Reply (RFC 9854, section 4.2)
     RPL_OPTION_AODV_ART = 0x0D,  //!< AODV-RPL Target (RFC 9854, section 4.3)
@@ -295,6 +297,73 @@ RplAodvLifetimeSeconds(uint8_t lifetimeField)
         return 0;
     }
 }
+
+/// The P2P Route Discovery Option's (P2P-RDO, RFC 6997 section 7) flag
+/// octet, the byte right after Option Length: 'R' (Reply), 'H' (Hop-by-hop),
+/// 'N' (Number of Routes, 2 bits) and 'Compr' (4 bits), in that bit order --
+/// unlike the AODV-RPL RREQ/RREP options, this byte has no reserved bit and
+/// none of its fields straddle a byte boundary, confirmed against the RFC's
+/// own bit ruler (@see design-constraints.md).
+constexpr uint8_t RPL_P2P_R_FLAG = 0x80;
+constexpr uint8_t RPL_P2P_H_FLAG = 0x40;
+constexpr uint8_t RPL_P2P_N_MASK = 0x30;
+constexpr uint8_t RPL_P2P_N_SHIFT = 4;
+constexpr uint8_t RPL_P2P_COMPR_MASK = 0x0F;
+
+/// The byte after the flag octet: 'L' (Lifetime, 2 bits) then 'MaxRank/NH'
+/// (6 bits) -- the field means MaxRank inside a P2P mode DIO's P2P-RDO and
+/// the Address Vector's next-hop index inside a P2P-DRO's (RFC 6997
+/// sections 7, 8.2).
+constexpr uint8_t RPL_P2P_LIFETIME_MASK = 0xC0;
+constexpr uint8_t RPL_P2P_LIFETIME_SHIFT = 6;
+constexpr uint8_t RPL_P2P_MAX_RANK_MASK = 0x3F;
+/// Zero means "MaxRank is infinity" (RFC 6997 section 7).
+constexpr uint8_t RPL_P2P_MAX_RANK_INFINITE = 0;
+
+/// How many Address Vector entries a P2P-RDO can carry. Not a policy choice:
+/// the option's own Opt Data Len is eight bits, and unlike the AODV-RPL
+/// RREQ/RREP options, TargetAddr shares the option with the Address Vector
+/// rather than living in a separate ART option, so with the 2-byte flags/L
+/// part, an uncompressed (Compr 0) 16-byte TargetAddr, and 16 bytes per
+/// entry, the wire format stops at 14: 2 + 16 + 14 * 16 = 242 <= 255, one
+/// more entry would need 258.
+constexpr uint8_t RPL_P2P_ADDRESS_VECTOR_MAX_ENTRIES = 14;
+
+/**
+ * @brief How long the 'L' field of a P2P-RDO lets a node stay in the
+ *        temporary DAG, in seconds.
+ *
+ * RFC 6997 section 7 tabulates this two-bit field as 0x00 1 second, 0x01 4
+ * seconds, 0x02 16 seconds, 0x03 64 seconds -- a different mapping (and no
+ * "unlimited" encoding) from the AODV-RPL RREQ/RREP options' own 'L' field,
+ * @see RplAodvLifetimeSeconds().
+ *
+ * @param lifetimeField the 'L' field, only its low two bits are read
+ * @return the duration in seconds
+ */
+constexpr uint32_t
+RplP2pLifetimeSeconds(uint8_t lifetimeField)
+{
+    switch (lifetimeField & 0x03)
+    {
+    case 1:
+        return 4;
+    case 2:
+        return 16;
+    case 3:
+        return 64;
+    default:
+        return 1;
+    }
+}
+
+/// The P2P Discovery Reply Object's (P2P-DRO, RFC 6997 section 8) third
+/// octet: 'S' (Stop), 'A' (Ack Required) and 'Seq' (2 bits), the rest of
+/// that octet and the whole octet after it being Reserved.
+constexpr uint8_t RPL_P2P_DRO_S_FLAG = 0x80;
+constexpr uint8_t RPL_P2P_DRO_A_FLAG = 0x40;
+constexpr uint8_t RPL_P2P_DRO_SEQ_MASK = 0x30;
+constexpr uint8_t RPL_P2P_DRO_SEQ_SHIFT = 4;
 
 /// Routing Metric/Constraint object types (RFC 6551, section 4).
 constexpr uint8_t RPL_DAG_MC_LQL = 6;
