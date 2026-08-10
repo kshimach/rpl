@@ -3524,3 +3524,54 @@ Vector は不変長なので増幅は起きず (中継のたびに hop 数が増
 仕組みではない)、OrigNode 側の経路保存も同一内容での上書きで冪等
 なので、実害の無い冗長送信に留まる — 修正の優先度は低いと判断し
 今回は見送った。
+
+### 35.10 base DODAG の root が他の RREQ-Instance の親を失うとクラッシュする
+
+ns3-editor に AODV-RPL 対応を追加する作業中、実際に生成した 5 ノードの
+メッシュ・シナリオ (root 1 ノード + 4 ノード、root 自身が他 2 ノード間の
+AODV-RPL 経路探索に中継ノードとして参加する) を `./ns3 run` したところ、
+120 秒付近で `NS_ASSERT failed, cond="m_impl != nullptr", file=.../
+timer.cc, line=160` (`Timer::Schedule()` 内) でクラッシュした。62 件の
+既存テストはどれも検出していなかった。
+
+**原因**: `RplRoutingProtocol::DoInitialize()` は `m_disTimer` (DIS を
+再送してDODAGを探すためのタイマー) の `SetFunction()` を、
+`m_isRoot == false` の分岐でしか呼んでいなかった。「base DODAG の root は
+DIS で何かを探しに行くことは無い」という、AODV-RPL 登場前は正しかった
+前提に基づく。
+
+ところが AODV-RPL の `CreateLocalDodag()`/`HandleAodvRreq()` は
+`m_isRoot` を一切参照しない。base DODAG の root であるノードも、他の
+ノードが開始した RREQ-Instance には**ただの一般ノードとして** join
+できる (その RREQ-Instance 用の `DodagMembership::isRoot` は false)。
+`SelectPreferredParent()` が「親を失った」と判定してから
+`LeaveDodag(key, true)` の後に呼ぶ `m_disTimer.Schedule(...)`
+(cc:2511-2512、「再びソリシットする」ための再送) はノード単位の
+`m_disTimer` を使うが、この経路は `dodag.isRoot` (per-membership) しか
+見ておらず、`m_isRoot` (per-node) が true のノードでは `m_disTimer` が
+一度も `SetFunction()` されていない ―― 呼べば必ず
+`Timer::Schedule()` の `NS_ASSERT(m_impl != nullptr)` に落ちる。
+
+base DODAG 単体のテスト・サンプルではこの組み合わせ (「root ノードが、
+自分が root ではない別の DODAG の親を失う」) が一度も起きなかったため
+発覚しなかった。AODV-RPL がノードを複数 DODAG の同時メンバーにできる
+ようになって初めて到達可能になった経路。
+
+**修正**: `m_disTimer.SetFunction(&RplRoutingProtocol::DisTimerExpire,
+this);` を `if (m_isRoot)` 分岐の外に出し、root/非 root を問わず常に
+呼ぶようにした (`rpl-routing-protocol.cc` の `DoInitialize()`)。
+「起動直後に自分から DIS を撒く」という non-root 専用の初期ソリシット
+(`Simulator::Schedule(..., &DisTimerExpire, this)`) は従来どおり
+`else` 分岐に残した — root が自分の base DODAG のために DIS を撒く
+必要は無いのは変わらないので、この部分だけ root/非 root で分ける
+理由は今もある。`SetFunction()` はタイマーに関数を結び付けるだけで
+何も送信しないため、root に対して呼んでも副作用は無い。
+
+**検証**: 回帰テスト `RplRootJoinsForeignRreqInstanceParentLossTestCase`
+を追加。base DODAG の root 1 ノードに、架空の隣接ノードからの
+RREQ-DIO を 1 通だけ注入して join させ、以降何も送らずに Trickle の
+2 周期分以上 (デフォルトの `AodvDioIntervalMin`/`Doublings` から
+Imax は約 2.048 秒、その 2 倍) 待つと、root 自身の Trickle 再評価が
+「親を失った」経路を踏む。修正を外すとこのテストは (アサーション失敗
+ではなく) プロセスごと `NS_FATAL` で落ちることを確認済み (`git stash`
+で修正だけを外して確認)。修正を戻すと 62+1 件全 PASS (3 回連続)。

@@ -5220,6 +5220,146 @@ RplAodvRrepCompletesTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief A base-DODAG root that also joins another RREQ-Instance as an
+ *        ordinary member must not crash when it loses that RREQ-Instance's
+ *        last parent.
+ *
+ * RplRoutingProtocol::DoInitialize() used to call m_disTimer.SetFunction()
+ * only for non-root nodes, on the assumption that a base-DODAG root
+ * (m_isRoot) never needs to solicit a DODAG via DIS. AODV-RPL (RFC 9854)
+ * breaks that assumption: CreateLocalDodag()/HandleAodvRreq() do not consult
+ * m_isRoot at all, so the very node that roots the base DODAG can also join
+ * someone else's RREQ-Instance as an ordinary (non-root) member --
+ * DodagMembership::isRoot, not the node-wide m_isRoot, is what
+ * SelectPreferredParent() actually checks. When that membership's only
+ * neighbour goes stale, SelectPreferredParent() falls through to its generic
+ * "lost the last parent, solicit again" path (the same one an ordinary
+ * node's own base DODAG membership already exercises safely) and calls
+ * m_disTimer.Schedule() -- asserting "m_impl != nullptr" in
+ * Timer::Schedule() the first time a root ever reached it, since m_disTimer
+ * had never had SetFunction() called on a root node.
+ *
+ * Found running an ns3-editor-generated scenario (a 5-node mesh where the
+ * base DODAG root also relayed an AODV-RPL discovery between two other
+ * nodes); reproduced here without ns3-editor, the same way
+ * RplAodvAddressVectorFollowsParentTestCase injects a fabricated RREQ-DIO.
+ */
+class RplRootJoinsForeignRreqInstanceParentLossTestCase : public TestCase
+{
+  public:
+    RplRootJoinsForeignRreqInstanceParentLossTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplRootJoinsForeignRreqInstanceParentLossTestCase::
+    RplRootJoinsForeignRreqInstanceParentLossTestCase()
+    : TestCase("A base-DODAG root losing an RREQ-Instance's last parent does not crash")
+{
+}
+
+void
+RplRootJoinsForeignRreqInstanceParentLossTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(1);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.AssignWithoutAddress(devices);
+
+    // The node under test is the base DODAG's own root -- m_isRoot ends up
+    // true, which is this bug's precondition.
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    Simulator::Stop(Seconds(2));
+    Simulator::Run();
+
+    Ptr<Node> node = nodes.Get(0);
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+    Ipv6Address nodeLinkLocal = node->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    static constexpr uint8_t RREQ_INSTANCE = 0x81;
+    Ipv6Address origNode("2001:9::1");
+    Ipv6Address onlyNeighbour("fe80::a");
+
+    RplDioHeader dio;
+    dio.SetInstanceId(RREQ_INSTANCE);
+    dio.SetVersionNumber(0);
+    dio.SetRank(128);
+    dio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+    dio.SetDodagId(origNode);
+    dio.SetDtsn(0);
+    dio.SetDagConfiguration(0,
+                            8,
+                            RPL_DIO_REDUNDANCY,
+                            RPL_MAX_RANKINC,
+                            RPL_MIN_HOPRANKINC,
+                            RPL_OCP_OF0,
+                            RPL_DEFAULT_LIFETIME,
+                            RPL_DEFAULT_LIFETIME_UNIT);
+    RplDioHeader::RreqOption rreq;
+    rreq.symmetric = true;
+    rreq.hopByHop = false;
+    rreq.compr = 0;
+    // Unlimited: only the staleness path below should ever fire in this
+    // test, not AodvInstanceExpired()'s own (already-guarded, poison=false)
+    // one -- they are different bugs, and this test is only about the first.
+    rreq.lifetime = 0;
+    rreq.rankLimit = 0;
+    rreq.origSeqNo = 1;
+    rreq.addressVector = {};
+    dio.SetRreq(rreq);
+    RplDioHeader::ArtOption art;
+    art.destSeqNo = 0;
+    art.prefixLength = 0;
+    art.target = Ipv6Address("2001:9::99"); // a fake target, not this node
+    dio.SetArt(art);
+
+    Simulator::Schedule(Seconds(0),
+                        &DeliverRawRplMessage<RplDioHeader>,
+                        node,
+                        1,
+                        dio,
+                        static_cast<uint8_t>(RPL_CODE_DIO),
+                        onlyNeighbour,
+                        nodeLinkLocal);
+    Simulator::Stop(MilliSeconds(10));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(RREQ_INSTANCE, origNode),
+                          true,
+                          "Did not join the fabricated RREQ-Instance");
+
+    // Nothing more is ever sent from onlyNeighbour. Two full Trickle
+    // intervals is the staleness threshold SelectPreferredParent() itself
+    // uses (AodvDioIntervalMin/AodvDioIntervalDoublings default to 128ms/4,
+    // so Imax is ~2.048s); waiting well past that lets the root's own
+    // Trickle-fired re-evaluation of this membership find no parent left in
+    // it and take the "lost the last parent" path -- which is exactly what
+    // used to crash the whole process before a single assertion below could
+    // even run.
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(RREQ_INSTANCE, origNode),
+                          false,
+                          "Should have left the RREQ-Instance after losing its last parent");
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Check which DIOs RplRoutingProtocol::HandleDio() acts on and which
  *        it turns away: a mode of operation it does not implement, another
  *        RPL instance or DODAG, a stale DODAG version, and the infinite
@@ -9429,6 +9569,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplAodvAddressVectorFollowsParentTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRreqFloodTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRrepCompletesTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplRootJoinsForeignRreqInstanceParentLossTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDioRejectionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplParentLossRejoinTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplInterfaceRestartTestCase, TestCase::Duration::QUICK);

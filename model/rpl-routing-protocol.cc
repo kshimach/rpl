@@ -368,6 +368,20 @@ RplRoutingProtocol::DoInitialize()
     // dioTrickle instead, seeded from the same m_dioIntervalMin/Doublings/
     // Redundancy attributes this used to configure ahead of time.
 
+    // Always wired up, even for the base DODAG's own root: m_isRoot only
+    // says this node owns the base DODAG, not that every DodagMembership it
+    // ever holds is one it roots. AODV-RPL (RFC 9854) lets this same node
+    // join someone else's RREQ-Instance as an ordinary (non-root) member --
+    // CreateLocalDodag()/HandleAodvRreq() do not consult m_isRoot at all --
+    // and SelectPreferredParent() falls back to m_disTimer.Schedule() for
+    // any non-root membership that loses its last parent (DodagMembership::
+    // isRoot is what actually gates that path, checked per membership).
+    // Leaving m_disTimer without a function only for m_isRoot nodes left it
+    // Schedule()'d against a Timer that had never had SetFunction() called,
+    // asserting "m_impl != nullptr" in Timer::Schedule() the first time a
+    // root's own RREQ-Instance membership lost its last neighbour.
+    m_disTimer.SetFunction(&RplRoutingProtocol::DisTimerExpire, this);
+
     if (m_isRoot)
     {
         // RFC 6550, section 8.2.2.2: the root is at MinHopRankIncrease and the
@@ -392,7 +406,6 @@ RplRoutingProtocol::DoInitialize()
     }
     else
     {
-        m_disTimer.SetFunction(&RplRoutingProtocol::DisTimerExpire, this);
         // daoEvent/daoRetryEvent are bound per DODAG membership instead, in
         // JoinDodag(): each is a fresh Timer, part of a DodagMembership that
         // does not exist yet at this point.
