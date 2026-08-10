@@ -3954,3 +3954,56 @@ flood に留まるが、同じ穴を 2 つ目の instance 種別で開けたま�
 積み上がり順)、`RplAodvAsymmetricRouteCompletesTestCase`
 (逆順格納と end-to-end 疎通) の 4 件を追加。各増分で「修正を外すと
 落ちる」ことを確認済み。全件 PASS (3 回連続)。
+
+### 35.17 `protocol-test-matrix` で §35.16 を監査し直して見つかったバグ: RREP-Instance に RankLimit が効いていなかった
+
+§35.16 の実装が終わった後、`/protocol-test-matrix` の Phase 0 に従って
+RFC 9854 を読み直したところ、§6.4.1 の一文が実装に反映されていない
+ことに気づいた:
+
+> If the S bit of the RREQ-Instance is set to 0, the router MUST
+> determine whether the downward direction of the link ... satisfies
+> the OF and whether the router's Rank would not exceed the
+> RankLimit. If these are true, the router joins the DODAG of the
+> RREP-Instance.
+
+RREQ-Instance 側は `ShouldRefuseAodvRreq()` が §6.2.1 の同種規定を
+最初から実装していたが (§35.8)、その RREP-Instance 版が
+`HandleAodvRrepInstance()` には無かった — RankLimit がいくつでも
+中継が無条件に join していた。
+
+#### 修正は 2 段階で正しくなった
+
+最初に足したテスト (`RplAodvRrepInstanceRankLimitTestCase`) は、
+RankLimit 内に収まっているはずのケースまで含めて**全件 FAIL** した。
+原因は RankLimit のロジックではなくテスト自体の配送先: RREP-DIO を
+ノード自身の link-local アドレス宛てに注入していたため、
+`HandleDio()` の `toMulticast` 判別 (§35.16 で導入したもの) が
+symmetric な unicast 応答経路 (`HandleAodvRrep()`) に振ってしまい、
+検証対象の join 経路をそもそも通っていなかった。配送先を
+all-AODV-RPL-nodes multicast に直して解消。
+
+配送先を直した後も、境界値・超過値のケースだけがまだ「join した」
+判定のままだった。RankLimit チェックを最初 `HandleAodvRrepInstance()`
+の中に置いていたのが原因: `HandleDio()` は未知の `DodagKey` に対して
+`HandleAodvRrepInstance()` を呼ぶ**前**に `JoinDodag()` を無条件で
+呼んでいる (§35.16 の join 経路そのもの) ため、post-join 側で拒否
+しても `dodag.aodv` の書き込みを止めるだけで、`SelectPreferredParent()`
+が選んだ本物の親を持つ通常の DODAG membership は `m_dodags` に残った
+まま — `IsJoinedTo()` はそれを普通に「参加済み」と報告する。これは
+`ShouldRefuseAodvRreq()` が RREQ-Instance 側で最初から回避していた
+のと同じ形の配置ミスで、RREP-Instance 側で新たに繰り返していた。
+
+**修正**: `ShouldRefuseAodvRrep()` を新設し、RankLimit チェックに
+加えて `!dio.HasArt()`・`hopByHop`・§6.4.1 の AV 自己ループチェック
+(この 3 つも同じ配置ミスで post-join 側にあった) をまとめて移し、
+`HandleDio()` の join 解決より前から呼ぶようにした。RankLimit の
+計算自体は `ShouldRefuseAodvRreq()` と同型: 送信側の advertised
+DAGRank が既に RankLimit 以上なら拒否、自分の結果 DAGRank が
+RankLimit 以上でも拒否 — ただし ART の target が自分自身
+(= OrigNode) の場合は §4.1 の緩和により 1 段だけ許容する
+(RREQ 側の TargNode 緩和に対応)。
+
+各チェックを個別に無効化してテストが期待どおりの assertion
+メッセージで落ちることを確認してから復元し、rpl スイート全件を
+3 回連続 PASS させて確定。コミットは `121f05a`。
