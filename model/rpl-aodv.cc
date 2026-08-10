@@ -470,9 +470,132 @@ RplRoutingProtocol::SendAodvRrepTo(const DodagMembership& dodag,
 }
 
 void
+RplRoutingProtocol::StartAodvRrepInstance(const DodagMembership& rreqDodag, DodagKey rreqKey)
+{
+    NS_LOG_FUNCTION(this << +rreqKey.instanceId << rreqKey.dodagId);
+
+    Ipv6Address ownAddress = GetGlobalAddressIn(rreqDodag);
+    if (ownAddress.IsAny())
+    {
+        NS_LOG_LOGIC("No global address to root an RREP-Instance at yet");
+        return;
+    }
+
+    // Everything carried over from the RREQ-Instance, read out up front so
+    // the rest of this function does not interleave reads of one membership
+    // with writes to another. (m_dodags is a std::map, so the insertion
+    // below does not invalidate rreqDodag -- this is for legibility, not
+    // safety.) The RREQ-Instance's own DODAGID is the OrigNode, which is
+    // what the RREP has to be aimed back at.
+    Ipv6Address origNode = rreqKey.dodagId;
+    uint8_t rankLimit = rreqDodag.aodv.rankLimit;
+    uint8_t lifetimeField = rreqDodag.aodv.lifetimeField;
+
+    // RFC 9854 section 6.3.3: the RREP-InstanceID is the RREQ-InstanceID
+    // plus Delta, and "the RPLInstanceID of an already active RREP-Instance
+    // MUST NOT be used again for assigning RPLInstanceID for the later
+    // RREP-Instance" -- two OrigNodes that happened to pick the same
+    // RREQ-InstanceID for routes to this same TargNode would otherwise
+    // produce two DODAGs an intermediate router could not tell apart, since
+    // both would carry this node's address as the DODAGID.
+    //
+    // Delta is six bits, so the search runs 0..63. A candidate that would
+    // set the Local RPLInstanceID's 'D' flag is skipped rather than used:
+    // CreateLocalDodag() clears that bit unconditionally (RFC 6550 section
+    // 5.1 requires it clear in control messages), which would leave the
+    // instance running under an ID one bit off from the one Delta describes,
+    // and every receiver's own instanceId - delta would then miss.
+    uint8_t rrepInstanceId = 0;
+    bool found = false;
+    for (uint8_t delta = 0; delta <= (RPL_AODV_DELTA_MASK >> RPL_AODV_DELTA_SHIFT); delta++)
+    {
+        uint8_t candidate = static_cast<uint8_t>(rreqKey.instanceId + delta);
+        if ((candidate & RPL_LOCAL_INSTANCE_D_FLAG) != 0)
+        {
+            continue;
+        }
+        if (!IsJoinedTo(candidate, ownAddress))
+        {
+            rrepInstanceId = candidate;
+            found = true;
+            break;
+        }
+    }
+    if (!found)
+    {
+        NS_LOG_WARN("No free RPLInstanceID left to pair an RREP-Instance with RREQ-Instance "
+                    << +rreqKey.instanceId);
+        return;
+    }
+
+    // "the TargNode MUST build a DODAG in the RREP-Instance corresponding to
+    // the RREQ-DIO rooted at itself, in order to provide OrigNode with a
+    // downstream route to the TargNode" (section 6.3.2).
+    DodagKey rrepKey = CreateLocalDodag(rrepInstanceId, RPL_MOP_P2P_ROUTE_DISCOVERY);
+    if (rrepKey.dodagId.IsAny())
+    {
+        return;
+    }
+
+    auto it = m_dodags.find(rrepKey);
+    NS_ASSERT_MSG(it != m_dodags.end(), "CreateLocalDodag() did not leave a membership behind");
+    DodagMembership& rrepDodag = it->second;
+
+    // RFC 9854 section 6.1's rule for the OrigNode's own Sequence Number,
+    // applied to the TargNode originating this instance: it is what the ART
+    // option carries as Dest SeqNo, and what tells a stale route from this
+    // one at the far end.
+    m_aodvSeqNo++;
+
+    rrepDodag.aodv.isRrepInstance = true;
+    rrepDodag.aodv.pairedInstanceId = rreqKey.instanceId;
+    rrepDodag.aodv.origNode = origNode;
+    rrepDodag.aodv.origSeqNo = m_aodvSeqNo;
+    rrepDodag.aodv.rankLimit = rankLimit;
+    rrepDodag.aodv.lifetimeField = lifetimeField;
+    rrepDodag.aodv.target = ownAddress; // the TargNode is this node
+    rrepDodag.aodv.isOrigin = false;
+    rrepDodag.aodv.isTarget = true;
+    // Empty at the root: section 6.4.4 has only the routers the RREP passes
+    // through append to it, the mirror of the RREQ's own rule.
+    rrepDodag.aodv.addressVector.clear();
+
+    // Paced like the RREQ-Instance rather than like the base DODAG: the
+    // RREP has to reach the OrigNode inside the same 'L' lifetime.
+    rrepDodag.dioIntervalMin = m_aodvDioIntervalMin;
+    rrepDodag.dioIntervalDoublings = m_aodvDioIntervalDoublings;
+    rrepDodag.dioTrickle.SetParameters(rrepDodag.dioIntervalMin,
+                                       rrepDodag.dioIntervalDoublings,
+                                       rrepDodag.dioRedundancy);
+    rrepDodag.dioTrickle.Reset();
+
+    ArmAodvExpiry(rrepDodag, rrepKey);
+
+    NS_LOG_INFO("Answering the RREQ for " << ownAddress << " with an asymmetric RREP-Instance "
+                                          << +rrepInstanceId << " (Delta "
+                                          << +static_cast<uint8_t>(rrepInstanceId -
+                                                                   rreqKey.instanceId)
+                                          << ") rooted here, towards OrigNode " << origNode);
+    // Nothing is transmitted here: the Trickle timer just reset above
+    // multicasts the RREP-DIO, with SendDio() filling in the RREP and ART
+    // options from the state recorded above -- the same division of labour
+    // the RREQ side uses.
+}
+
+void
 RplRoutingProtocol::SendAodvRrep(DodagMembership& dodag, DodagKey key)
 {
     NS_LOG_FUNCTION(this << +key.instanceId << key.dodagId);
+
+    // RFC 9854 section 6.3.2: an asymmetric route cannot be answered by
+    // unicasting back the way the RREQ came, because that is exactly the
+    // direction some hop on it failed to satisfy. The TargNode floods a
+    // DODAG of its own instead.
+    if (!dodag.aodv.symmetric)
+    {
+        StartAodvRrepInstance(dodag, key);
+        return;
+    }
 
     Ipv6Address ownAddress = GetGlobalAddressIn(dodag);
     if (ownAddress.IsAny())
@@ -735,6 +858,20 @@ RplRoutingProtocol::IsAodvSymmetric(uint8_t instanceId, Ipv6Address dodagId) con
 {
     auto it = m_dodags.find(DodagKey{instanceId, dodagId});
     return it != m_dodags.end() && it->second.aodv.symmetric;
+}
+
+bool
+RplRoutingProtocol::FindAodvRrepInstance(Ipv6Address origNode, DodagKey& key) const
+{
+    for (const auto& [candidate, dodag] : m_dodags)
+    {
+        if (dodag.aodv.isRrepInstance && dodag.aodv.origNode == origNode)
+        {
+            key = candidate;
+            return true;
+        }
+    }
+    return false;
 }
 
 } // namespace rpl

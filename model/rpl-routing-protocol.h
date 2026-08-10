@@ -555,6 +555,22 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      */
     bool IsAodvSymmetric(uint8_t instanceId, Ipv6Address dodagId) const;
 
+    /**
+     * @brief Find the RREP-Instance this node holds for a given OrigNode.
+     *
+     * An asymmetric discovery's RREP-Instance is keyed by the TargNode's
+     * address, not the OrigNode's, and its RPLInstanceID is the
+     * RREQ-InstanceID plus a Delta chosen at the TargNode (RFC 9854 section
+     * 6.3.3) -- so neither half of its key can be predicted from the
+     * RREQ-Instance alone. This looks it up by the one thing a caller does
+     * know.
+     *
+     * @param origNode the OrigNode the discovery is for
+     * @param [out] key the RREP-Instance's key, untouched if none is found
+     * @return true if this node holds such an RREP-Instance
+     */
+    bool FindAodvRrepInstance(Ipv6Address origNode, DodagKey& key) const;
+
   protected:
     void DoInitialize() override;
     void DoDispose() override;
@@ -690,7 +706,12 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
             /// Objective Function so far (RFC 9854 section 6.2.4's "S bit of
             /// the RREQ-Instance").
             bool symmetric{true};
-            uint8_t origSeqNo{0}; //!< Orig SeqNo of the RREQ that formed this
+            /// The Sequence Number of whichever node originated this
+            /// instance: the OrigNode's, off the RREQ that formed an
+            /// RREQ-Instance, or the TargNode's own for an RREP-Instance
+            /// (@see isRrepInstance), where it is what the RREP's ART
+            /// option carries as its Dest SeqNo.
+            uint8_t origSeqNo{0};
             uint8_t rankLimit{0}; //!< RankLimit, 0 meaning no limit
             uint8_t lifetimeField{0}; //!< the 'L' field this instance was opened with
             Ipv6Address target;   //!< the single ART target being looked for
@@ -700,6 +721,29 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
             std::vector<Ipv6Address> addressVector;
             bool isOrigin{false}; //!< this node started the discovery
             bool isTarget{false}; //!< this node is the TargNode being looked for
+            /// This membership is the RREP-Instance of an asymmetric (S=0)
+            /// discovery rather than its RREQ-Instance: a second DODAG the
+            /// TargNode roots at itself and floods, so that the OrigNode
+            /// learns a downstream route whose links were each checked in
+            /// the direction data will actually take (RFC 9854 section
+            /// 6.3.2). Every field above keeps its meaning, read against
+            /// this DODAG instead -- target is the TargNode either way,
+            /// addressVector is the RREP's own accumulated path (section
+            /// 6.4.4), and isOrigin/isTarget still say which end this node
+            /// is. A symmetric discovery never sets this: its RREP is a
+            /// unicast that builds no DODAG at all (section 6.3.1).
+            bool isRrepInstance{false};
+            /// The RREQ-InstanceID this RREP-Instance is paired with (RFC
+            /// 9854 section 6.3.3). The RREP-Instance's own RPLInstanceID
+            /// is this plus the RREP option's Delta; both ends need the
+            /// pair to tell one discovery's RREP-Instance from another's.
+            uint8_t pairedInstanceId{0};
+            /// The OrigNode, i.e. the RREQ-Instance's DODAGID. Named in the
+            /// RREP's ART option, which is how a router receiving an
+            /// RREP-DIO recognises whether it is the OrigNode (section
+            /// 6.4.2) -- for an RREP-Instance the DODAGID is the TargNode,
+            /// so the OrigNode has to be carried separately.
+            Ipv6Address origNode;
             /// RFC 9854 section 6.4: "a router that already belongs to the
             /// RREP-Instance SHOULD drop the RREP-DIO". A symmetric route
             /// never forms an RREP-Instance DODAG to check membership
@@ -834,10 +878,36 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
 
     /**
      * @brief Send the RREP that answers an RREQ this node is the target of.
+     *
+     * Branches on the RREQ-Instance's own 'S' bit: a symmetric route is
+     * answered by unicasting straight back along the Address Vector (RFC
+     * 9854 section 6.3.1), an asymmetric one by handing off to
+     * StartAodvRrepInstance().
+     *
      * @param dodag the RREQ-Instance being answered
      * @param key its key
      */
     void SendAodvRrep(DodagMembership& dodag, DodagKey key);
+
+    /**
+     * @brief Root and start flooding an RREP-Instance for an asymmetric
+     *        (S=0) discovery this node is the target of.
+     *
+     * RFC 9854 section 6.3.2: the reverse of the path the RREQ took is by
+     * definition not usable when 'S' was cleared, so instead of unicasting
+     * an answer the TargNode builds a second DODAG rooted at itself and
+     * floods it. Routers join it only over links that satisfy the Objective
+     * Function in the direction of the TargNode -- which is the direction
+     * the OrigNode's data will travel.
+     *
+     * Nothing is transmitted before this returns: the membership's own
+     * Trickle timer multicasts the RREP-DIO, built by SendDio() from the
+     * state recorded here, exactly as an RREQ-Instance's is.
+     *
+     * @param rreqDodag the RREQ-Instance being answered
+     * @param rreqKey its key, whose dodagId is the OrigNode
+     */
+    void StartAodvRrepInstance(const DodagMembership& rreqDodag, DodagKey rreqKey);
 
     /**
      * @brief Unicast an RREP-DIO one hop towards the OrigNode.

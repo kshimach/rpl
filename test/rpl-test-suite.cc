@@ -5284,6 +5284,189 @@ RplAodvForcedAsymmetricSBitTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief On an asymmetric (S=0) discovery the TargNode roots an
+ *        RREP-Instance DODAG of its own instead of unicasting an answer.
+ *
+ * RFC 9854 section 6.3.2: with 'S' cleared, the reverse of the path the
+ * RREQ took is by definition not usable, so the TargNode "MUST build a
+ * DODAG in the RREP-Instance corresponding to the RREQ-DIO rooted at
+ * itself" and flood it, rather than section 6.3.1's unicast back along the
+ * Address Vector.
+ *
+ * The same four-node line, with every node forcing asymmetry so the RREQ
+ * reaches the far end with 'S' clear:
+ *
+ *     orig(0) ---- relay1(1) ---- relay2(2) ---- targ(3)
+ *
+ * What this pins down is the TargNode's side only -- that the second DODAG
+ * exists, is rooted at the TargNode rather than the OrigNode, carries a
+ * Delta that pairs it back to the RREQ-Instance (section 6.3.3), and that
+ * the RREP-DIO actually goes out. Whether the relays then join it is the
+ * next test's business.
+ */
+class RplAodvAsymmetricRrepInstanceTestCase : public TestCase
+{
+  public:
+    RplAodvAsymmetricRrepInstanceTestCase();
+
+  private:
+    void DoRun() override;
+
+    /// @brief Count an RREP-DIO seen at the monitor.
+    /// @param socket the monitoring socket
+    void CountRrepDio(Ptr<Socket> socket);
+
+    uint32_t m_rrepDioCount{0}; //!< RREP-carrying DIOs seen at the monitor
+    uint8_t m_seenDelta{0};     //!< Delta off the last one
+};
+
+RplAodvAsymmetricRrepInstanceTestCase::RplAodvAsymmetricRrepInstanceTestCase()
+    : TestCase("An asymmetric discovery has the TargNode root and flood an RREP-Instance")
+{
+}
+
+void
+RplAodvAsymmetricRrepInstanceTestCase::CountRrepDio(Ptr<Socket> socket)
+{
+    Address sender;
+    Ptr<Packet> packet = socket->RecvFrom(sender);
+    if (!packet)
+    {
+        return;
+    }
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ipv6Header);
+    Icmpv6Header icmpv6Header;
+    packet->RemoveHeader(icmpv6Header);
+    if (icmpv6Header.GetType() != ICMPV6_RPL || icmpv6Header.GetCode() != RPL_CODE_DIO)
+    {
+        return;
+    }
+    RplDioHeader dio;
+    packet->RemoveHeader(dio);
+    if (dio.HasRrep())
+    {
+        m_rrepDioCount++;
+        m_seenDelta = dio.GetRrep().delta;
+    }
+}
+
+void
+RplAodvAsymmetricRrepInstanceTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(4); // 0 = OrigNode and base root, 1 and 2 = relays, 3 = TargNode
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    auto blacklist = [&](uint32_t a, uint32_t b) {
+        Ptr<SimpleNetDevice> devA = DynamicCast<SimpleNetDevice>(devices.Get(a));
+        Ptr<SimpleNetDevice> devB = DynamicCast<SimpleNetDevice>(devices.Get(b));
+        channel->BlackList(devA, devB);
+        channel->BlackList(devB, devA);
+    };
+    blacklist(0, 2);
+    blacklist(0, 3);
+    blacklist(1, 3);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(250));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> orig = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> relay1 = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> targ = nodes.Get(3)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(targ->IsJoined(), true, "The base DODAG did not reach the far end");
+
+    // Every relay declares its link asymmetric, so the RREQ arrives at the
+    // far end with 'S' clear whichever way it was relayed.
+    for (uint32_t i = 1; i < nodes.GetN(); i++)
+    {
+        nodes.Get(i)->GetObject<RplRoutingProtocol>()->SetAttribute("AodvForceAsymmetric",
+                                                                    BooleanValue(true));
+    }
+
+    Ipv6Address origAddress = orig->GetGlobalAddress();
+    Ipv6Address targAddress = targ->GetGlobalAddress();
+
+    // Watching from relay2, the TargNode's only neighbour, so the flooded
+    // RREP-DIO has somewhere real to arrive.
+    Ptr<Socket> monitor = Socket::CreateSocket(nodes.Get(2), Ipv6RawSocketFactory::GetTypeId());
+    monitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    monitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    monitor->BindToNetDevice(nodes.Get(2)->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+    monitor->SetRecvCallback(
+        MakeCallback(&RplAodvAsymmetricRrepInstanceTestCase::CountRrepDio, this));
+
+    RplRoutingProtocol::DodagKey rreqKey = orig->DiscoverRoute(targAddress);
+    NS_TEST_ASSERT_MSG_NE(rreqKey.dodagId, Ipv6Address::GetAny(), "The discovery did not start");
+
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(targ->IsAodvSymmetric(rreqKey.instanceId, rreqKey.dodagId),
+                          false,
+                          "The RREQ reached the TargNode still marked symmetric");
+
+    // The second DODAG: rooted at the TargNode, not at the OrigNode.
+    RplRoutingProtocol::DodagKey rrepKey;
+    NS_TEST_ASSERT_MSG_EQ(targ->FindAodvRrepInstance(origAddress, rrepKey),
+                          true,
+                          "The TargNode never rooted an RREP-Instance for the asymmetric route");
+    NS_TEST_ASSERT_MSG_EQ(rrepKey.dodagId,
+                          targAddress,
+                          "The RREP-Instance is not rooted at the TargNode's own address");
+    NS_TEST_ASSERT_MSG_EQ(rrepKey.instanceId & RPL_LOCAL_INSTANCE_D_FLAG,
+                          0,
+                          "The RREP-Instance's Local RPLInstanceID has its 'D' flag set");
+
+    // Section 6.3.3: Delta is what a receiver subtracts to get back to the
+    // RREQ-InstanceID. Nothing else is competing for an ID at this TargNode,
+    // so the first candidate (Delta 0) should have been free.
+    uint8_t expectedDelta = static_cast<uint8_t>(rrepKey.instanceId - rreqKey.instanceId);
+    NS_TEST_ASSERT_MSG_EQ(expectedDelta, 0, "Delta should be 0 with no competing RREP-Instance");
+
+    // Both DODAGs at once, plus the base one.
+    NS_TEST_ASSERT_MSG_EQ(targ->GetDodagCount(),
+                          3,
+                          "The TargNode should hold the base DODAG, the RREQ-Instance and the "
+                          "RREP-Instance");
+
+    // And the RREP-DIO actually went out, carrying that Delta.
+    NS_TEST_ASSERT_MSG_GT_OR_EQ(m_rrepDioCount, 1, "No RREP-DIO was ever flooded");
+    NS_TEST_ASSERT_MSG_EQ(m_seenDelta, expectedDelta, "The flooded RREP-DIO carried a wrong Delta");
+
+    // The symmetric path is untouched: nothing was unicast back along the
+    // Address Vector, so relay1 -- which would have relayed such a unicast --
+    // holds no RREP-Instance of its own from that route.
+    NS_TEST_ASSERT_MSG_EQ(relay1->GetAodvRouteCount(),
+                          0,
+                          "A relay recorded a route: the symmetric unicast path ran anyway");
+
+    monitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief An AODV-RPL discovery completes end to end: the RREP comes back
  *        along the Address Vector and the route it delivers carries data.
  *
@@ -10117,6 +10300,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplAodvAddressVectorFollowsParentTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRreqFloodTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvForcedAsymmetricSBitTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplAodvAsymmetricRrepInstanceTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRrepCompletesTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplRootJoinsForeignRreqInstanceParentLossTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRrepDuplicateRelayedOnceTestCase, TestCase::Duration::QUICK);

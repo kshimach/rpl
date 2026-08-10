@@ -990,7 +990,40 @@ RplRoutingProtocol::SendDio(DodagMembership& dodag, Ipv6Address dst, uint32_t in
                           dodag.prefixPreferredLifetime);
     }
 
-    if (dodag.mop == RPL_MOP_P2P_ROUTE_DISCOVERY && !dodag.aodv.target.IsAny())
+    if (dodag.mop == RPL_MOP_P2P_ROUTE_DISCOVERY && dodag.aodv.isRrepInstance)
+    {
+        // An RREP-DIO for an asymmetric route (RFC 9854 section 6.3.2): the
+        // TargNode roots this DODAG and floods it, and every router that
+        // joins re-advertises it the same way, so this is rebuilt from the
+        // membership's own state on each transmission exactly as the RREQ
+        // case below is.
+        RplDioHeader::RrepOption rrep;
+        rrep.gratuitous = false; // section 7's Gratuitous RREP is out of scope
+        rrep.hopByHop = false;   // matching the RREQ's own H bit
+        rrep.lifetime = dodag.aodv.lifetimeField;
+        rrep.rankLimit = dodag.aodv.rankLimit;
+        // Section 6.3.3: Delta is what the TargNode added to the
+        // RREQ-InstanceID to get this instance's own, so that a receiver can
+        // subtract it back off. Held as the pair rather than as Delta itself
+        // because every router re-advertising this DODAG has to reproduce
+        // the same value the TargNode chose.
+        rrep.delta = static_cast<uint8_t>(dodag.instanceId - dodag.aodv.pairedInstanceId);
+        rrep.addressVector = dodag.aodv.addressVector;
+        dio.SetRrep(rrep);
+
+        RplDioHeader::ArtOption art;
+        // "The address of the OrigNode MUST be encapsulated in the ART
+        // option and included in this RREP-DIO message along with the SeqNo
+        // of TargNode" (section 6.3). origSeqNo holds it: the field means
+        // "the Sequence Number of whichever node originated this instance",
+        // which for an RREP-Instance is the TargNode rooting it, exactly as
+        // it is the OrigNode for an RREQ-Instance.
+        art.destSeqNo = dodag.aodv.origSeqNo;
+        art.prefixLength = 0; // the field holds an address, not a prefix
+        art.target = dodag.aodv.origNode;
+        dio.SetArt(art);
+    }
+    else if (dodag.mop == RPL_MOP_P2P_ROUTE_DISCOVERY && !dodag.aodv.target.IsAny())
     {
         // An RREQ-DIO (RFC 9854 section 4.1): "Exactly one RREQ option MUST
         // be present in an RREQ-DIO message", and section 4.3 "An RREQ-DIO
