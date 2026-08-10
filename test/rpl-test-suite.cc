@@ -7607,6 +7607,177 @@ RplP2pMaxRankTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief A P2P-RPL Target answers a P2P mode DIO with a P2P-DRO carrying
+ *        the fixed values RFC 6997 section 8.2 requires, its Address
+ *        Vector trimmed of the Target's own trailing entry.
+ *
+ * The increment 4 counterpart of RplP2pFloodTestCase, on the same
+ * four-node line:
+ *
+ *     orig(0) ---- relay1(1) ---- relay2(2) ---- targ(3)
+ *
+ * By the time the DIO flood (already covered by RplP2pFloodTestCase)
+ * reaches the Target, its own dodag.p2p.addressVector is [relay1, relay2,
+ * targ] -- the Target appends itself exactly like an ordinary Intermediate
+ * Router does. Section 8.2 has the P2P-DRO's own Address vector end at
+ * "the router next to the Target" instead, so the outgoing P2P-RDO should
+ * carry only [relay1, relay2], not the Target's own address a third time.
+ * Nothing processes the P2P-DRO on the receiving end yet -- that is a
+ * later increment's job -- so this only pins down what the Target itself
+ * sends, captured off the wire by a monitor socket on relay2 the same way
+ * RplP2pDiscoverRouteTestCase captures a DIO.
+ */
+class RplP2pDroGeneratedTestCase : public TestCase
+{
+  public:
+    RplP2pDroGeneratedTestCase();
+
+  private:
+    void DoRun() override;
+
+    /// @brief Capture a P2P-DRO seen at the monitor.
+    /// @param socket the monitoring socket
+    void CaptureDro(Ptr<Socket> socket);
+
+    bool m_seenDro{false};      //!< a P2P-DRO was seen
+    RplP2pDroHeader m_captured; //!< the last one seen
+};
+
+RplP2pDroGeneratedTestCase::RplP2pDroGeneratedTestCase()
+    : TestCase("A P2P-RPL Target answers a P2P mode DIO with a P2P-DRO")
+{
+}
+
+void
+RplP2pDroGeneratedTestCase::CaptureDro(Ptr<Socket> socket)
+{
+    Address sender;
+    Ptr<Packet> packet = socket->RecvFrom(sender);
+    if (!packet)
+    {
+        return;
+    }
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ipv6Header);
+    Icmpv6Header icmpv6Header;
+    packet->RemoveHeader(icmpv6Header);
+    if (icmpv6Header.GetType() != ICMPV6_RPL || icmpv6Header.GetCode() != RPL_CODE_P2P_DRO)
+    {
+        return;
+    }
+    m_seenDro = true;
+    packet->RemoveHeader(m_captured);
+}
+
+void
+RplP2pDroGeneratedTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(4); // 0 = Origin and base root, 1 and 2 = relays, 3 = Target
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    auto blacklist = [&](uint32_t a, uint32_t b) {
+        Ptr<SimpleNetDevice> devA = DynamicCast<SimpleNetDevice>(devices.Get(a));
+        Ptr<SimpleNetDevice> devB = DynamicCast<SimpleNetDevice>(devices.Get(b));
+        channel->BlackList(devA, devB);
+        channel->BlackList(devB, devA);
+    };
+    blacklist(0, 2);
+    blacklist(0, 3);
+    blacklist(1, 3);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(250));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> orig = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> relay1 = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> relay2 = nodes.Get(2)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> targ = nodes.Get(3)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(targ->IsJoined(), true, "The base DODAG did not reach the far end");
+
+    Ipv6Address relay1Address = relay1->GetGlobalAddress();
+    Ipv6Address relay2Address = relay2->GetGlobalAddress();
+    Ipv6Address targAddress = targ->GetGlobalAddress();
+
+    // Watching from relay2, the Target's only neighbour, so the P2P-DRO has
+    // somewhere real to arrive.
+    Ptr<Socket> monitor = Socket::CreateSocket(nodes.Get(2), Ipv6RawSocketFactory::GetTypeId());
+    monitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    monitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    monitor->BindToNetDevice(nodes.Get(2)->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+    monitor->SetRecvCallback(MakeCallback(&RplP2pDroGeneratedTestCase::CaptureDro, this));
+
+    RplRoutingProtocol::DodagKey key = orig->DiscoverP2pRoute(targAddress);
+    NS_TEST_ASSERT_MSG_NE(key.dodagId, Ipv6Address::GetAny(), "The discovery did not start");
+
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(targ->IsP2pTarget(key.instanceId, key.dodagId),
+                          true,
+                          "The Target never recognised itself");
+    NS_TEST_ASSERT_MSG_EQ(m_seenDro, true, "No P2P-DRO was ever sent");
+    NS_TEST_ASSERT_MSG_EQ(m_captured.GetInstanceId(), key.instanceId, "Wrong RPLInstanceID");
+    NS_TEST_ASSERT_MSG_EQ(m_captured.GetStop(), false, "Wrong 'S' flag");
+    NS_TEST_ASSERT_MSG_EQ(m_captured.GetAckRequested(), false, "Wrong 'A' flag");
+    NS_TEST_ASSERT_MSG_EQ(m_captured.GetDodagId(), key.dodagId, "Wrong DODAGID");
+    NS_TEST_ASSERT_MSG_EQ(m_captured.HasP2pRdo(), true, "No P2P-RDO");
+    NS_TEST_ASSERT_MSG_EQ(m_captured.GetP2pRdo().reply,
+                          false,
+                          "'R' must always be zero on transmission (RFC 6997 section 8.2)");
+    NS_TEST_ASSERT_MSG_EQ(m_captured.GetP2pRdo().hopByHop, false, "Wrong 'H' flag");
+    NS_TEST_ASSERT_MSG_EQ(m_captured.GetP2pRdo().numRoutes,
+                          0,
+                          "'N' must always be zero on transmission (RFC 6997 section 8.2)");
+    NS_TEST_ASSERT_MSG_EQ(m_captured.GetP2pRdo().lifetime,
+                          0,
+                          "'L' must always be zero on transmission (RFC 6997 section 8.2)");
+    NS_TEST_ASSERT_MSG_EQ(m_captured.GetP2pRdo().target, targAddress, "Wrong TargetAddr");
+    // The Target's own dodag.p2p.addressVector is [relay1, relay2, targ] by
+    // the time it answers -- it appends itself exactly like an ordinary
+    // Intermediate Router (@see RplP2pFloodTestCase). The outgoing P2P-RDO
+    // should carry only [relay1, relay2]: the Target's own trailing entry
+    // trimmed off, ending at "the router next to the Target" (relay2) per
+    // section 8.2, not at the Target a second time.
+    NS_TEST_ASSERT_MSG_EQ(m_captured.GetP2pRdo().addressVector.size(),
+                          2,
+                          "The Target's own trailing entry should have been trimmed, leaving "
+                          "just the two routers before it");
+    NS_TEST_ASSERT_MSG_EQ(m_captured.GetP2pRdo().addressVector[0],
+                          relay1Address,
+                          "Wrong first Address Vector entry");
+    NS_TEST_ASSERT_MSG_EQ(m_captured.GetP2pRdo().addressVector[1],
+                          relay2Address,
+                          "Wrong second Address Vector entry: should be the router next to the "
+                          "Target");
+    NS_TEST_ASSERT_MSG_EQ(m_captured.GetP2pRdo().maxRankOrNh, 2, "Wrong NH");
+
+    monitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Check which DIOs RplRoutingProtocol::HandleDio() acts on and which
  *        it turns away: a mode of operation it does not implement, another
  *        RPL instance or DODAG, a stale DODAG version, and the infinite
@@ -11830,6 +12001,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplP2pDiscoverRouteTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pFloodTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pMaxRankTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pDroGeneratedTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDioRejectionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplParentLossRejoinTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplInterfaceRestartTestCase, TestCase::Duration::QUICK);

@@ -335,19 +335,74 @@ RplRoutingProtocol::HandleP2pRdo(const RplDioHeader& dio, Ipv6Address from, uint
     // RFC 6997 section 9.5: "A Target MUST NOT forward a P2P mode DIO any
     // further if no other Targets are to be discovered" -- true here
     // unconditionally, since multiple Targets via RPL Target options are
-    // out of scope (@see design-constraints.md). Replying with a P2P-DRO is
-    // a later increment's job; for now this just stops the propagation an
-    // Intermediate Router gets below, rather than leaving the Target's own
-    // Trickle timer (already reset by HandleDio() when the preferred parent
-    // was chosen) to re-flood the DIO exactly like an ordinary relay would.
+    // out of scope (@see design-constraints.md). This stops the propagation
+    // an Intermediate Router gets below, rather than leaving the Target's
+    // own Trickle timer (already reset by HandleDio() when the preferred
+    // parent was chosen) to re-flood the DIO exactly like an ordinary relay
+    // would.
     if (dodag.p2p.isTarget)
     {
+        // "If the Reply flag inside the P2P-RDO in the received DIO is set
+        // to one, the Target MUST select one or more discovered routes and
+        // send one or more P2P-DRO messages" (section 9.5). Exactly one
+        // here: N > 0 (several Source Routes) is out of scope.
+        if (dodag.p2p.reply)
+        {
+            SendP2pDro(dodag, key);
+        }
         return;
     }
 
     // Nothing sends the DIO onward here: DioTrickleFire() already
     // multicasts this membership's DIO on its own schedule, and SendDio()
     // fills in the P2P-RDO from the state just recorded.
+}
+
+void
+RplRoutingProtocol::SendP2pDro(DodagMembership& dodag, DodagKey key)
+{
+    NS_LOG_FUNCTION(this << +key.instanceId << key.dodagId);
+
+    NS_ASSERT_MSG(!dodag.p2p.addressVector.empty(), "The Target is not in its own Address Vector");
+    Ipv6Address ownAddress = dodag.p2p.addressVector.back();
+
+    RplP2pDroHeader dro;
+    dro.SetInstanceId(dodag.instanceId);
+    dro.SetStop(false);         // early termination via 'S' is out of scope
+    dro.SetAckRequested(false); // P2P-DRO-ACK ('A') is out of scope
+    dro.SetSequence(0);
+    // "the router recognizes itself as the Origin" by matching the P2P-DRO's
+    // own DODAGID field (RFC 6997 section 9.7) -- the temporary DAG's own
+    // DODAGID already is the Origin's address.
+    dro.SetDodagId(key.dodagId);
+
+    P2pRdoOption rdo;
+    rdo.reply = false; // section 8.2: "MUST be set to zero on transmission"
+    rdo.hopByHop = dodag.p2p.hopByHop; // "MUST have the same value as the H bit...in the...DIO"
+    rdo.numRoutes = 0;                 // section 8.2: "MUST be set to zero on transmission"
+    rdo.lifetime = 0;                  // section 8.2: "MUST be set to zero on transmission"
+    // Section 8.2: "the Address vector MUST contain a complete route...such
+    // that...the last element contains the IPv6 address of the router next
+    // to the Target" -- this node's own trailing entry (the Target itself)
+    // is excluded here, unlike the DIO's own accumulated Address Vector,
+    // which keeps it (@see HandleP2pRdo() and design-constraints.md).
+    rdo.addressVector.assign(dodag.p2p.addressVector.begin(), dodag.p2p.addressVector.end() - 1);
+    // "the NH field is set to n = (Option Length - 2 - (16 - Compr)) /
+    // (16 - Compr)", which is exactly this vector's own entry count.
+    rdo.maxRankOrNh = static_cast<uint8_t>(rdo.addressVector.size());
+    rdo.target = ownAddress;
+    dro.SetP2pRdo(rdo);
+
+    Ptr<Packet> packet = Create<Packet>();
+    packet->AddHeader(dro);
+    // "A P2P-DRO message MUST travel from the Target to the Origin via
+    // link-local multicast...transmitted on all interfaces" (section 8) --
+    // unlike AODV-RPL's symmetric RREP, which SendAodvRrepTo() unicasts to
+    // one specific next hop.
+    SendRplMessageMulticast(packet, RPL_CODE_P2P_DRO, Ipv6Address(RPL_ALL_NODES_MULTICAST));
+
+    NS_LOG_INFO("Answering the P2P mode DIO for " << dodag.p2p.target << " with a P2P-DRO over "
+                                                   << rdo.addressVector.size() << " hop(s)");
 }
 
 bool

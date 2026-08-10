@@ -1081,14 +1081,36 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      * has the router append the address of the interface it heard the DIO
      * on, which is only meaningful once this membership's preferred parent
      * has been settled. Recognising this node as the Target (section 9.3)
-     * happens here too; actually generating a P2P-DRO in response is a
-     * later increment's job (@see design-constraints.md).
+     * happens here too, triggering SendP2pDro() the first time.
      *
      * @param dio the P2P mode DIO just processed
      * @param from the neighbour it came from, a link-local address
      * @param interface the interface it arrived on
      */
     void HandleP2pRdo(const RplDioHeader& dio, Ipv6Address from, uint32_t interface);
+
+    /**
+     * @brief Answer a P2P mode DIO with a P2P-DRO, as its Target.
+     *
+     * RFC 6997 section 9.5: sent once this router has recognised itself as
+     * the Target and the P2P-RDO's Reply flag asked for one. The Address
+     * Vector accumulated so far (dodag.p2p.addressVector) already ends with
+     * this node's own address, appended by HandleP2pRdo() the same way an
+     * ordinary Intermediate Router's is; the outgoing P2P-RDO drops that
+     * trailing entry, since section 8.2 has the vector's last element be
+     * "the router next to the Target" rather than the Target itself (a
+     * narrower exclusion than the RREP option's own Address Vector, which
+     * AODV-RPL's SendAodvRrep() sends unchanged, TargNode's own trailing
+     * entry included -- @see design-constraints.md).
+     *
+     * Transmitted via link-local multicast on every interface (section 8),
+     * unlike AODV-RPL's symmetric RREP, which unicasts to a specific next
+     * hop.
+     *
+     * @param dodag the temporary DAG membership, at this Target
+     * @param key its key
+     */
+    void SendP2pDro(DodagMembership& dodag, DodagKey key);
 
     /**
      * @brief Unicast an RREP-DIO one hop towards the OrigNode.
