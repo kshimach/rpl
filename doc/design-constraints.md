@@ -3460,3 +3460,67 @@ ensure that the SRH does not contain loops" と明示的に許しているが、
 件数は実装の性質を表す数字ではないので過去の節は書き換えないが、
 **権威ある値は常にスイートの実行結果**であり、文書中の数字を根拠に
 してはいけない。
+
+### 35.9 `protocol-test-matrix` で 35 節を監査し直して見つかったバグ
+
+35 節のコミット後、`protocol-test-matrix` を AODV-RPL 実装自体に対して
+適用した。RFC 9854 §6.2.1 を読み直す Phase 0 の過程で、実装時には
+気づかなかった見落としが見つかった。
+
+**RFC の文言**: 「If the router has previously joined the RREQ-Instance
+associated with the RREQ-DIO, then MaxUsefulRank is set to be the Rank
+value that was stored when the router processed the best previous RREQ
+for the DODAG with the given RREQ-Instance.」— 既に join 済みの
+RREQ-Instance に後から届いた RREQ は、**それまでに見た最良の Rank と
+比較して再評価する**、というのが RFC の要求。
+
+**見つかったバグ**: `HandleAodvRreq()` は、`dodag.aodv.addressVector`
+が空でなくなった時点 (=一度でも join した後) の RREQ を**無条件に**
+無視していた。一方、`HandleDio()` は `HandleAodvRreq()` を呼ぶ**前**に
+既存の (AODV-RPL とは無関係な) `SelectPreferredParent()` を毎回走らせて
+おり、これは新しい候補親の rank が良ければ普通に `dodag.preferredParent`
+を切り替える。結果、**core RPL 側は最良の親に切り替わっているのに、
+AODV-RPL 側の Address Vector は最初に届いた (=より悪い) 親からの
+ものが残り続ける**という不整合が起きる。この Address Vector は
+`SendDio()` がそのまま次のホップへ再送する経路情報そのものなので、
+最終的に OrigNode が得る経路そのものが、実際に選ばれた最良経路と
+食い違ったものになる。
+
+**プローブでの再現** (`scratch/rpl-aodv-av-stale-probe.cc`、確認後
+削除): 1 ノードに架空の隣接ノード B (rank 384、3 ホップ相当) からの
+RREQ を先に、続いて架空の隣接ノード A (rank 128、1 ホップ相当) からの
+RREQ を後に注入した。修正前は rank が 512→256 に切り替わった (=A が
+preferred parent になった) にもかかわらず、Address Vector は B 経由の
+ホップを保持したままだった。
+
+**修正**: 「既に join 済みなら無条件に無視」を、「Address Vector が
+空でなく、かつ送信元がその時点の `preferredParent` と一致しない場合に
+限り無視」に変更した。`HandleDio()` が `HandleAodvRreq()` を呼ぶ直前に
+`SelectPreferredParent()` を済ませている (この関数がハンドオフの直前に
+実行される最後の処理であることは元々のコメントで明記していた) ため、
+`dodag.preferredParent` はこの RREQ 自身を考慮した後の最新の値になって
+おり、「今回の送信元が現在の最良の親と一致するか」だけで正しく判定
+できる。TargNode 側の「既に応答済みなら無視」(RFC §6.2.6 の無条件の
+規定) はこの再評価の対象ではないので、判定を分離して残した。
+
+**検証**: 回帰テスト `RplAodvAddressVectorFollowsParentTestCase` を
+追加。ガードの条件を無効化すると
+`test="addressVector.size() (actual) == 2 (limit)" ... actual="2" limit="1"`
+で確実に落ちることを確認済み。62 件全 PASS (5 回連続)、4 シナリオ
+0% packet loss 維持。
+
+**マトリクス上、意図的に手を付けなかった隣接事項**: §6.4.4 は H=0 の
+RREP 中継でも「受信インターフェースのアドレスを Address Vector に
+追加する」と書いているが、これは §4.2 の Address Vector フィールド
+説明 (「対称経路では RREQ-DIO が TargNode に到達した時点のものが
+**変更されずに** OrigNode まで運ばれる」) と合わせて読むと非対称
+(S=0) 専用の規定と解釈できる。今回のスコープ (S=1 のみ) では該当せず、
+`HandleAodvRrep()` が RREP 中継時に Address Vector を書き換えていない
+のは正しい。また、同一 RREP-DIO が重複して届いた場合の中継側の重複
+排除は RFC 上「RREP-Instance に既に属していれば SHOULD drop」だが、
+S=1 では RREP-Instance の DODAG がそもそも形成されないためこの規定は
+適用されない。重複した RREP は現状そのまま再中継されるが、Address
+Vector は不変長なので増幅は起きず (中継のたびに hop 数が増える
+仕組みではない)、OrigNode 側の経路保存も同一内容での上書きで冪等
+なので、実害の無い冗長送信に留まる — 修正の優先度は低いと判断し
+今回は見送った。

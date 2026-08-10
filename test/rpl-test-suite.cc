@@ -4705,6 +4705,152 @@ RplAodvMopAcceptedTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief An intermediate router's Address Vector follows its preferred
+ *        parent, even when a better RREQ arrives after a worse one already
+ *        joined the instance.
+ *
+ * Found auditing the AODV-RPL implementation with the protocol-test-matrix
+ * skill, against RFC 9854 section 6.2.1's MaxUsefulRank language: a router
+ * already in an RREQ-Instance re-evaluates a later RREQ against the best
+ * Rank it has seen, rather than keeping only the first one it heard.
+ * HandleAodvRreq() ignored every repeat unconditionally once its Address
+ * Vector was non-empty, so core RPL's own SelectPreferredParent() (run
+ * before HandleAodvRreq(), and entirely unaware that this membership is
+ * AODV-RPL's) would switch the preferred parent to a better neighbour while
+ * the Address Vector -- and so the route eventually propagated onward --
+ * kept pointing at the worse one.
+ *
+ * One node under test, fed two hand-built RREQ-DIOs for the same
+ * RREQ-Instance from two fabricated neighbours: B first, at a rank three
+ * hops out, then A, at a rank one hop out. Neither is a real node -- this
+ * is deliberately a unit-style test of HandleAodvRreq()/
+ * SelectPreferredParent()'s interaction, not a topology -- so both are
+ * addresses of convenience, RplMultiDodagVersionIsolationTestCase's own
+ * pattern for exactly this reason.
+ */
+class RplAodvAddressVectorFollowsParentTestCase : public TestCase
+{
+  public:
+    RplAodvAddressVectorFollowsParentTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplAodvAddressVectorFollowsParentTestCase::RplAodvAddressVectorFollowsParentTestCase()
+    : TestCase("An AODV-RPL Address Vector follows a switch to a better preferred parent")
+{
+}
+
+void
+RplAodvAddressVectorFollowsParentTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(1);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.AssignWithoutAddress(devices);
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    Simulator::Stop(Seconds(2));
+    Simulator::Run();
+
+    Ptr<Node> node = nodes.Get(0);
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+    Ipv6Address nodeLinkLocal = node->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    static constexpr uint8_t RREQ_INSTANCE = 0x81;
+    Ipv6Address origNode("2001:9::1");
+    Ipv6Address neighbourB("fe80::b"); // worse: rank 384, 3 hops from OrigNode
+    Ipv6Address neighbourA("fe80::a"); // better: rank 128, 1 hop from OrigNode
+    Ipv6Address hopViaB("2001:9::b0");
+
+    auto buildRreq = [&](uint16_t rank, const std::vector<Ipv6Address>& av) {
+        RplDioHeader dio;
+        dio.SetInstanceId(RREQ_INSTANCE);
+        dio.SetVersionNumber(0);
+        dio.SetRank(rank);
+        dio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+        dio.SetDodagId(origNode);
+        dio.SetDtsn(0);
+        dio.SetDagConfiguration(0,
+                                8,
+                                RPL_DIO_REDUNDANCY,
+                                RPL_MAX_RANKINC,
+                                RPL_MIN_HOPRANKINC,
+                                RPL_OCP_OF0,
+                                RPL_DEFAULT_LIFETIME,
+                                RPL_DEFAULT_LIFETIME_UNIT);
+        RplDioHeader::RreqOption rreq;
+        rreq.symmetric = true;
+        rreq.hopByHop = false;
+        rreq.compr = 0;
+        rreq.lifetime = 0; // no limit, keeps this test's timing simple
+        rreq.rankLimit = 0;
+        rreq.origSeqNo = 1;
+        rreq.addressVector = av;
+        dio.SetRreq(rreq);
+        RplDioHeader::ArtOption art;
+        art.destSeqNo = 0;
+        art.prefixLength = 0;
+        art.target = Ipv6Address("2001:9::99"); // a fake target, not this node
+        dio.SetArt(art);
+        return dio;
+    };
+    auto deliverRreq = [&](Ipv6Address from, uint16_t rank, const std::vector<Ipv6Address>& av) {
+        Simulator::Schedule(Seconds(0),
+                            &DeliverRawRplMessage<RplDioHeader>,
+                            node,
+                            1,
+                            buildRreq(rank, av),
+                            static_cast<uint8_t>(RPL_CODE_DIO),
+                            from,
+                            nodeLinkLocal);
+        Simulator::Stop(MilliSeconds(10));
+        Simulator::Run();
+    };
+
+    // The worse RREQ, from B, arrives first and is joined.
+    deliverRreq(neighbourB, 384, {hopViaB});
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetRankIn(RREQ_INSTANCE, origNode),
+                          512,
+                          "Did not join the RREQ-Instance via B at the expected rank");
+    std::vector<Ipv6Address> addressVector;
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetAodvAddressVector(RREQ_INSTANCE, origNode, addressVector),
+                          true,
+                          "No Address Vector after joining via B");
+    NS_TEST_ASSERT_MSG_EQ(addressVector.size(), 2, "Wrong Address Vector size after B");
+    NS_TEST_ASSERT_MSG_EQ(addressVector[0], hopViaB, "Wrong hop recorded for the path via B");
+
+    // The better RREQ, from A, arrives second.
+    deliverRreq(neighbourA, 128, {});
+
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetRankIn(RREQ_INSTANCE, origNode),
+                          256,
+                          "The preferred parent did not switch to the better neighbour A");
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetAodvAddressVector(RREQ_INSTANCE, origNode, addressVector),
+                          true,
+                          "No Address Vector after the switch to A");
+    NS_TEST_ASSERT_MSG_EQ(addressVector.size(),
+                          1,
+                          "The Address Vector still reflects the path through B, not A: it "
+                          "should hold only this node's own address now, one hop from A");
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief An AODV-RPL route discovery floods an RREQ outward, each hop
  *        appending its own address to the Address Vector.
  *
@@ -9280,6 +9426,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplNonBaseRootDownwardPacketTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplReadRpiInstanceIdRejectsWrongOptionTypeTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvMopAcceptedTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplAodvAddressVectorFollowsParentTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRreqFloodTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRrepCompletesTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDioRejectionTestCase, TestCase::Duration::QUICK);

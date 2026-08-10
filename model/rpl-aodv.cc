@@ -335,15 +335,37 @@ RplRoutingProtocol::HandleAodvRreq(const RplDioHeader& dio, Ipv6Address from, ui
         return;
     }
 
-    // Already in this instance, from an earlier copy of the same RREQ. RFC
-    // 9854 section 6.2.6: a TargNode "already associated with the
-    // RREQ-Instance ... takes no further action". For an intermediate router
-    // the Address Vector already recorded is the one it propagates, and
-    // replacing it with a later copy's would swap a settled route for
-    // another with no reason to prefer it.
-    if (!dodag.aodv.addressVector.empty() || dodag.aodv.isTarget)
+    // RFC 9854 section 6.2.6: a TargNode "already associated with the
+    // RREQ-Instance ... takes no further action" -- unconditional, unlike
+    // the intermediate-router case just below, so this stays a plain repeat
+    // check.
+    if (dodag.aodv.isTarget)
     {
-        NS_LOG_LOGIC("Already part of RREQ-Instance " << +key.instanceId << ", ignoring a repeat");
+        NS_LOG_LOGIC("Already the TargNode of RREQ-Instance " << +key.instanceId
+                                                              << ", ignoring a repeat");
+        return;
+    }
+
+    // An intermediate router's Address Vector must track its preferred
+    // parent, not just whichever copy of the RREQ arrived first. HandleDio()
+    // already ran SelectPreferredParent() before calling here (it is the
+    // very last thing it does before handing off to this function), so
+    // dodag.preferredParent already reflects this DIO if it was good enough
+    // to win -- a link-local, comparable to from directly, both being the
+    // sender's own address. Found the hard way: a probe
+    // (scratch/rpl-aodv-av-stale-probe.cc, deleted once this was confirmed
+    // and fixed) sent a worse RREQ first and a better one second and found
+    // the Rank had switched to the better parent while the Address Vector
+    // -- and so the route eventually propagated onward, and the source
+    // route an OrigNode would end up with -- still named the worse one.
+    // RFC 9854 section 6.2.1's own MaxUsefulRank language backs this: a
+    // router already in the instance re-evaluates a later RREQ against the
+    // best Rank it has seen, it does not simply keep the first one.
+    if (!dodag.aodv.addressVector.empty() && from != dodag.preferredParent)
+    {
+        NS_LOG_LOGIC("Already part of RREQ-Instance "
+                    << +key.instanceId << " via a better parent than " << from
+                    << ", ignoring this copy");
         return;
     }
 
