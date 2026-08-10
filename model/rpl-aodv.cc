@@ -882,14 +882,47 @@ RplRoutingProtocol::HandleAodvRrepInstance(const RplDioHeader& dio,
     if (dodag.aodv.isOrigin)
     {
         // The OrigNode consumes the RREP rather than propagating it: this is
-        // the end of the flood's useful reach. The route it takes away is
-        // handled by the caller's own branch (@see the increment that adds
-        // it); the address is still appended first so the vector this node
-        // holds describes the whole path.
+        // the end of the flood's useful reach. Its own address is appended
+        // first anyway, so the vector this node holds describes the whole
+        // path the way every other member's does.
         dodag.aodv.addressVector.push_back(ownAddress);
         ArmAodvExpiry(dodag, key);
-        NS_LOG_INFO("The RREP-Instance for " << dodag.aodv.target << " reached its OrigNode over "
-                                             << dodag.aodv.addressVector.size() << " hop(s)");
+
+        // And the route falls out of it -- reversed. The RREP flooded from
+        // the TargNode outward, each router appending itself, so this vector
+        // runs TargNode-side first and ends at this node: [R2, R1, self] on
+        // a line self--R1--R2--TargNode. AodvRoute::hops is the other way
+        // round by construction, "every hop from the OrigNode outward, the
+        // TargNode last", so it is this vector minus its own last entry,
+        // reversed, with the TargNode appended: [R1, R2, TargNode].
+        //
+        // The symmetric case does no reversing: there the vector is the
+        // RREQ's, already accumulated in the OrigNode-outward direction and
+        // carried back unchanged (RFC 9854 section 4.2). Getting these two
+        // the same way round is the single easiest thing to get wrong here,
+        // which is why each direction has its own end-to-end test.
+        //
+        // Reversing is sound precisely because this is the RREP-Instance:
+        // every router joined it over a link that satisfied the Objective
+        // Function towards the TargNode (section 6.4.1), which is the
+        // direction this route will carry data.
+        AodvRoute route;
+        NS_ASSERT_MSG(!dodag.aodv.addressVector.empty(), "The OrigNode is not in its own vector");
+        for (size_t i = dodag.aodv.addressVector.size() - 1; i > 0; i--)
+        {
+            route.hops.push_back(dodag.aodv.addressVector[i - 1]);
+        }
+        route.hops.push_back(dodag.aodv.target);
+        route.rreqInstanceId = dodag.aodv.pairedInstanceId;
+        route.destSeqNo = dodag.aodv.origSeqNo;
+        // "The lifetime is set according to DODAG configuration (i.e., not
+        // the L field)" (section 6.4.3), same as the symmetric path.
+        route.expire = Simulator::Now() + Seconds(m_pathLifetime * m_lifetimeUnit);
+        m_aodvRoutes[dodag.aodv.target] = route;
+
+        NS_LOG_INFO("Asymmetric route discovery to " << dodag.aodv.target << " completed over "
+                                                     << route.hops.size() << " hop(s), Dest SeqNo "
+                                                     << +route.destSeqNo);
         return;
     }
 

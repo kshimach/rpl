@@ -5625,6 +5625,184 @@ RplAodvAsymmetricRrepFloodTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief An asymmetric discovery completes end to end: the OrigNode turns
+ *        the RREP-Instance's Address Vector round into a source route, and
+ *        that route carries data.
+ *
+ * The asymmetric counterpart of RplAodvRrepCompletesTestCase, on the same
+ * four-node line:
+ *
+ *     orig(0) ---- relay1(1) ---- relay2(2) ---- targ(3)
+ *
+ * The direction of the Address Vector is what this exists to pin down. On a
+ * symmetric route it is the RREQ's own, accumulated OrigNode-outward and
+ * carried back unchanged (RFC 9854 section 4.2), so the OrigNode can use it
+ * as it stands. On an asymmetric route it is the RREP's, accumulated as the
+ * flood ran the other way, so it arrives at the OrigNode reading
+ * [relay2, relay1, orig] and has to be turned round into the
+ * [relay1, relay2, targ] AodvRoute::hops is defined to hold. Getting that
+ * backwards yields a route that looks plausible and delivers nothing, which
+ * is why the check is not just on the stored hops but on a datagram
+ * actually arriving.
+ */
+class RplAodvAsymmetricRouteCompletesTestCase : public TestCase
+{
+  public:
+    RplAodvAsymmetricRouteCompletesTestCase();
+
+  private:
+    void DoRun() override;
+
+    /// @brief Count a datagram delivered at the TargNode.
+    /// @param socket the receiving socket
+    void CountDelivery(Ptr<Socket> socket);
+
+    /// @brief Send one datagram, as a named method Simulator::Schedule() can
+    ///        resolve (Socket::Send is overloaded).
+    /// @param socket the sending socket
+    void SendOne(Ptr<Socket> socket);
+
+    uint32_t m_delivered{0}; //!< datagrams that reached the TargNode
+    int m_sendResult{0};     //!< what Socket::Send() returned, -1 on refusal
+};
+
+RplAodvAsymmetricRouteCompletesTestCase::RplAodvAsymmetricRouteCompletesTestCase()
+    : TestCase("An asymmetric AODV-RPL route is stored the right way round and carries data")
+{
+}
+
+void
+RplAodvAsymmetricRouteCompletesTestCase::CountDelivery(Ptr<Socket> socket)
+{
+    Ptr<Packet> packet = socket->Recv();
+    while (packet)
+    {
+        m_delivered++;
+        packet = socket->Recv();
+    }
+}
+
+void
+RplAodvAsymmetricRouteCompletesTestCase::SendOne(Ptr<Socket> socket)
+{
+    m_sendResult = socket->Send(Create<Packet>(64));
+}
+
+void
+RplAodvAsymmetricRouteCompletesTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(4); // 0 = OrigNode and base root, 1 and 2 = relays, 3 = TargNode
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    auto blacklist = [&](uint32_t a, uint32_t b) {
+        Ptr<SimpleNetDevice> devA = DynamicCast<SimpleNetDevice>(devices.Get(a));
+        Ptr<SimpleNetDevice> devB = DynamicCast<SimpleNetDevice>(devices.Get(b));
+        channel->BlackList(devA, devB);
+        channel->BlackList(devB, devA);
+    };
+    blacklist(0, 2);
+    blacklist(0, 3);
+    blacklist(1, 3);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(250));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> orig = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> relay1 = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> relay2 = nodes.Get(2)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> targ = nodes.Get(3)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(targ->IsJoined(), true, "The base DODAG did not reach the far end");
+
+    for (uint32_t i = 1; i < nodes.GetN(); i++)
+    {
+        nodes.Get(i)->GetObject<RplRoutingProtocol>()->SetAttribute("AodvForceAsymmetric",
+                                                                    BooleanValue(true));
+    }
+
+    Ipv6Address relay1Address = relay1->GetGlobalAddress();
+    Ipv6Address relay2Address = relay2->GetGlobalAddress();
+    Ipv6Address targAddress = targ->GetGlobalAddress();
+
+    NS_TEST_ASSERT_MSG_EQ(orig->GetAodvRouteCount(), 0, "A route exists before any discovery");
+
+    RplRoutingProtocol::DodagKey rreqKey = orig->DiscoverRoute(targAddress);
+    NS_TEST_ASSERT_MSG_NE(rreqKey.dodagId, Ipv6Address::GetAny(), "The discovery did not start");
+
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    // The route runs OrigNode-outward, whatever direction the RREP's own
+    // vector accumulated in.
+    std::vector<Ipv6Address> hops;
+    NS_TEST_ASSERT_MSG_EQ(orig->GetAodvRoute(targAddress, hops),
+                          true,
+                          "The asymmetric RREP never produced a route at the OrigNode");
+    NS_TEST_ASSERT_MSG_EQ(hops.size(), 3, "The discovered route has the wrong length");
+    NS_TEST_ASSERT_MSG_EQ(hops[0],
+                          relay1Address,
+                          "The route starts at the wrong end: relay1 is the OrigNode's own "
+                          "neighbour, so it has to come first");
+    NS_TEST_ASSERT_MSG_EQ(hops[1], relay2Address, "Wrong second hop");
+    NS_TEST_ASSERT_MSG_EQ(hops[2], targAddress, "The route does not end at the TargNode");
+    NS_TEST_ASSERT_MSG_EQ(orig->GetAodvRouteCount(), 1, "Wrong number of routes");
+
+    // Source routing keeps no per-hop state, on this path as on the
+    // symmetric one.
+    NS_TEST_ASSERT_MSG_EQ(relay1->GetAodvRouteCount(), 0, "relay1 recorded a route it should not");
+    NS_TEST_ASSERT_MSG_EQ(relay2->GetAodvRouteCount(), 0, "relay2 recorded a route it should not");
+
+    // And it works. A route stored backwards would still have three entries
+    // and still look like a path; only actually sending over it tells the
+    // difference.
+    uint16_t port = 4243;
+    Ptr<Socket> receiver = Socket::CreateSocket(nodes.Get(3), UdpSocketFactory::GetTypeId());
+    receiver->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), port));
+    receiver->SetRecvCallback(
+        MakeCallback(&RplAodvAsymmetricRouteCompletesTestCase::CountDelivery, this));
+
+    Ptr<Socket> sender = Socket::CreateSocket(nodes.Get(0), UdpSocketFactory::GetTypeId());
+    sender->Connect(Inet6SocketAddress(targAddress, port));
+    Simulator::Schedule(Seconds(1),
+                        &RplAodvAsymmetricRouteCompletesTestCase::SendOne,
+                        this,
+                        sender);
+
+    Simulator::Stop(Seconds(5));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_GT(m_sendResult, 0, "Socket::Send() refused the datagram outright");
+    NS_TEST_ASSERT_MSG_EQ(m_delivered,
+                          1,
+                          "The datagram never reached the TargNode over the asymmetric route");
+
+    receiver->Close();
+    sender->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief An AODV-RPL discovery completes end to end: the RREP comes back
  *        along the Address Vector and the route it delivers carries data.
  *
@@ -10460,6 +10638,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplAodvForcedAsymmetricSBitTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvAsymmetricRrepInstanceTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvAsymmetricRrepFloodTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplAodvAsymmetricRouteCompletesTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRrepCompletesTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplRootJoinsForeignRreqInstanceParentLossTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRrepDuplicateRelayedOnceTestCase, TestCase::Duration::QUICK);
