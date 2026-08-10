@@ -824,12 +824,20 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      *                (neutral, i.e. 1.0) if it could not be estimated
      * @param lql the Link Quality Level to the sender, RPL_LQL_UNDETERMINED (0)
      *            if it could not be estimated
+     * @param toMulticast whether it was addressed to all-RPL-nodes rather
+     *                    than to this node. Only AODV-RPL looks at it, to
+     *                    tell an RREP-DIO unicast back along a symmetric
+     *                    route (RFC 9854 section 6.3.1) from one flooded
+     *                    into an asymmetric route's RREP-Instance (section
+     *                    6.3.2) -- the RREP option carries nothing that
+     *                    distinguishes them.
      */
     void HandleDio(const RplDioHeader& dio,
                    Ipv6Address from,
                    uint32_t interface,
                    uint16_t linkEtx,
-                   uint8_t lql);
+                   uint8_t lql,
+                   bool toMulticast);
 
     /**
      * @brief Act on the AODV-RPL options of a DIO that carries them.
@@ -908,6 +916,22 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      * @param rreqKey its key, whose dodagId is the OrigNode
      */
     void StartAodvRrepInstance(const DodagMembership& rreqDodag, DodagKey rreqKey);
+
+    /**
+     * @brief Take an RREP-DIO of an asymmetric discovery's RREP-Instance,
+     *        once the DODAG machinery has already joined it.
+     *
+     * The RREP-Instance counterpart of HandleAodvRreq(), called from the
+     * same place in HandleDio() and for the same reason: RFC 9854 section
+     * 6.4.4 has the router append the address of the interface it heard the
+     * RREP-DIO on, which is only meaningful once this membership's preferred
+     * parent has been settled.
+     *
+     * @param dio the RREP-DIO just processed
+     * @param from the neighbour it came from, a link-local address
+     * @param interface the interface it arrived on
+     */
+    void HandleAodvRrepInstance(const RplDioHeader& dio, Ipv6Address from, uint32_t interface);
 
     /**
      * @brief Unicast an RREP-DIO one hop towards the OrigNode.

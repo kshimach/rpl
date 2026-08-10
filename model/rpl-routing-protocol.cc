@@ -814,7 +814,7 @@ RplRoutingProtocol::RecvRpl(Ptr<Socket> socket)
         double linkEtxValue = double(linkEtx) / RPL_ETX_FIXED_POINT;
         NS_LOG_INFO("Received a DIO from " << from << " on interface " << interface << " (link ETX "
                                            << linkEtxValue << ", LQL " << +lql << "): " << dio);
-        HandleDio(dio, from, interface, linkEtx, lql);
+        HandleDio(dio, from, interface, linkEtx, lql, ipv6Header.GetDestination().IsMulticast());
         break;
     }
     case RPL_CODE_DAO: {
@@ -1155,7 +1155,8 @@ RplRoutingProtocol::HandleDio(const RplDioHeader& dio,
                               Ipv6Address from,
                               uint32_t interface,
                               uint16_t linkEtx,
-                              uint8_t lql)
+                              uint8_t lql,
+                              bool toMulticast)
 {
     NS_LOG_FUNCTION(this << from << interface);
 
@@ -1200,13 +1201,28 @@ RplRoutingProtocol::HandleDio(const RplDioHeader& dio,
         return;
     }
 
-    // An RREP-DIO is not an advertisement to join: on a symmetric route
+    // On a symmetric route an RREP-DIO is not an advertisement to join --
     // "the DODAG in RREP-Instance does not need to be built" (RFC 9854
-    // section 6.3.1), so it is a unicast carrying a finished route back
-    // towards the OrigNode. Handled and returned before any of the ordinary
+    // section 6.3.1), it is a unicast carrying a finished route back towards
+    // the OrigNode. Handled and returned before any of the ordinary
     // machinery below, which would otherwise have this node join a DODAG
     // rooted at the TargNode.
-    if (dio.HasRrep())
+    //
+    // On an asymmetric route the opposite holds: section 6.3.2's
+    // RREP-Instance is a real flooded DODAG and this DIO is exactly an
+    // invitation to join it, so it falls through to the join logic and is
+    // picked up by HandleAodvRrepInstance() at the end, the way an RREQ-DIO
+    // is by HandleAodvRreq().
+    //
+    // How it arrived is what tells the two apart, because that is precisely
+    // what the RFC makes different about them -- section 6.3.1 unicasts to
+    // the next hop, section 6.3.2 transmits "to multicast group
+    // all-AODV-RPL-nodes". The RREP option itself carries nothing to
+    // distinguish them (its 'G' is the Gratuitous flag, a different thing),
+    // and the paired RREQ-Instance's own 'S' bit cannot stand in for it: at
+    // the OrigNode that bit is always 1, since section 6.1 has the OrigNode
+    // originate it that way and only the routers downstream ever clear it.
+    if (dio.HasRrep() && !toMulticast)
     {
         HandleAodvRrep(dio, from, interface);
         return;
@@ -1368,6 +1384,15 @@ RplRoutingProtocol::HandleDio(const RplDioHeader& dio,
     if (dio.HasRreq() && m_dodags.find(dioKey) != m_dodags.end())
     {
         HandleAodvRreq(dio, from, interface);
+    }
+
+    // The asymmetric RREP-Instance's own equivalent, in the same position
+    // and for the same reason: section 6.4.4 has the router append the
+    // address of the interface it heard the RREP-DIO on, which only means
+    // anything once this membership's preferred parent is settled.
+    if (dio.HasRrep() && m_dodags.find(dioKey) != m_dodags.end())
+    {
+        HandleAodvRrepInstance(dio, from, interface);
     }
 }
 

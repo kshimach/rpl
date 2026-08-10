@@ -5467,6 +5467,164 @@ RplAodvAsymmetricRrepInstanceTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief The RREP-Instance floods back towards the OrigNode, each relay
+ *        joining it and appending itself to the RREP's own Address Vector.
+ *
+ * The return half of an asymmetric discovery, on the same four-node line:
+ *
+ *     orig(0) ---- relay1(1) ---- relay2(2) ---- targ(3)
+ *
+ * The RREQ-Instance floods outward O to T accumulating [relay1, relay2, T];
+ * with 'S' cleared the TargNode answers by rooting an RREP-Instance and
+ * flooding it back, and that flood accumulates a vector of its own in the
+ * opposite order, [relay2, relay1], as RFC 9854 section 4.2 describes ("for
+ * an asymmetric route, the Address Vector represents the IPv6 addresses of
+ * the path through the network the RREP-DIO has passed").
+ *
+ * Also pins down that section 6.4.1's "discard an RREP if one of its
+ * addresses is present in the Address Vector" applies here: on the
+ * asymmetric path the vector really is the RREP's own, so a copy that has
+ * already run through a router is a loop -- unlike on the symmetric path,
+ * where the vector is the RREQ's and holds every relay by construction.
+ * That relay-count assertion is what would catch the rule being applied to
+ * the wrong one of the two.
+ */
+class RplAodvAsymmetricRrepFloodTestCase : public TestCase
+{
+  public:
+    RplAodvAsymmetricRrepFloodTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplAodvAsymmetricRrepFloodTestCase::RplAodvAsymmetricRrepFloodTestCase()
+    : TestCase("An asymmetric RREP-Instance floods back, each relay appending itself")
+{
+}
+
+void
+RplAodvAsymmetricRrepFloodTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(4); // 0 = OrigNode and base root, 1 and 2 = relays, 3 = TargNode
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    auto blacklist = [&](uint32_t a, uint32_t b) {
+        Ptr<SimpleNetDevice> devA = DynamicCast<SimpleNetDevice>(devices.Get(a));
+        Ptr<SimpleNetDevice> devB = DynamicCast<SimpleNetDevice>(devices.Get(b));
+        channel->BlackList(devA, devB);
+        channel->BlackList(devB, devA);
+    };
+    blacklist(0, 2);
+    blacklist(0, 3);
+    blacklist(1, 3);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(250));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> orig = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> relay1 = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> relay2 = nodes.Get(2)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> targ = nodes.Get(3)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(targ->IsJoined(), true, "The base DODAG did not reach the far end");
+
+    for (uint32_t i = 1; i < nodes.GetN(); i++)
+    {
+        nodes.Get(i)->GetObject<RplRoutingProtocol>()->SetAttribute("AodvForceAsymmetric",
+                                                                    BooleanValue(true));
+    }
+
+    Ipv6Address origAddress = orig->GetGlobalAddress();
+    Ipv6Address relay1Address = relay1->GetGlobalAddress();
+    Ipv6Address relay2Address = relay2->GetGlobalAddress();
+    Ipv6Address targAddress = targ->GetGlobalAddress();
+
+    RplRoutingProtocol::DodagKey rreqKey = orig->DiscoverRoute(targAddress);
+    NS_TEST_ASSERT_MSG_NE(rreqKey.dodagId, Ipv6Address::GetAny(), "The discovery did not start");
+
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    // The RREP-Instance the TargNode rooted, found by the OrigNode it names.
+    RplRoutingProtocol::DodagKey rrepKey;
+    NS_TEST_ASSERT_MSG_EQ(targ->FindAodvRrepInstance(origAddress, rrepKey),
+                          true,
+                          "The TargNode never rooted an RREP-Instance");
+
+    // Both relays joined it on the way back.
+    NS_TEST_ASSERT_MSG_EQ(relay2->IsJoinedTo(rrepKey.instanceId, rrepKey.dodagId),
+                          true,
+                          "relay2 did not join the RREP-Instance");
+    NS_TEST_ASSERT_MSG_EQ(relay1->IsJoinedTo(rrepKey.instanceId, rrepKey.dodagId),
+                          true,
+                          "relay1 did not join the RREP-Instance: the flood stopped after one hop");
+    NS_TEST_ASSERT_MSG_EQ(orig->IsJoinedTo(rrepKey.instanceId, rrepKey.dodagId),
+                          true,
+                          "The OrigNode never heard the RREP-Instance");
+
+    // And the Address Vector grew by one entry per hop, TargNode-side first
+    // -- the opposite order from the RREQ's own vector.
+    std::vector<Ipv6Address> vector;
+    NS_TEST_ASSERT_MSG_EQ(targ->GetAodvAddressVector(rrepKey.instanceId, rrepKey.dodagId, vector),
+                          true,
+                          "No Address Vector at the TargNode");
+    NS_TEST_ASSERT_MSG_EQ(vector.size(), 0, "The TargNode put itself in its own Address Vector");
+
+    NS_TEST_ASSERT_MSG_EQ(relay2->GetAodvAddressVector(rrepKey.instanceId, rrepKey.dodagId, vector),
+                          true,
+                          "No Address Vector at relay2");
+    NS_TEST_ASSERT_MSG_EQ(vector.size(), 1, "Wrong Address Vector size at relay2");
+    NS_TEST_ASSERT_MSG_EQ(vector[0], relay2Address, "relay2 recorded the wrong address");
+
+    NS_TEST_ASSERT_MSG_EQ(relay1->GetAodvAddressVector(rrepKey.instanceId, rrepKey.dodagId, vector),
+                          true,
+                          "No Address Vector at relay1");
+    NS_TEST_ASSERT_MSG_EQ(vector.size(), 2, "Wrong Address Vector size at relay1");
+    NS_TEST_ASSERT_MSG_EQ(vector[0],
+                          relay2Address,
+                          "relay1's Address Vector does not start at the TargNode's side");
+    NS_TEST_ASSERT_MSG_EQ(vector[1], relay1Address, "relay1 did not append itself last");
+
+    NS_TEST_ASSERT_MSG_EQ(orig->GetAodvAddressVector(rrepKey.instanceId, rrepKey.dodagId, vector),
+                          true,
+                          "No Address Vector at the OrigNode");
+    NS_TEST_ASSERT_MSG_EQ(vector.size(),
+                          3,
+                          "The OrigNode's Address Vector should hold both relays and itself");
+    NS_TEST_ASSERT_MSG_EQ(vector[0], relay2Address, "Wrong first entry at the OrigNode");
+    NS_TEST_ASSERT_MSG_EQ(vector[1], relay1Address, "Wrong second entry at the OrigNode");
+    NS_TEST_ASSERT_MSG_EQ(vector[2], origAddress, "The OrigNode did not append itself");
+
+    // The base DODAG is untouched by any of this.
+    NS_TEST_ASSERT_MSG_EQ(relay1->IsJoined(), true, "The base DODAG membership was lost");
+    NS_TEST_ASSERT_MSG_EQ(relay1->GetDodagId(), origAddress, "The base DODAG's DODAGID changed");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief An AODV-RPL discovery completes end to end: the RREP comes back
  *        along the Address Vector and the route it delivers carries data.
  *
@@ -10301,6 +10459,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplAodvRreqFloodTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvForcedAsymmetricSBitTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvAsymmetricRrepInstanceTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplAodvAsymmetricRrepFloodTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRrepCompletesTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplRootJoinsForeignRreqInstanceParentLossTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRrepDuplicateRelayedOnceTestCase, TestCase::Duration::QUICK);

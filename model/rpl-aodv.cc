@@ -779,6 +779,132 @@ RplRoutingProtocol::HandleAodvRrep(const RplDioHeader& dio, Ipv6Address from, ui
     SendAodvRrepTo(dodag, dio, nextHop);
 }
 
+void
+RplRoutingProtocol::HandleAodvRrepInstance(const RplDioHeader& dio,
+                                           Ipv6Address from,
+                                           uint32_t interface)
+{
+    NS_LOG_FUNCTION(this << from << interface);
+
+    DodagKey key{dio.GetInstanceId(), dio.GetDodagId()};
+
+    auto it = m_dodags.find(key);
+    if (it == m_dodags.end())
+    {
+        return;
+    }
+    DodagMembership& dodag = it->second;
+
+    const RplDioHeader::RrepOption& rrep = dio.GetRrep();
+
+    // RFC 9854 section 4.3: an RREP-DIO carries exactly one ART option, and
+    // it is what names the OrigNode this RREP-Instance is aimed at. Checked
+    // here rather than before the join for the same reason HandleAodvRreq()
+    // checks its own: the DIO was a valid DIO, so the DODAG side of it
+    // stands even when its AODV-RPL content is unusable.
+    if (!dio.HasArt())
+    {
+        NS_LOG_WARN("Ignoring the AODV-RPL content of an RREP-DIO with no ART option");
+        return;
+    }
+    if (rrep.hopByHop)
+    {
+        NS_LOG_LOGIC("Ignoring an RREP asking for hop-by-hop routing");
+        return;
+    }
+
+    // The TargNode rooting this instance has nothing to learn from its own
+    // flood coming back around.
+    if (dodag.aodv.isRrepInstance && dodag.aodv.isTarget)
+    {
+        return;
+    }
+
+    // RFC 9854 section 6.4.1: "An intermediate router MUST discard an RREP
+    // if one of its addresses is present in the Address Vector". This is
+    // where that rule finally means something -- on an asymmetric route the
+    // Address Vector is the RREP's own, accumulated as it floods, so a
+    // repeat that already ran through here is a loop. (On a symmetric route
+    // the vector is the RREQ's, which by construction holds every
+    // intermediate router, so the same rule is deliberately not applied
+    // there. @see HandleAodvRrep() and design-constraints.md.)
+    for (const auto& hop : rrep.addressVector)
+    {
+        if (IsOwnAddress(hop))
+        {
+            NS_LOG_LOGIC("Dropping an RREP whose Address Vector already holds " << hop);
+            return;
+        }
+    }
+
+    // First arrival: record what this instance is. Re-recorded on a later,
+    // better copy the same way HandleAodvRreq() does, which is what keeps
+    // the Address Vector in step with the preferred parent.
+    if (!dodag.aodv.addressVector.empty() && from != dodag.preferredParent)
+    {
+        NS_LOG_LOGIC("Already in RREP-Instance " << +key.instanceId
+                                                  << " via a better parent than " << from
+                                                  << ", ignoring this copy");
+        return;
+    }
+
+    dodag.aodv.isRrepInstance = true;
+    dodag.aodv.pairedInstanceId = static_cast<uint8_t>(dio.GetInstanceId() - rrep.delta);
+    dodag.aodv.origNode = dio.GetArt().target;
+    dodag.aodv.origSeqNo = dio.GetArt().destSeqNo;
+    dodag.aodv.rankLimit = rrep.rankLimit;
+    dodag.aodv.lifetimeField = rrep.lifetime;
+    dodag.aodv.target = key.dodagId; // an RREP-Instance is rooted at the TargNode
+    dodag.aodv.isTarget = false;
+    dodag.aodv.isOrigin = IsOwnAddress(dodag.aodv.origNode);
+
+    // Section 6.4.4: "If H=0, the intermediate router MUST include the
+    // address of the interface receiving the RREP-DIO into the Address
+    // Vector" -- the mirror of the RREQ's own rule, and the same recipe:
+    // a global address, since the vector becomes a source route later.
+    Ipv6Address ownAddress = GetGlobalAddressIn(dodag);
+    if (ownAddress.IsAny())
+    {
+        NS_LOG_LOGIC("No global address to put in the Address Vector yet");
+        return;
+    }
+
+    dodag.aodv.addressVector = rrep.addressVector;
+    if (dodag.aodv.addressVector.size() >= RplDioHeader::AODV_ADDRESS_VECTOR_MAX_ENTRIES)
+    {
+        NS_LOG_WARN("The Address Vector is full at "
+                    << dodag.aodv.addressVector.size() << " entries; leaving RREP-Instance "
+                    << +key.instanceId);
+        LeaveDodag(key, false);
+        return;
+    }
+
+    if (dodag.aodv.isOrigin)
+    {
+        // The OrigNode consumes the RREP rather than propagating it: this is
+        // the end of the flood's useful reach. The route it takes away is
+        // handled by the caller's own branch (@see the increment that adds
+        // it); the address is still appended first so the vector this node
+        // holds describes the whole path.
+        dodag.aodv.addressVector.push_back(ownAddress);
+        ArmAodvExpiry(dodag, key);
+        NS_LOG_INFO("The RREP-Instance for " << dodag.aodv.target << " reached its OrigNode over "
+                                             << dodag.aodv.addressVector.size() << " hop(s)");
+        return;
+    }
+
+    dodag.aodv.addressVector.push_back(ownAddress);
+    ArmAodvExpiry(dodag, key);
+
+    NS_LOG_INFO("Joined RREP-Instance " << +key.instanceId << " at " << key.dodagId
+                                        << " heading for OrigNode " << dodag.aodv.origNode << ", "
+                                        << dodag.aodv.addressVector.size()
+                                        << " hop(s) from the TargNode");
+    // Nothing transmits here: this membership's own Trickle timer, reset by
+    // HandleDio() when the preferred parent was chosen, multicasts the
+    // RREP-DIO onward with SendDio() filling in the options.
+}
+
 bool
 RplRoutingProtocol::GetAodvRoute(Ipv6Address target, std::vector<Ipv6Address>& hops) const
 {
