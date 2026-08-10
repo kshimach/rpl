@@ -378,15 +378,19 @@ RplRoutingProtocol::HandleAodvRreq(const RplDioHeader& dio, Ipv6Address from, ui
     // router decides whether the downward direction of the link it just
     // heard this on also satisfies the Objective Function.
     //
-    // Deciding that is explicitly out of the RFC's own scope ("It is beyond
-    // the scope of this document to specify the criteria used when
-    // determining whether or not each link is symmetric"), and this module
-    // has no reverse-direction link metric to consult: the ETX it keeps is
-    // measured on received frames only. Every link is therefore treated as
-    // symmetric, which is also the RFC's own opening position -- "Links are
-    // considered symmetric until indication to the contrary is received"
-    // (section 5). @see design-constraints.md.
-    dodag.aodv.symmetric = rreq.symmetric;
+    // Deciding that for real is explicitly out of the RFC's own scope ("It
+    // is beyond the scope of this document to specify the criteria used when
+    // determining whether or not each link is symmetric"), and it is not
+    // implementable here in any case: both metrics this module keeps are
+    // measured on received frames (ETX from the LQI tag, LQL from the RSSI
+    // tag), so they describe the same direction as each other and comparing
+    // them -- which is what RFC 9854 Appendix A's example method does, using
+    // a transmit-side ETX this module has no equivalent of -- says nothing
+    // about asymmetry. Links are therefore symmetric unless the
+    // AodvForceAsymmetric attribute says otherwise, which is also the RFC's
+    // own opening position: "Links are considered symmetric until indication
+    // to the contrary is received" (section 5). @see design-constraints.md.
+    dodag.aodv.symmetric = rreq.symmetric && !m_aodvForceAsymmetric;
 
     // RFC 9854 section 6.2.5: "the intermediate router MUST append the
     // address of its interface receiving the RREQ-DIO into the Address
@@ -724,6 +728,13 @@ RplRoutingProtocol::IsAodvTarget(uint8_t instanceId, Ipv6Address dodagId) const
 {
     auto it = m_dodags.find(DodagKey{instanceId, dodagId});
     return it != m_dodags.end() && it->second.aodv.isTarget;
+}
+
+bool
+RplRoutingProtocol::IsAodvSymmetric(uint8_t instanceId, Ipv6Address dodagId) const
+{
+    auto it = m_dodags.find(DodagKey{instanceId, dodagId});
+    return it != m_dodags.end() && it->second.aodv.symmetric;
 }
 
 } // namespace rpl

@@ -5159,6 +5159,131 @@ RplAodvRreqFloodTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief AodvForceAsymmetric clears the 'S' bit an intermediate router
+ *        propagates, and a cleared bit stays cleared the rest of the way.
+ *
+ * RFC 9854 section 6.2.4 has each intermediate router decide whether the
+ * link it just heard an RREQ-DIO on is symmetric, clearing 'S' if not, and
+ * makes a cleared bit final: "If the S bit arrives already set to be 0, then
+ * it is set to be 0 when the RREQ-DIO is propagated". Deciding symmetry for
+ * real is out of the RFC's own scope (section 5) and is not implementable in
+ * this module -- both metrics it keeps, ETX and RSSI-derived LQL, come off
+ * received frames, so they measure the same direction and comparing them (as
+ * Appendix A's example method does, against a transmit-side ETX this module
+ * has no equivalent of) says nothing about asymmetry. The
+ * AodvForceAsymmetric attribute stands in for that decision so the
+ * asymmetric path is reachable at all.
+ *
+ * The same four-node line as the flood test, with the attribute set on
+ * relay1 only:
+ *
+ *     orig(0) ---- relay1(1) ---- relay2(2) ---- targ(3)
+ *
+ * The OrigNode still starts at S=1 (section 6.1 gives it no choice), relay1
+ * clears it, and relay2 -- which does *not* have the attribute set -- has to
+ * keep it cleared rather than deciding for itself that its own link was
+ * fine.
+ */
+class RplAodvForcedAsymmetricSBitTestCase : public TestCase
+{
+  public:
+    RplAodvForcedAsymmetricSBitTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplAodvForcedAsymmetricSBitTestCase::RplAodvForcedAsymmetricSBitTestCase()
+    : TestCase("AodvForceAsymmetric clears the RREQ's 'S' bit, and it stays cleared downstream")
+{
+}
+
+void
+RplAodvForcedAsymmetricSBitTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(4); // 0 = OrigNode and base root, 1 and 2 = relays, 3 = TargNode
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    auto blacklist = [&](uint32_t a, uint32_t b) {
+        Ptr<SimpleNetDevice> devA = DynamicCast<SimpleNetDevice>(devices.Get(a));
+        Ptr<SimpleNetDevice> devB = DynamicCast<SimpleNetDevice>(devices.Get(b));
+        channel->BlackList(devA, devB);
+        channel->BlackList(devB, devA);
+    };
+    blacklist(0, 2);
+    blacklist(0, 3);
+    blacklist(1, 3);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(250));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> orig = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> relay1 = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> relay2 = nodes.Get(2)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> targ = nodes.Get(3)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(targ->IsJoined(), true, "The base DODAG did not reach the far end");
+
+    // Only relay1 decides its link is asymmetric. Set after the base DODAG
+    // has formed so nothing about that formation is affected either.
+    relay1->SetAttribute("AodvForceAsymmetric", BooleanValue(true));
+
+    Ipv6Address targAddress = targ->GetGlobalAddress();
+    RplRoutingProtocol::DodagKey key = orig->DiscoverRoute(targAddress);
+    NS_TEST_ASSERT_MSG_NE(key.dodagId, Ipv6Address::GetAny(), "The discovery did not start");
+
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(relay2->IsJoinedTo(key.instanceId, key.dodagId),
+                          true,
+                          "relay2 never heard the RREQ");
+    NS_TEST_ASSERT_MSG_EQ(targ->IsJoinedTo(key.instanceId, key.dodagId),
+                          true,
+                          "The TargNode never heard the RREQ");
+
+    // The OrigNode is unaffected: section 6.1 has it originate S=1, and it
+    // does not run the intermediate-router decision on its own RREQ at all.
+    NS_TEST_ASSERT_MSG_EQ(orig->IsAodvSymmetric(key.instanceId, key.dodagId),
+                          true,
+                          "The OrigNode cleared its own 'S' bit");
+
+    NS_TEST_ASSERT_MSG_EQ(relay1->IsAodvSymmetric(key.instanceId, key.dodagId),
+                          false,
+                          "AodvForceAsymmetric did not clear relay1's 'S' bit");
+    NS_TEST_ASSERT_MSG_EQ(relay2->IsAodvSymmetric(key.instanceId, key.dodagId),
+                          false,
+                          "relay2 put the 'S' bit back up: a cleared bit is final (RFC 9854 "
+                          "section 6.2.4), whatever the receiving router thinks of its own link");
+    NS_TEST_ASSERT_MSG_EQ(targ->IsAodvSymmetric(key.instanceId, key.dodagId),
+                          false,
+                          "The TargNode saw a symmetric route despite a relay clearing 'S'");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief An AODV-RPL discovery completes end to end: the RREP comes back
  *        along the Address Vector and the route it delivers carries data.
  *
@@ -9991,6 +10116,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplAodvMopAcceptedTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvAddressVectorFollowsParentTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRreqFloodTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplAodvForcedAsymmetricSBitTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRrepCompletesTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplRootJoinsForeignRreqInstanceParentLossTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRrepDuplicateRelayedOnceTestCase, TestCase::Duration::QUICK);

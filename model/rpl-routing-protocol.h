@@ -545,6 +545,16 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      */
     bool IsAodvTarget(uint8_t instanceId, Ipv6Address dodagId) const;
 
+    /**
+     * @brief The 'S' bit this node would put on an RREQ-DIO it propagates
+     *        for an RREQ-Instance it holds (RFC 9854 section 6.2.4).
+     * @param instanceId the RPLInstanceID of the RREQ-Instance
+     * @param dodagId the DODAGID of the RREQ-Instance
+     * @return true if the route so far is symmetric, false if it is not or
+     *         if this node holds no such membership
+     */
+    bool IsAodvSymmetric(uint8_t instanceId, Ipv6Address dodagId) const;
+
   protected:
     void DoInitialize() override;
     void DoDispose() override;
@@ -1406,6 +1416,10 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     /// REJOIN_REENABLE (RFC 9854 section 2): how long after leaving an
     /// RREQ-Instance a node is barred from rejoining the same one.
     Time m_aodvRejoinReenable;
+    /// Clear the 'S' bit on every RREQ-DIO propagated from here, forcing the
+    /// asymmetric path (RFC 9854 section 6.2.4). @see the AodvForceAsymmetric
+    /// attribute for why real link-symmetry detection is not an option here.
+    bool m_aodvForceAsymmetric;
     /// When each recently-left RREQ-Instance may be joined again. Without
     /// it, a discovery never really ends: the RREQ-DIOs a neighbour is still
     /// Trickle-pacing pull the node -- the OrigNode very much included --

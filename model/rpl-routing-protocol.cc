@@ -262,7 +262,21 @@ RplRoutingProtocol::GetTypeId()
                           "RREQ-DIOs pulls the node back in immediately.",
                           TimeValue(Minutes(15)),
                           MakeTimeAccessor(&RplRoutingProtocol::m_aodvRejoinReenable),
-                          MakeTimeChecker());
+                          MakeTimeChecker())
+            .AddAttribute("AodvForceAsymmetric",
+                          "Clear the 'S' bit of every RREQ-DIO this router propagates (RFC 9854 "
+                          "section 6.2.4), forcing the discovery onto the asymmetric path: the "
+                          "TargNode answers by building an RREP-Instance DODAG of its own and "
+                          "flooding it, rather than unicasting back along the RREQ's Address "
+                          "Vector. Deciding link symmetry for real is out of the RFC's own scope "
+                          "(section 5) and is not implementable here anyway -- both metrics this "
+                          "module keeps, ETX and RSSI-derived LQL, are measured on received "
+                          "frames, so they describe the same direction and comparing them says "
+                          "nothing about asymmetry. This attribute is what makes the asymmetric "
+                          "path reachable in a simulation at all.",
+                          BooleanValue(false),
+                          MakeBooleanAccessor(&RplRoutingProtocol::m_aodvForceAsymmetric),
+                          MakeBooleanChecker());
     return tid;
 }
 
