@@ -347,7 +347,38 @@ RplRoutingProtocol::GetTypeId()
                           "design-constraints.md section 37.",
                           TimeValue(Time::Max()),
                           MakeTimeAccessor(&RplRoutingProtocol::m_globalRepairInterval),
-                          MakeTimeChecker());
+                          MakeTimeChecker())
+            .AddAttribute("P2pDroAckRequested",
+                          "Whether a Target sets the 'A' flag on its P2P-DRO (RFC 6997 section "
+                          "9.5), asking the Origin to reply with a P2P-DRO-ACK. Unlike "
+                          "GlobalRepairInterval, which layers an optional policy on top of an "
+                          "already-functioning base, P2P-DRO travels by link-local multicast "
+                          "with no link-level acknowledgement to fall back on (section 10), so "
+                          "without this a single lost P2P-DRO silently fails the whole route "
+                          "discovery -- the same reliability role DAO-ACK plays for DAO, which "
+                          "this module also defaults to on. True by default.",
+                          BooleanValue(true),
+                          MakeBooleanAccessor(&RplRoutingProtocol::m_p2pDroAckRequested),
+                          MakeBooleanChecker())
+            .AddAttribute("P2pDroAckWaitTime",
+                          "How long a Target waits for a P2P-DRO-ACK before retransmitting its "
+                          "P2P-DRO (RFC 6997 section 9.5's P2P_DRO_ACK_WAIT_TIME). RFC 6997 sets "
+                          "no numeric default of its own ('configurable...based on the "
+                          "characteristics of individual deployments'); this module's default is "
+                          "chosen on the same order as the P2P mode DIO's own Imax "
+                          "(P2pDioIntervalMin=64ms, P2pDioIntervalDoublings=4 -> ~1.024s), rather "
+                          "than reusing DaoAckTimeout's 5s -- P2P-RPL's 'L' (16s by default) "
+                          "would lose most of its budget to a single wait at that timescale.",
+                          TimeValue(Seconds(1)),
+                          MakeTimeAccessor(&RplRoutingProtocol::m_p2pDroAckWaitTime),
+                          MakeTimeChecker())
+            .AddAttribute("P2pDroMaxRetransmissions",
+                          "How many times a Target retransmits an unacknowledged P2P-DRO (RFC "
+                          "6997 section 9.5's MAX_P2P_DRO_RETRANSMISSIONS) before giving up. No "
+                          "RFC default; matches DaoRetries.",
+                          UintegerValue(3),
+                          MakeUintegerAccessor(&RplRoutingProtocol::m_p2pDroMaxRetransmissions),
+                          MakeUintegerChecker<uint8_t>());
     return tid;
 }
 
@@ -1708,6 +1739,7 @@ RplRoutingProtocol::LeaveDodag(DodagKey key, bool poison)
     dodag.daoEvent.Cancel();
     dodag.daoRetryEvent.Cancel();
     dodag.globalRepairEvent.Cancel();
+    dodag.p2p.droRetryEvent.Cancel();
     m_dodags.erase(it);
 
     if (poison && m_hasBaseDodag && m_baseDodagKey == key)

@@ -348,6 +348,17 @@ RplRoutingProtocol::HandleP2pRdo(const RplDioHeader& dio, Ipv6Address from, uint
         // here: N > 0 (several Source Routes) is out of scope.
         if (dodag.p2p.reply)
         {
+            // A fresh transmission cycle, distinct from P2pDroRetry()'s own
+            // resend of the same content on timeout -- RFC 6997 section 10's
+            // 'Seq' is what lets the Origin's P2P-DRO-ACK be matched back to
+            // the P2P-DRO it acknowledges, so a P2P-DRO whose Address Vector
+            // just changed (this DIO may have arrived with a different one
+            // than the last) needs a Seq of its own. Resets the retry budget
+            // for the same reason: this supersedes whatever cycle (if any)
+            // was already in flight for the old Seq.
+            dodag.p2p.droSequence++;
+            dodag.p2p.droAckPending = m_p2pDroAckRequested;
+            dodag.p2p.droRetriesLeft = m_p2pDroMaxRetransmissions;
             SendP2pDro(dodag, key);
         }
         return;
@@ -368,9 +379,15 @@ RplRoutingProtocol::SendP2pDro(DodagMembership& dodag, DodagKey key)
 
     RplP2pDroHeader dro;
     dro.SetInstanceId(dodag.instanceId);
-    dro.SetStop(false);         // early termination via 'S' is out of scope
-    dro.SetAckRequested(false); // P2P-DRO-ACK ('A') is out of scope
-    dro.SetSequence(0);
+    // RFC 6997 section 9.5: a Target MAY set 'S' when "this router is the
+    // only Target specified in the corresponding DIO...and the Target has
+    // already selected the desired number of routes" -- both are always
+    // true in this implementation's scope (a single Target, N=0 meaning
+    // exactly one route), so this is unconditional rather than a policy
+    // choice the way the 'A' flag below is.
+    dro.SetStop(true);
+    dro.SetAckRequested(m_p2pDroAckRequested);
+    dro.SetSequence(dodag.p2p.droSequence);
     // "the router recognizes itself as the Origin" by matching the P2P-DRO's
     // own DODAGID field (RFC 6997 section 9.7) -- the temporary DAG's own
     // DODAGID already is the Origin's address.
@@ -402,7 +419,63 @@ RplRoutingProtocol::SendP2pDro(DodagMembership& dodag, DodagKey key)
     SendRplMessageMulticast(packet, RPL_CODE_P2P_DRO, Ipv6Address(RPL_ALL_NODES_MULTICAST));
 
     NS_LOG_INFO("Answering the P2P mode DIO for " << dodag.p2p.target << " with a P2P-DRO over "
-                                                   << rdo.addressVector.size() << " hop(s)");
+                                                   << rdo.addressVector.size() << " hop(s)"
+                                                   << (m_p2pDroAckRequested ? ", ack requested" : ""));
+
+    // Only arms the wait timer, never resets droAckPending/droRetriesLeft:
+    // this function is also what P2pDroRetry() calls to resend the exact
+    // same P2P-DRO on timeout, and doing either here would make every retry
+    // renew its own retry budget, so MAX_P2P_DRO_RETRANSMISSIONS would never
+    // actually bind. The two callers -- HandleP2pRdo() for a fresh cycle,
+    // P2pDroRetry() for a resend -- own that state themselves instead.
+    if (m_p2pDroAckRequested)
+    {
+        // Bound here rather than in CreateDodagMembership() (@see
+        // DodagMembership::P2pState::droRetryEvent's own comment): harmless
+        // to redo on every call, SetFunction()/SetArguments() just overwrite
+        // the same binding.
+        dodag.p2p.droRetryEvent.SetFunction(&RplRoutingProtocol::P2pDroRetry, this);
+        dodag.p2p.droRetryEvent.SetArguments(key);
+        dodag.p2p.droRetryEvent.Cancel();
+        dodag.p2p.droRetryEvent.Schedule(m_p2pDroAckWaitTime);
+    }
+}
+
+void
+RplRoutingProtocol::P2pDroRetry(DodagKey key)
+{
+    auto it = m_dodags.find(key);
+    if (it == m_dodags.end())
+    {
+        return;
+    }
+    DodagMembership& dodag = it->second;
+
+    NS_LOG_FUNCTION(this << +dodag.p2p.droRetriesLeft);
+
+    if (!dodag.p2p.droAckPending)
+    {
+        return;
+    }
+
+    if (dodag.p2p.droRetriesLeft == 0)
+    {
+        // RFC 6997 section 9.5 caps retransmissions at
+        // MAX_P2P_DRO_RETRANSMISSIONS and says nothing beyond that -- unlike
+        // a DAO, which the next periodic refresh tries again, a P2P-DRO has
+        // no periodic refresh of its own to fall back on (the temporary DAG
+        // just expires at its own 'L' deadline, @see P2pInstanceExpired()).
+        NS_LOG_WARN("No P2P-DRO-ACK for sequence " << +dodag.p2p.droSequence
+                                                    << ", giving up until the temporary DAG "
+                                                       "expires");
+        dodag.p2p.droAckPending = false;
+        return;
+    }
+
+    dodag.p2p.droRetriesLeft--;
+    // Rebuilds and resends the same content: droSequence is untouched here,
+    // only HandleP2pRdo() bumps it for a genuinely new cycle.
+    SendP2pDro(dodag, key);
 }
 
 void

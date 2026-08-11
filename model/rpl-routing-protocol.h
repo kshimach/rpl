@@ -37,6 +37,7 @@ class RplDioHeader;
 class RplDaoHeader;
 class RplDaoAckHeader;
 class RplP2pDroHeader;
+class RplP2pDroAckHeader;
 
 /**
  * @ingroup rpl
@@ -876,6 +877,21 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
             /// When the 'L' field's deadline takes this node out of the
             /// temporary DAG (RFC 6997 section 7).
             Timer expiry{Timer::CANCEL_ON_DESTROY};
+
+            /// Target only, RFC 6997 sections 9.5/10: state for the P2P-DRO
+            /// this node is waiting on a P2P-DRO-ACK for. droSequence is the
+            /// 'Seq' the outstanding (or most recently sent) P2P-DRO carried,
+            /// what an arriving P2P-DRO-ACK is checked against.
+            uint8_t droSequence{0};
+            bool droAckPending{false};   //!< true while waiting on a P2P-DRO-ACK
+            uint8_t droRetriesLeft{0};   //!< retries left for the P2P-DRO awaiting one
+            /// Schedules the retransmission of an unacknowledged P2P-DRO
+            /// (P2P_DRO_ACK_WAIT_TIME). Bound on first use, in SendP2pDro()
+            /// itself, rather than in CreateDodagMembership() alongside
+            /// daoRetryEvent's own binding: unlike a DAO, whether a P2P-DRO
+            /// (and hence this Timer) is ever needed is not known until this
+            /// node turns out to be a Target and actually sends one.
+            Timer droRetryEvent{Timer::CANCEL_ON_DESTROY};
         };
 
         P2pState p2p; //!< P2P-RPL state; untouched unless this membership is a temporary DAG
@@ -1179,6 +1195,30 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      * @param interface the interface it arrived on
      */
     void HandleP2pDro(const RplP2pDroHeader& dro, Ipv6Address from, uint32_t interface);
+
+    /**
+     * @brief Re-send an unacknowledged P2P-DRO, or give up.
+     *
+     * RFC 6997 section 9.5: a Target that set the P2P-DRO's 'A' flag
+     * retransmits the same P2P-DRO (same 'Seq') if
+     * P2P_DRO_ACK_WAIT_TIME elapses with no P2P-DRO-ACK, up to
+     * MAX_P2P_DRO_RETRANSMISSIONS times. Modelled on DaoRetry().
+     *
+     * @param key identifies which DODAG membership's retry timer fired
+     */
+    void P2pDroRetry(DodagKey key);
+
+    /**
+     * @brief Act on a received P2P-DRO-ACK: cancel the retry it acknowledges.
+     *
+     * RFC 6997 section 10. Only meaningful at the Target that requested it;
+     * silently dropped if this node is not currently waiting on one, or if
+     * the instanceId/dodagId/sequence do not match what is outstanding (a
+     * stale or misdirected ACK).
+     *
+     * @param ack the P2P-DRO-ACK just received
+     */
+    void HandleP2pDroAck(const RplP2pDroAckHeader& ack);
 
     /**
      * @brief Unicast an RREP-DIO one hop towards the OrigNode.
@@ -1882,6 +1922,10 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     /// armed at all, so this is a no-op change from every prior release.
     /// @see DodagMembership::globalRepairEvent.
     Time m_globalRepairInterval;
+
+    bool m_p2pDroAckRequested;         //!< whether a Target sets the P2P-DRO's 'A' flag
+    Time m_p2pDroAckWaitTime;          //!< P2P_DRO_ACK_WAIT_TIME (RFC 6997 section 9.5)
+    uint8_t m_p2pDroMaxRetransmissions; //!< MAX_P2P_DRO_RETRANSMISSIONS (RFC 6997 section 9.5)
 
     Ipv6Address m_rootPrefix;    //!< the root's own GUA/ULA prefix (RootPrefix attribute)
     uint8_t m_rootPrefixLength; //!< prefix length of m_rootPrefix, in bits
