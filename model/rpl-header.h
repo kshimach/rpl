@@ -560,6 +560,38 @@ class RplDioHeader : public Header
      */
     bool HasP2pRdo() const;
     /**
+     * @brief RFC 6550's own RPL Target option (section 6.7.7), reused
+     *        inside a P2P mode DIO (RFC 6997) to name an additional
+     *        Target beyond the P2P-RDO's own primary TargetAddr.
+     *
+     * This implementation only ever sends/accepts prefixLength 0 (a full
+     * unicast address), the same simplification the DAO side already
+     * makes (@see RplDaoHeader::TARGET_OPTION_LENGTH) -- multicast Targets
+     * and prefixes are out of scope.
+     */
+    struct TargetOption
+    {
+        uint8_t prefixLength{0}; //!< 'Prefix Length'; only 0 (a full address) is supported
+        Ipv6Address target;      //!< 'Target Prefix'
+    };
+
+    /**
+     * @brief Get every additional Target named by an RPL Target option.
+     * @return the list, empty if none are present
+     */
+    const std::vector<TargetOption>& GetTargets() const;
+    /**
+     * @brief Append an additional Target, carried as its own RPL Target
+     *        option (RFC 6550 section 6.7.7, RFC 6997's own reuse of it).
+     *
+     * Unlike SetP2pRdo()/SetRreq()/etc., this adds rather than replaces:
+     * a P2P mode DIO MAY carry any number of these.
+     *
+     * @param target the option
+     */
+    void AddTarget(const TargetOption& target);
+
+    /**
      * @brief Attach a P2P-RDO (RFC 6997 section 7).
      *
      * A P2P mode DIO MUST carry exactly one; a second call replaces the
@@ -630,6 +662,16 @@ class RplDioHeader : public Header
     static constexpr uint8_t AODV_ART_OPTION_SIZE = 20;
     /// Value of the length field of the ART option.
     static constexpr uint8_t AODV_ART_OPTION_LENGTH = AODV_ART_OPTION_SIZE - 2;
+    /// Serialized size of the RPL Target option carrying a full address
+    /// (Prefix Length 0): Type+Length (2), Flags (1), Prefix Length (1)
+    /// and the 16-byte address -- the same fixed shape
+    /// RplDaoHeader::TARGET_OPTION_SIZE has, duplicated rather than shared
+    /// since the two classes have no other Target-related logic in common
+    /// (unlike P2pRdoOption, carried by two message classes with real
+    /// shared Compr arithmetic).
+    static constexpr uint8_t TARGET_OPTION_SIZE = 20;
+    /// Value of the length field of the RPL Target option.
+    static constexpr uint8_t TARGET_OPTION_LENGTH = TARGET_OPTION_SIZE - 2;
     /// Mask of the 'L' field's high bit, which sits in the last bit of the
     /// RREQ/RREP option's first flag octet (bit 23 of the row); its low bit
     /// is the top bit of the octet after (bit 24). @see rpl-conf.h.
@@ -698,6 +740,11 @@ class RplDioHeader : public Header
 
     bool m_hasP2pRdo;    //!< true if the P2P Route Discovery Option is present
     P2pRdoOption m_p2pRdo; //!< the P2P Route Discovery Option
+
+    /// Additional Targets named by RPL Target options (RFC 6997's own
+    /// reuse of RFC 6550 section 6.7.7), beyond the P2P-RDO's own primary
+    /// TargetAddr. Empty on a DIO that names none.
+    std::vector<TargetOption> m_targets;
 };
 
 /**

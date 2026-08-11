@@ -312,6 +312,10 @@ RplDioHeader::Print(std::ostream& os) const
            << " Target " << m_p2pRdo.target << " MaxRank " << +m_p2pRdo.maxRankOrNh << " AV "
            << m_p2pRdo.addressVector.size();
     }
+    if (!m_targets.empty())
+    {
+        os << " +" << m_targets.size() << " Target option(s)";
+    }
 }
 
 uint8_t
@@ -353,7 +357,8 @@ RplDioHeader::GetSerializedSize() const
                                  ElidedPrefixLength(m_rrep.addressVector))
                       : 0) +
            (m_hasArt ? AODV_ART_OPTION_SIZE : 0) +
-           (m_hasP2pRdo ? P2pRdoSerializedSize(m_p2pRdo, m_dodagId) : 0);
+           (m_hasP2pRdo ? P2pRdoSerializedSize(m_p2pRdo, m_dodagId) : 0) +
+           m_targets.size() * TARGET_OPTION_SIZE;
 }
 
 void
@@ -508,6 +513,19 @@ RplDioHeader::Serialize(Buffer::Iterator start) const
     {
         P2pRdoSerialize(start, m_p2pRdo, m_dodagId);
     }
+
+    // RFC 6997's own reuse of RFC 6550 section 6.7.7: any number of these,
+    // one per additional Target beyond the P2P-RDO's own primary one.
+    for (const auto& targetOption : m_targets)
+    {
+        start.WriteU8(RPL_OPTION_TARGET);
+        start.WriteU8(TARGET_OPTION_LENGTH);
+        start.WriteU8(0); // Flags, reserved
+        start.WriteU8(targetOption.prefixLength);
+        uint8_t targetOptionBuf[16];
+        targetOption.target.Serialize(targetOptionBuf);
+        start.Write(targetOptionBuf, 16);
+    }
 }
 
 uint32_t
@@ -542,6 +560,7 @@ RplDioHeader::Deserialize(Buffer::Iterator start)
     m_hasRrep = false;
     m_hasArt = false;
     m_hasP2pRdo = false;
+    m_targets.clear();
     while (!i.IsEnd())
     {
         uint8_t type = i.ReadU8();
@@ -747,6 +766,19 @@ RplDioHeader::Deserialize(Buffer::Iterator start)
             // "declared length trusted, but validated" contract the AODV-RPL
             // RREQ/RREP branches above follow.
             m_hasP2pRdo = P2pRdoDeserialize(i, length, m_dodagId, m_p2pRdo);
+        }
+        else if (type == RPL_OPTION_TARGET && length == TARGET_OPTION_LENGTH)
+        {
+            // May appear any number of times (RFC 6997's own reuse of RFC
+            // 6550 section 6.7.7), unlike every other option above, which a
+            // P2P mode DIO carries at most one of.
+            TargetOption targetOption;
+            i.ReadU8(); // Flags, reserved
+            targetOption.prefixLength = i.ReadU8();
+            uint8_t targetOptionBuf[16];
+            i.Read(targetOptionBuf, 16);
+            targetOption.target = Ipv6Address::Deserialize(targetOptionBuf);
+            m_targets.push_back(targetOption);
         }
         else
         {
@@ -1143,6 +1175,18 @@ const P2pRdoOption&
 RplDioHeader::GetP2pRdo() const
 {
     return m_p2pRdo;
+}
+
+const std::vector<RplDioHeader::TargetOption>&
+RplDioHeader::GetTargets() const
+{
+    return m_targets;
+}
+
+void
+RplDioHeader::AddTarget(const TargetOption& target)
+{
+    m_targets.push_back(target);
 }
 
 NS_OBJECT_ENSURE_REGISTERED(RplP2pDroHeader);

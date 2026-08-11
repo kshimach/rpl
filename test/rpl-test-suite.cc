@@ -1381,6 +1381,178 @@ RplDioOptionEdgeTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief RPL Target options (RFC 6550 section 6.7.7) on a DIO -- RFC
+ *        6997's own reuse of them to name additional P2P-RPL Targets
+ *        beyond the P2P-RDO's own primary one.
+ *
+ * Round trip with 0, 1, and 3 entries (the normal and boundary cases), a
+ * Target option with a non-zero declared Prefix Length that this
+ * implementation does not support and a truncated one, both of which
+ * should be skipped like any other option this implementation does not
+ * recognise (RplDioOptionEdgeTestCase's own discipline, applied here
+ * since AddTarget()/GetTargets() only ever produces the one shape this
+ * implementation supports and so cannot exercise either by itself).
+ */
+class RplDioTargetOptionTestCase : public TestCase
+{
+  public:
+    RplDioTargetOptionTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplDioTargetOptionTestCase::RplDioTargetOptionTestCase()
+    : TestCase("DIO RPL Target options")
+{
+}
+
+void
+RplDioTargetOptionTestCase::DoRun()
+{
+    // No Target options at all: the common case, since only P2P-RPL
+    // multi-Target discoveries ever carry one.
+    {
+        RplDioHeader dio;
+        dio.SetRank(256);
+        dio.SetDodagId(Ipv6Address("2001:1::1"));
+
+        Ptr<Packet> packet = Create<Packet>();
+        packet->AddHeader(dio);
+
+        RplDioHeader received;
+        packet->RemoveHeader(received);
+        NS_TEST_ASSERT_MSG_EQ(received.GetTargets().size(),
+                              0,
+                              "A Target option appeared from nowhere");
+    }
+
+    // One, the minimum a multi-Target discovery actually adds beyond the
+    // P2P-RDO's own primary TargetAddr.
+    {
+        RplDioHeader dio;
+        dio.SetRank(256);
+        dio.SetDodagId(Ipv6Address("2001:1::1"));
+        RplDioHeader::TargetOption target;
+        target.target = Ipv6Address("2001:1::9");
+        dio.AddTarget(target);
+
+        NS_TEST_ASSERT_MSG_EQ(dio.GetSerializedSize(),
+                              24 + 20, // TARGET_OPTION_SIZE, private to RplDioHeader
+                              "Wrong serialized size for one Target option");
+
+        Ptr<Packet> packet = Create<Packet>();
+        packet->AddHeader(dio);
+
+        RplDioHeader received;
+        packet->RemoveHeader(received);
+        NS_TEST_ASSERT_MSG_EQ(received.GetTargets().size(), 1, "Wrong number of Target options");
+        NS_TEST_ASSERT_MSG_EQ(received.GetTargets()[0].target,
+                              Ipv6Address("2001:1::9"),
+                              "Wrong Target address");
+        NS_TEST_ASSERT_MSG_EQ(received.GetTargets()[0].prefixLength, 0, "Wrong Prefix Length");
+    }
+
+    // Three, in the order added -- AddTarget() appends rather than
+    // replaces, unlike every other DIO option this implementation has.
+    {
+        RplDioHeader dio;
+        dio.SetRank(256);
+        dio.SetDodagId(Ipv6Address("2001:1::1"));
+        for (uint8_t i = 2; i <= 4; i++)
+        {
+            RplDioHeader::TargetOption target;
+            std::ostringstream address;
+            address << "2001:1::" << +i;
+            target.target = Ipv6Address(address.str().c_str());
+            dio.AddTarget(target);
+        }
+
+        Ptr<Packet> packet = Create<Packet>();
+        packet->AddHeader(dio);
+
+        RplDioHeader received;
+        packet->RemoveHeader(received);
+        NS_TEST_ASSERT_MSG_EQ(received.GetTargets().size(), 3, "Wrong number of Target options");
+        NS_TEST_ASSERT_MSG_EQ(received.GetTargets()[0].target,
+                              Ipv6Address("2001:1::2"),
+                              "Wrong first Target address");
+        NS_TEST_ASSERT_MSG_EQ(received.GetTargets()[1].target,
+                              Ipv6Address("2001:1::3"),
+                              "Wrong second Target address");
+        NS_TEST_ASSERT_MSG_EQ(received.GetTargets()[2].target,
+                              Ipv6Address("2001:1::4"),
+                              "Wrong third Target address");
+    }
+
+    // A Target option with a nonzero declared Prefix Length: not the
+    // fixed 20-byte shape this implementation supports (@see
+    // RplDioHeader::TargetOption's own doc comment), but still a
+    // well-formed option as far as the generic option loop is concerned,
+    // so it is skipped rather than misread -- the same discipline every
+    // other option type this implementation does not recognise gets.
+    {
+        RplDioHeader dio;
+        dio.SetRank(256);
+        dio.SetDodagId(Ipv6Address("2001:1::1"));
+
+        Ptr<Packet> packet = Create<Packet>();
+        packet->AddHeader(dio);
+
+        // Type, Length (10, a shorter Target Prefix than the 16-byte one
+        // TARGET_OPTION_LENGTH itself implies), Flags, Prefix Length (64),
+        // and 8 bytes of prefix.
+        uint8_t shortPrefixTarget[12] = {
+            RPL_OPTION_TARGET, 10, 0, 64, 0x20, 0x01, 0, 1, 0, 0, 0, 0};
+        packet->AddAtEnd(Create<Packet>(shortPrefixTarget, sizeof(shortPrefixTarget)));
+
+        RplDioHeader received;
+        uint32_t consumed = packet->RemoveHeader(received);
+        NS_TEST_ASSERT_MSG_EQ(consumed,
+                              24 + sizeof(shortPrefixTarget),
+                              "The whole packet, option included, should still have been "
+                              "consumed -- skipping is not discarding");
+        NS_TEST_ASSERT_MSG_EQ(received.GetTargets().size(),
+                              0,
+                              "A Target option with an unsupported Prefix Length was accepted "
+                              "instead of skipped");
+        NS_TEST_ASSERT_MSG_EQ(received.GetRank(), 256, "The option ate part of the base object");
+    }
+
+    // A Target option truncated shorter than its own declared Length: the
+    // generic option loop's own bounds check (RplDioOptionEdgeTestCase
+    // already covers this for other option types; repeated here because
+    // AddTarget()/GetTargets() is the first option in this class that can
+    // appear more than once, so a truncated one could in principle
+    // corrupt the count rather than just being dropped).
+    {
+        RplDioHeader dio;
+        dio.SetRank(256);
+        dio.SetDodagId(Ipv6Address("2001:1::1"));
+
+        Ptr<Packet> packet = Create<Packet>();
+        packet->AddHeader(dio);
+
+        // Declares TARGET_OPTION_LENGTH (18) but only 4 bytes actually
+        // follow.
+        uint8_t truncatedTarget[6] = {RPL_OPTION_TARGET, 18, // TARGET_OPTION_LENGTH, private
+                                      0,                 0,
+                                      0x20,              0x01};
+        packet->AddAtEnd(Create<Packet>(truncatedTarget, sizeof(truncatedTarget)));
+
+        RplDioHeader received;
+        packet->RemoveHeader(received);
+        NS_TEST_ASSERT_MSG_EQ(received.GetTargets().size(),
+                              0,
+                              "A truncated Target option should not have been recorded");
+        NS_TEST_ASSERT_MSG_EQ(received.GetRank(), 256, "The option ate part of the base object");
+    }
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Check that a DAO and a DAO-ACK survive a round trip.
  */
 class RplDaoHeaderTestCase : public TestCase
@@ -13043,6 +13215,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplDioTruncatedOptionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDioUnknownMetricTypeTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDioOptionEdgeTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplDioTargetOptionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDaoHeaderTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pDroHeaderTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pDroAckHeaderTestCase, TestCase::Duration::QUICK);
