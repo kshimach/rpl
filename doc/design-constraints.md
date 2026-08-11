@@ -4720,3 +4720,66 @@ Reset() する (変化はした) が、rule 1 は Reset() **しない** (改善�
 --suite=rpl` PASS (既存の全テストに変化なし — 39.2 の分析どおり、
 既定設定下でのconsistencyHit()/Reset()呼び出し条件変更は無害である
 ことの間接的な裏付け)。専用の新規テストは追加していない(39.2参照)。
+
+## 40. `/protocol-test-matrix` で P2P-DRO-ACK 実装(§38・39)を監査
+
+以後「実装が一区切りついたら `/protocol-test-matrix` を実施する」との
+方針を受け、直前の4コミット(§38・§39、P2P-DRO-ACK一式)を対象に
+Phase 1の4象限監査を実施した。
+
+### 40.1 見つかった未検証の穴
+
+- **正常系: ACKが実際にTargetまで届き再送を止める経路が一度も検証
+  されていなかった**。既存の`RplP2pRouteCompletesTestCase`はEnd-to-end
+  データ到達は検証していたが、Origin側が実際にACKを生成・配送し、
+  Targetの`droAckPending`が解除されることは一切見ていなかった —
+  この機能の最も基本的な成功パスが未検証のまま残っていた。
+- **異常系: シーケンス番号が一致しないP2P-DRO-ACKの拒否**が未検証
+  だった。`HandleP2pDroAck()`のSeq照合ロジックは実装済みだったが、
+  実際に不一致ACKを届けて「再送が止まらないこと」を確認したテストは
+  無かった。
+
+### 40.2 見つけて塞いだ穴、いずれもテスト側
+
+- `RplP2pRouteCompletesTestCase`にrelay2上のモニタを追加し、Target
+  発のP2P-DRO送信回数を数える形でACK到達を間接確認 (`m_droCount==1`、
+  `P2pDroAckWaitTime`超過後も再送が起きないことを確認)。ACK生成部を
+  一時的に無効化 (`if (false && ...)`)して`m_droCount`が4
+  (1+`P2pDroMaxRetransmissions`既定3) に増えることを確認、ロード
+  ベアリングと確定。
+- 新規`RplP2pDroAckWrongSequenceTestCase`(2ノード構成、
+  `RplP2pDroRetryTestCase`と同じ手法): 合成DIOでnode1をTargetにし、
+  最初のP2P-DRO送信後に**わざと違うSeq**のP2P-DRO-ACKを直接注入、
+  `P2pDroMaxRetransmissions`回すべて再送されること(=ACKが無視された
+  こと)を確認。Seq照合を一時的に無効化して`m_droCount`が3ではなく
+  1のまま(誤ってACK扱いされた)になることを確認、ロードベアリングと
+  確定。
+
+このテスト自体を書く過程で2つのタイミングバグを自己発見・修正した
+(いずれも実装ではなくテストコード側): (1) `SendP2pDro()`の multicast
+送信は`SimpleChannel::Send()`が`Simulator::ScheduleWithContext()`で
+非同期にスケジュールするため、注入直後に`Simulator::Run()`を挟まず
+`m_droCount`を確認すると0のまま — 短い`Simulator::Run()`を挟んで
+解消。(2) 再送1回分しか見込んでいなかった観測窓(0.5秒)が実際には
+`P2pDroMaxRetransmissions=2`回**両方**の再送を許す長さだった
+(100ms間隔で2回分) — 期待値を「両方の再送が起きる」に修正して解消。
+
+### 40.3 見つけたが今回は塞がなかった穴(意図的に空)
+
+- **異常系: Stopフラグ(`stopped`)がその後のP2P mode DIOを正しく
+  拒否することの直接検証**。`ShouldRefuseP2pRdo()`の実装自体は
+  §38で追加済みで、RFC原文どおりに書かれていることは確認済みだが、
+  「S=1を見た後、改善するはずのDIOが実際に拒否される」ことを直接
+  観測するテストは書いていない。時間都合により次回の監査対象として
+  持ち越す。
+- **異常系: 未知のDodagKey宛てP2P-DRO-ACKの静かな破棄**、
+  **異常系: `isTarget=false`または既にACK済みの状態でのACK重複到達**
+  — いずれもコードレビューでは正しく `return` されることを確認済み
+  だが、専用のプローブ/テストは無い。
+
+### 40.4 検証
+
+`./ns3 build`clean、`./test.py -s rpl`PASS、`test-runner --suite=rpl`
+3回連続PASS。追加した2つの新規アサーション(ACK到達確認・Seq不一致
+拒否)はいずれも該当コードを一時的に無効化して失敗することを確認
+済み。

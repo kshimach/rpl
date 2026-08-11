@@ -8062,6 +8062,181 @@ RplP2pDroRetryTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief A P2P-DRO-ACK for the wrong sequence is ignored, not mistaken for
+ *        the one actually outstanding.
+ *
+ * RFC 6997 section 10: "Various fields in a P2P-DRO-ACK message MUST have
+ * the same values as the corresponding fields in the P2P-DRO message" --
+ * HandleP2pDroAck() checks Seq against dodag.p2p.droSequence before
+ * cancelling the retry timer, but nothing so far had actually delivered a
+ * mismatched one to confirm the check bites. Same two-node construction as
+ * RplP2pDroRetryTestCase (@see its own doc comment for why a single
+ * self-rooted node hangs), but this time a P2P-DRO-ACK naming the wrong
+ * Seq is delivered directly (DeliverRawRplMessage()) to node 1 in between
+ * the original P2P-DRO and the point its retry would otherwise fire.
+ */
+class RplP2pDroAckWrongSequenceTestCase : public TestCase
+{
+  public:
+    RplP2pDroAckWrongSequenceTestCase();
+
+  private:
+    void DoRun() override;
+
+    /// @brief Count each P2P-DRO seen at the monitor.
+    /// @param socket the monitoring socket
+    void CaptureDro(Ptr<Socket> socket);
+
+    uint32_t m_droCount{0}; //!< how many times node 1 has sent a P2P-DRO
+};
+
+RplP2pDroAckWrongSequenceTestCase::RplP2pDroAckWrongSequenceTestCase()
+    : TestCase("A P2P-DRO-ACK for the wrong sequence does not cancel the retry")
+{
+}
+
+void
+RplP2pDroAckWrongSequenceTestCase::CaptureDro(Ptr<Socket> socket)
+{
+    Address sender;
+    Ptr<Packet> packet = socket->RecvFrom(sender);
+    if (!packet)
+    {
+        return;
+    }
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ipv6Header);
+    Icmpv6Header icmpv6Header;
+    packet->RemoveHeader(icmpv6Header);
+    if (icmpv6Header.GetType() != ICMPV6_RPL || icmpv6Header.GetCode() != RPL_CODE_P2P_DRO)
+    {
+        return;
+    }
+    m_droCount++;
+}
+
+void
+RplP2pDroAckWrongSequenceTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    rplHelper.Set("P2pDroAckWaitTime", TimeValue(MilliSeconds(100)));
+    rplHelper.Set("P2pDroMaxRetransmissions", UintegerValue(2));
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.AssignWithoutAddress(devices);
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    // Same margin as RplP2pDroRetryTestCase: base RPL's DioIntervalMin
+    // default (4.096 s) means the root's first DIO can take that long.
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    Ptr<Node> node = nodes.Get(1);
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoined(), true, "The base DODAG did not reach node 1");
+
+    Ptr<SimpleNetDevice> dev0 = DynamicCast<SimpleNetDevice>(devices.Get(0));
+    Ptr<SimpleNetDevice> dev1 = DynamicCast<SimpleNetDevice>(devices.Get(1));
+    channel->BlackList(dev0, dev1);
+
+    Ptr<Socket> monitor =
+        Socket::CreateSocket(nodes.Get(0), Ipv6RawSocketFactory::GetTypeId());
+    monitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    monitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    monitor->BindToNetDevice(nodes.Get(0)->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+    monitor->SetRecvCallback(MakeCallback(&RplP2pDroAckWrongSequenceTestCase::CaptureDro, this));
+
+    Ipv6Address origin("2001:9::1"); // no real node owns this address
+    Ipv6Address neighbour("fe80::a");
+    static constexpr uint8_t INSTANCE = 0x81;
+
+    RplDioHeader dio;
+    dio.SetInstanceId(INSTANCE);
+    dio.SetVersionNumber(0);
+    dio.SetRank(RPL_MIN_HOPRANKINC);
+    dio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+    dio.SetGrounded(true);
+    dio.SetDodagId(origin);
+    dio.SetDtsn(0);
+    // @see RplP2pDroRetryTestCase's own comment: without this,
+    // dodag.dioIntervalMin stays at zero and Trickle livelocks.
+    dio.SetDagConfiguration(4, 6, 0, 0, RPL_MIN_HOPRANKINC, RPL_OCP_OF0, RPL_DEFAULT_LIFETIME,
+                            RPL_DEFAULT_LIFETIME_UNIT);
+    P2pRdoOption rdo;
+    rdo.reply = true;
+    rdo.hopByHop = false;
+    rdo.numRoutes = 0;
+    rdo.lifetime = 2; // 16 seconds, comfortably past this test's own window
+    rdo.maxRankOrNh = 3;
+    rdo.target = rpl->GetGlobalAddress(); // node 1 is the Target
+    rdo.addressVector = {};
+    dio.SetP2pRdo(rdo);
+
+    DeliverRawRplMessage<RplDioHeader>(node,
+                                       1,
+                                       dio,
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       neighbour,
+                                       Ipv6Address(RPL_ALL_NODES_MULTICAST));
+
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsP2pTarget(INSTANCE, origin),
+                          true,
+                          "The node did not recognise itself as the Target");
+
+    // SendP2pDro()'s multicast is scheduled onto the channel
+    // (SimpleChannel::Send() uses Simulator::ScheduleWithContext()), not
+    // delivered synchronously, so it needs a short run before the monitor
+    // actually sees it.
+    Simulator::Stop(MilliSeconds(10));
+    Simulator::Run();
+    NS_TEST_ASSERT_MSG_EQ(m_droCount, 1, "The first P2P-DRO was not sent");
+
+    // A P2P-DRO-ACK for Seq 2, when the outstanding one is Seq 1 (the first
+    // and, so far, only cycle HandleP2pRdo() has started): must not be
+    // mistaken for the real one.
+    RplP2pDroAckHeader wrongAck;
+    wrongAck.SetInstanceId(INSTANCE);
+    wrongAck.SetSequence(2);
+    wrongAck.SetDodagId(origin);
+    DeliverRawRplMessage<RplP2pDroAckHeader>(node,
+                                             1,
+                                             wrongAck,
+                                             static_cast<uint8_t>(RPL_CODE_P2P_DRO_ACK),
+                                             neighbour,
+                                             rpl->GetGlobalAddress());
+
+    // Long enough for both retries P2pDroMaxRetransmissions=2 allows to
+    // fire (P2pDroAckWaitTime is 100 ms here, so ~100 ms and ~200 ms after
+    // the original) if the wrong-sequence ack had (incorrectly) cancelled
+    // the cycle, none would.
+    Simulator::Stop(Seconds(0.5));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(m_droCount,
+                          3,
+                          "The wrong-sequence P2P-DRO-ACK cancelled the retry cycle: the "
+                          "Target should have retried both times by now (the original plus "
+                          "P2pDroMaxRetransmissions=2), exactly as if no ack had arrived at "
+                          "all");
+
+    monitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief A P2P-RPL discovery completes end to end: the P2P-DRO relays back
  *        along the trimmed Address Vector, the Origin stores an
  *        Origin-outward route from it, and the route carries data.
@@ -8104,13 +8279,51 @@ class RplP2pRouteCompletesTestCase : public TestCase
     /// @param socket the sending socket
     void SendOne(Ptr<Socket> socket);
 
+    /// @brief Count each P2P-DRO seen at the monitor that came from the
+    ///        Target itself (not a relay's own re-transmission of it) --
+    ///        proves the P2P-DRO-ACK this scenario's default
+    ///        P2pDroAckRequested=true actually reaches the Target and
+    ///        P2pDroRetry() has nothing to retry, the one thing this
+    ///        class's own end-to-end setup had never checked.
+    /// @param socket the monitoring socket
+    void CaptureDro(Ptr<Socket> socket);
+
     uint32_t m_delivered{0}; //!< datagrams that reached the Target
     int m_sendResult{0};     //!< what Socket::Send() returned, -1 on refusal
+    Ipv6Address m_targLinkLocal; //!< set before Simulator::Run(), filters CaptureDro()
+    uint32_t m_droCount{0};      //!< how many times the Target has sent a P2P-DRO
 };
 
 RplP2pRouteCompletesTestCase::RplP2pRouteCompletesTestCase()
     : TestCase("A P2P-RPL P2P-DRO returns a source route that carries data end to end")
 {
+}
+
+void
+RplP2pRouteCompletesTestCase::CaptureDro(Ptr<Socket> socket)
+{
+    Address sender;
+    Ptr<Packet> packet = socket->RecvFrom(sender);
+    if (!packet)
+    {
+        return;
+    }
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ipv6Header);
+    if (ipv6Header.GetSource() != m_targLinkLocal)
+    {
+        // relay2 relays every P2P-DRO it receives onward (NH decremented),
+        // the same reason RplP2pDroRetryTestCase's own CaptureDro() filters
+        // by source.
+        return;
+    }
+    Icmpv6Header icmpv6Header;
+    packet->RemoveHeader(icmpv6Header);
+    if (icmpv6Header.GetType() != ICMPV6_RPL || icmpv6Header.GetCode() != RPL_CODE_P2P_DRO)
+    {
+        return;
+    }
+    m_droCount++;
 }
 
 void
@@ -8180,6 +8393,18 @@ RplP2pRouteCompletesTestCase::DoRun()
 
     NS_TEST_ASSERT_MSG_EQ(orig->GetP2pRouteCount(), 0, "A route exists before any discovery");
 
+    // Watching from relay2, the same vantage RplP2pDroGeneratedTestCase and
+    // RplP2pDroRetryTestCase use, filtered to P2P-DROs that came from the
+    // Target itself.
+    m_targLinkLocal = nodes.Get(3)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ptr<Socket> droMonitor =
+        Socket::CreateSocket(nodes.Get(2), Ipv6RawSocketFactory::GetTypeId());
+    droMonitor->SetAttribute("Protocol",
+                             UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    droMonitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    droMonitor->BindToNetDevice(nodes.Get(2)->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+    droMonitor->SetRecvCallback(MakeCallback(&RplP2pRouteCompletesTestCase::CaptureDro, this));
+
     RplRoutingProtocol::DodagKey key = orig->DiscoverP2pRoute(targAddress);
     NS_TEST_ASSERT_MSG_NE(key.dodagId, Ipv6Address::GetAny(), "The discovery did not start");
 
@@ -8198,6 +8423,26 @@ RplP2pRouteCompletesTestCase::DoRun()
     NS_TEST_ASSERT_MSG_EQ(hops[1], relay2Address, "Wrong second hop");
     NS_TEST_ASSERT_MSG_EQ(hops[2], targAddress, "The route does not end at the Target");
     NS_TEST_ASSERT_MSG_EQ(orig->GetP2pRouteCount(), 1, "Wrong number of routes");
+
+    // The Origin's P2pDroAckRequested default is true, so getting this far
+    // (the route above is only recorded once the Origin processes the
+    // P2P-DRO) already means it should have generated and unicast a
+    // P2P-DRO-ACK -- confirmed by there being exactly one P2P-DRO from the
+    // Target, not the up-to-four (1 + P2pDroMaxRetransmissions) an
+    // unacknowledged one would produce (@see RplP2pDroRetryTestCase). Run
+    // well past P2pDroAckWaitTime's 1 s default to be sure a retry was not
+    // simply still pending.
+    NS_TEST_ASSERT_MSG_EQ(m_droCount,
+                          1,
+                          "The Target retried its P2P-DRO, meaning the P2P-DRO-ACK never "
+                          "arrived or was not recognised");
+    Simulator::Stop(Seconds(2));
+    Simulator::Run();
+    NS_TEST_ASSERT_MSG_EQ(m_droCount,
+                          1,
+                          "A P2P-DRO retry appeared after the fact: the ack did not actually "
+                          "cancel P2pDroRetry()'s timer");
+    droMonitor->Close();
 
     // Source routing keeps no per-hop state.
     NS_TEST_ASSERT_MSG_EQ(relay1->GetP2pRouteCount(), 0, "relay1 recorded a route it should not");
@@ -12840,6 +13085,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplP2pMaxRankTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pDroGeneratedTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pDroRetryTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pDroAckWrongSequenceTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pRouteCompletesTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pDroRelayTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pAddressVectorFullTestCase, TestCase::Duration::QUICK);
