@@ -4355,18 +4355,148 @@ DODAGVersionNumber をインクリメントして新しい Version の DIO を�
 処理。RFC 6550 section 8.2.2.1 では、グローバル修復を発動するのは
 root の裁量 (policy) であり、発動条件そのものは RFC が規定していない。
 
-### 37.6 未着手 (次の作業項目)
+### 37.6 root 側の起動契機を実装: `GlobalRepairInterval`
 
-この節は測定と原因特定までで、修正は行っていない。実装時の論点:
+37.5 の残タスクのうち、発動 policy を周期的なものに決めて実装した。
+RFC 6550 section 18.2.5 が "A RPL implementation SHOULD allow
+configuring whether or not periodic or event triggered mechanisms are
+used by the DODAG root to control DODAGVersionNumber change" と、
+"periodic" と "event triggered" の 2 択を名指ししており、後者は
+`INFINITE_RANK` を広告する子の数を数える等の検出ロジックを新設する
+必要があるのに対し、前者は既存の Timer パターン (`daoRetryEvent` 等)
+をそのまま転用できるため、今回は周期的な方を選んだ。
 
-- **発動条件の設計**: RFC が規定していないため、このモジュール独自の
-  policy を決める必要がある。「`INFINITE_RANK` を広告する子が一定数を
-  超えたら」「一定周期で」等。周期的な発動は DIO の Trickle をリセット
-  させるので、コストと回復性のトレードオフになる。
-- **ローカル修復 (RFC 6550 section 8.2.2.2) との切り分け**: こちらも
-  未実装。グローバル修復だけで 37.2 の症状が解消するかは実装後に同じ
-  プローブで再測定して確かめる (今回の教訓どおり、推定で済ませない)。
-- **検証は 100 ノード / 200 m 四方 / 12000 s / トラフィック無しで、
-  OF0 と MRHOF の両方**。参加ノード数が減少しないこと、avgRank が
-  頭打ちになることの 2 点を見る。30 ノードでは再現しないので回帰
-  テストには使えない。
+**実装**: `DodagMembership::globalRepairEvent` (Timer,
+CANCEL_ON_DESTROY) を新設し、`CreateDodagMembership()` でこのノードが
+root になる DODAG のうち route-discovery インスタンス
+(`mop == RPL_MOP_P2P_ROUTE_DISCOVERY`、AODV-RPL/P2P-RPL の一時 DAG) を
+除く全てにバインドした -- 一時 DAG は自分の 'L' で自然終了する設計
+なので、グローバル修復の概念自体を持たない (RFC 6997/9854 のどちらも
+言及がない)。新設 `GlobalRepairInterval` attribute (Time) で周期を
+設定でき、既定値 `Time::Max()` はバインド自体をスキップする (Timer を
+一切 arm しない) ことで無効化を表現し、既存の全シナリオ・全テストに
+対して完全な no-op を保証した。`GlobalRepairFire()` は
+`dodag.version++` (26/27 節で dtsn/pathSequence に対して既に採用して
+いる素朴な wraparound インクリメントと同じ流儀 -- lollipop の循環
+領域境界 (127 -> 0) を厳密には再現しないが、`RplSequenceCompare()` の
+window (16) が単発の +1 増分を全ての境界で正しく "newer" と判定する
+ことをコード上でトレース済み、@see 37.7 のコメントで残した根拠) の後
+`dioTrickle.Reset()` で即時伝播させ、次回を再スケジュールする。
+`LeaveDodag()` にも `globalRepairEvent.Cancel()` を追加した。
+
+`./ns3 build rpl` clean、`test-runner --suite=rpl` 全件 PASS
+(既定で無効なので当然だが確認した)。
+
+### 37.7 実測: 37 節の測定条件 (100 ノード) では効果ゼロ、原因は root 自身がほぼ聞かれていないこと
+
+`GlobalRepairInterval=300s` を設定し、37.2 と全く同じ条件 (100 ノード /
+200 m 四方 / 12000 s / トラフィック無し / OF0) で再測定したところ、
+**サンプル値が小数点まで無修正のベースラインと完全に一致した**
+(`diff` で `IDENTICAL`)。同条件を再現性確認のため再実行しても同じ結果。
+修復が一切効いていない。
+
+原因を切り分けるため、`SendDio()` に一時的な診断出力を挿入して root
+自身の送信を直接追跡したところ、`GlobalRepairFire()` は設計どおり
+`dodag.version` をインクリメントし、`dioTrickle.Reset()` 後
+数秒でちゃんと `SendDio()` を呼んでいた (t=303s, 604s, 904s に
+version=1,2,3 で送信)。**送信は起きている。** 一方、`HandleDio()` の
+migration 分岐にも同様の診断出力を仕込んで数えたところ、**この
+100 ノードシナリオ全体を通して、どのノードも一度も root 発の
+DIO を version 0 の初回バースト (t=3.14s) 以降、一度も受信していない**
+ことが判明した -- これは新しい repair 由来の DIO に限らず、37.2
+以前から存在する **root の通常の Trickle 再送 (t=10.85s, 21.5s, ...)
+も含めて** 誰にも届いていない。同じ時間帯に他の中継ノード
+(fe80::ff:fe00:a 等) の DIO は複数ノードに問題なく届いており、
+root 特有の現象だった。
+
+### 37.8 根本原因: LR-WPAN のチャネル輻輳と、root の Trickle が伸び切ったまま戻らない構造の複合
+
+`LrWpanCsmaCa` を `level_debug` で有効化すると (`NS_LOG_DEBUG("Channel
+access failure")`, `lr-wpan-csmaca.cc:504`)、この密度では CSMA-CA の
+バックオフ枯渇による送信断念が実際に多数発生していることを確認した:
+30/100 ノード規模で先頭 25 秒間の失敗件数を数えると
+5 / 21 / 31 / 52 / 54 / 76 / 107 / 341 (ノード数 30, 40, 50, 60, 70,
+80, 90, 100) と密度に対して単調に悪化する。
+
+これ単体なら「輻輳した無線環境ではよくある話」で済むが、決定的なのは
+**root だけがこの影響を非対称に受ける構造上の理由がある**こと:
+`HandleDio()` の先頭 (1274 行付近) は "この DIO は自分が root の
+DODAG 宛て" なら即 return するガードを持つ -- root が自分自身の
+DODAG に誤って join するのを防ぐためのものだが、副作用として **root
+は自分の DODAG について飛び交う DIO を一切処理しない**。他の全ての
+ノードは、近隣の DIO を聞くたびに Trickle の
+`ConsistencyHit()`/`Reset()` が (HandleDio() 後半の通常経路を通じて)
+働きうるのに対し、root の `dioTrickle` にはそれが一切効かない。結果、
+root の Trickle 間隔は起動直後から一方的に伸び続け、数百秒で
+Imax (既定 `RPL_DIO_INTERVAL_DOUBLINGS=8`, Imin=4.096s なら
+Imax=1048.576s) に達したきり、二度と Imin に戻らない -- **リセットする
+契機は今回追加した `GlobalRepairFire()` の明示的な `.Reset()` 呼び
+出ししかない**。
+
+この 2 つが組み合わさると: root は「他のどのノードよりも稀にしか送信
+しない参加者」になった状態で、輻輳したチャネルへ送信を試みることになる。
+CSMA-CA のバックオフ枯渇はどの送信者にも起こりうるが、**次のチャンスが
+最大 Imax 秒後になる root にとっては、1 回の失敗の代償が他のどの
+ノードより大きい**。しかも Trickle 自身は `TransmitEvent()` が
+`m_callback()` を同期的に呼んだ時点で「送信した」ことにして
+`IntervalEvent()` へ進み、実際の無線送信が CSMA-CA レベルで成功したか
+どうかを一切フィードバックしない (`SendRplMessageOn()` も
+`Socket::SendTo()` の戻り値を見ていない) -- 失敗は完全にサイレントで、
+Trickle 側の間隔はダブリングを続ける。稀にしか送らない上に、送った
+という記録だけが残り実際には届いていない状態が、指数関数的に間隔が
+伸びる中で積み重なる。
+
+### 37.9 実測: 50/70/100 ノードいずれでも `GlobalRepairInterval` に観測可能な効果なし
+
+37.8 の仮説を検証するため、輻輳の少ない密度で baseline (repair 無効)
+と repair 有効を同一条件で比較した (Imin=300s、8000s または 6000s、
+トラフィック無し、OF0):
+
+- **100 ノード** (37.7 と同条件、12000 s): `IDENTICAL`
+- **70 ノード** (6000 s): t=2400s から baseline が既に劣化開始
+  (70 -> 61)、repair 有効版は **全サンプル点で baseline と完全一致**
+- **50 ノード** (8000 s): t=5200s から baseline が劣化開始 (50 -> 43)、
+  repair 有効版は **全サンプル点で baseline と完全一致**
+
+30 ノード規模でも起動直後に 5 件の Channel access failure が観測される
+(37.8) ため、輻輳が完全にゼロの条件は用意できていない -- 3 つの密度
+全てで repair の効果が測定できなかったのは、37.8 の機序 (root の
+Trickle が Imax に張り付いたまま戻らないため、稀な送信 1 回の失敗の
+代償が非常に大きい) が、この規模のシナリオが持つ最小限の輻輳だけでも
+再現するほど鋭敏であることを示している。
+
+### 37.10 結論と次の課題
+
+`GlobalRepairInterval` はコード上・RFC 準拠上は正しく動作する
+(root 側の version インクリメント・Trickle リセット・再送スケジュール、
+受信側の migration 処理は全て実装どおりに動く。単体では検証できている)。
+しかし **今回試した 50/70/100 ノードのいずれの密度でも、実際に
+観測可能な形でノード脱落を防ぐ効果は確認できなかった**。原因は
+このモジュール固有の脆弱性 (root の Trickle が他のどのノードとも違う
+扱いを受け、一方的に伸び切ったまま戻らない) と、LR-WPAN の
+CSMA-CA 輻輳という 2 つの要因の組み合わせであり、後者は
+`contrib/rpl` の外側 (`src/lr-wpan`) の一般的な特性のため、この
+モジュール単独では制御できない。
+
+**今回はここまでとし、修正は次の課題として残す**。手を付けるとすれば
+有力な方向は次の 2 つ (どちらも未検証、思いつきの案として記録するに
+留める):
+
+- **root の `dioTrickle` にも通常の consistency/inconsistency の
+  仕組みを適用する**: `HandleDio()` 冒頭の "root は自分の DODAG 宛て
+  DIO を無視する" ガードが、root の Trickle を他のノードと非対称に
+  扱っている直接の原因。ガード自体は自己 join 防止に必要だが、
+  Trickle の Reset()/ConsistencyHit() だけは通す形に分離できれば、
+  root の間隔が Imax に張り付いたままにならず、CSMA-CA の輻輳下でも
+  再送の機会が他のノードと同程度の頻度で得られる可能性がある。
+- **`GlobalRepairFire()` に配送確認・再送を持たせる**: 現状は
+  DAO-ACK のような確認応答の仕組みが無く、Trickle が 1 回
+  `SendDio()` を呼んだら送達したものとして扱う。DAO-ACK 相当の
+  ack/retry を Global Repair 自身に持たせれば、CSMA-CA レベルの
+  1 回の失敗をこの層で吸収できる可能性がある。ただしこれは新しい
+  確認応答プロトコルの新設に近く、コストは小さくない。
+
+検証には `scratch/rpl-rank-stability-probe.cc` 相当のプローブ (使い
+捨て、この節の作業で作成・削除済み) を再現すればよい: 100 ノード /
+200 m 四方の `RandomRectanglePositionAllocator`、無トラフィック、
+一定間隔で `GetRank()` を全ノードから採取。

@@ -329,7 +329,25 @@ RplRoutingProtocol::GetTypeId()
                           "3 for 64 s.",
                           UintegerValue(2),
                           MakeUintegerAccessor(&RplRoutingProtocol::m_p2pLifetime),
-                          MakeUintegerChecker<uint8_t>(0, 3));
+                          MakeUintegerChecker<uint8_t>(0, 3))
+            .AddAttribute("GlobalRepairInterval",
+                          "How often a root institutes a Global Repair (RFC 6550 section 3.2.2) "
+                          "on a DODAG it roots, by incrementing its DODAGVersionNumber -- never "
+                          "for a route-discovery instance (AODV-RPL/P2P-RPL), which already "
+                          "self-terminates on its own 'L' deadline. RFC 6550 leaves the trigger "
+                          "to root policy (section 8.2.2.1) and section 18.2.5 names 'periodic' "
+                          "as one of the two configurable choices, which this is. Exists because "
+                          "this module implements the detecting half of RFC 6550 section "
+                          "8.2.2.4 rule 3 (a node whose Rank would exceed L + DAGMaxRankIncrease "
+                          "advertises INFINITE_RANK) but not the recovering half: with no Global "
+                          "Repair ever incrementing the DODAGVersionNumber, a node that trips "
+                          "that bound never gets to reset L and stays stuck advertising "
+                          "INFINITE_RANK permanently. Time::Max(), the default, disables this "
+                          "attribute -- a no-op change from every prior release; @see "
+                          "design-constraints.md section 37.",
+                          TimeValue(Time::Max()),
+                          MakeTimeAccessor(&RplRoutingProtocol::m_globalRepairInterval),
+                          MakeTimeChecker());
     return tid;
 }
 
@@ -571,6 +589,18 @@ RplRoutingProtocol::CreateDodagMembership(DodagKey key, uint8_t mop)
         dodag.dioTrickle.AssignStreams(m_dioTrickleStream);
     }
     dodag.dioTrickle.Start();
+
+    // Never for a route-discovery instance (@see DodagMembership::
+    // globalRepairEvent), and left unarmed entirely when the attribute is
+    // disabled rather than scheduled at Time::Max(): Timer::Schedule() adds
+    // the delay to Simulator::Now(), and Time::Max() is already the
+    // largest representable Time, so that addition would overflow.
+    if (mop != RPL_MOP_P2P_ROUTE_DISCOVERY && m_globalRepairInterval != Time::Max())
+    {
+        dodag.globalRepairEvent.SetFunction(&RplRoutingProtocol::GlobalRepairFire, this);
+        dodag.globalRepairEvent.SetArguments(key);
+        dodag.globalRepairEvent.Schedule(m_globalRepairInterval);
+    }
 
     if (!m_hasBaseDodag && mop != RPL_MOP_P2P_ROUTE_DISCOVERY)
     {
@@ -1677,6 +1707,7 @@ RplRoutingProtocol::LeaveDodag(DodagKey key, bool poison)
     dodag.dioTrickle.Stop();
     dodag.daoEvent.Cancel();
     dodag.daoRetryEvent.Cancel();
+    dodag.globalRepairEvent.Cancel();
     m_dodags.erase(it);
 
     if (poison && m_hasBaseDodag && m_baseDodagKey == key)
@@ -1899,6 +1930,44 @@ RplRoutingProtocol::DaoRetry(DodagKey key)
 
     dodag.daoRetryEvent.Cancel();
     dodag.daoRetryEvent.Schedule(m_daoAckTimeout);
+}
+
+void
+RplRoutingProtocol::GlobalRepairFire(DodagKey key)
+{
+    auto it = m_dodags.find(key);
+    if (it == m_dodags.end())
+    {
+        return;
+    }
+    DodagMembership& dodag = it->second;
+
+    NS_LOG_FUNCTION(this << +dodag.instanceId << dodag.dodagId << +dodag.version);
+    NS_ASSERT_MSG(dodag.isRoot,
+                 "GlobalRepairFire() fired for a DODAG membership this node does not root");
+
+    // RFC 6550 section 3.2.2: "A DODAG root institutes a global repair
+    // operation by incrementing the DODAGVersionNumber." A plain wraparound
+    // increment, the same simplification section 26/27 already made for
+    // dtsn/pathSequence: not a faithful lollipop increment (section 7.2's
+    // circular region wraps 127 back to 0, not into the linear region this
+    // takes it through instead), but every receiver compares versions with
+    // RplSequenceNewer() rather than '>', so the wrap this produces is still
+    // read correctly as "newer" once it lands (rule 4's NOT_COMPARABLE case
+    // does not arise here: this node's own held version is always the one
+    // just incremented, one step away by construction).
+    dodag.version++;
+
+    NS_LOG_INFO("Global repair: DODAG " << dodag.dodagId << " moved to version "
+                                        << +dodag.version);
+
+    // A version change is exactly the kind of DODAG-wide inconsistency
+    // Trickle exists to spread quickly, the same reasoning HandleDio()
+    // already applies to a received version change (dioTrickle.Reset() at
+    // the migration branch above).
+    dodag.dioTrickle.Reset();
+
+    dodag.globalRepairEvent.Schedule(m_globalRepairInterval);
 }
 
 void

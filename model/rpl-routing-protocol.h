@@ -752,6 +752,25 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
         Timer daoEvent{Timer::CANCEL_ON_DESTROY};      //!< schedules the periodic DAO
         Timer daoRetryEvent{Timer::CANCEL_ON_DESTROY}; //!< schedules the retry of an unacknowledged DAO
 
+        /**
+         * @brief Paces this node's own periodic Global Repair, root only.
+         *
+         * RFC 6550 section 3.2.2: "A DODAG root institutes a global repair
+         * operation by incrementing the DODAGVersionNumber." Section 8.2.2.1
+         * leaves the trigger to root policy, and section 18.2.5 lists
+         * "periodic or event triggered" as the two configurable choices --
+         * GlobalRepairFire() is the periodic one. Bound in
+         * CreateDodagMembership() only for a DODAG this node roots that is
+         * not a route-discovery instance (mop != RPL_MOP_P2P_ROUTE_DISCOVERY):
+         * an AODV-RPL/P2P-RPL temporary DAG already self-terminates on its
+         * own 'L' deadline and RFC 6997/9854 have no global repair concept of
+         * their own. Left unarmed (never scheduled) when
+         * m_globalRepairInterval is Time::Max(), the default -- see
+         * design-constraints.md section 37 for the count-to-infinity bug
+         * this exists to recover from.
+         */
+        Timer globalRepairEvent{Timer::CANCEL_ON_DESTROY};
+
         /// The root only: which parent each node reports sitting under.
         std::map<Ipv6Address, TopologyEntry> topology;
 
@@ -1415,6 +1434,19 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     void DaoRetry(DodagKey key);
 
     /**
+     * @brief Institute a Global Repair (RFC 6550 section 3.2.2): move this
+     *        node's own DODAG to a new Version and reschedule the next one.
+     *
+     * Root only, and only for a DODAG this node roots -- globalRepairEvent
+     * is never bound otherwise. @see DodagMembership::globalRepairEvent for
+     * why this is periodic rather than event-triggered, and
+     * design-constraints.md section 37 for the bug this recovers from.
+     *
+     * @param key identifies which DODAG membership's repair timer fired
+     */
+    void GlobalRepairFire(DodagKey key);
+
+    /**
      * @brief Act on a received DAO. Only the root ever gets one.
      * @param dao the DAO
      * @param from the address of the node that advertised itself
@@ -1843,6 +1875,13 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     uint8_t m_daoRetries;    //!< how many times an unacknowledged DAO is resent
     uint8_t m_pathLifetime;  //!< lifetime this node advertises, in lifetime units
     uint16_t m_lifetimeUnit; //!< the unit of the path lifetime, in seconds
+
+    /// How often a root institutes a Global Repair on a DODAG it roots, by
+    /// incrementing its DODAGVersionNumber (RFC 6550 section 3.2.2).
+    /// Time::Max(), the default, disables it -- GlobalRepairFire() is never
+    /// armed at all, so this is a no-op change from every prior release.
+    /// @see DodagMembership::globalRepairEvent.
+    Time m_globalRepairInterval;
 
     Ipv6Address m_rootPrefix;    //!< the root's own GUA/ULA prefix (RootPrefix attribute)
     uint8_t m_rootPrefixLength; //!< prefix length of m_rootPrefix, in bits
