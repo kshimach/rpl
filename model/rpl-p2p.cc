@@ -168,6 +168,17 @@ RplRoutingProtocol::ShouldRefuseP2pRdo(const RplDioHeader& dio, Ipv6Address from
 {
     DodagKey key{dio.GetInstanceId(), dio.GetDodagId()};
 
+    // RFC 6997 sections 8/9.6/9.7: once a P2P-DRO with 'S' = 1 has been seen
+    // for this temporary DAG, "SHOULD NOT...process any more DIOs" for it --
+    // @see DodagMembership::P2pState::stopped's own comment for the other
+    // half (not generating any more).
+    auto existing = m_dodags.find(key);
+    if (existing != m_dodags.end() && existing->second.p2p.stopped)
+    {
+        NS_LOG_LOGIC("Refusing a P2P mode DIO for a temporary DAG that has already stopped");
+        return true;
+    }
+
     // The structural counterpart of ShouldRefuseAodvInstance()'s own
     // self-DODAGID check, without the REJOIN_REENABLE bar: RFC 6997 does
     // not mention rejoining a temporary DAG, but once this node's own
@@ -525,6 +536,45 @@ RplRoutingProtocol::HandleP2pDro(const RplP2pDroHeader& dro, Ipv6Address from, u
 
         NS_LOG_INFO("P2P-RPL route discovery to " << rdo.target << " completed over "
                                                    << route.hops.size() << " hop(s)");
+
+        // RFC 6997 section 9.7: "If the A flag is set to one...the Origin
+        // MUST generate a P2P-DRO-ACK message...and unicast the message to
+        // the Target." Fields are copied straight from the P2P-DRO, per
+        // section 10's "MUST have the same values as the corresponding
+        // fields in the P2P-DRO message". The route just recorded above
+        // resolves the unicast: RouteOutput()'s own P2P route lookup (@see
+        // GetP2pRoute()) finds it by rdo.target, the same way ordinary
+        // application traffic to a freshly discovered P2P-RPL target does.
+        if (dro.GetAckRequested())
+        {
+            RplP2pDroAckHeader ack;
+            ack.SetInstanceId(dro.GetInstanceId());
+            ack.SetSequence(dro.GetSequence());
+            ack.SetDodagId(dro.GetDodagId());
+
+            Ptr<Packet> ackPacket = Create<Packet>();
+            ackPacket->AddHeader(ack);
+            SendRplMessageUnicast(ackPacket, RPL_CODE_P2P_DRO_ACK, rdo.target);
+
+            NS_LOG_INFO("Acknowledging the P2P-DRO from " << rdo.target << " (Seq "
+                                                           << +dro.GetSequence() << ")");
+        }
+
+        // RFC 6997 section 9.7: "If the Stop flag...is set to one, the
+        // Origin SHOULD NOT generate any more DIOs for this temporary DAG
+        // and SHOULD cancel any pending DIO transmissions." Only the
+        // "SHOULD NOT...generate" half is implemented, via
+        // ShouldRefuseP2pRdo()'s own stopped check refusing this node's own
+        // rejoin/reprocessing path -- not dioTrickle.Stop() itself. Calling
+        // that here was tried and reverted: it silences this node's DIOs
+        // for the temporary DAG immediately, but a downstream router whose
+        // preferredParent is this node is still an ordinary DodagMembership
+        // as far as the generic staleness sweep in SelectPreferredParent()
+        // is concerned, and going silent reads to it as "parent died", not
+        // "discovery is over" -- it loses its last parent and poisons
+        // itself out within a few Trickle intervals, well before its own
+        // 'L' deadline. @see design-constraints.md.
+        dodag.p2p.stopped = dodag.p2p.stopped || dro.GetStop();
         return;
     }
 
@@ -579,6 +629,52 @@ RplRoutingProtocol::HandleP2pDro(const RplP2pDroHeader& dro, Ipv6Address from, u
 
     NS_LOG_INFO("Relaying a P2P-DRO for " << rdo.target << " onward, NH now "
                                           << +relayedRdo.maxRankOrNh);
+
+    // RFC 6997 section 9.6: same Stop handling as the Origin branch above
+    // (@see its own comment for why dioTrickle.Stop() is deliberately not
+    // called here), after relaying rather than before -- relaying this
+    // P2P-DRO is unaffected by its own Stop flag, the same "P2P-DRO
+    // processing continues regardless" rule.
+    dodag.p2p.stopped = dodag.p2p.stopped || dro.GetStop();
+}
+
+void
+RplRoutingProtocol::HandleP2pDroAck(const RplP2pDroAckHeader& ack, Ipv6Address from)
+{
+    NS_LOG_FUNCTION(this << from);
+
+    // Resolved by the DODAG the P2P-DRO-ACK itself names, the same reason
+    // HandleDaoAck() does: with more than one temporary DAG's own P2P-DRO
+    // pending an ack at once, a P2P-DRO-ACK naming one must not be applied
+    // to a different membership's droAckPending/droRetryEvent.
+    auto it = m_dodags.find(DodagKey{ack.GetInstanceId(), ack.GetDodagId()});
+    if (it == m_dodags.end())
+    {
+        NS_LOG_LOGIC("Dropping a P2P-DRO-ACK for a temporary DAG this node is not part of");
+        return;
+    }
+    DodagMembership& dodag = it->second;
+
+    if (!dodag.p2p.isTarget || !dodag.p2p.droAckPending)
+    {
+        NS_LOG_LOGIC("Not waiting on a P2P-DRO-ACK for this temporary DAG, dropping");
+        return;
+    }
+
+    if (ack.GetSequence() != dodag.p2p.droSequence)
+    {
+        // A stale ack for a P2P-DRO this node has since superseded (a newer
+        // DIO arrived and HandleP2pRdo() started a fresh cycle with its own
+        // Seq), or a misdirected one.
+        NS_LOG_LOGIC("Ignoring a P2P-DRO-ACK for sequence "
+                    << +ack.GetSequence() << ", waiting for " << +dodag.p2p.droSequence);
+        return;
+    }
+
+    dodag.p2p.droRetryEvent.Cancel();
+    dodag.p2p.droAckPending = false;
+
+    NS_LOG_INFO("P2P-DRO-ACK received for sequence " << +ack.GetSequence() << " from " << from);
 }
 
 bool

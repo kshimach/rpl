@@ -952,6 +952,13 @@ RplRoutingProtocol::RecvRpl(Ptr<Socket> socket)
         HandleP2pDro(dro, from, interface);
         break;
     }
+    case RPL_CODE_P2P_DRO_ACK: {
+        RplP2pDroAckHeader droAck;
+        packet->RemoveHeader(droAck);
+        NS_LOG_INFO("Received a P2P-DRO-ACK from " << from);
+        HandleP2pDroAck(droAck, from);
+        break;
+    }
     default:
         NS_LOG_WARN("Unsupported RPL message code " << +icmpv6Header.GetCode() << " from " << from);
         break;
@@ -1324,6 +1331,30 @@ RplRoutingProtocol::HandleDio(const RplDioHeader& dio,
         // rather than GetBaseDodag(): the old base-only version of this
         // check let a local DODAG's own re-advertised DIO reach its root
         // and be treated as an ordinary join candidate, a self-loop.
+        return;
+    }
+
+    if (IsOwnAddress(from))
+    {
+        // The same self-loop the check above guards against, but for a
+        // DODAG this node does not root: an ordinary (non-root) member of a
+        // temporary DAG hearing its own just-multicast DIO echoed back.
+        // Confirmed happening for real while debugging
+        // RplP2pDroRetryTestCase: a node's own multicast is delivered back
+        // to its own raw ICMPv6 socket independently of the L2 channel
+        // (SimpleChannel::Send() itself excludes the sending device), the
+        // same self-reception RplP2pFloodTestCase's own trace already shows
+        // for a P2P-DRO. Left unguarded, this reaches the generic
+        // parent-map update and SelectPreferredParent() below with from ==
+        // this node's own address; a genuinely unbounded temporary DAG's
+        // own Trickle re-arming from that spurious "parent" is a livelock
+        // risk this session hit once already for an unrelated reason (a
+        // fixture-DIO's missing DODAG Configuration option leaving
+        // dioIntervalMin at zero, @see design-constraints.md), but this
+        // guard is not itself proven load-bearing against the current test
+        // suite -- kept as a proactive fix for a confirmed hazard, the same
+        // reasoning as the isRoot check just above it, not one a specific
+        // regression currently forces.
         return;
     }
 

@@ -7880,12 +7880,27 @@ RplP2pDroGeneratedTestCase::DoRun()
  * @brief An unacknowledged P2P-DRO is retransmitted up to
  *        P2pDroMaxRetransmissions times, then abandoned.
  *
- * Same four-node line and topology as RplP2pDroGeneratedTestCase, but with
- * nothing processing the P2P-DRO-ACK yet (that is HandleP2pDroAck(), a
- * later increment's job), so every P2P-DRO the Target sends here goes
- * unacknowledged by construction -- exactly the condition P2pDroRetry() is
- * meant to handle. P2pDroAckWaitTime and P2pDroMaxRetransmissions are set
- * to small values so the test does not have to wait out the 1 s default.
+ * Two nodes: node 0 the base-RPL root, purely a monitor here; node 1 the
+ * node under test, fed a fabricated P2P mode DIO directly
+ * (DeliverRawRplMessage()) naming it the Target and an Origin address
+ * ("2001:9::1") that belongs to no real node in the topology -- nobody
+ * can ever answer with a P2P-DRO-ACK, however many times node 1 retries,
+ * which is exactly the condition P2pDroRetry() is meant to handle.
+ *
+ * The channel is blacklisted one-way (0 -> 1 only, SimpleChannel::
+ * BlackList()'s block is unidirectional) once the base DODAG has formed:
+ * node 1's own transmissions still reach node 0's monitor, but node 0
+ * (which is not part of the fabricated temporary DAG, but would
+ * otherwise join it as an ordinary Intermediate Router the first time it
+ * hears one of node 1's re-broadcasts) can never answer back. Without
+ * this, an earlier version of this test used a single self-rooted node
+ * instead and hung: SimpleNetDevice's local delivery lets a node hear its
+ * own multicast, and each such self-reception fed straight back into
+ * SelectPreferredParent(), triggering dioTrickle.Reset() and an immediate
+ * re-transmission at the same simulated instant with no advancing time in
+ * between -- a livelock, not a crash, so Simulator::Run() never returned.
+ * P2pDroAckWaitTime and P2pDroMaxRetransmissions are set to small values
+ * so the test does not have to wait out the 1 s default.
  */
 class RplP2pDroRetryTestCase : public TestCase
 {
@@ -7895,13 +7910,11 @@ class RplP2pDroRetryTestCase : public TestCase
   private:
     void DoRun() override;
 
-    /// @brief Count each P2P-DRO seen at the monitor that came from the
-    ///        Target itself (not a relay's own re-transmission of it).
+    /// @brief Count each P2P-DRO seen at the monitor.
     /// @param socket the monitoring socket
     void CaptureDro(Ptr<Socket> socket);
 
-    Ipv6Address m_targLinkLocal; //!< set before Simulator::Run(), filters CaptureDro()
-    uint32_t m_droCount{0};      //!< how many times the Target has sent a P2P-DRO
+    uint32_t m_droCount{0}; //!< how many times node 1 has sent a P2P-DRO
 };
 
 RplP2pDroRetryTestCase::RplP2pDroRetryTestCase()
@@ -7920,16 +7933,6 @@ RplP2pDroRetryTestCase::CaptureDro(Ptr<Socket> socket)
     }
     Ipv6Header ipv6Header;
     packet->RemoveHeader(ipv6Header);
-    if (ipv6Header.GetSource() != m_targLinkLocal)
-    {
-        // relay2 is itself a full RPL node and relays every P2P-DRO it
-        // receives onward (NH decremented) -- without this filter, the
-        // monitor on relay2's own interface would count that relayed copy
-        // too, exactly the reason RplP2pDroGeneratedTestCase's own
-        // CaptureDro() has an m_seenDro guard (a single capture does not
-        // need to tell the two apart; a count does).
-        return;
-    }
     Icmpv6Header icmpv6Header;
     packet->RemoveHeader(icmpv6Header);
     if (icmpv6Header.GetType() != ICMPV6_RPL || icmpv6Header.GetCode() != RPL_CODE_P2P_DRO)
@@ -7943,21 +7946,11 @@ void
 RplP2pDroRetryTestCase::DoRun()
 {
     NodeContainer nodes;
-    nodes.Create(4); // 0 = Origin and base root, 1 and 2 = relays, 3 = Target
+    nodes.Create(2);
 
     Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
     SimpleNetDeviceHelper simpleNetDevice;
     NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
-
-    auto blacklist = [&](uint32_t a, uint32_t b) {
-        Ptr<SimpleNetDevice> devA = DynamicCast<SimpleNetDevice>(devices.Get(a));
-        Ptr<SimpleNetDevice> devB = DynamicCast<SimpleNetDevice>(devices.Get(b));
-        channel->BlackList(devA, devB);
-        channel->BlackList(devB, devA);
-    };
-    blacklist(0, 2);
-    blacklist(0, 3);
-    blacklist(1, 3);
 
     RplHelper rplHelper;
     rplHelper.Set("P2pDroAckWaitTime", TimeValue(MilliSeconds(100)));
@@ -7967,37 +7960,85 @@ RplP2pDroRetryTestCase::DoRun()
     internetv6.Install(nodes);
 
     Ipv6AddressHelper ipv6;
-    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
-    for (uint32_t i = 0; i < nodes.GetN(); i++)
-    {
-        interfaces.SetForwarding(i, true);
-    }
+    ipv6.AssignWithoutAddress(devices);
 
     rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
-    rplHelper.AssignStreams(nodes, 1);
-
-    Simulator::Stop(Seconds(250));
+    // Base RPL's own DioIntervalMin (4.096 s by default) means the root's
+    // first DIO can take up to that long to go out at all (Trickle's
+    // Start() picks the first firing in [Imin/2, Imin]); 10 s leaves a
+    // comfortable margin for one hop.
+    Simulator::Stop(Seconds(10));
     Simulator::Run();
 
-    Ptr<RplRoutingProtocol> orig = nodes.Get(0)->GetObject<RplRoutingProtocol>();
-    Ptr<RplRoutingProtocol> targ = nodes.Get(3)->GetObject<RplRoutingProtocol>();
-    NS_TEST_ASSERT_MSG_EQ(targ->IsJoined(), true, "The base DODAG did not reach the far end");
+    Ptr<Node> node = nodes.Get(1);
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoined(), true, "The base DODAG did not reach node 1");
 
-    m_targLinkLocal = nodes.Get(3)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
-    Ipv6Address targAddress = targ->GetGlobalAddress();
+    // One-way only: node 1 -> node 0 stays open for the monitor, node 0 ->
+    // node 1 is cut so nothing node 0 does in response can ever reach node
+    // 1 back (@see this class's own doc comment).
+    Ptr<SimpleNetDevice> dev0 = DynamicCast<SimpleNetDevice>(devices.Get(0));
+    Ptr<SimpleNetDevice> dev1 = DynamicCast<SimpleNetDevice>(devices.Get(1));
+    channel->BlackList(dev0, dev1);
 
-    Ptr<Socket> monitor = Socket::CreateSocket(nodes.Get(2), Ipv6RawSocketFactory::GetTypeId());
+    Ptr<Socket> monitor =
+        Socket::CreateSocket(nodes.Get(0), Ipv6RawSocketFactory::GetTypeId());
     monitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
     monitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
-    monitor->BindToNetDevice(nodes.Get(2)->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+    monitor->BindToNetDevice(nodes.Get(0)->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
     monitor->SetRecvCallback(MakeCallback(&RplP2pDroRetryTestCase::CaptureDro, this));
 
-    RplRoutingProtocol::DodagKey key = orig->DiscoverP2pRoute(targAddress);
-    NS_TEST_ASSERT_MSG_NE(key.dodagId, Ipv6Address::GetAny(), "The discovery did not start");
+    Ipv6Address origin("2001:9::1"); // no real node owns this address
+    Ipv6Address neighbour("fe80::a");
+    static constexpr uint8_t INSTANCE = 0x81;
+
+    RplDioHeader dio;
+    dio.SetInstanceId(INSTANCE);
+    dio.SetVersionNumber(0);
+    dio.SetRank(RPL_MIN_HOPRANKINC);
+    dio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+    dio.SetGrounded(true);
+    dio.SetDodagId(origin);
+    dio.SetDtsn(0);
+    // Without this, dodag.dioIntervalMin stays at its Time-default of zero
+    // (JoinDodag() only sets it from a DIO that HasDagConfiguration()),
+    // which makes RplTrickleTimer::NewInterval()'s Uniform(half, interval)
+    // draw deterministically 0 -- a zero-delay livelock, every firing
+    // rescheduling the next one at the same simulated instant, so
+    // Simulator::Run() never returns. Hung this exact way once already
+    // writing this test (@see design-constraints.md).
+    dio.SetDagConfiguration(4, // doublings, matching P2pDioIntervalDoublings's own default
+                            6, // Imin = 2^6 ms = 64 ms
+                            0,
+                            0,
+                            RPL_MIN_HOPRANKINC,
+                            RPL_OCP_OF0,
+                            RPL_DEFAULT_LIFETIME,
+                            RPL_DEFAULT_LIFETIME_UNIT);
+    P2pRdoOption rdo;
+    rdo.reply = true;
+    rdo.hopByHop = false;
+    rdo.numRoutes = 0;
+    rdo.lifetime = 2; // 16 seconds, comfortably past this test's own window
+    rdo.maxRankOrNh = 3;
+    rdo.target = rpl->GetGlobalAddress(); // node 1 is the Target
+    rdo.addressVector = {};
+    dio.SetP2pRdo(rdo);
+
+    DeliverRawRplMessage<RplDioHeader>(node,
+                                       1,
+                                       dio,
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       neighbour,
+                                       Ipv6Address(RPL_ALL_NODES_MULTICAST));
+
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsP2pTarget(INSTANCE, origin),
+                          true,
+                          "The node did not recognise itself as the Target");
 
     // Long enough for the original P2P-DRO plus 2 retries at 100 ms apart
     // (400 ms) with a comfortable margin, but short enough that the
-    // temporary DAG's own 'L' deadline (16 s by default) is nowhere close.
+    // temporary DAG's own 'L' deadline (16 s) is nowhere close.
     Simulator::Stop(Seconds(2));
     Simulator::Run();
 

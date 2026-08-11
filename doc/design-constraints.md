@@ -4500,3 +4500,151 @@ CSMA-CA 輻輳という 2 つの要因の組み合わせであり、後者は
 捨て、この節の作業で作成・削除済み) を再現すればよい: 100 ノード /
 200 m 四方の `RandomRectanglePositionAllocator`、無トラフィック、
 一定間隔で `GetRank()` を全ノードから採取。
+
+## 38. P2P-DRO-ACK (RFC 6997 section 10) を実装
+
+§36.2 で見送った 2 項目 (P2P-DRO-ACK・§9.2 の Trickle 一貫性判定) のうち
+前者に着手した。3 増分:
+
+- **増分1**: ワイヤフォーマット。`RplP2pDroAckHeader` (§37 の
+  `RplP2pDroAckHeader`... ではなく新規、名前が紛らわしいが別物) を
+  新設。P2P-DRO の base object と酷似 (instanceId・version・Seq・
+  DODAGID) だがオプションを一切持たない、固定 20 バイト。Seq のビット
+  位置は P2P-DRO 自身の `RPL_P2P_DRO_SEQ_MASK` (S/A フラグの後ろ、
+  ビット4-5) と違い、P2P-DRO-ACK には S/A が無いため Seq は第3
+  オクテットの先頭2ビット (`RPL_P2P_DRO_ACK_SEQ_MASK = 0xC0`) —
+  RFC 原文を列位置カウントで確認済み (§36.3 と同じ手法)。
+  `RplP2pDroHeader::BASE_SIZE` と同じ短パケットガードを最初から実装。
+- **増分2**: Target 側の送信・再送。`SendP2pDro()` が
+  `S`/`A`/`Seq` を実際の値で埋めるようになった (それまでは固定で
+  `S=0, A=0` を送っていた)。新規 attribute 3つ
+  (`P2pDroAckRequested` 既定true・`P2pDroAckWaitTime` 既定1s・
+  `P2pDroMaxRetransmissions` 既定3)、`P2pDroRetry()` (DAO-ACK の
+  `DaoRetry()` を手本にした)。
+- **増分3**: Origin 側の ACK 生成 (`RPL_CODE_P2P_DRO_ACK` を
+  `RecvRpl()` に追加、`HandleP2pDro()` の Origin 分岐が
+  `dro.GetAckRequested()` を見て `RplP2pDroAckHeader` を組み立て
+  unicast)、Target 側の `HandleP2pDroAck()` (instanceId/dodagId/Seq
+  照合、一致すれば `droRetryEvent` 解除)。S フラグの受信側処理
+  (§9.6/9.7 の「以後この一時 DAG の DIO を生成/処理しない」) も
+  この増分で追加。
+
+### 38.1 実装中に見つけたバグ3件、いずれも実装ロジックの穴
+
+この増分は、実装したそばから既存テストが壊れる → 原因を追う →
+実装ロジックの見落としだったと判明、という流れを3回繰り返した。
+いずれも「機能を追加したら見えるようになった、元から存在した/
+新たに作った論理的な穴」であり、テストの書き方の問題ではない。
+
+#### 38.1.1 Stop フラグ受信時に `dioTrickle.Stop()` を呼ぶと、下流ノードが誤って poison-leave するバグ
+
+増分3の実装当初、`HandleP2pDro()` の Origin/中継ルータ両分岐で
+S=1 を見た瞬間 `dodag.p2p.stopped=true` に加えて
+`dodag.dioTrickle.Stop()` も呼んでいた (RFC 9.6/9.7 の「SHOULD NOT
+generate any more DIOs...cancel any pending transmissions」を素直に
+実装したもの)。これが `RplP2pFloodTestCase` を壊した:
+Target が`IsJoinedTo()`で偽になり、`GetDodagCount()`も1で2つ目の
+membership が消えていた。
+
+原因: `HandleP2pRdo()`の中継ルータ/Target は、汎用 RPL の
+`SelectPreferredParent()`によるstaleness sweepを共有している
+(P2P-RPL専用ではなく base RPL と同じ仕組み)。中継ルータが Stop
+処理でTrickleを即座に止めると、その下流のノード (preferredParent
+としてその中継ルータを見ている子) は「親が沈黙した」としか解釈
+できず、数 Trickle 間隔以内に「最後の親を失った」と判定して
+`LeaveDodag(poison=true)`する — temporary DAG 自身の'L'期限
+(16秒) よりずっと早く、意図しない形で退出してしまう。
+
+**修正**: `dioTrickle.Stop()`の呼び出しを削除、`p2p.stopped=true`
+だけ残した (§9.6/9.7の「SHOULD NOT...process」半分のみ実装、
+「SHOULD NOT...generate」半分は見送り)。この結果、Stop後もこの
+ノード自身のTrickleは自然減衰に任せ、temporary DAGは他のP2P-RPL
+membership同様'L'期限で退出する。design-constraints.mdの
+`DodagMembership::P2pState::stopped`のdocコメントにこの経緯を
+そのまま記録した。
+
+#### 38.1.2 `HandleP2pRdo()` が重複DIO受信のたびに新規P2P-DRO送信+再送状態リセットを行い、自己ループバックで無限ライブロックになるバグ
+
+増分2実装当初、`SendP2pDro()`が呼ばれるたびに
+`droAckPending=true; droRetriesLeft=m_p2pDroMaxRetransmissions;`を
+無条件に(再送呼び出しからも)リセットしていた。これは
+`P2pDroRetry()`自身が`SendP2pDro()`を呼んで再送する設計にした際、
+「再送のたびに再送予算がリセットされ、
+`MAX_P2P_DRO_RETRANSMISSIONS`が絶対に効かない」形になっていた
+(バグ自体は実装中に気づいて修正済み、§38本文に記載の設計)。
+
+その後、`RplP2pDroRetryTestCase`を書く過程で**別の**ハングを踏んだ:
+単一ノードでTargetとして合成DIOを注入し、Simulator::Run()を
+延長したところ、プロセスが返ってこなくなった (壁時計99%CPU、
+シミュレーション時刻は+2.000000000sに固定されたまま)。
+
+原因の切り分け(段階的に判明):
+1. まず「IPv6マルチキャストは`SimpleChannel::Send()`が送信元
+   デバイスを明示的に除外する」ことをソースで確認 — L2レベルの
+   自己ループバックは無い。
+2. だが実際には`Ipv6RawSocketImpl`/`Ipv6L3Protocol`のマルチ
+   キャストソケットが、ローカル発の送信をL2チャネルとは独立に
+   自ノードのソケットへ配送していることを、単一ノード構成の
+   デバッグ再現で直接確認した(通常のPOSIXマルチキャストソケットの
+   `IP_MULTICAST_LOOP`相当の挙動、この実装のいずれかの層がこれを
+   無効化していない)。`RplP2pFloodTestCase`の以前のトレースで
+   Targetが自分自身の送ったP2P-DROを受信していたのも同じ現象
+   だったと事後で気づいた。
+3. 2ノード構成に変更し`SimpleChannel::BlackList()`の**片方向性**
+   (`from`→`to`のみを塞ぐ、逆方向は開いたまま)を使って
+   モニター役ノードからの応答を物理的に遮断したが、**それでも
+   ハングした**。詳細ログを追うと、ハングしていたのは「自己
+   ループバック」ではなく別の原因だった: 注入した合成DIOに
+   **DODAG Configuration optionを付け忘れていた**ため、
+   `JoinDodag()`の`dio.HasDagConfiguration()`ガードが素通りせず
+   `dodag.dioIntervalMin`がTimeの既定値(ゼロ)のまま残り、
+   `RplTrickleTimer::NewInterval()`の`Uniform(interval/2, interval)`
+   乱数抽選が`Uniform(0,0)=0`に退化 — 毎回のTrickle発火が
+   **同一シミュレーション時刻で即座に次を再スケジュール**する
+   ゼロ遅延ライブロックだった。このセッションの以前の増分でも
+   同種の「zero-Imin fixtureバグ」を踏んでおり(P2P-RPL初期実装
+   時、§36節)、再現条件は違うが同じ根本原因のクラス。
+
+**修正**: テストの合成DIOに`dio.SetDagConfiguration(...)`を追加
+(Imin=64ms相当)。加えて、`P2pDroRetry()`が呼ぶ`SendP2pDro()`の
+状態リセットを「新規サイクルの入り口(`HandleP2pRdo()`の呼び出し側)
+だけが行う」設計に整理し、`SendP2pDro()`自身はTimerの再武装のみ
+行うよう分離した(38本文の設計どおり)。
+
+**副次的な予防策**: 上記の調査中に判明した「マルチキャスト自己
+ループバックが実在する」という事実を踏まえ、`HandleDio()`の先頭に
+`IsOwnAddress(from)`なら即returnするガードを追加した。既存の
+「rootは自分がrootのDODAG宛てDIOを無視する」ガード(隣接コード)の
+一般化にあたる — こちらは特定のDODAGのrootでなくても、
+「自分自身から届いたように見えるDIOは常に無視する」形にした。
+**現状のテストスイートではこのガード単体をコメントアウトしても
+全件PASSする**(実際に壊れたのはzero-Imin側のバグ)ため回帰
+テストでの裏付けは無いが、上記2で直接確認した「自己ループバックは
+実在する」という事実に基づく予防的措置として残した
+(root-selfガードと同じ判断の延長)。
+
+#### 38.1.3 base DODAG形成待ち時間が短すぎたテストのタイミングバグ
+
+`RplP2pDroRetryTestCase`の初版は base DODAG 形成に
+`Simulator::Stop(Seconds(2))`しか与えていなかった。base RPL の
+既定`DioIntervalMin`(4.096秒)では、rootの最初のDIO送出だけで
+最大4.096秒かかりうる(Trickleの`Start()`は`[Imin/2, Imin]`の
+乱数点で最初の発火を予約する)ため、2秒ではrootのDIOがまだ
+一度も出ていない可能性がある。10秒に延長して解消。
+(3ノード以上の既存4-node系テストは`Seconds(250)`を使っており、
+今回の2ノード・1ホップという単純なトポロジではそこまで長くする
+必要はないと判断した。)
+
+### 38.2 検証
+
+各修正は「外すとどう壊れるか」を個別に確認した:
+- Stop時の`dioTrickle.Stop()`削除: 削除前は`RplP2pFloodTestCase`が
+  確実に失敗(標準出力を実測済み)。
+- `P2pDroRetry()`の給付ガード(`droRetriesLeft==0`)を無効化すると
+  `RplP2pDroRetryTestCase`が`m_droCount`19件・49件など無制限に
+  増加して失敗することを確認。
+- `IsOwnAddress(from)`ガードは単体では現行スイートを壊さない
+  (§38.1.2に記載のとおり、実際の原因はテスト側のzero-Imin)。
+
+`./ns3 build`clean、`./test.py -s rpl`PASS、
+`test-runner --suite=rpl`を3回連続PASS確認。

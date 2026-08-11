@@ -870,6 +870,26 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
             uint8_t lifetimeField{0}; //!< the 'L' field this temporary DAG was opened with
             bool reply{true};         //!< 'R': whether the Target should send a P2P-DRO back
             bool hopByHop{false};     //!< 'H': always false; H=1 is out of scope
+            /// RFC 6997 sections 8/9.6/9.7: set once a P2P-DRO with 'S' = 1
+            /// has been seen for this temporary DAG. ShouldRefuseP2pRdo()
+            /// refuses every further P2P mode DIO once this is true -- the
+            /// "SHOULD NOT...process any more DIOs" half only.
+            /// dioTrickle.Stop() (the "SHOULD NOT generate any more
+            /// DIOs...cancel any pending transmissions" half) is
+            /// deliberately not called: it was tried and reverted, because
+            /// it silences this node immediately, and a downstream router
+            /// whose preferredParent is this node is still an ordinary
+            /// DodagMembership as far as the generic staleness sweep in
+            /// SelectPreferredParent() is concerned -- going silent reads
+            /// to it as "parent died", not "discovery is over", so it loses
+            /// its last parent and poisons itself out well before its own
+            /// 'L' deadline. This node's own Trickle is instead left to
+            /// wind down naturally and the temporary DAG to retire on 'L'
+            /// like any other, the same as every other P2P-RPL membership.
+            /// P2P-DRO processing itself is unaffected either way, per the
+            /// RFC's own "MUST continue to process the P2P-DRO messages"
+            /// even after Stop.
+            bool stopped{false};
             /// The route accumulated so far in the Forward direction
             /// (Origin-side first), as this node would propagate it: its own
             /// address is already appended (RFC 6997 section 9.4).
@@ -1217,8 +1237,10 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      * stale or misdirected ACK).
      *
      * @param ack the P2P-DRO-ACK just received
+     * @param from the neighbour it arrived from (unicast, but not
+     *        necessarily one radio hop -- forwarded like any other unicast)
      */
-    void HandleP2pDroAck(const RplP2pDroAckHeader& ack);
+    void HandleP2pDroAck(const RplP2pDroAckHeader& ack, Ipv6Address from);
 
     /**
      * @brief Unicast an RREP-DIO one hop towards the OrigNode.
