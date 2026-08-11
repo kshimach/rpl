@@ -8405,6 +8405,129 @@ RplP2pMultiTargetTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief A relay that matches none of a P2P mode DIO's Targets still
+ *        carries every RPL Target option forward when it re-broadcasts,
+ *        so a Target two hops from the Origin still gets discovered.
+ *
+ * Found by /protocol-test-matrix auditing this feature after the fact:
+ * RplP2pMultiTargetTestCase only ever checked the single node a DIO was
+ * delivered straight to, never that a relay's own re-transmission
+ * (SendDio(), which rebuilds every DIO from a membership's own stored
+ * state) actually re-attached the RPL Target options it had recorded.
+ * It did not: SendDio()'s P2P branch built the P2P-RDO from
+ * dodag.p2p.addressVector/target but never called AddTarget() for
+ * dodag.p2p.additionalTargets, so a multi-Target discovery silently lost
+ * every Target beyond the primary one after a single hop. This is the
+ * regression test for the fix.
+ *
+ *     node0 (base root) ---- node1 (relay) ---- node2 (Target)
+ *
+ * node1 is fed a DIO naming an unrelated primary Target plus one RPL
+ * Target option naming node2's address; node1 itself matches neither.
+ * If node1's own re-broadcast (over the real channel, not injected)
+ * still carries that Target option, node2 -- a real node, not a
+ * synthetic delivery -- recognises itself as the Target.
+ */
+class RplP2pMultiTargetRelayTestCase : public TestCase
+{
+  public:
+    RplP2pMultiTargetRelayTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplP2pMultiTargetRelayTestCase::RplP2pMultiTargetRelayTestCase()
+    : TestCase("A relay re-broadcasts every RPL Target option, not just the primary one")
+{
+}
+
+void
+RplP2pMultiTargetRelayTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(3); // 0 = base root, 1 = relay under test, 2 = the Target
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.AssignWithoutAddress(devices);
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    Ptr<Node> relayNode = nodes.Get(1);
+    Ptr<RplRoutingProtocol> relay = relayNode->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> targ = nodes.Get(2)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(relay->IsJoined(), true, "The base DODAG did not reach node 1");
+    NS_TEST_ASSERT_MSG_EQ(targ->IsJoined(), true, "The base DODAG did not reach node 2");
+
+    Ipv6Address origin("2001:9::1");         // no real node owns this address
+    Ipv6Address primaryTarget("2001:9::99"); // unrelated to both node 1 and node 2
+    Ipv6Address neighbour("fe80::a");
+    static constexpr uint8_t INSTANCE = 0x81;
+
+    RplDioHeader dio;
+    dio.SetInstanceId(INSTANCE);
+    dio.SetVersionNumber(0);
+    dio.SetRank(RPL_MIN_HOPRANKINC);
+    dio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+    dio.SetGrounded(true);
+    dio.SetDodagId(origin);
+    dio.SetDtsn(0);
+    dio.SetDagConfiguration(4, 6, 0, 0, RPL_MIN_HOPRANKINC, RPL_OCP_OF0, RPL_DEFAULT_LIFETIME,
+                            RPL_DEFAULT_LIFETIME_UNIT);
+    P2pRdoOption rdo;
+    rdo.reply = true;
+    rdo.hopByHop = false;
+    rdo.numRoutes = 0;
+    rdo.lifetime = 2; // 16 seconds
+    rdo.maxRankOrNh = 3;
+    rdo.target = primaryTarget; // neither node 1 nor node 2
+    rdo.addressVector = {};
+    dio.SetP2pRdo(rdo);
+
+    RplDioHeader::TargetOption targetOption;
+    targetOption.target = targ->GetGlobalAddress();
+    dio.AddTarget(targetOption);
+
+    DeliverRawRplMessage<RplDioHeader>(relayNode,
+                                       1,
+                                       dio,
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       neighbour,
+                                       Ipv6Address(RPL_ALL_NODES_MULTICAST));
+
+    NS_TEST_ASSERT_MSG_EQ(relay->IsP2pTarget(INSTANCE, origin),
+                          false,
+                          "node 1 should not consider itself a Target here");
+
+    // node1's own Trickle has to actually fire and reach node2 over the
+    // real channel -- Imin is 64 ms per the DagConfiguration above, so 1 s
+    // leaves a comfortable margin for at least one firing plus propagation.
+    Simulator::Stop(Seconds(1));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(targ->IsP2pTarget(INSTANCE, origin),
+                          true,
+                          "node2 never recognised itself as the Target: node1's own "
+                          "re-broadcast must have dropped the RPL Target option naming it");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief A P2P-DRO-ACK for the wrong sequence is ignored, not mistaken for
  *        the one actually outstanding.
  *
@@ -13430,6 +13553,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplP2pDroGeneratedTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pDroRetryTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pMultiTargetTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pMultiTargetRelayTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pDroAckWrongSequenceTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pRouteCompletesTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pDroRelayTestCase, TestCase::Duration::QUICK);

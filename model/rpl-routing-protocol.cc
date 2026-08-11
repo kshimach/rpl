@@ -1197,6 +1197,22 @@ RplRoutingProtocol::SendDio(DodagMembership& dodag, Ipv6Address dst, uint32_t in
         rdo.target = dodag.p2p.target;
         rdo.addressVector = dodag.p2p.addressVector;
         dio.SetP2pRdo(rdo);
+
+        // RFC 6997 section 9.3's own reuse of RFC 6550's RPL Target option
+        // (section 6.7.7) for any additional Targets beyond the P2P-RDO's
+        // primary one, re-attached on every transmission the same reason
+        // the P2P-RDO above is: without this, additionalTargets recorded
+        // on the way in (HandleP2pRdo()) would never actually reach this
+        // node's own downstream neighbours, silently truncating a
+        // multi-Target discovery to one hop. Found by
+        // /protocol-test-matrix auditing the receive side without first
+        // confirming the send side re-emitted what it parsed.
+        for (const auto& target : dodag.p2p.additionalTargets)
+        {
+            RplDioHeader::TargetOption targetOption;
+            targetOption.target = target;
+            dio.AddTarget(targetOption);
+        }
     }
 
     Ptr<Packet> packet = Create<Packet>();

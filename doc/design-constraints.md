@@ -4783,3 +4783,97 @@ Phase 1の4象限監査を実施した。
 3回連続PASS。追加した2つの新規アサーション(ACK到達確認・Seq不一致
 拒否)はいずれも該当コードを一時的に無効化して失敗することを確認
 済み。
+
+## 41. `/protocol-test-matrix` で P2P-RPL 複数Target対応 (§40の続き) を監査、重大バグ2件を発見
+
+39節の続き。P2P-RPL複数Target対応 (直近2コミット、Target Optionワイヤ
+フォーマットと`MatchesP2pTarget()`/転送継続ロジック) に `/protocol-
+test-matrix` を適用した。既存のテスト (`RplP2pMultiTargetTestCase`)
+は「注入されたDIOを受け取った**その1ノード**」の反応 (isTarget判定・
+Stopフラグ) しか見ておらず、計画書自身が明記していた「状態遷移系:
+中継ルータ経由の複数Target discovery end-to-end」象限が未着手のまま
+残っていた。これを埋める過程で、実装ロジックのバグを2件発見した
+(テストの書き方の問題ではない)。
+
+### 41.1 `SendDio()` が `additionalTargets` を再送出DIOに含めていなかった
+
+`HandleP2pRdo()` は受信したDIOのRPL Target optionを正しく
+`dodag.p2p.additionalTargets` に記録するが、**この状態を実際に
+送出DIOへ反映する処理が存在しなかった** — `SendDio()` のP2P分岐は
+P2P-RDOを`dodag.p2p.*`から組み立てるが、`dio.AddTarget()`を一度も
+呼んでいなかった。結果、中継ルータが複数Targetの情報を正しく
+「記憶」していても、次に自分のTrickleが発火して再送出する瞬間に
+Target Optionが**サイレントに消える** — 複数Target discoveryが
+実質1ホップで壊れて見えなくなる、というテストを書かなければ気づけない
+種類のバグだった。
+
+**修正**: `SendDio()`のP2P分岐末尾に、`dodag.p2p.additionalTargets`の
+各エントリを`dio.AddTarget()`で追加するループを追加。3ノード構成
+(root/中継/Target、中継はどちらのTargetにも一致しない)で、中継の
+**実際のチャネル経由の再送出**をTargetノードが正しく受け取り
+`isTarget`と判定できることを確認する`RplP2pMultiTargetRelayTestCase`
+を新設。この行を無効化すると同テストが確実に失敗することを確認済み。
+
+### 41.2 `droSequence` (2ビットのワイヤフィールド) が無制限に増加しクラッシュ
+
+上記のend-to-endテストを書いて初めて踏んだ、41.1とは独立の別バグ。
+`RplP2pMultiTargetRelayTestCase`は当初、node2 (Target) 側で
+`NS_ASSERT failed, cond="sequence <= (RPL_P2P_DRO_SEQ_MASK >>
+RPL_P2P_DRO_SEQ_SHIFT)"` — 2ビットの`Seq`フィールド (最大値3) の
+範囲外書き込みでクラッシュした。
+
+原因: §38.1.2 (増分3) で「他のTargetが残っていれば再処理ガードを
+緩め、`HandleP2pRdo()`を通すたびに`droSequence++`する」設計にしたが、
+今回のケース (単一Targetを **RPL Target optionのみ** で指定、
+他に本当のadditional Targetは無い) では、`additionalTargets`が
+「自分自身の1エントリ」を含んだまま **決して空にならない**
+(§9.5「no additional Targets specified via RPL Target options」を
+RFC原文どおり「自分の一致分を除外しないリストがそもそも空か」と
+解釈したため — 41.3参照)。このため再処理ガードが毎回素通りし、
+temporary DAGが存在し続ける限り (既定'L'=16秒、Trickle Iminは64ms)
+`droSequence++`が繰り返され、無制限に増加した8ビット変数の値を
+2ビットフィールドへそのまま書き込もうとしてクラッシュした。
+
+単一Target (RFC 6997のPrimary TargetAddr経由) の従来経路では、
+再処理ガードが無条件 (`if (isTarget) return;`) だったため
+`droSequence++`は生涯で最大1回しか起きず、このバグは**今回の
+複数Target対応で初めて到達可能になった経路**であり、既存の単一
+Targetシナリオには実害が無かったことも確認した (回帰スイート全件が
+無変更でPASSし続けている)。
+
+**修正**: `dodag.p2p.droSequence = (dodag.p2p.droSequence + 1) &
+(RPL_P2P_DRO_SEQ_MASK >> RPL_P2P_DRO_SEQ_SHIFT);` — 2ビット境界での
+明示的なラップに変更 (このモジュールの他の8ビットlollipopカウンタ
+(`dtsn`・`pathSequence`・`version`) が使う生の`++`ラップアラウンド
+慣習とは違う対応が必要だった、フィールド幅がそもそも異なるため)。
+修正前の状態でテストを再実行しクラッシュを再現、修正後は解消する
+ことを確認済み。
+
+### 41.3 RFC 6997 §9.5 の Stop 適格条件の文言上の限界 (未解決、意図的に記録)
+
+41.2の根本原因を追う過程で、RFC 6997 §9.5自身の文言的な限界に
+気づいた: Stop条件 ("this router is the only Target specified...
+i.e., the corresponding DIO specified a unicast address of the router
+as the TargetAddr **inside the P2P-RDO** with no additional Targets
+specified via RPL Target options") は、**Primary TargetAddr経由で
+一致した場合だけ**を前提にした文言になっている。RPL Target option
+**のみ**で一致したTarget (Primary TargetAddrは別の誰か) が「他に
+本当のTargetがいない」ケースについて、RFC原文は明確な扱いを与えて
+いない — 文字通り読むと、この場合Stopは**決して**適格にならない
+(自分の一致分がリストに残り続ける限り)。今回の実装はRFC原文の
+文言に忠実な解釈 (リストが空かどうかを、自分の一致を除外せずに
+判定する) を維持し、この「RPL Target optionのみで指定された単独
+Targetは、'L'期限まで S=0 のまま関連DIOをTrickleで送り続ける」
+という挙動を**そのまま許容する** (41.2の無限増加はガードで解決した
+ため、S=0のまま送り続けること自体は実害を伴わない — 単にRFCの
+想定するStopの早期終了効果を得られないだけ)。将来この節を厳密化
+するなら、「additionalTargetsから自分自身の一致分を除外したリストが
+空か」という、より寛容な (だが原文からは一段踏み込んだ) 解釈に
+切り替える設計変更が候補になる。
+
+### 41.4 検証
+
+各修正は個別に無効化して対応する新規テストが失敗することを確認
+(41.1は`RplP2pMultiTargetRelayTestCase`、41.2はクラッシュの再現/
+解消)。`./ns3 build`clean、`./test.py -s rpl`PASS、`test-runner
+--suite=rpl`3回連続PASS。

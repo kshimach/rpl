@@ -419,7 +419,22 @@ RplRoutingProtocol::HandleP2pRdo(const RplDioHeader& dio, Ipv6Address from, uint
             // than the last) needs a Seq of its own. Resets the retry budget
             // for the same reason: this supersedes whatever cycle (if any)
             // was already in flight for the old Seq.
-            dodag.p2p.droSequence++;
+            //
+            // Wrapped at the wire field's own 2-bit width rather than left
+            // to grow (the raw wraparound this module uses for its 8-bit
+            // lollipop counters, e.g. dodag.version++ in GlobalRepairFire()):
+            // a Target with a temporary DAG membership that outlives its
+            // own 'L' deadline by little enough, or one that keeps
+            // re-matching a Target named only via an RPL Target option
+            // (@see DodagMembership::P2pState::additionalTargets, never
+            // filtered down to exclude this node's own already-matched
+            // entry), can run this every time a fresh-looking DIO arrives
+            // for as long as the membership exists -- found by
+            // /protocol-test-matrix's own multi-Target relay test, an
+            // NS_ASSERT in RplP2pDroHeader::SetSequence() ("Seq does not
+            // fit its 2-bit field") past four cycles without this.
+            dodag.p2p.droSequence =
+                (dodag.p2p.droSequence + 1) & (RPL_P2P_DRO_SEQ_MASK >> RPL_P2P_DRO_SEQ_SHIFT);
             dodag.p2p.droAckPending = m_p2pDroAckRequested;
             dodag.p2p.droRetriesLeft = m_p2pDroMaxRetransmissions;
             SendP2pDro(dodag, key);
