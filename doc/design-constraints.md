@@ -5049,3 +5049,69 @@ ns3-debug-pitfalls参照)が、実装コードだけでなく**テストの合�
   ほか既存全AODV-RPLテスト)はテスト変更ゼロで回帰確認済み。
 - `./ns3 build`clean、`test-runner --suite=rpl`を複数回連続実行し
   安定してPASSすることを確認 (42.3のクラッシュ修正後)。
+
+## 43. `/protocol-test-matrix` でAODV-RPL複数ART対応(§42)を監査
+
+§42完了直後、標準運用(ユーザーからの継続的な指示: 実装が一区切り
+したら`/protocol-test-matrix`を実施する)に従い、直近2コミット
+(ワイヤフォーマット・ロジック)を対象に4象限監査を実施した。
+
+Phase 0でRFC 9854 section 4.3・6.1・6.2.2を再読し、42.2の設計判断
+(「別個のRank記録は追加せず、既存の単一preferred parentモデルへの
+単純化として扱う」)の根拠になったRFC文言を再確認したほか、
+section 6.1に「OrigNode can initiate the route discovery process for
+multiple targets simultaneously by including multiple ART options」
+という一文があることを再確認した — これは本実装が意図的に公開して
+いないOrigNode発の複数Target同時開始 (`DiscoverRoute()`は単一Target
+のみ) に対応する原文で、P2P-RPL側の`DiscoverP2pRoute()`も同じ
+制約を持つことは既に確認済み(§42.2)。既存の意図的スコープ境界として
+そのまま維持する。
+
+Phase 1で4象限を洗い出した結果、42.2で「専用テストなし」と明記した
+2件について、実際にRFC文言が要求する形での検証が欠けていることに
+気づいた:
+
+1. **RFC 9854 section 6.2.2「one of the TargNodes can be an
+   intermediate router to other TargNodes」の真の形**:
+   `RplAodvMultiArtTwoTargetsAnsweredTestCase`のtargA・targBは共通の
+   relayの兄弟ノードであり、targBはrelay自身の再送信で直接到達できる
+   ため、「targAの継続中継が実際にtargBへの到達に寄与したか」を
+   区別できないトポロジだった。
+2. **RFC 9854 section 6.2.2「より高いRankの送信元からの複数ARTを
+   無視する」の逆順**: 既存の`RplAodvMultiArtIntersectionTestCase`は
+   「悪いRank→良いRank」の順でしか検証しておらず、実際にRFCの文が
+   意味する「良いRankが確立済みの状態に、後から悪いRankの複数ARTが
+   届いても無視される(交差されない)」という順序を検証していなかった。
+
+Phase 2でこの2件をそれぞれ新規テストとして実装し(プローブ代わりに
+直接テストとして書き、実装を疑いながら検証した): 1件目
+(`RplAodvMultiArtTargNodeRelaysToFartherTargetTestCase`、
+relay-targA-targBの直列トポロジでrelay<->targBを遮断)は、初回実行で
+FAILしたが、原因はAODV-RPL側の実装ではなく**このテスト自身の
+Address Vectorエントリ数の見積もり違い**(「2ホップだから2エントリ」
+と誤って想定していたが、`RplAodvRreqFloodTestCase`が既に確立して
+いるとおり、最終的なTargNode自身も自分のアドレスをAddress Vectorへ
+追加するため、正しくは3エントリ)だった。アサーションを修正した
+ところPASSし、TargNode経由での多段中継自体は実装として正しく動作
+していることを確認した。2件目
+(`RplAodvMultiArtWorseRankIgnoredTestCase`)は初回実装でそのまま
+PASSし、42.2の設計判断(既存の`from != preferredParent`ガードで
+十分)が実際に正しいことを実証した。
+
+この監査で見つかったのは実装バグではなくテスト自身の見積もり違い
+だったが、これは`/protocol-test-matrix`が「実装のバグを踏んでから
+テストを書く」だけでなく「テストの前提自体が誤っていないか」も
+検証する過程だからこそ拾えた類のものであり(このスキル自身のPhase 2
+の趣旨どおり)、監査を経ずにテストを書いていれば、誤った期待値の
+まま気づかれずに残っていた可能性がある。
+
+### 43.1 検証
+
+新規2テストを追加(`RplAodvMultiArtTargNodeRelaysToFartherTargetTestCase`、
+`RplAodvMultiArtWorseRankIgnoredTestCase`)。既存の単一Target・複数ART
+テスト全件を含む回帰スイートに変更を加えることなく、`test-runner
+--suite=rpl`を4回連続実行して安定してPASSすることを確認した。実装
+コード(model/rpl-aodv.cc・model/rpl-routing-protocol.cc・
+model/rpl-routing-protocol.h)は本節で変更していない — この監査は
+既存実装が正しいことをテストで実証したのみで、修正すべきバグは
+見つからなかった。

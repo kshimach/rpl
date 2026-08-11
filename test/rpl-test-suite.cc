@@ -6165,6 +6165,342 @@ RplAodvMultiArtTwoTargetsAnsweredTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief A TargNode that still has another target outstanding relays it
+ *        onward as an intermediate router would, reaching a second TargNode
+ *        that is otherwise unreachable except through the first.
+ *
+ * RFC 9854 section 6.2.2: "If the OrigNode tries to reach multiple TargNodes
+ * in a single RREQ-Instance, one of the TargNodes can be an intermediate
+ * router to other TargNodes." RplAodvMultiArtTwoTargetsAnsweredTestCase's own
+ * targA/targB sit as siblings under a shared relay, so targB is reached by
+ * relay's own re-transmission regardless of whether targA relays anything --
+ * that topology cannot actually tell "targA's continued relay reached targB"
+ * apart from "targB heard relay directly". This is the genuinely chained
+ * case the sentence above describes:
+ *
+ *     relay(0) ---- targA(1) ---- targB(2)
+ *
+ * relay is blacklisted from targB directly, so the only way targB can ever
+ * learn of the discovery is through targA's own, real, channel-propagated
+ * re-transmission of its RREQ-DIO -- confirming that a TargNode with other
+ * targets still outstanding does not simply stop at answering its own RREP,
+ * the way the pre-multi-ART code always did once dodag.aodv.isTarget became
+ * true.
+ */
+class RplAodvMultiArtTargNodeRelaysToFartherTargetTestCase : public TestCase
+{
+  public:
+    RplAodvMultiArtTargNodeRelaysToFartherTargetTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplAodvMultiArtTargNodeRelaysToFartherTargetTestCase::
+    RplAodvMultiArtTargNodeRelaysToFartherTargetTestCase()
+    : TestCase("An AODV-RPL TargNode relays a remaining ART onward to reach a farther TargNode")
+{
+}
+
+void
+RplAodvMultiArtTargNodeRelaysToFartherTargetTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(3); // 0 = relay (neither target), 1 = targA, 2 = targB (only reachable via targA)
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    Ptr<SimpleNetDevice> devRelay = DynamicCast<SimpleNetDevice>(devices.Get(0));
+    Ptr<SimpleNetDevice> devTargB = DynamicCast<SimpleNetDevice>(devices.Get(2));
+    channel->BlackList(devRelay, devTargB);
+    channel->BlackList(devTargB, devRelay);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    // The base DODAG across both hops first, so relay, targA and targB all
+    // have the global addresses their Address Vector entries have to be.
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> relay = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> targA = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> targB = nodes.Get(2)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(targA->IsJoined(), true, "targA never joined the base DODAG");
+    NS_TEST_ASSERT_MSG_EQ(targB->IsJoined(), true, "targB never joined the base DODAG");
+
+    Ipv6Address relayLinkLocal =
+        nodes.Get(0)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address targAAddress = targA->GetGlobalAddress();
+    Ipv6Address targBAddress = targB->GetGlobalAddress();
+    NS_TEST_ASSERT_MSG_NE(targAAddress, Ipv6Address::GetAny(), "targA has no address");
+    NS_TEST_ASSERT_MSG_NE(targBAddress, Ipv6Address::GetAny(), "targB has no address");
+
+    static constexpr uint8_t RREQ_INSTANCE = 0x85;
+    Ipv6Address origNode("2001:9::1"); // fabricated: no real node behind it
+    RplDioHeader rreqDio;
+    rreqDio.SetInstanceId(RREQ_INSTANCE);
+    rreqDio.SetVersionNumber(0);
+    rreqDio.SetRank(RPL_MIN_HOPRANKINC);
+    rreqDio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+    rreqDio.SetDodagId(origNode);
+    rreqDio.SetDtsn(0);
+    rreqDio.SetDagConfiguration(0,
+                                8,
+                                RPL_DIO_REDUNDANCY,
+                                RPL_MAX_RANKINC,
+                                RPL_MIN_HOPRANKINC,
+                                RPL_OCP_OF0,
+                                RPL_DEFAULT_LIFETIME,
+                                RPL_DEFAULT_LIFETIME_UNIT);
+    RplDioHeader::RreqOption rreq;
+    rreq.symmetric = true;
+    rreq.hopByHop = false;
+    rreq.compr = 0;
+    rreq.lifetime = 0;
+    rreq.rankLimit = 0;
+    rreq.origSeqNo = 1;
+    rreqDio.SetRreq(rreq);
+    RplDioHeader::ArtOption artA;
+    artA.destSeqNo = 0;
+    artA.prefixLength = 0;
+    artA.target = targAAddress;
+    rreqDio.AddArt(artA);
+    RplDioHeader::ArtOption artB;
+    artB.destSeqNo = 0;
+    artB.prefixLength = 0;
+    artB.target = targBAddress;
+    rreqDio.AddArt(artB);
+
+    // Kept fresh the same way RplAodvMultiArtTwoTargetsAnsweredTestCase's
+    // own injection is: a one-shot fabricated sender goes stale and would
+    // otherwise poison relay's own RREQ-Instance out from under it before
+    // targA ever gets a chance to relay anything onward to targB. @see
+    // design-constraints.md section 42.3.
+    for (uint32_t i = 0; i < 30; i++)
+    {
+        Simulator::Schedule(MilliSeconds(100 * i),
+                            &DeliverRawRplMessage<RplDioHeader>,
+                            nodes.Get(0),
+                            1,
+                            rreqDio,
+                            static_cast<uint8_t>(RPL_CODE_DIO),
+                            Ipv6Address("fe80::f1"),
+                            relayLinkLocal);
+    }
+
+    // Two hops of Trickle-paced re-transmission at AodvDioIntervalMin
+    // (128 ms, doubling), well inside the default 16-second 'L'.
+    Simulator::Stop(Seconds(3));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(targA->IsAodvTarget(RREQ_INSTANCE, origNode),
+                          true,
+                          "targA did not recognise itself in relay's re-transmitted ART option");
+    NS_TEST_ASSERT_MSG_EQ(
+        targB->IsJoinedTo(RREQ_INSTANCE, origNode),
+        true,
+        "targB never joined the RREQ-Instance at all: it is blacklisted from relay directly, so "
+        "this can only have come from targA's own relay of its remaining ART");
+    NS_TEST_ASSERT_MSG_EQ(
+        targB->IsAodvTarget(RREQ_INSTANCE, origNode),
+        true,
+        "targB did not recognise itself in the ART option targA relayed onward -- the RFC 9854 "
+        "section 6.2.2 scenario of a TargNode acting as an intermediate router to another "
+        "TargNode is not actually reaching that farther TargNode");
+
+    // targB's Address Vector must show it arrived via relay then targA, in
+    // that order, each hop having appended its own address including
+    // targB's own -- the same three-entries-for-two-relayed-hops shape
+    // RplAodvRreqFloodTestCase's own targ (also a leaf two hops beyond the
+    // first relay) confirms, and here the only way to have picked up
+    // targA's entry at all is a route that genuinely passed through it.
+    std::vector<Ipv6Address> targBAddressVector;
+    NS_TEST_ASSERT_MSG_EQ(targB->GetAodvAddressVector(RREQ_INSTANCE, origNode, targBAddressVector),
+                          true,
+                          "targB has no Address Vector");
+    NS_TEST_ASSERT_MSG_EQ(targBAddressVector.size(),
+                          3,
+                          "targB's Address Vector should be relay, targA, targB itself");
+    NS_TEST_ASSERT_MSG_EQ(targBAddressVector[0],
+                          relay->GetGlobalAddress(),
+                          "The first hop is wrong at targB");
+    NS_TEST_ASSERT_MSG_EQ(targBAddressVector[1],
+                          targAAddress,
+                          "targB's route did not pass through targA");
+    NS_TEST_ASSERT_MSG_EQ(targBAddressVector[2],
+                          targBAddress,
+                          "targB did not append its own address");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief An intermediate router does not let a worse-Rank sender's RREQ-DIO
+ *        overwrite the target record a better-Rank sender already
+ *        contributed.
+ *
+ * RFC 9854 section 6.2.2: "An incoming RREQ-DIO message having multiple ART
+ * options coming from a router with higher Rank than the Rank of the stored
+ * targets is ignored." design-constraints.md section 42.2 records the design
+ * decision not to track a separate per-target Rank for this: the existing
+ * from != dodag.preferredParent guard in HandleAodvRreq(), combined with
+ * SelectPreferredParent() only ever moving to an equal-or-better Rank,
+ * already keeps a worse-Rank sender's copy from reaching the intersection
+ * step at all. RplAodvMultiArtIntersectionTestCase only exercises the
+ * opposite order (worse first, then better); this is the order that
+ * actually matters for the RFC sentence above -- a worse-Rank copy arriving
+ * *after* a better one is already established must be ignored outright, not
+ * intersected in.
+ */
+class RplAodvMultiArtWorseRankIgnoredTestCase : public TestCase
+{
+  public:
+    RplAodvMultiArtWorseRankIgnoredTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplAodvMultiArtWorseRankIgnoredTestCase::RplAodvMultiArtWorseRankIgnoredTestCase()
+    : TestCase("An AODV-RPL intermediate router ignores a worse-Rank sender's multi-ART RREQ-DIO")
+{
+}
+
+void
+RplAodvMultiArtWorseRankIgnoredTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(1);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.AssignWithoutAddress(devices);
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    Simulator::Stop(Seconds(2));
+    Simulator::Run();
+
+    Ptr<Node> node = nodes.Get(0);
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+    Ipv6Address nodeLinkLocal = node->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    static constexpr uint8_t RREQ_INSTANCE = 0x86;
+    Ipv6Address origNode("2001:9::1");
+    Ipv6Address neighbourA("fe80::a"); // better: rank 128, carries (T1, T2)
+    Ipv6Address neighbourB("fe80::b"); // worse: rank 384, carries (T2, T4)
+    Ipv6Address t1("2001:9::11");
+    Ipv6Address t2("2001:9::12");
+    Ipv6Address t4("2001:9::14");
+
+    auto buildRreq = [&](uint16_t rank, const std::vector<Ipv6Address>& targets) {
+        RplDioHeader dio;
+        dio.SetInstanceId(RREQ_INSTANCE);
+        dio.SetVersionNumber(0);
+        dio.SetRank(rank);
+        dio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+        dio.SetDodagId(origNode);
+        dio.SetDtsn(0);
+        dio.SetDagConfiguration(0,
+                                8,
+                                RPL_DIO_REDUNDANCY,
+                                RPL_MAX_RANKINC,
+                                RPL_MIN_HOPRANKINC,
+                                RPL_OCP_OF0,
+                                RPL_DEFAULT_LIFETIME,
+                                RPL_DEFAULT_LIFETIME_UNIT);
+        RplDioHeader::RreqOption rreq;
+        rreq.symmetric = true;
+        rreq.hopByHop = false;
+        rreq.compr = 0;
+        rreq.lifetime = 0;
+        rreq.rankLimit = 0;
+        rreq.origSeqNo = 1;
+        rreq.addressVector = {};
+        dio.SetRreq(rreq);
+        for (const auto& target : targets)
+        {
+            RplDioHeader::ArtOption art;
+            art.destSeqNo = 0;
+            art.prefixLength = 0;
+            art.target = target;
+            dio.AddArt(art);
+        }
+        return dio;
+    };
+    auto deliverRreq = [&](Ipv6Address from, uint16_t rank, const std::vector<Ipv6Address>& targets) {
+        Simulator::Schedule(Seconds(0),
+                            &DeliverRawRplMessage<RplDioHeader>,
+                            node,
+                            1,
+                            buildRreq(rank, targets),
+                            static_cast<uint8_t>(RPL_CODE_DIO),
+                            from,
+                            nodeLinkLocal);
+        Simulator::Stop(MilliSeconds(10));
+        Simulator::Run();
+    };
+
+    // The better RREQ-DIO, from A, arrives first and is joined -- seeding
+    // the target record outright, the same as RplAodvMultiArtIntersectionTestCase's
+    // own first delivery.
+    deliverRreq(neighbourA, 128, {t1, t2});
+    std::vector<Ipv6Address> targets;
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetAodvTargets(RREQ_INSTANCE, origNode, targets),
+                          true,
+                          "Not joined to the RREQ-Instance after the first RREQ-DIO");
+    NS_TEST_ASSERT_MSG_EQ(targets.size(), 2, "Wrong target count after the first RREQ-DIO");
+
+    // The worse RREQ-DIO, from B, arrives second, carrying a different
+    // target list (T2, T4). RFC 9854 section 6.2.2: a worse-Rank sender's
+    // multi-ART RREQ-DIO "is ignored" -- the stored record must stay
+    // exactly (T1, T2), not shrink to the intersection with (T2, T4), which
+    // would incorrectly drop T1.
+    deliverRreq(neighbourB, 384, {t2, t4});
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetAodvTargets(RREQ_INSTANCE, origNode, targets),
+                          true,
+                          "Not joined to the RREQ-Instance after the second RREQ-DIO");
+    NS_TEST_ASSERT_MSG_EQ(targets.size(),
+                          2,
+                          "A worse-Rank sender's RREQ-DIO was intersected in instead of ignored");
+    NS_TEST_ASSERT_MSG_EQ(targets[0], t1, "T1 was incorrectly dropped by the worse-Rank sender");
+    NS_TEST_ASSERT_MSG_EQ(targets[1], t2, "T2 is still present");
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetRankIn(RREQ_INSTANCE, origNode),
+                          256,
+                          "The preferred parent should still be A, not have switched to B");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief A TargNode with no other targets left to relay stops transmitting
  *        RREQ-DIOs for that instance altogether.
  *
@@ -14195,6 +14531,8 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplAodvRreqFloodTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvMultiArtIntersectionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvMultiArtTwoTargetsAnsweredTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplAodvMultiArtTargNodeRelaysToFartherTargetTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplAodvMultiArtWorseRankIgnoredTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvMultiArtStopsWhenExhaustedTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvForcedAsymmetricSBitTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvAsymmetricRrepInstanceTestCase, TestCase::Duration::QUICK);
