@@ -243,7 +243,6 @@ RplDioHeader::RplDioHeader()
       m_prefixPreferredLifetime(0),
       m_hasRreq(false),
       m_hasRrep(false),
-      m_hasArt(false),
       m_hasP2pRdo(false)
 {
 }
@@ -301,10 +300,10 @@ RplDioHeader::Print(std::ostream& os) const
            << " Delta " << +m_rrep.delta << " RankLimit " << +m_rrep.rankLimit
            << " AV " << m_rrep.addressVector.size();
     }
-    if (m_hasArt)
+    for (const auto& art : m_arts)
     {
-        os << " ART " << m_art.target << "/" << +m_art.prefixLength << " DestSeqNo "
-           << +m_art.destSeqNo;
+        os << " ART " << art.target << "/" << +art.prefixLength << " DestSeqNo "
+           << +art.destSeqNo;
     }
     if (m_hasP2pRdo)
     {
@@ -356,7 +355,7 @@ RplDioHeader::GetSerializedSize() const
                                 (AODV_ADDRESS_VECTOR_ENTRY_SIZE -
                                  ElidedPrefixLength(m_rrep.addressVector))
                       : 0) +
-           (m_hasArt ? AODV_ART_OPTION_SIZE : 0) +
+           m_arts.size() * AODV_ART_OPTION_SIZE +
            (m_hasP2pRdo ? P2pRdoSerializedSize(m_p2pRdo, m_dodagId) : 0) +
            m_targets.size() * TARGET_OPTION_SIZE;
 }
@@ -497,15 +496,18 @@ RplDioHeader::Serialize(Buffer::Iterator start) const
         }
     }
 
-    if (m_hasArt)
+    // RFC 9854 section 6.1: "The OrigNode can initiate the route discovery
+    // process for multiple targets simultaneously by including multiple ART
+    // options" -- any number, one per TargNode being sought.
+    for (const auto& art : m_arts)
     {
         start.WriteU8(RPL_OPTION_AODV_ART);
         start.WriteU8(AODV_ART_OPTION_LENGTH);
-        start.WriteU8(m_art.destSeqNo);
+        start.WriteU8(art.destSeqNo);
         // The top bit of this octet is the reserved 'X', always zero.
-        start.WriteU8(static_cast<uint8_t>(m_art.prefixLength & RPL_AODV_PREFIX_LENGTH_MASK));
+        start.WriteU8(static_cast<uint8_t>(art.prefixLength & RPL_AODV_PREFIX_LENGTH_MASK));
         uint8_t targetBuf[16];
-        m_art.target.Serialize(targetBuf);
+        art.target.Serialize(targetBuf);
         start.Write(targetBuf, 16);
     }
 
@@ -558,8 +560,8 @@ RplDioHeader::Deserialize(Buffer::Iterator start)
     m_hasPrefixInfo = false;
     m_hasRreq = false;
     m_hasRrep = false;
-    m_hasArt = false;
     m_hasP2pRdo = false;
+    m_arts.clear();
     m_targets.clear();
     while (!i.IsEnd())
     {
@@ -749,14 +751,17 @@ RplDioHeader::Deserialize(Buffer::Iterator start)
         }
         else if (type == RPL_OPTION_AODV_ART && length == AODV_ART_OPTION_LENGTH)
         {
-            m_hasArt = true;
-            m_art.destSeqNo = i.ReadU8();
+            // May appear any number of times (RFC 9854 section 6.1), unlike
+            // RREQ/RREP/P2P-RDO above, which a DIO carries at most one of.
+            ArtOption art;
+            art.destSeqNo = i.ReadU8();
             // The top bit is the reserved 'X', ignored on receipt per RFC
             // 9854 section 4.3.
-            m_art.prefixLength = i.ReadU8() & RPL_AODV_PREFIX_LENGTH_MASK;
+            art.prefixLength = i.ReadU8() & RPL_AODV_PREFIX_LENGTH_MASK;
             uint8_t targetBuf[16];
             i.Read(targetBuf, 16);
-            m_art.target = Ipv6Address::Deserialize(targetBuf);
+            art.target = Ipv6Address::Deserialize(targetBuf);
+            m_arts.push_back(art);
         }
         else if (type == RPL_OPTION_P2P_RDO)
         {
@@ -1132,7 +1137,7 @@ RplDioHeader::GetRrep() const
 bool
 RplDioHeader::HasArt() const
 {
-    return m_hasArt;
+    return !m_arts.empty();
 }
 
 void
@@ -1140,14 +1145,28 @@ RplDioHeader::SetArt(const ArtOption& art)
 {
     NS_ASSERT_MSG(art.prefixLength <= RPL_AODV_PREFIX_LENGTH_MASK,
                   "Prefix Length does not fit the ART option's 7-bit field");
-    m_hasArt = true;
-    m_art = art;
+    m_arts.assign(1, art);
 }
 
 const RplDioHeader::ArtOption&
 RplDioHeader::GetArt() const
 {
-    return m_art;
+    static const ArtOption empty;
+    return m_arts.empty() ? empty : m_arts.front();
+}
+
+void
+RplDioHeader::AddArt(const ArtOption& art)
+{
+    NS_ASSERT_MSG(art.prefixLength <= RPL_AODV_PREFIX_LENGTH_MASK,
+                  "Prefix Length does not fit the ART option's 7-bit field");
+    m_arts.push_back(art);
+}
+
+const std::vector<RplDioHeader::ArtOption>&
+RplDioHeader::GetArts() const
+{
+    return m_arts;
 }
 
 bool

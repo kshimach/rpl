@@ -1553,6 +1553,117 @@ RplDioTargetOptionTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief Multiple AODV-RPL Target (ART) options (RFC 9854 section 6.1) on
+ *        an RREQ-DIO, via AddArt()/GetArts().
+ *
+ * SetArt()/GetArt() (RplDioHeaderTestCase's own concern) keep working
+ * unchanged -- SetArt() still replaces down to a single entry, matching
+ * the RREP-DIO case (section 4.3: "MUST carry exactly one"), which never
+ * uses the list API at all.
+ */
+class RplDioMultiArtTestCase : public TestCase
+{
+  public:
+    RplDioMultiArtTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplDioMultiArtTestCase::RplDioMultiArtTestCase()
+    : TestCase("DIO with multiple ART options")
+{
+}
+
+void
+RplDioMultiArtTestCase::DoRun()
+{
+    // No ART options at all.
+    {
+        RplDioHeader dio;
+        dio.SetRank(256);
+        dio.SetDodagId(Ipv6Address("2001:1::1"));
+
+        Ptr<Packet> packet = Create<Packet>();
+        packet->AddHeader(dio);
+
+        RplDioHeader received;
+        packet->RemoveHeader(received);
+        NS_TEST_ASSERT_MSG_EQ(received.HasArt(), false, "An ART option appeared from nowhere");
+        NS_TEST_ASSERT_MSG_EQ(received.GetArts().size(), 0, "Wrong ART count");
+    }
+
+    // Three, in the order added.
+    {
+        RplDioHeader dio;
+        dio.SetRank(256);
+        dio.SetDodagId(Ipv6Address("2001:1::1"));
+        for (uint8_t i = 2; i <= 4; i++)
+        {
+            RplDioHeader::ArtOption art;
+            art.destSeqNo = i;
+            std::ostringstream address;
+            address << "2001:1::" << +i;
+            art.target = Ipv6Address(address.str().c_str());
+            dio.AddArt(art);
+        }
+
+        NS_TEST_ASSERT_MSG_EQ(dio.GetSerializedSize(), 24 + 3 * 20, "Wrong size for 3 ART options");
+
+        Ptr<Packet> packet = Create<Packet>();
+        packet->AddHeader(dio);
+
+        RplDioHeader received;
+        packet->RemoveHeader(received);
+        NS_TEST_ASSERT_MSG_EQ(received.HasArt(), true, "The ART options were lost");
+        NS_TEST_ASSERT_MSG_EQ(received.GetArts().size(), 3, "Wrong ART count");
+        NS_TEST_ASSERT_MSG_EQ(received.GetArts()[0].target,
+                              Ipv6Address("2001:1::2"),
+                              "Wrong first ART target");
+        NS_TEST_ASSERT_MSG_EQ(received.GetArts()[0].destSeqNo, 2, "Wrong first ART Dest SeqNo");
+        NS_TEST_ASSERT_MSG_EQ(received.GetArts()[1].target,
+                              Ipv6Address("2001:1::3"),
+                              "Wrong second ART target");
+        NS_TEST_ASSERT_MSG_EQ(received.GetArts()[2].target,
+                              Ipv6Address("2001:1::4"),
+                              "Wrong third ART target");
+        // GetArt() (the single-entry accessor RREP-DIO handling still uses)
+        // sees the first of the list, not an error or a default.
+        NS_TEST_ASSERT_MSG_EQ(received.GetArt().target,
+                              Ipv6Address("2001:1::2"),
+                              "GetArt() should see the first of several ART options");
+    }
+
+    // SetArt() after AddArt() calls replaces the whole list, not just the
+    // first entry -- the "at most one" contract RREP-DIO handling relies
+    // on still has to hold even if some other code path built up a list on
+    // the same header first.
+    {
+        RplDioHeader dio;
+        dio.SetRank(256);
+        dio.SetDodagId(Ipv6Address("2001:1::1"));
+        RplDioHeader::ArtOption first;
+        first.target = Ipv6Address("2001:1::2");
+        dio.AddArt(first);
+        RplDioHeader::ArtOption second;
+        second.target = Ipv6Address("2001:1::3");
+        dio.AddArt(second);
+
+        RplDioHeader::ArtOption replacement;
+        replacement.target = Ipv6Address("2001:1::9");
+        dio.SetArt(replacement);
+
+        NS_TEST_ASSERT_MSG_EQ(dio.GetArts().size(), 1, "SetArt() should have replaced the list");
+        NS_TEST_ASSERT_MSG_EQ(dio.GetArt().target,
+                              Ipv6Address("2001:1::9"),
+                              "SetArt() did not replace the earlier entries");
+    }
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Check that a DAO and a DAO-ACK survive a round trip.
  */
 class RplDaoHeaderTestCase : public TestCase
@@ -13510,6 +13621,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplDioUnknownMetricTypeTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDioOptionEdgeTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDioTargetOptionTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplDioMultiArtTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDaoHeaderTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pDroHeaderTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pDroAckHeaderTestCase, TestCase::Duration::QUICK);

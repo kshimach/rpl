@@ -534,25 +534,46 @@ class RplDioHeader : public Header
     const RrepOption& GetRrep() const;
 
     /**
-     * @brief Whether the AODV-RPL Target (ART) option is present.
+     * @brief Whether at least one AODV-RPL Target (ART) option is present.
      * @return true if the option is present
      */
     bool HasArt() const;
     /**
-     * @brief Attach an AODV-RPL Target (ART) option (RFC 9854, section 4.3).
+     * @brief Attach a single AODV-RPL Target (ART) option (RFC 9854,
+     *        section 4.3), replacing every ART option already attached.
      *
-     * At most one, unlike the RFC, which lets an RREQ-DIO carry several to
-     * look for several targets at once -- @see design-constraints.md for why
-     * multiple targets are out of scope. A second call replaces the first.
+     * The RREP-DIO case: RFC 9854 section 4.3 has it carry exactly one.
+     * For an RREQ-DIO, which MAY carry several (section 6.1's own multiple
+     * targets), @see AddArt() instead.
      *
      * @param art the option
      */
     void SetArt(const ArtOption& art);
     /**
-     * @brief Get the AODV-RPL Target (ART) option.
+     * @brief Get the first AODV-RPL Target (ART) option.
+     *
+     * For an RREQ-DIO carrying more than one, @see GetArts() for the rest.
+     *
      * @return the option, default-constructed if none is present
      */
     const ArtOption& GetArt() const;
+    /**
+     * @brief Append an AODV-RPL Target (ART) option (RFC 9854, section
+     *        4.3), for an RREQ-DIO naming more than one TargNode at once
+     *        (section 6.1: "The OrigNode can initiate the route discovery
+     *        process for multiple targets simultaneously by including
+     *        multiple ART options").
+     *
+     * Unlike SetArt(), this adds rather than replaces.
+     *
+     * @param art the option
+     */
+    void AddArt(const ArtOption& art);
+    /**
+     * @brief Get every AODV-RPL Target (ART) option.
+     * @return the list, in the order attached; empty if none are present
+     */
+    const std::vector<ArtOption>& GetArts() const;
 
     /**
      * @brief Whether the P2P Route Discovery Option (P2P-RDO) is present.
@@ -735,8 +756,11 @@ class RplDioHeader : public Header
     RreqOption m_rreq; //!< the AODV-RPL RREQ option
     bool m_hasRrep;    //!< true if the AODV-RPL RREP option is present
     RrepOption m_rrep; //!< the AODV-RPL RREP option
-    bool m_hasArt;     //!< true if the AODV-RPL Target (ART) option is present
-    ArtOption m_art;   //!< the AODV-RPL Target (ART) option
+    /// Every AODV-RPL Target (ART) option attached: RFC 9854 section 6.1
+    /// lets an RREQ-DIO carry more than one, though section 4.3 requires
+    /// exactly one on an RREP-DIO. SetArt()/GetArt() operate on the first
+    /// entry only; AddArt()/GetArts() see the whole list.
+    std::vector<ArtOption> m_arts;
 
     bool m_hasP2pRdo;    //!< true if the P2P Route Discovery Option is present
     P2pRdoOption m_p2pRdo; //!< the P2P Route Discovery Option
