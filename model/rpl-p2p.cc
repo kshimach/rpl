@@ -164,6 +164,23 @@ RplRoutingProtocol::P2pInstanceExpired(DodagKey key)
 }
 
 bool
+RplRoutingProtocol::MatchesP2pTarget(const RplDioHeader& dio) const
+{
+    if (IsOwnAddress(dio.GetP2pRdo().target))
+    {
+        return true;
+    }
+    for (const auto& targetOption : dio.GetTargets())
+    {
+        if (IsOwnAddress(targetOption.target))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool
 RplRoutingProtocol::ShouldRefuseP2pRdo(const RplDioHeader& dio, Ipv6Address from) const
 {
     DodagKey key{dio.GetInstanceId(), dio.GetDodagId()};
@@ -229,10 +246,10 @@ RplRoutingProtocol::ShouldRefuseP2pRdo(const RplDioHeader& dio, Ipv6Address from
     // at a rank whose integer portion is equal to the MaxRank." The same
     // relaxation-for-the-far-end shape as AODV-RPL's own RankLimit (@see
     // ShouldRefuseAodvRreq()), with "is this node the Target" standing in
-    // for "is this node the TargNode/OrigNode" there -- this router is the
-    // Target if one of its own addresses is the TargetAddr the P2P-RDO
-    // names (multiple Targets via RPL Target options are out of scope,
-    // @see design-constraints.md).
+    // for "is this node the TargNode/OrigNode" there -- this router is a
+    // Target if one of its own addresses is the P2P-RDO's own primary
+    // TargetAddr or names one of any additional RPL Target options
+    // (@see MatchesP2pTarget(), RFC 6997 section 9.3).
     if (rdo.maxRankOrNh != RPL_P2P_MAX_RANK_INFINITE)
     {
         uint16_t minHopRankIncrease =
@@ -248,7 +265,7 @@ RplRoutingProtocol::ShouldRefuseP2pRdo(const RplDioHeader& dio, Ipv6Address from
         }
 
         uint16_t ownDagRank = static_cast<uint16_t>(advertisedDagRank + 1);
-        bool isTarget = IsOwnAddress(rdo.target);
+        bool isTarget = MatchesP2pTarget(dio);
         if (isTarget ? (ownDagRank > rdo.maxRankOrNh) : (ownDagRank >= rdo.maxRankOrNh))
         {
             NS_LOG_LOGIC("Refusing a P2P mode DIO that would put this node at DAGRank "
@@ -286,9 +303,18 @@ RplRoutingProtocol::HandleP2pRdo(const RplDioHeader& dio, Ipv6Address from, uint
     const P2pRdoOption& rdo = dio.GetP2pRdo();
 
     // A Target that already recognised itself has nothing further to learn
-    // from a later copy -- an unconditional repeat check, the same as
-    // HandleAodvRreq()'s own dodag.aodv.isTarget one.
-    if (dodag.p2p.isTarget)
+    // from a later copy -- unless other Targets (RPL Target options,
+    // @see MatchesP2pTarget()) remain undiscovered, in which case RFC 6997
+    // section 9.5 has it continue "as an Intermediate Router would": still
+    // accumulating and re-advertising the Address Vector below, for
+    // whichever other Target(s) are further along. additionalTargets is
+    // last known from whenever this node most recently processed a DIO for
+    // this temporary DAG (rebuilt fresh below, the same "state from the
+    // last DIO" contract addressVector already has), so an empty one here
+    // means either this is the single-Target case HandleAodvRreq()'s own
+    // isTarget repeat check mirrors, or every other Target this node once
+    // knew about is gone from the DIOs it has heard since.
+    if (dodag.p2p.isTarget && dodag.p2p.additionalTargets.empty())
     {
         NS_LOG_LOGIC("Already the Target of temporary DAG " << +key.instanceId
                                                              << ", ignoring a repeat");
@@ -311,7 +337,23 @@ RplRoutingProtocol::HandleP2pRdo(const RplDioHeader& dio, Ipv6Address from, uint
     dodag.p2p.lifetimeField = rdo.lifetime;
     dodag.p2p.reply = rdo.reply;
     dodag.p2p.hopByHop = rdo.hopByHop;
-    dodag.p2p.isTarget = IsOwnAddress(rdo.target);
+    // Once true, stays true even if a later DIO's P2P-RDO TargetAddr
+    // happens to differ (RFC 6997 gives routers no way to un-become a
+    // Target); MatchesP2pTarget() also catches an RPL Target option match,
+    // which the old IsOwnAddress(rdo.target) alone missed entirely.
+    dodag.p2p.isTarget = dodag.p2p.isTarget || MatchesP2pTarget(dio);
+
+    // Raw copy of this DIO's own RPL Target options, unfiltered: RFC 6997
+    // has no rule removing a Target option once it matches this router
+    // (unlike AODV-RPL's ART, which a TargNode MUST delete its own copy of
+    // before relaying, @see design-constraints.md), so section 9.5's "no
+    // other Targets...specified via RPL Target options" is checked as
+    // written -- an empty list, not an empty list-minus-self.
+    dodag.p2p.additionalTargets.clear();
+    for (const auto& targetOption : dio.GetTargets())
+    {
+        dodag.p2p.additionalTargets.push_back(targetOption.target);
+    }
 
     // RFC 6997 section 9.4: "the intermediate router MUST add a unicast
     // IPv6 address of the receiving interface...to the route in the Address
@@ -343,16 +385,26 @@ RplRoutingProtocol::HandleP2pRdo(const RplDioHeader& dio, Ipv6Address from, uint
                                         << " hop(s) from the Origin"
                                         << (dodag.p2p.isTarget ? ", and this node is it" : ""));
 
-    // RFC 6997 section 9.5: "A Target MUST NOT forward a P2P mode DIO any
-    // further if no other Targets are to be discovered" -- true here
-    // unconditionally, since multiple Targets via RPL Target options are
-    // out of scope (@see design-constraints.md). This stops the propagation
-    // an Intermediate Router gets below, rather than leaving the Target's
-    // own Trickle timer (already reset by HandleDio() when the preferred
-    // parent was chosen) to re-flood the DIO exactly like an ordinary relay
-    // would.
+    // Whether this DIO named this node as (one of) the Target(s), whatever
+    // the node's own broader isTarget history -- this specific reply is
+    // triggered by this specific DIO having matched, not by isTarget
+    // already being true from a previous one (the repeat guard above
+    // already filtered out DIOs that would not otherwise have reached
+    // here).
     if (dodag.p2p.isTarget)
     {
+        // RFC 6997 section 9.5: "A Target MUST NOT forward a P2P mode DIO
+        // any further if no other Targets are to be discovered... the
+        // Target MUST generate DIOs for this route discovery as an
+        // Intermediate Router would" otherwise. The latter needs nothing
+        // extra here: falling through to the function's end does not
+        // itself send anything (DioTrickleFire() -- already reset above,
+        // via SelectPreferredParent() in HandleDio() -- is what re-floods
+        // this membership's DIO on its own schedule, exactly like an
+        // ordinary relay's), so the only decision left to make here is the
+        // reply below, gated on additionalTargets being irrelevant to it:
+        // RFC 6997 does not condition sending a P2P-DRO on whether other
+        // Targets remain, only on the 'R' flag.
         // "If the Reply flag inside the P2P-RDO in the received DIO is set
         // to one, the Target MUST select one or more discovered routes and
         // send one or more P2P-DRO messages" (section 9.5). Exactly one
@@ -392,11 +444,11 @@ RplRoutingProtocol::SendP2pDro(DodagMembership& dodag, DodagKey key)
     dro.SetInstanceId(dodag.instanceId);
     // RFC 6997 section 9.5: a Target MAY set 'S' when "this router is the
     // only Target specified in the corresponding DIO...and the Target has
-    // already selected the desired number of routes" -- both are always
-    // true in this implementation's scope (a single Target, N=0 meaning
-    // exactly one route), so this is unconditional rather than a policy
-    // choice the way the 'A' flag below is.
-    dro.SetStop(true);
+    // already selected the desired number of routes". The second half is
+    // always true in this implementation's scope (N=0 meaning exactly one
+    // route), so this reduces to "no other Targets are named" --
+    // additionalTargets being empty, section 9.3's own condition for it.
+    dro.SetStop(dodag.p2p.additionalTargets.empty());
     dro.SetAckRequested(m_p2pDroAckRequested);
     dro.SetSequence(dodag.p2p.droSequence);
     // "the router recognizes itself as the Origin" by matching the P2P-DRO's

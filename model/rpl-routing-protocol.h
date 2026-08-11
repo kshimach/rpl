@@ -866,6 +866,17 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
             bool isOrigin{false}; //!< this node started the discovery
             bool isTarget{false}; //!< this node is (one of) the Target(s) being looked for
             Ipv6Address target;   //!< the Target being looked for (RFC 6997 section 7's TargetAddr)
+            /// Any additional Targets this temporary DAG's DIOs name via
+            /// RPL Target options (RFC 6550 section 6.7.7, reused by RFC
+            /// 6997 section 9.3), beyond the primary one above. Rebuilt
+            /// from scratch on every DIO HandleP2pRdo() processes, the
+            /// same "state from the last DIO" contract addressVector
+            /// already has -- RFC 6997 has no rule removing an entry once
+            /// it matches this router (unlike AODV-RPL's ART, @see
+            /// design-constraints.md), so this is always this DIO's raw
+            /// list. Empty is what section 9.5's "no other Targets...
+            /// specified via RPL Target options" checks for.
+            std::vector<Ipv6Address> additionalTargets;
             uint8_t maxRank{0};   //!< MaxRank, 0 meaning no limit
             uint8_t lifetimeField{0}; //!< the 'L' field this temporary DAG was opened with
             bool reply{true};         //!< 'R': whether the Target should send a P2P-DRO back
@@ -1082,6 +1093,25 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      * @return true if the DIO must be dropped without joining
      */
     bool ShouldRefuseP2pRdo(const RplDioHeader& dio, Ipv6Address from) const;
+
+    /**
+     * @brief Whether this node is (one of) the Target(s) a P2P mode DIO
+     *        names.
+     *
+     * RFC 6997 section 9.3: "The router MUST check the Target addresses
+     * listed in the P2P-RDO and any RPL Target options included in the
+     * received DIO. If one of its IPv6 addresses is listed as a Target
+     * address...the router considers itself a Target." Checked against
+     * the P2P-RDO's own primary TargetAddr and every RPL Target option
+     * (@see RplDioHeader::GetTargets()) -- a small helper rather than
+     * inlining the loop twice, since ShouldRefuseP2pRdo()'s MaxRank
+     * relaxation and HandleP2pRdo()'s own isTarget assignment both need
+     * exactly this same check.
+     *
+     * @param dio the P2P mode DIO to check
+     * @return true if one of this node's own addresses is named
+     */
+    bool MatchesP2pTarget(const RplDioHeader& dio) const;
 
     /**
      * @brief Act on an RREP-DIO travelling back towards the OrigNode.
