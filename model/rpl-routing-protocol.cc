@@ -1557,16 +1557,80 @@ RplRoutingProtocol::HandleDio(const RplDioHeader& dio,
         dodag->daoEvent.Schedule(Seconds(m_jitter->GetValue(0.0, 1.0)));
     }
 
-    dodag->dioTrickle.ConsistencyHit();
-
-    // Same dangling-pointer hazard as the infinite-rank branch above:
-    // SelectPreferredParent() can erase this very entry via LeaveDodag().
-    if (SelectPreferredParent(*dodag))
+    if (dio.HasP2pRdo())
     {
+        // RFC 6997 section 9.2's own Trickle consistency rules for a P2P
+        // mode DIO, distinct from the generic rule below (shared by base
+        // RPL and AODV-RPL, which also reaches this same tail): a DIO from
+        // the current preferred parent that does not improve this node's
+        // own rank is neither consistent nor inconsistent -- no counter
+        // increment at all, where the generic rule below would count it as
+        // consistent unconditionally. dio.HasP2pRdo() rather than
+        // dodag->p2p.target.IsAny() as the test: the latter is not
+        // populated until HandleP2pRdo() runs, later in this same
+        // function on this DIO's first delivery, so it would misclassify
+        // exactly the DIO that starts a new discovery -- harmlessly, since
+        // the generic branch's own "just joined" Reset() happens to agree
+        // with rule 1 below for that one case, but dio.HasP2pRdo() is
+        // correct from the first DIO onward without relying on that
+        // coincidence.
+        //
+        // Captured before SelectPreferredParent() runs, which is what
+        // updates both.
+        Ipv6Address previousParent = dodag->preferredParent;
+        uint16_t previousRank = dodag->rank;
+        bool isFromParent = (from == previousParent);
+
+        SelectPreferredParent(*dodag);
         auto it = m_dodags.find(dioKey);
-        if (it != m_dodags.end())
+        if (it == m_dodags.end())
         {
-            it->second.dioTrickle.Reset();
+            // SelectPreferredParent() dropped the last parent and
+            // LeaveDodag() erased this very entry.
+            return;
+        }
+        DodagMembership& after = it->second;
+
+        if (after.rank < previousRank)
+        {
+            // Rule 1: "the receipt of a P2P mode DIO that allows the
+            // router to advertise a better route...is considered
+            // inconsistent", regardless of source. The first DIO ever
+            // heard for a temporary DAG satisfies this automatically --
+            // JoinDodag() leaves rank at RPL_INFINITE_RANK until a parent
+            // is picked, so any finite result is an improvement -- exactly
+            // rule 1's own "the first receipt...is always considered an
+            // inconsistent event", without needing to special-case it.
+            after.dioTrickle.Reset();
+        }
+        else if (isFromParent)
+        {
+            // Rule 2: neither, no counter increment -- the difference from
+            // the generic rule below.
+        }
+        else if (dio.GetRank() <= after.rank)
+        {
+            // Rule 3: at least as good as what this router (would)
+            // advertise, from a non-parent.
+            after.dioTrickle.ConsistencyHit();
+        }
+        // Rule 4 (worse than this router's own route, from a non-parent):
+        // neither -- the implicit else, same as rule 2's branch just for a
+        // different reason.
+    }
+    else
+    {
+        dodag->dioTrickle.ConsistencyHit();
+
+        // Same dangling-pointer hazard as the infinite-rank branch above:
+        // SelectPreferredParent() can erase this very entry via LeaveDodag().
+        if (SelectPreferredParent(*dodag))
+        {
+            auto it = m_dodags.find(dioKey);
+            if (it != m_dodags.end())
+            {
+                it->second.dioTrickle.Reset();
+            }
         }
     }
 

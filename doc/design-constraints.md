@@ -4648,3 +4648,75 @@ membership同様'L'期限で退出する。design-constraints.mdの
 
 `./ns3 build`clean、`./test.py -s rpl`PASS、
 `test-runner --suite=rpl`を3回連続PASS確認。
+
+## 39. §9.2 の P2P mode DIO 独自 Trickle 一貫性判定を実装(既定値変更は保留)
+
+§36.2 で見送った最後の1項目。RFC 6997 §9.2 の4パターン分類を
+`HandleDio()` の Trickle-hit 部分に実装した:
+
+1. **rank が改善する DIO** (送信元がparentか否かに関わらず): inconsistent
+   → `dioTrickle.Reset()`。「初回受信は常に inconsistent」は特別扱い
+   不要 — `JoinDodag()` が rank を `RPL_INFINITE_RANK` にしてから
+   呼ぶため、初回は必ず「改善」判定になる。
+2. **現在の preferred parent から、改善しない DIO**: neither
+   (`ConsistencyHit()` すら呼ばない) — base RPL/AODV-RPL と共有する
+   汎用ロジック (無条件に `ConsistencyHit()`) との差分そのもの。
+3. **parent 以外から、自分の rank と同等以上の DIO**: consistent →
+   `ConsistencyHit()`。
+4. **parent 以外から、自分の rank より悪い DIO**: neither。
+
+判別式は `dio.HasP2pRdo()` を使った (`dodag->p2p.target.IsAny()` では
+なく) — 後者は `HandleP2pRdo()` (この節より後で呼ばれる) が初めて
+`p2p.target` を埋めるため、新規 discovery の**最初の** DIO だけ誤判定
+する (今回は「たまたま既存の汎用分岐のReset()挙動と一致するので実害
+無し」と気づいたが、`dio.HasP2pRdo()` の方が最初から取り違えようが
+ない)。
+
+### 39.1 base RPL の汎用規則との、もう1つの違い (RFC 6997 の方が厳密)
+
+汎用規則 (`SelectPreferredParent()` が真 = preferred parent が
+**変化**すれば Reset()) と、今回実装した rule 1 (rank が**改善**すれば
+Reset()) は同じではない — staleness sweep 等で親が失われ、より
+**悪い** rank の代替候補に**強制的に**切り替わるケースでは、汎用規則は
+Reset() する (変化はした) が、rule 1 は Reset() **しない** (改善して
+いない)。これは RFC の文言 ("allows the router to advertise a
+**better** route...is considered inconsistent") に忠実な帰結であり、
+意図的な差分として残した — Trickle の抑制哲学 (悪い情報を急いで
+広める理由はない) とも整合する。base RPL 側にこの区別を持ち込む変更は
+していない (この節の分岐は P2P-RPL の temporary DAG にのみ適用され、
+`dio.HasP2pRdo()` で汎用パスと排他的に分かれる)。
+
+### 39.2 `P2pDioRedundancy` の既定値変更は今回見送り
+
+計画では §36.6 で 0 にした既定値を RFC 推奨の 1 に戻す予定だったが、
+**見送った**。理由:
+
+- `P2pDioRedundancy=0` (「絶対に抑制しない」) の下では、
+  `TransmitEvent()` の抑制判定 (`m_redundancy == 0 || m_counter <
+  m_redundancy`) が `m_redundancy==0` の時点で常に真になり、
+  `ConsistencyHit()` が呼ばれるかどうか自体が送信可否に一切影響
+  しない。つまり**今回の分類ロジックは、既定値を変えない限り
+  Reset() の呼び出し条件 (rule 1) だけが実際の挙動を左右し、
+  rule 2/3/4 の違い (ConsistencyHit() を呼ぶかどうか) は既定設定下では
+  無害・無効**。実際、rpl スイート全件が変更前と変わらず PASS した
+  こともこれと整合する (既定動作は変わっていないはず、という予想が
+  裏付けられた)。
+- 一方で、`P2pDioRedundancy` を実際に 1 (RFC 推奨値) 以上に上げると、
+  rule 2/3/4 の判定が初めて実際の送信抑制に影響する — ここを
+  検証するテストを今回は書けていない。Trickle のタイミングに依存する
+  テストはこのセッションで複数回踏み抜いた地雷 (§38.1.2 の
+  zero-Imin ライブロック、以前の増分での同種のバグ) であり、拙速に
+  書いて別の不具合を作り込むリスクの方が、既定値をもう1増分保留する
+  コストより大きいと判断した。
+- **結論**: rule 1〜4 の分類ロジック自体は実装・RFC原文と突き合わせ
+  済みで、既定設定下で無害であることを回帰スイート全件PASSで確認
+  済みだが、**rule 2/3/4 を専用テストで直接検証してはいない**。
+  `P2pDioRedundancy` の既定値変更(0→1)は、そのテストを書いてからの
+  次回増分に持ち越す。
+
+### 39.3 検証
+
+`./ns3 build` clean、`./test.py -s rpl` PASS、`test-runner
+--suite=rpl` PASS (既存の全テストに変化なし — 39.2 の分析どおり、
+既定設定下でのconsistencyHit()/Reset()呼び出し条件変更は無害である
+ことの間接的な裏付け)。専用の新規テストは追加していない(39.2参照)。
