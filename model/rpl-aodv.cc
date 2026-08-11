@@ -24,6 +24,8 @@
 #include "ns3/log.h"
 #include "ns3/simulator.h"
 
+#include <algorithm>
+
 namespace ns3
 {
 
@@ -127,6 +129,15 @@ RplRoutingProtocol::DiscoverRoute(Ipv6Address target)
     dodag.aodv.rankLimit = m_aodvRankLimit;
     dodag.aodv.lifetimeField = m_aodvLifetime;
     dodag.aodv.target = target;
+    // A single-entry record: this module's own DiscoverRoute() only ever
+    // starts a discovery for one target at a time (RFC 9854 section 6.1's
+    // OrigNode-initiated multi-target discovery, via more than one ART
+    // option from the very start, is not exposed here -- the same scope
+    // boundary P2P-RPL's own DiscoverP2pRoute() keeps, @see
+    // design-constraints.md). SendDio() rebuilds the outgoing ART list from
+    // this rather than from target directly, so it has to be seeded here
+    // too, not just at a relay that learns it from an incoming RREQ-DIO.
+    dodag.aodv.targets = {target};
     dodag.aodv.isOrigin = true;
     dodag.aodv.isTarget = false;
     // Empty at the OrigNode: "The Origin and Target addresses MUST NOT be
@@ -294,9 +305,17 @@ RplRoutingProtocol::ShouldRefuseAodvRreq(const RplDioHeader& dio, Ipv6Address fr
         // sit exactly at the RankLimit ("TargNode can join the RREQ-Instance
         // at a Rank whose integer portion is less than or equal to the
         // RankLimit"), every other router strictly below it, so the check is
-        // relaxed by one step when the ART option names this node.
+        // relaxed by one step when an ART option names this node -- checked
+        // against every ART option the RREQ-DIO carries (section 6.1: "the
+        // OrigNode can include multiple TargNode addresses via multiple ART
+        // options"), not just the first, since this router can be any one of
+        // several TargNodes this discovery is looking for.
         uint16_t ownDagRank = static_cast<uint16_t>(advertisedDagRank + 1);
-        bool isTarget = dio.HasArt() && IsOwnAddress(dio.GetArt().target);
+        bool isTarget = std::any_of(dio.GetArts().begin(),
+                                    dio.GetArts().end(),
+                                    [this](const RplDioHeader::ArtOption& art) {
+                                        return IsOwnAddress(art.target);
+                                    });
         if (isTarget ? (ownDagRank > rreq.rankLimit) : (ownDagRank >= rreq.rankLimit))
         {
             NS_LOG_LOGIC("Refusing an RREQ that would put this node at DAGRank "
@@ -447,10 +466,14 @@ RplRoutingProtocol::HandleAodvRreq(const RplDioHeader& dio, Ipv6Address from, ui
     }
 
     // RFC 9854 section 6.2.6: a TargNode "already associated with the
-    // RREQ-Instance ... takes no further action" -- unconditional, unlike
-    // the intermediate-router case just below, so this stays a plain repeat
-    // check.
-    if (dodag.aodv.isTarget)
+    // RREQ-Instance ... takes no further action" -- relaxed the same way
+    // MatchesP2pTarget()'s caller relaxes P2P-RPL's own repeat guard
+    // (@see design-constraints.md): section 6.2.2 lets "one of the
+    // TargNodes ... be an intermediate router to other TargNodes" when a
+    // discovery names more than one, so a TargNode only truly has nothing
+    // further to do once targets (the ones still left to relay onward) is
+    // also empty.
+    if (dodag.aodv.isTarget && dodag.aodv.targets.empty())
     {
         NS_LOG_LOGIC("Already the TargNode of RREQ-Instance " << +key.instanceId
                                                               << ", ignoring a repeat");
@@ -485,7 +508,80 @@ RplRoutingProtocol::HandleAodvRreq(const RplDioHeader& dio, Ipv6Address from, ui
     dodag.aodv.lifetimeField = rreq.lifetime;
     dodag.aodv.target = dio.GetArt().target;
     dodag.aodv.isOrigin = false;
-    dodag.aodv.isTarget = IsOwnAddress(dio.GetArt().target);
+
+    // RFC 9854 section 6.2.2: "the intermediate router maintains a record
+    // of the targets that have been requested for a given RREQ-Instance"
+    // and, once a later RREQ-DIO's own list differs from what came before,
+    // propagates only "the intersection of all received lists". targets
+    // holds that record; dodag.aodv.addressVector is still the previous
+    // RREQ-DIO's own at this point (overwritten further down), so its
+    // emptiness is what tells the very first RREQ-DIO this instance ever
+    // processes apart from a later one -- nothing has been recorded yet
+    // for the first, so it seeds the record outright instead of
+    // intersecting against nothing.
+    //
+    // The RFC also asks a router to ignore "an incoming RREQ-DIO message
+    // having multiple ART options coming from a router with higher Rank
+    // than the Rank of the stored targets". A separate check for that is
+    // not needed on top of this: the guard just above already refuses any
+    // RREQ-DIO whose sender is not (still) dodag.preferredParent once this
+    // router has joined, and SelectPreferredParent() -- run by HandleDio()
+    // immediately before this function, on every DIO -- only ever moves
+    // that to a neighbour whose Rank is at least as good as the best seen
+    // so far, so a worse-Rank sender's copy never reaches this point to
+    // begin with. @see design-constraints.md for the fuller comparison
+    // against the RFC's own, per-target-record wording.
+    std::vector<Ipv6Address> incomingTargets;
+    for (const auto& art : dio.GetArts())
+    {
+        incomingTargets.push_back(art.target);
+    }
+    if (dodag.aodv.addressVector.empty())
+    {
+        dodag.aodv.targets = incomingTargets;
+    }
+    else
+    {
+        std::vector<Ipv6Address> intersected;
+        for (const auto& storedTarget : dodag.aodv.targets)
+        {
+            if (std::find(incomingTargets.begin(), incomingTargets.end(), storedTarget) !=
+                incomingTargets.end())
+            {
+                intersected.push_back(storedTarget);
+            }
+        }
+        dodag.aodv.targets = intersected;
+    }
+
+    // "The router is a TargNode if it finds one of its own addresses in a
+    // Target option in the RREQ" -- checked against every entry left in
+    // targets after the intersection above, not just the first. If the
+    // OrigNode is looking for more than one TargNode, "before transmitting
+    // the RREQ-DIO ... a TargNode MUST delete the Target option
+    // encapsulating its own address, so that downstream routers with
+    // higher Rank values do not try to create a route to this TargNode" --
+    // done here rather than at SendDio() time so that targets already
+    // holds exactly what this router still needs to relay onward. Once
+    // true, isTarget stays true even though the very entry that matched is
+    // erased in the same step: RFC 9854 gives a router no way to
+    // un-become a TargNode, the same "no way to un-become a Target"
+    // reasoning MatchesP2pTarget()'s own caller documents for P2P-RPL.
+    bool wasTarget = dodag.aodv.isTarget;
+    bool matchedThisTime = false;
+    for (auto entry = dodag.aodv.targets.begin(); entry != dodag.aodv.targets.end();)
+    {
+        if (IsOwnAddress(*entry))
+        {
+            matchedThisTime = true;
+            entry = dodag.aodv.targets.erase(entry);
+        }
+        else
+        {
+            ++entry;
+        }
+    }
+    dodag.aodv.isTarget = wasTarget || matchedThisTime;
 
     // RFC 9854 section 6.2.4. The incoming 'S' having been cleared anywhere
     // upstream is final -- "If the S bit arrives already set to be 0, then
@@ -539,22 +635,31 @@ RplRoutingProtocol::HandleAodvRreq(const RplDioHeader& dio, Ipv6Address from, ui
                                         << " looking for " << dodag.aodv.target << ", "
                                         << dodag.aodv.addressVector.size()
                                         << " hop(s) from the OrigNode"
-                                        << (dodag.aodv.isTarget ? ", and this node is it" : ""));
+                                        << (dodag.aodv.isTarget ? ", and this node is it" : "")
+                                        << ", " << dodag.aodv.targets.size()
+                                        << " target(s) left to relay onward");
 
     // RFC 9854 section 6.2.6: a TargNode that was not already in the
     // RREQ-Instance "prepares and transmits an RREP-DIO". Answered once --
-    // a repeat copy of the same RREQ is turned away by the check above, so
-    // this cannot fire twice for one discovery.
-    if (dodag.aodv.isTarget)
+    // matchedThisTime can only be true when wasTarget was still false: the
+    // repeat guard above already returns early whenever isTarget is true
+    // and nothing is left in targets, and a TargNode with other targets
+    // still outstanding cannot match its own address a second time, since
+    // the very entry that matched it the first time was erased out of
+    // targets in that same step above.
+    if (matchedThisTime)
     {
         SendAodvRrep(dodag, key);
     }
 
     // Nothing sends the RREQ onward here: DioTrickleFire() already
     // multicasts this membership's DIO on its own schedule, and SendDio()
-    // fills in the RREQ and ART options from the state just recorded. The
-    // Trickle timer was reset by HandleDio() when the preferred parent was
-    // chosen, so the propagation is already imminent.
+    // fills in the RREQ and ART options from the state just recorded -- or,
+    // if targets came out empty, suppresses the RREQ-DIO outright (section
+    // 6.2.2's "If the intersection is empty ... the router MUST NOT
+    // transmit any RREQ-DIO"). The Trickle timer was reset by HandleDio()
+    // when the preferred parent was chosen, so the propagation is already
+    // imminent either way.
 }
 
 void
@@ -1094,6 +1199,21 @@ RplRoutingProtocol::GetAodvAddressVector(uint8_t instanceId,
         return false;
     }
     addressVector = it->second.aodv.addressVector;
+    return true;
+}
+
+bool
+RplRoutingProtocol::GetAodvTargets(uint8_t instanceId,
+                                   Ipv6Address dodagId,
+                                   std::vector<Ipv6Address>& targets) const
+{
+    targets.clear();
+    auto it = m_dodags.find(DodagKey{instanceId, dodagId});
+    if (it == m_dodags.end())
+    {
+        return false;
+    }
+    targets = it->second.aodv.targets;
     return true;
 }
 

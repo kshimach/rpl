@@ -518,6 +518,24 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
                               std::vector<Ipv6Address>& addressVector) const;
 
     /**
+     * @brief Get the ART targets an RREQ-Instance still has left to relay.
+     *
+     * RFC 9854 section 6.2.2's own record of "the targets that have been
+     * requested for a given RREQ-Instance", after every intersection with a
+     * later RREQ-DIO's own list and every self-ART deletion this node has
+     * made. Exposed for tests and for inspecting a discovery in progress,
+     * the AODV-RPL counterpart of GetAodvAddressVector().
+     *
+     * @param instanceId the RPLInstanceID of the RREQ-Instance
+     * @param dodagId the DODAGID of the RREQ-Instance, i.e. the OrigNode
+     * @param [out] targets the targets still left to relay onward
+     * @return true if this node is part of that RREQ-Instance
+     */
+    bool GetAodvTargets(uint8_t instanceId,
+                        Ipv6Address dodagId,
+                        std::vector<Ipv6Address>& targets) const;
+
+    /**
      * @brief Get the source route an AODV-RPL discovery found to a target.
      *
      * The Address Vector the RREP brought back: every hop from the OrigNode
@@ -802,7 +820,30 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
             uint8_t origSeqNo{0};
             uint8_t rankLimit{0}; //!< RankLimit, 0 meaning no limit
             uint8_t lifetimeField{0}; //!< the 'L' field this instance was opened with
-            Ipv6Address target;   //!< the single ART target being looked for
+            Ipv6Address target;   //!< the first ART target ever seen for this instance; logging/RREP-Instance use only, @see targets below
+
+            /// Every ART target this router still has to relay onward for
+            /// this RREQ-Instance (RFC 9854 section 6.1 lets an RREQ-DIO
+            /// carry more than one ART option: "OrigNode can initiate the
+            /// route discovery process for multiple targets
+            /// simultaneously"). Seeded from the first RREQ-DIO
+            /// HandleAodvRreq() processes for this instance, then on every
+            /// later one intersected against that DIO's own ART list
+            /// (section 6.2.2's "the intersection of all received lists"),
+            /// then has this router's own matched address(es) deleted from
+            /// it ("a TargNode MUST delete the Target option encapsulating
+            /// its own address") -- unlike P2P-RPL's additionalTargets,
+            /// which RFC 6997 never asks to be filtered this way, @see
+            /// design-constraints.md. Re-emitted as SendDio()'s outgoing
+            /// ART list; empty means every target reached so far has been
+            /// accounted for, which is also this router's cue to stop
+            /// transmitting an RREQ-DIO at all (section 6.2.2's "If the
+            /// intersection is empty ... the router MUST NOT transmit any
+            /// RREQ-DIO") unless it is still the OrigNode. Meaningless for
+            /// an RREP-Instance (@see isRrepInstance), which always carries
+            /// exactly one ART (section 4.3) built straight from origNode
+            /// instead.
+            std::vector<Ipv6Address> targets;
             /// The route the RREQ-DIO took to get here, OrigNode-side first,
             /// as this node would propagate it: its own address is already
             /// appended (RFC 9854 section 6.2.5).

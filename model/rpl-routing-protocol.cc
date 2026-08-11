@@ -1066,6 +1066,25 @@ RplRoutingProtocol::SendDio(DodagMembership& dodag, Ipv6Address dst, uint32_t in
 {
     NS_LOG_FUNCTION(this << dst << interface);
 
+    // RFC 9854 section 6.2.2: "If the intersection [of the targets this
+    // router still has to relay] is empty, it means that all the targets
+    // have been reached, and the router MUST NOT transmit any RREQ-DIO."
+    // Checked here rather than folded into the RREQ-Instance branch below,
+    // which only decides what to put ON an outgoing DIO: an empty targets
+    // list has to suppress the whole transmission, not leave this router
+    // sending an RREQ-Instance DIO with no ART option on it at all. Does
+    // not apply to the OrigNode, whose own targets never permanently empties
+    // out from processing incoming DIOs the way a relay's does (@see
+    // HandleAodvRreq()), or to an RREP-Instance, which is a different
+    // DODAG with no targets record of its own to consult.
+    if (dodag.mop == RPL_MOP_P2P_ROUTE_DISCOVERY && !dodag.aodv.isRrepInstance &&
+        !dodag.aodv.isOrigin && !dodag.aodv.target.IsAny() && dodag.aodv.targets.empty())
+    {
+        NS_LOG_LOGIC("No AODV-RPL targets left to relay for RREQ-Instance "
+                    << +dodag.instanceId << "; suppressing this RREQ-DIO");
+        return;
+    }
+
     RplDioHeader dio;
     dio.SetInstanceId(dodag.instanceId);
     dio.SetVersionNumber(dodag.version);
@@ -1170,14 +1189,26 @@ RplRoutingProtocol::SendDio(DodagMembership& dodag, Ipv6Address dst, uint32_t in
         rreq.addressVector = dodag.aodv.addressVector;
         dio.SetRreq(rreq);
 
-        RplDioHeader::ArtOption art;
-        // The TargNode's own Sequence Number is not known until its RREP
-        // arrives; RFC 9854 section 4.3 has the RREQ carry 0 for "no known
-        // information about the Sequence Number of TargNode".
-        art.destSeqNo = 0;
-        art.prefixLength = 0; // the field holds an address, not a prefix
-        art.target = dodag.aodv.target;
-        dio.SetArt(art);
+        // RFC 9854 section 6.2.2: a router relays "the intersection of all
+        // received lists" once TargNode self-deletions are applied -- built
+        // up by HandleAodvRreq() into dodag.aodv.targets already (this
+        // branch is unreachable with that list empty; the guard at the top
+        // of this function suppresses the whole transmission first), so
+        // this simply re-emits however many entries are left as their own
+        // ART options. AddArt() rather than the single-entry SetArt(): the
+        // same list-vs-scalar split RplDioHeader itself keeps between the
+        // two, @see design-constraints.md.
+        for (const auto& target : dodag.aodv.targets)
+        {
+            RplDioHeader::ArtOption art;
+            // The TargNode's own Sequence Number is not known until its
+            // RREP arrives; RFC 9854 section 4.3 has the RREQ carry 0 for
+            // "no known information about the Sequence Number of TargNode".
+            art.destSeqNo = 0;
+            art.prefixLength = 0; // the field holds an address, not a prefix
+            art.target = target;
+            dio.AddArt(art);
+        }
     }
     else if (dodag.mop == RPL_MOP_P2P_ROUTE_DISCOVERY && !dodag.p2p.target.IsAny())
     {

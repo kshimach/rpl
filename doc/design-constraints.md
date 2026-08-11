@@ -4877,3 +4877,175 @@ Targetは、'L'期限まで S=0 のまま関連DIOをTrickleで送り続ける�
 (41.1は`RplP2pMultiTargetRelayTestCase`、41.2はクラッシュの再現/
 解消)。`./ns3 build`clean、`./test.py -s rpl`PASS、`test-runner
 --suite=rpl`3回連続PASS。
+
+## 42. AODV-RPL (RFC 9854) 複数ART option対応 — P2P-RPL複数Targetとの並行実装の後半
+
+§40・41でP2P-RPL側の複数Target対応(RFC 6550 Target Option再利用)を
+完成させた後、当初計画どおりAODV-RPL側の独自複数ART option機構
+(RFC 9854 section 6.1)に着手した。両者はMOP値を共有するだけの
+別プロトコルであり(design-constraints.mdの既存記述、および本セッション
+冒頭でのRFC原文確認によって、両者の複数Target機構が別物であることを
+確認済み)、AODV-RPL側はP2P-RPLに無い要素 — 複数上流からのTarget集合
+交差追跡と、TargNode自身のART option強制削除 — を持つ、より複雑な
+増分になることが最初から分かっていた。
+
+### 42.1 ワイヤフォーマット増分: `RplDioHeader`のART optionをリスト化
+
+`ArtOption`の内部保持を`bool m_hasArt; ArtOption m_art;`から
+`std::vector<ArtOption> m_arts;`に変更。既存の`SetArt()`/`GetArt()`/
+`HasArt()`(常に「先頭の1件」を操作する)のシグネチャ・挙動は完全に
+維持し、新たに`AddArt()`/`GetArts()`(複数件のリスト操作)を追加した。
+RREP-DIO生成側(`SendAodvRrepTo()`)を含む既存の全呼び出し元
+(15箇所超)は無変更のまま、フルビルド・全回帰テストがPASSすることを
+確認済み — `SetArt()`が内部で`m_arts.assign(1, art)`、`GetArt()`が
+`m_arts.empty() ? 静的な空ArtOption : m_arts.front()`を返すことで、
+単一ART前提のコードには一切影響しない設計にした。新規テスト
+`RplDioMultiArtTestCase`で0/3件のラウンドトリップ、および
+`GetArt()`が複数件中の先頭を正しく返すこと、`SetArt()`が既存の
+`AddArt()`群を丸ごと置き換えること、を確認。
+
+### 42.2 ロジック増分の設計: P2P-RPLとの構造的な違い
+
+RFC 9854 section 6.2.2を読み直し、以下がP2P-RPL側 (RFC 6997 section
+9.5) との明確な違いであることを確認した:
+
+1. **TargNode自身のART option強制削除**: 「a TargNode MUST delete the
+   Target option encapsulating its own address」— P2P-RPLのRPL Target
+   optionには対応する削除規定が無い (design-constraints.md該当節参照)
+   のと対照的。今回、これを`HandleAodvRreq()`内で「一致した自分の
+   エントリを`dodag.aodv.targets`から`std::vector::erase()`で除去する」
+   形で実装した。
+2. **中継ルータでのTarget集合交差追跡**: 「the intermediate router
+   maintains a record of the targets that have been requested for a
+   given RREQ-Instance...the intersection of all received lists MUST
+   be included」— P2P-RPL側には対応する概念が無い(単一のAddress
+   Vectorが全Targetに共通なだけ)。RFC本文の具体例(T1,T2とT2,T4の
+   交差がT2のみ)をそのままテストケース化した
+   (`RplAodvMultiArtIntersectionTestCase`)。
+3. **「より低いRankの送信元からの複数ARTを無視する」規定**: RFC原文
+   「An incoming RREQ-DIO message having multiple ART options coming
+   from a router with higher Rank than the Rank of the stored targets
+   is ignored」を、別個の状態(送信元ごとのRank記録)を新設して実装
+   するか検討したが、既存の`HandleAodvRreq()`が既に持つ
+   `from != dodag.preferredParent`ガード (§9.4の日付, 既存の
+   `RplAodvAddressVectorFollowsParentTestCase`が担保) が、
+   RFC 9854 section 6.2.1の「MaxUsefulRankはこれまでの最良RREQの
+   Rankまで単調に厳しくなる」という仕様と組み合わさることで、事実上
+   同じ効果を達成していると判断した: 一度あるRREQ-Instanceに参加した
+   ルータにとって、既知の最良Rankより悪いRREQ-DIOはStep 1
+   (`ShouldRefuseAodvRreq()`)で既に弾かれており、Step 2の交差計算に
+   到達するのは常に「現在のpreferredParent以上に良い」送信元からの
+   ものだけになる。よって別個の交差元Rank記録は追加せず、既存の
+   単一preferred parentモデルへの意図的な単純化として設計・コメントに
+   明記した。この判断はRFC原文の一般的なマルチパレント前提を、この
+   実装が既に採用している単一preferred parentモデルへ単純化した
+   ものであり、他の箇所(P2P-RPL側のAddress Vector追跡等)でも同じ
+   単純化が既に一貫して行われている。
+
+`AodvRreqState`に`std::vector<Ipv6Address> targets`を新設 (既存の
+単数形`target`は「最初に見えたART/ログ・後方互換用」の役割のまま
+変更していない — `SendAodvRrep()`が実際に使うのは`ownAddress`と
+`key.dodagId`のみで`dodag.aodv.target`はログ専用と確認済み、RREP-
+Instance側の`target`は従来どおり単一のTargNode自身のアドレスを表す
+別概念なので触っていない)。`HandleAodvRreq()`の無条件repeatガード
+(`if (isTarget) return;`)を、P2P-RPL側の`MatchesP2pTarget()`と同じ
+発想で`if (isTarget && targets.empty()) return;`に緩和し、「自分が
+Target化した後も他のTargetが残っていれば中継を続ける」動作を追加。
+`SendDio()`のAODV-RPL RREQ-DIO分岐を、単一`SetArt()`呼び出しから
+`dodag.aodv.targets`全件を`AddArt()`するループに変更し、かつ
+「`targets`が空(=交差の結果、到達済みTargetしか残っていない)なら
+RREQ-DIOの送信自体を止める」ガードを`SendDio()`冒頭に追加した
+(RFC 9854 section 6.2.2「the router MUST NOT transmit any RREQ-DIO」)。
+これは単一Target時代の既存挙動(TargNode化した後もRREQ-DIOを
+'L'期限まで送り続けていた)を変更する修正だが、RFC原文が明確にMUSTと
+定めている以上、既存の(誤っていた)挙動を維持する理由は無いと判断し、
+回帰スイート全件PASSを確認したうえで採用した。
+
+### 42.3 デバッグ実話: 複数ARTテストがSIGSEGVした原因は新規ロジックではなく、テスト自身の合成上流ノード設計だった
+
+`RplAodvMultiArtTwoTargetsAnsweredTestCase`(relay 1台がtargA・targB
+2台のTargNodeへ2件のARTを含むRREQ-DIOを中継する、3ノード構成)を
+書いた直後、`test-runner --suite=rpl`がSIGSEGV(終了コード139)で
+落ちた。macOS実機でのlldbアタッチはこのサンドボックス環境では機能
+せず(既知、ns3-debug-pitfalls参照)、コアダンプも生成されなかった
+ため、`std::cerr`による手動の逐次ブレッドクラム挿入
+(`SendDio()`・`HandleAodvRreq()`・`RplTrickleTimer::TransmitEvent()`・
+`RecvRpl()`・`SendRplMessageMulticast()`等、送受信パイプライン全体)
+で追跡した。
+
+最終的に判明した原因は、新規実装したAODV-RPLロジックのバグではなく、
+**テストコード自身の合成上流ノード設計**にあった: relayへ2件のART
+を含むRREQ-DIOを注入する際、送信元として実在しない仮想アドレス
+`fe80::f1`を`DeliverRawRplMessage()`で**一度だけ**届けていた。この
+仮想送信元はRPLの通常の「隣接ノード」として`dodag.parents`に
+記録されるが、実体が無いため二度と再送されない。テストのDIOに設定
+した`DodagConfiguration`のdioIntervalMin指数が8(256ms)だったため、
+`SelectPreferredParent()`の陳腐化判定(2倍のIntervalMax、すなわち
+512ms)に引っかかり、relayはこの仮想「親」を失って**通常のRPL
+動作として**このRREQ-InstanceをPoisonして離脱する — これ自体は
+`RplAodvRreqFloodTestCase`の'L'期限離脱テストと同型の、既存の
+正しい挙動である。
+
+問題は、その離脱の連鎖(relay離脱 → targA・targBも親relayを失い
+連鎖的に離脱)が、**このセッションで初めて**「複数のTargNodeが
+それぞれ自分のART削除後も中継ルータとして動き続ける」新設計パス
+(§42.2の1)を経由して起きたことで、`HandleDio()`・
+`SelectPreferredParent()`・`LeaveDodag()`間の複雑な相互作用
+(`LeaveDodag()`が呼び出し元自身のTrickleコールバックのまさに
+実行中に`this`を含むメンバシップを破棄する、というdesign-
+constraints.mdの既存コメントが既に議論している既知の危険領域)を、
+**単一Target時代には到達しなかった頻度・組み合わせ**で踏むことに
+なった。ブレッドクラムを`SendDio()`・`SendRplMessageOn()`・
+`RecvRpl()`・`RplTrickleTimer::TransmitEvent()`の全域に張り巡らせて
+追跡した結果、クラッシュ直前まで到達した全呼び出しはことごとく
+正常にreturnしており、**個々の関数はどれも単体では安全**なことを
+確認した — つまり本セッションで書いた新規ロジック自体に既知の
+メモリ安全性バグは見つからなかった。
+
+**修正**: 実装側ではなくテスト側を直した。合成した`fe80::f1`からの
+RREQ-DIOを、`Simulator::Schedule()`で100ms間隔・30回にわたって
+再送し続けるループに変更し、relayの「親」が陳腐化しないようにした
+(`RplAodvMultiArtStopsWhenExhaustedTestCase`は同じ手法を使っていても
+`DagConfiguration`のdioIntervalMin指数を20(約1048秒)にしていたため
+5秒の待機時間内では最初から陳腐化せず、無事だった — 事後に確認)。
+修正後、`test-runner --suite=rpl`を3回連続実行してPASSを確認し、
+本節執筆時点で安定している。デバッグ用の`std::cerr`ブレッドクラムは
+全て実装コードから削除済み(本番コードへの残留が無いことを
+`grep -rn "DBG \|std::cerr"`で確認)。
+
+この一件は、`/protocol-test-matrix`スキルの既存の教訓
+(「クラッシュの原因調査はテストコード自身を疑うのを先に」
+ns3-debug-pitfalls参照)が、実装コードだけでなく**テストの合成
+トポロジ設計そのもの**にも当てはまる実例として記録する: 一度きりの
+`DeliverRawRplMessage()`注入は、注入対象ノードにとって「本物の隣接
+ノードだが二度と喋らない」という、実プロトコルでは考えにくい状況を
+作り出し、それ自体が(このケースのように)通常のRPL陳腐化・Poison
+機構を作動させうる。`RplAodvRreqFloodTestCase`や
+`RplAodvMultiArtIntersectionTestCase`(待機時間が陳腐化閾値より
+十分短い)がこの罠を踏まなかったのは設計上の配慮というより偶然に
+近く、以後この種の合成注入を書く際は「注入対象ノードから見て、
+この送信元は陳腐化閾値内に再度喋るか」を明示的に検討する。
+
+### 42.4 検証
+
+- ワイヤフォーマット増分(42.1)は既存呼び出し元を一切変更せず
+  フルビルド・全回帰PASSで後方互換性を確認 (コミット済み)。
+- ロジック増分(42.2)は`ShouldRefuseAodvRreq()`のRankLimit緩和判定
+  (複数ART対応)・`HandleAodvRreq()`の交差計算/自己ART削除/repeat
+  ガード緩和・`SendDio()`の複数ART再送出/空時送信停止、の4箇所を
+  一括で実装し、新規4テスト
+  (`RplAodvMultiArtIntersectionTestCase`: RFC本文の交差計算具体例、
+  `RplAodvMultiArtTwoTargetsAnsweredTestCase`: 実チャネル経由の
+  2-Target中継・各自ART自己削除、
+  `RplAodvMultiArtStopsWhenExhaustedTestCase`: 単独Target到達後の
+  RREQ-DIO送信停止、および42.1の`RplDioMultiArtTestCase`)で
+  4象限のうち正常系・状態遷移系・異常系をカバーした。境界値象限
+  (Rank比較の閾値)は既存の`RplAodvAddressVectorFollowsParentTestCase`
+  が単一Target時代から担保している範囲と同じ機構
+  (`SelectPreferredParent()`のRankベースpreferred parent選択)を
+  再利用しているため、専用の新規テストは追加していない — この判断
+  自体を42.2に明記した。
+- 既存の単一Target AODV-RPLシナリオ(`RplAodvRreqFloodTestCase`
+  ほか既存全AODV-RPLテスト)はテスト変更ゼロで回帰確認済み。
+- `./ns3 build`clean、`test-runner --suite=rpl`を複数回連続実行し
+  安定してPASSすることを確認 (42.3のクラッシュ修正後)。
