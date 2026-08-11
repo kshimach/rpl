@@ -1582,6 +1582,72 @@ RplP2pDroHeaderTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief Round-trip the P2P-DRO-ACK (RFC 6997 section 10) and check its
+ *        short-packet handling.
+ */
+class RplP2pDroAckHeaderTestCase : public TestCase
+{
+  public:
+    RplP2pDroAckHeaderTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplP2pDroAckHeaderTestCase::RplP2pDroAckHeaderTestCase()
+    : TestCase("P2P-DRO-ACK serialization")
+{
+}
+
+void
+RplP2pDroAckHeaderTestCase::DoRun()
+{
+    RplP2pDroAckHeader ack;
+    ack.SetInstanceId(9);
+    ack.SetSequence(2);
+    ack.SetDodagId(Ipv6Address("2001:1::1")); // the Origin
+
+    NS_TEST_ASSERT_MSG_EQ(ack.GetSerializedSize(), 20, "The P2P-DRO-ACK is a fixed 20 bytes");
+
+    Ptr<Packet> packet = Create<Packet>();
+    packet->AddHeader(ack);
+
+    RplP2pDroAckHeader received;
+    uint32_t consumed = packet->RemoveHeader(received);
+
+    NS_TEST_ASSERT_MSG_EQ(consumed, 20, "Wrong number of bytes consumed");
+    NS_TEST_ASSERT_MSG_EQ(received.GetInstanceId(), 9, "Wrong RPLInstanceID");
+    NS_TEST_ASSERT_MSG_EQ(received.GetSequence(), 2, "Wrong Seq");
+    NS_TEST_ASSERT_MSG_EQ(received.GetDodagId(), Ipv6Address("2001:1::1"), "Wrong DODAGID");
+
+    // Seq is 2 bits, positioned differently from the P2P-DRO's own Seq: no
+    // 'S'/'A' flags precede it here (RFC 6997 section 10's Figure 3 has
+    // none), so it sits at the top of the third octet rather than after
+    // them (@see RPL_P2P_DRO_ACK_SEQ_MASK). Check its 2-bit maximum does
+    // not bleed into the Reserved bits around it.
+    RplP2pDroAckHeader packed;
+    packed.SetSequence(3);
+    packet = Create<Packet>();
+    packet->AddHeader(packed);
+    packet->RemoveHeader(received);
+    NS_TEST_ASSERT_MSG_EQ(received.GetSequence(), 3, "Seq was truncated at its 2-bit maximum");
+
+    // Same short-packet discipline as RplP2pDroHeader::Deserialize(): a
+    // fixed base object with no length field of its own has to check a
+    // received packet's remaining size explicitly before reading it.
+    {
+        uint8_t shortBody[5] = {9, 0, 0, 0, 0};
+        Ptr<Packet> shortPacket = Create<Packet>(shortBody, sizeof(shortBody));
+        RplP2pDroAckHeader shortAck;
+        uint32_t shortConsumed = shortPacket->RemoveHeader(shortAck);
+        NS_TEST_ASSERT_MSG_EQ(shortConsumed, 0, "A truncated P2P-DRO-ACK should consume nothing");
+    }
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Check the DAO and DAO-ACK at their field boundaries, and against
  *        the option lists a peer could send that this implementation never
  *        does: no Target, no Transit Information, a truncated option, an
@@ -12544,6 +12610,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplDioOptionEdgeTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDaoHeaderTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pDroHeaderTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pDroAckHeaderTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDaoBoundaryTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplSourceRoutingHeaderTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplSourceRoutingCompressionTestCase, TestCase::Duration::QUICK);

@@ -844,6 +844,80 @@ class RplP2pDroHeader : public Header
 /**
  * @ingroup rpl
  *
+ * @brief P2P Discovery Reply Object Acknowledgement, RFC 6997 section 10.
+ *
+ * Unlike the P2P-DRO, this carries no options at all -- the base object,
+ * unconditionally 20 bytes, is the entire message. Sent by the Origin to
+ * the Target, as a unicast, when a received P2P-DRO's 'A' flag asked for
+ * one; instanceId/dodagId/sequence are copied straight from that P2P-DRO
+ * (RFC 6997 section 10: "Various fields...MUST have the same values as
+ * the corresponding fields in the P2P-DRO message").
+ */
+class RplP2pDroAckHeader : public Header
+{
+  public:
+    /**
+     * @brief Get the type ID.
+     * @return the object TypeId
+     */
+    static TypeId GetTypeId();
+
+    RplP2pDroAckHeader();
+
+    TypeId GetInstanceTypeId() const override;
+    void Print(std::ostream& os) const override;
+    uint32_t GetSerializedSize() const override;
+    void Serialize(Buffer::Iterator start) const override;
+    uint32_t Deserialize(Buffer::Iterator start) override;
+
+    /**
+     * @brief Set the RPLInstanceID of the temporary DAG this acknowledges.
+     * @param instanceId the RPLInstanceID
+     */
+    void SetInstanceId(uint8_t instanceId);
+    /**
+     * @brief Get the RPLInstanceID of the temporary DAG this acknowledges.
+     * @return the RPLInstanceID
+     */
+    uint8_t GetInstanceId() const;
+
+    /**
+     * @brief Set the sequence number of the P2P-DRO being acknowledged.
+     * @param sequence the 'Seq' field, 2 bits
+     */
+    void SetSequence(uint8_t sequence);
+    /**
+     * @brief Get the sequence number of the P2P-DRO being acknowledged.
+     * @return the 'Seq' field
+     */
+    uint8_t GetSequence() const;
+
+    /**
+     * @brief Set the DODAGID: the temporary DAG's root, the Origin.
+     * @param dodagId the DODAGID
+     */
+    void SetDodagId(Ipv6Address dodagId);
+    /**
+     * @brief Get the DODAGID.
+     * @return the DODAGID
+     */
+    Ipv6Address GetDodagId() const;
+
+  private:
+    /// Serialized size of this header -- fixed, since it carries no
+    /// options. Checked by Deserialize() against a received packet's
+    /// remaining size before reading any of it, the same reason
+    /// RplP2pDroHeader::BASE_SIZE exists.
+    static constexpr uint8_t SIZE = 20;
+
+    uint8_t m_instanceId;  //!< RPLInstanceID
+    uint8_t m_sequence;    //!< 'Seq', 2 bits
+    Ipv6Address m_dodagId; //!< DODAGID
+};
+
+/**
+ * @ingroup rpl
+ *
  * @brief Destination Advertisement Object, RFC 6550 section 6.4.
  *
  * A DAO advertises one target, i.e. one address that can be reached through

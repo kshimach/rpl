@@ -1381,6 +1381,124 @@ RplP2pDroHeader::GetP2pRdo() const
     return m_p2pRdo;
 }
 
+NS_OBJECT_ENSURE_REGISTERED(RplP2pDroAckHeader);
+
+RplP2pDroAckHeader::RplP2pDroAckHeader()
+    : m_instanceId(RPL_DEFAULT_INSTANCE),
+      m_sequence(0),
+      m_dodagId(Ipv6Address::GetAny())
+{
+}
+
+TypeId
+RplP2pDroAckHeader::GetTypeId()
+{
+    static TypeId tid = TypeId("ns3::rpl::RplP2pDroAckHeader")
+                            .SetParent<Header>()
+                            .SetGroupName("Rpl")
+                            .AddConstructor<RplP2pDroAckHeader>();
+    return tid;
+}
+
+TypeId
+RplP2pDroAckHeader::GetInstanceTypeId() const
+{
+    return GetTypeId();
+}
+
+void
+RplP2pDroAckHeader::Print(std::ostream& os) const
+{
+    os << "P2P-DRO-ACK instance " << +m_instanceId << " DODAGID " << m_dodagId << " Seq "
+       << +m_sequence;
+}
+
+uint32_t
+RplP2pDroAckHeader::GetSerializedSize() const
+{
+    return SIZE;
+}
+
+void
+RplP2pDroAckHeader::Serialize(Buffer::Iterator start) const
+{
+    start.WriteU8(m_instanceId);
+    start.WriteU8(0); // Version, RFC 6997 section 8: always zero
+
+    uint8_t flags = static_cast<uint8_t>((m_sequence << RPL_P2P_DRO_ACK_SEQ_SHIFT) &
+                                         RPL_P2P_DRO_ACK_SEQ_MASK);
+    start.WriteU8(flags);
+    start.WriteU8(0); // Reserved
+
+    uint8_t buf[16];
+    m_dodagId.Serialize(buf);
+    start.Write(buf, 16);
+}
+
+uint32_t
+RplP2pDroAckHeader::Deserialize(Buffer::Iterator start)
+{
+    Buffer::Iterator i = start;
+
+    // No length field of its own, same reason RplP2pDroHeader::Deserialize()
+    // checks its own BASE_SIZE before reading anything.
+    if (i.GetRemainingSize() < SIZE)
+    {
+        NS_LOG_WARN("Truncated P2P-DRO-ACK (" << i.GetRemainingSize() << " bytes, need "
+                                              << +SIZE << ")");
+        return 0;
+    }
+
+    m_instanceId = i.ReadU8();
+    i.ReadU8(); // Version, always zero, not checked on receipt
+
+    uint8_t flags = i.ReadU8();
+    m_sequence = (flags & RPL_P2P_DRO_ACK_SEQ_MASK) >> RPL_P2P_DRO_ACK_SEQ_SHIFT;
+    i.ReadU8(); // Reserved
+
+    uint8_t buf[16];
+    i.Read(buf, 16);
+    m_dodagId = Ipv6Address::Deserialize(buf);
+
+    return i.GetDistanceFrom(start);
+}
+
+void
+RplP2pDroAckHeader::SetInstanceId(uint8_t instanceId)
+{
+    m_instanceId = instanceId;
+}
+
+uint8_t
+RplP2pDroAckHeader::GetInstanceId() const
+{
+    return m_instanceId;
+}
+
+void
+RplP2pDroAckHeader::SetSequence(uint8_t sequence)
+{
+    m_sequence = sequence;
+}
+
+uint8_t
+RplP2pDroAckHeader::GetSequence() const
+{
+    return m_sequence;
+}
+
+void
+RplP2pDroAckHeader::SetDodagId(Ipv6Address dodagId)
+{
+    m_dodagId = dodagId;
+}
+
+Ipv6Address
+RplP2pDroAckHeader::GetDodagId() const
+{
+    return m_dodagId;
+}
+
 NS_OBJECT_ENSURE_REGISTERED(RplDaoHeader);
 
 RplDaoHeader::RplDaoHeader()

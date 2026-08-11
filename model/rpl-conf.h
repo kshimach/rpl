@@ -31,6 +31,7 @@ enum RplMessageCode : uint8_t
     RPL_CODE_DAO = 0x02,     //!< Destination Advertisement Object
     RPL_CODE_DAO_ACK = 0x03, //!< DAO Acknowledgement
     RPL_CODE_P2P_DRO = 0x04, //!< P2P Discovery Reply Object (RFC 6997, section 8)
+    RPL_CODE_P2P_DRO_ACK = 0x05, //!< P2P-DRO Acknowledgement (RFC 6997, section 10)
     RPL_CODE_SEC_DIS = 0x80, //!< Secure DIS (not implemented)
     RPL_CODE_SEC_DIO = 0x81, //!< Secure DIO (not implemented)
     RPL_CODE_SEC_DAO = 0x82, //!< Secure DAO (not implemented)
@@ -364,6 +365,15 @@ constexpr uint8_t RPL_P2P_DRO_S_FLAG = 0x80;
 constexpr uint8_t RPL_P2P_DRO_A_FLAG = 0x40;
 constexpr uint8_t RPL_P2P_DRO_SEQ_MASK = 0x30;
 constexpr uint8_t RPL_P2P_DRO_SEQ_SHIFT = 4;
+
+/// The P2P-DRO Acknowledgement's (P2P-DRO-ACK, RFC 6997 section 10) third
+/// octet: no 'S'/'A' here (there is nothing left to stop or to ask an ack
+/// for), so 'Seq' sits where those two flags would otherwise be -- the top
+/// 2 bits, not RPL_P2P_DRO_SEQ_MASK's position -- verified against the raw
+/// RFC text by column-counting the same way as the P2P-DRO's own bit width
+/// (@see design-constraints.md).
+constexpr uint8_t RPL_P2P_DRO_ACK_SEQ_MASK = 0xC0;
+constexpr uint8_t RPL_P2P_DRO_ACK_SEQ_SHIFT = 6;
 
 /// Routing Metric/Constraint object types (RFC 6551, section 4).
 constexpr uint8_t RPL_DAG_MC_LQL = 6;
