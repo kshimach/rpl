@@ -1226,6 +1226,21 @@ RplP2pDroHeader::Deserialize(Buffer::Iterator start)
 {
     Buffer::Iterator i = start;
 
+    // The fixed base object has no length field of its own to validate a
+    // received packet against -- unlike an option, whose declared length
+    // the loop below checks before trusting -- so a packet shorter than it
+    // has to be caught explicitly, before any of it is read: nothing here
+    // has bounds-checked reads of its own in an optimized build (@see
+    // design-constraints.md), and this class's own fields are left exactly
+    // as this header already held them (a fresh one's constructor
+    // defaults) rather than partially overwritten.
+    if (i.GetRemainingSize() < BASE_SIZE)
+    {
+        NS_LOG_WARN("Truncated P2P-DRO (" << i.GetRemainingSize() << " bytes, need at least "
+                                          << +BASE_SIZE << ")");
+        return 0;
+    }
+
     m_instanceId = i.ReadU8();
     i.ReadU8(); // Version, always zero, not checked on receipt
 

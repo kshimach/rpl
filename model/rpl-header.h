@@ -823,6 +823,14 @@ class RplP2pDroHeader : public Header
     const P2pRdoOption& GetP2pRdo() const;
 
   private:
+    /// Serialized size of the fixed base object -- RPLInstanceID, Version,
+    /// flags, Reserved, DODAGID -- before any options (RFC 6997 section 8,
+    /// Figure 2). Unlike an option, this has no length field of its own to
+    /// validate a received packet against, so Deserialize() checks a
+    /// received packet's remaining size against this directly before
+    /// reading any of it.
+    static constexpr uint8_t BASE_SIZE = 20;
+
     uint8_t m_instanceId;  //!< RPLInstanceID
     bool m_stop;           //!< 'S' flag
     bool m_ackRequested;   //!< 'A' flag

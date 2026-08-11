@@ -1556,6 +1556,26 @@ RplP2pDroHeaderTestCase::DoRun()
     NS_TEST_ASSERT_MSG_EQ(received.GetStop(), true, "'S' was lost");
     NS_TEST_ASSERT_MSG_EQ(received.GetAckRequested(), false, "'A' leaked when 'S' was set");
     NS_TEST_ASSERT_MSG_EQ(received.GetSequence(), 3, "Seq was truncated at its 2-bit maximum");
+
+    // RFC 6997 section 8's fixed base object -- RPLInstanceID, Version,
+    // flags, Reserved, DODAGID, 20 bytes -- has no length field of its own
+    // to validate a received packet against, unlike an option, whose
+    // declared length the option loop checks before trusting. Found via
+    // /protocol-test-matrix: an earlier version of
+    // RplP2pDroHeader::Deserialize() read those 20 bytes unconditionally
+    // and crashed on the NS_ASSERT in src/network/model/buffer.h ("You
+    // have attempted to read beyond the bounds of the available buffer
+    // space") given a packet shorter than that.
+    {
+        uint8_t shortBody[5] = {0x81, 0, 0, 0, 0};
+        Ptr<Packet> shortPacket = Create<Packet>(shortBody, sizeof(shortBody));
+        RplP2pDroHeader shortDro;
+        uint32_t consumed = shortPacket->RemoveHeader(shortDro);
+        NS_TEST_ASSERT_MSG_EQ(consumed, 0, "A truncated P2P-DRO should consume nothing");
+        NS_TEST_ASSERT_MSG_EQ(shortDro.HasP2pRdo(),
+                              false,
+                              "A truncated P2P-DRO should not have produced a P2P-RDO");
+    }
 }
 
 /**
