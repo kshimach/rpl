@@ -8225,6 +8225,139 @@ RplP2pDroRelayTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief A router leaves rather than joins a temporary DAG whose P2P mode
+ *        DIO Address Vector already has no room left for its own entry.
+ *
+ * The P2P-RPL counterpart of RplAodvRrepInstanceAddressVectorFullTestCase:
+ * HandleP2pRdo() already guards against joining with an Address Vector
+ * that has no room left for this router's own entry, but nothing exercised
+ * that boundary specifically for P2P-RPL -- RplP2pFloodTestCase's own
+ * four-node line never gets anywhere near
+ * RPL_P2P_ADDRESS_VECTOR_MAX_ENTRIES (14) hops. Without the guard, a
+ * vector already at that wire limit would grow to 15 on append and hit
+ * P2pRdoSerializedSize()/P2pRdoSerialize()'s own arithmetic assuming no
+ * more than 14 (RPL_P2P_ADDRESS_VECTOR_MAX_ENTRIES), the same shape of
+ * failure the AODV-RPL RREP-Instance test guards against for its own,
+ * differently-sized, limit.
+ */
+class RplP2pAddressVectorFullTestCase : public TestCase
+{
+  public:
+    RplP2pAddressVectorFullTestCase();
+
+  private:
+    void DoRun() override;
+
+    /**
+     * @brief Feed one fabricated P2P mode DIO, with an Address Vector of
+     *        the given length, and report whether the temporary DAG was
+     *        joined.
+     *
+     * @param node the node under test
+     * @param vectorEntries how many fabricated hops to put in the P2P-RDO's
+     *                      Address Vector before delivery
+     * @return true if the node ended up joined to the temporary DAG
+     */
+    bool TryJoin(Ptr<Node> node, uint8_t vectorEntries);
+};
+
+RplP2pAddressVectorFullTestCase::RplP2pAddressVectorFullTestCase()
+    : TestCase("A temporary DAG whose Address Vector is already full is left, not joined")
+{
+}
+
+bool
+RplP2pAddressVectorFullTestCase::TryJoin(Ptr<Node> node, uint8_t vectorEntries)
+{
+    static uint16_t sequence = 0;
+    sequence++;
+    // A fresh Origin address per call: distinct each time so no earlier
+    // sub-case's membership interferes with this one's.
+    std::ostringstream originSuffix;
+    originSuffix << "2001:a::" << sequence << ":1";
+    Ipv6Address origin(originSuffix.str().c_str());
+    Ipv6Address neighbour("fe80::a");
+
+    static constexpr uint8_t INSTANCE = 0x81;
+
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+
+    RplDioHeader dio;
+    dio.SetInstanceId(INSTANCE);
+    dio.SetVersionNumber(0);
+    dio.SetRank(RPL_MIN_HOPRANKINC);
+    dio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+    dio.SetGrounded(true);
+    dio.SetDodagId(origin);
+    dio.SetDtsn(0);
+
+    P2pRdoOption rdo;
+    rdo.reply = true;
+    rdo.hopByHop = false;
+    rdo.numRoutes = 0;
+    rdo.lifetime = 0;
+    rdo.maxRankOrNh = RPL_P2P_MAX_RANK_INFINITE; // out of the way: this test is about the AV
+    rdo.target = Ipv6Address("2001:a::dead:1");  // never this node: an ordinary relay throughout
+    for (uint8_t i = 0; i < vectorEntries; i++)
+    {
+        std::ostringstream hopSuffix;
+        hopSuffix << "2001:a::" << sequence << ":" << +i;
+        rdo.addressVector.push_back(Ipv6Address(hopSuffix.str().c_str()));
+    }
+    dio.SetP2pRdo(rdo);
+
+    DeliverRawRplMessage<RplDioHeader>(node,
+                                       1,
+                                       dio,
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       neighbour,
+                                       Ipv6Address(RPL_ALL_NODES_MULTICAST));
+
+    return rpl->IsJoinedTo(INSTANCE, origin);
+}
+
+void
+RplP2pAddressVectorFullTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(1);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.AssignWithoutAddress(devices);
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    Simulator::Stop(Seconds(2));
+    Simulator::Run();
+
+    Ptr<Node> node = nodes.Get(0);
+
+    NS_TEST_ASSERT_MSG_EQ(
+        TryJoin(node, RPL_P2P_ADDRESS_VECTOR_MAX_ENTRIES - 1),
+        true,
+        "A relay was refused a temporary DAG whose Address Vector still had room for its own "
+        "entry");
+    NS_TEST_ASSERT_MSG_EQ(
+        TryJoin(node, RPL_P2P_ADDRESS_VECTOR_MAX_ENTRIES),
+        false,
+        "A relay joined a temporary DAG whose Address Vector was already full, with no room "
+        "left to append its own entry");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Check which DIOs RplRoutingProtocol::HandleDio() acts on and which
  *        it turns away: a mode of operation it does not implement, another
  *        RPL instance or DODAG, a stale DODAG version, and the infinite
@@ -12451,6 +12584,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplP2pDroGeneratedTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pRouteCompletesTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pDroRelayTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pAddressVectorFullTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDioRejectionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplParentLossRejoinTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplInterfaceRestartTestCase, TestCase::Duration::QUICK);
