@@ -5665,3 +5665,97 @@ D=0固定という既存動作に対して安全なno-opであることの裏付
 一切変更していない。非対称H=1、および`AodvForceAsymmetric`
 属性とH=1の組み合わせのテストは次回増分 ("Increment B") へ
 持ち越す。
+
+## 49. `/protocol-test-matrix`でAODV-RPL H=1対応(§48)を監査
+
+RFC 9854 §6.2.1/6.2.3/6.3.1/6.4.3/6.4.4を原文で再確認した上で、
+§48完了時点で手薄だった境界値・状態遷移系を優先して埋めた。
+
+### 49.1 RFC原文の再確認で判明した点
+
+- §6.2.1の逐語「When H=1 in the incoming RREQ...older than the SeqNo
+  value that X has stored for a route to OrigNode」はinstanceId/
+  dodagIdでのスコープ限定を一切していない — `ShouldRefuseAodvRreq()`
+  の事前ゲート実装([m_hopByHopRoutesを宛先(OrigNode)のみで検索](
+  instanceId不問))はこの逐語と正確に一致していることを確認した。
+  一方`StoreHopByHopRoute()`自身の内部チェックはinstanceId/dodagId
+  一致時のみ働く、より狭いスコープ — 両者は矛盾しない: 事前ゲートが
+  OrigNode単位の単調増加不変条件(`m_aodvSeqNo`はノード単位で1つ、
+  discovery毎にインクリメントされるため、instanceIdが変わっても
+  seqNoは単調増加のはず)を担い、内部チェックは同一instanceの
+  更新に対する二重の安全網、という役割分担になっている。
+- §6.2.3「Source Address...is the address used by the router to send
+  data to the Next Hop」等、経路エントリの構成要素としてRFCが挙げる
+  "Source Address"フィールドは、`HopByHopRoute`構造体には対応する
+  フィールドが無い — ただしこれはP2P-RPL側のH=1(§46)から一貫した
+  簡略化(宛先のみでキー化し、自ノードのアドレスは都度
+  `GetGlobalAddressIn()`等で取得)であり、今回のAODV-RPL対応で
+  新たに生じたギャップではないため、既存の設計判断を踏襲するに留めた。
+- §6.4.4「If the intermediate router has a route to OrigNode, it uses
+  that route...Otherwise...the local route entry (H=1)」は、
+  base RPL側の別経路(non-storing modeの上り等)がOrigNodeへの経路を
+  たまたま知っている場合の最適化を示唆しているように読めるが、
+  本実装はそのような他プロトコルとの経路優先度判断を一切行わず、
+  常に「the local route entry」(自身のAODV-RPL上り経路)だけを使う
+  — 実装のスコープとして意識的に選んだ範囲であり、バグではない。
+
+### 49.2 新規テスト2件
+
+- `RplAodvHopByHopRouteDirectNeighbourTestCase`(境界値):
+  OrigNode/TargNodeが直接隣接(中継ルータ0台)する2ノード構成。
+  4ノード直線のテストでは踏めない境界 —
+  `SendAodvRrep()`のH=1分岐が自身の上り経路エントリからnext hopを
+  取得する際、その値がOrigNode自身になるケースと、
+  `HandleAodvRrep()`のOrigNode分岐が記録する下り経路のnext hopが
+  TargNode自身になるケースを確認。UDPデータの片道到達も確認。
+- `RplAodvHopByHopRouteOutlivesRreqInstanceTestCase`(状態遷移系):
+  `RplP2pHopByHopRouteOutlivesTemporaryDagTestCase`のAODV-RPL版。
+  `AodvLifetime`属性を短く設定(§4.1の'L'フィールド`0x01`=16秒)、
+  全ノードのRREQ-Instanceメンバシップが`IsJoinedTo()==false`に
+  なるまで待った後もHop-by-hop Route自体(および実データ到達)が
+  生き続けることを確認 — P2P-RPL側と同じく、経路の寿命は
+  DODAG Configuration OptionのDefault Lifetime/Lifetime Unit
+  由来であり、発見に使った一時的なRREQ-Instanceの'L'期限とは
+  独立している。
+
+両方ともHandleAodvRrep()の下り経路store呼び出しを一時的に
+`if (false && ...)`へ無効化し、この呼び出しに依存する既存の
+`RplAodvHopByHopRouteCompletesTestCase`がFAILすることを確認
+(load-bearing検証。個々の新規テストを直接無効化して確認する
+手段がテストランナーに無かった — このリポジトリのtest-runnerは
+1つのTestCaseがFAILすると同一`--verbose`実行内でそれ以降の
+詳細出力が得られない — ため、3件が同一コード経路を共有している
+ことを確認した上で、代表としてCompletesTestCase側での検証を
+これらの間接的な裏付けとした)。元に戻して3件とも再度PASSを確認。
+
+### 49.3 意図的にテストを追加しなかった項目 (異常系)
+
+- **RREQを一度も処理していないRREQ-Instanceキーへの RREP到達**
+  (`HandleAodvRrep()`中継ルータ分岐の`FindHopByHopRoute()`
+  失敗時フォールバック): `m_dodags.find(rreqKey)`自体が
+  見つからないケースは既存の(H=1対応前からある)ガードで
+  素通りしない設計だが、「メンバシップは存在するが上り経路が
+  一度も記録されていない」という状態は、通常のプロトコル動作
+  経路では`HandleAodvRreq()`が(H=0のAV構築同様)経路store呼び出しの
+  前に早期returnする条件を持たないため、意図的な悪用や
+  RPLInstanceID衝突等の極めて例外的な状況でしか到達しないと判断
+  した。無理に合成するより、防御的フォールバックとして
+  コメントに留める方が誠実と判断し、専用テストは追加しなかった。
+- **異なるInstanceIDが「衝突ではなく別ルート」として扱われることの
+  AODV-RPL(`hasSeqNo=true`)側での独立した実証**:
+  P2P-RPL側は`RplP2pHopByHopRouteConflictTestCase`(§47)で既に
+  この性質(`hasSeqNo=false`経路)を実証済み。AODV-RPL側で同じ
+  性質を独立に観測しようとすると、`ShouldRefuseAodvRreq()`の
+  事前ゲート(OrigNode単位でinstanceId不問のseqNo鮮度チェック、
+  §49.1)が常に先に働いてしまい、「seqNoが古いが別instanceIdだから
+  受理される」という組み合わせを`HandleAodvRreq()`の通常経路
+  からは再現できないことが分かった(これ自体が49.1で記録した
+  発見)。`StoreHopByHopRoute()`はprivateであり、パイプラインを
+  経由しない直接呼び出しでのテストもできない。よって専用テストは
+  見送り、この設計上の帰結を上記49.1に記録するに留めた。
+
+### 49.4 検証
+
+`./ns3 build`(rplモジュール・プロジェクト全体とも)、
+`test-runner --suite=rpl`を複数回連続実行して安定PASSを確認。
+既存の全P2P-RPL/AODV-RPLテスト(H=0、H=1双方)は無変更でPASS。

@@ -7970,6 +7970,284 @@ RplAodvHopByHopRouteCompletesTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief An AODV-RPL Hop-by-hop Route (H=1) discovery completes with zero
+ *        intermediate routers, OrigNode and TargNode directly adjacent.
+ *
+ * The boundary RplAodvHopByHopRouteCompletesTestCase's own four-node line
+ * cannot reach: with no relay in between, SendAodvRrep() has to source its
+ * next hop from the upward Hop-by-hop Route entry pointing straight at
+ * OrigNode rather than at some intermediate router, and HandleAodvRrep()'s
+ * OrigNode branch has to store its own downward entry with TargNode itself
+ * as the next hop, both one radio hop away in either direction.
+ */
+class RplAodvHopByHopRouteDirectNeighbourTestCase : public TestCase
+{
+  public:
+    RplAodvHopByHopRouteDirectNeighbourTestCase();
+
+  private:
+    void DoRun() override;
+
+    /// @brief Count a datagram delivered at either end.
+    /// @param socket the receiving socket
+    void CountDelivery(Ptr<Socket> socket);
+
+    uint32_t m_delivered{0}; //!< datagrams delivered, either direction
+};
+
+RplAodvHopByHopRouteDirectNeighbourTestCase::RplAodvHopByHopRouteDirectNeighbourTestCase()
+    : TestCase("An AODV-RPL Hop-by-hop Route (H=1) completes with no intermediate router")
+{
+}
+
+void
+RplAodvHopByHopRouteDirectNeighbourTestCase::CountDelivery(Ptr<Socket> socket)
+{
+    Ptr<Packet> packet = socket->Recv();
+    while (packet)
+    {
+        m_delivered++;
+        packet = socket->Recv();
+    }
+}
+
+void
+RplAodvHopByHopRouteDirectNeighbourTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2); // 0 = OrigNode and base root, 1 = TargNode
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(250));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> orig = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> targ = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(targ->IsJoined(), true, "The base DODAG did not reach the far end");
+
+    Ipv6Address origAddress = orig->GetGlobalAddress();
+    Ipv6Address targAddress = targ->GetGlobalAddress();
+    Ipv6Address origLinkLocal =
+        nodes.Get(0)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address targLinkLocal =
+        nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    RplRoutingProtocol::DodagKey key = orig->DiscoverRoute(targAddress, true);
+    NS_TEST_ASSERT_MSG_NE(key.dodagId, Ipv6Address::GetAny(), "The discovery did not start");
+
+    Simulator::Stop(Seconds(5));
+    Simulator::Run();
+
+    Ipv6Address nextHop;
+    uint8_t hopInstanceId = 0;
+    NS_TEST_ASSERT_MSG_EQ(orig->GetHopByHopRoute(targAddress, nextHop, hopInstanceId),
+                          true,
+                          "OrigNode never recorded a downward Hop-by-hop Route");
+    NS_TEST_ASSERT_MSG_EQ(nextHop, targLinkLocal, "OrigNode's next hop should be TargNode itself");
+    NS_TEST_ASSERT_MSG_EQ(targ->GetHopByHopRoute(origAddress, nextHop, hopInstanceId),
+                          true,
+                          "TargNode never recorded an upward Hop-by-hop Route");
+    NS_TEST_ASSERT_MSG_EQ(nextHop, origLinkLocal, "TargNode's next hop should be OrigNode itself");
+
+    uint16_t port = 4248;
+    Ptr<Socket> receiver = Socket::CreateSocket(nodes.Get(1), UdpSocketFactory::GetTypeId());
+    receiver->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), port));
+    receiver->SetRecvCallback(
+        MakeCallback(&RplAodvHopByHopRouteDirectNeighbourTestCase::CountDelivery, this));
+
+    Ptr<Socket> sender = Socket::CreateSocket(nodes.Get(0), UdpSocketFactory::GetTypeId());
+    sender->Connect(Inet6SocketAddress(targAddress, port));
+    sender->Send(Create<Packet>(64));
+
+    Simulator::Stop(Seconds(2));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(m_delivered, 1, "Data did not reach TargNode over one radio hop");
+
+    receiver->Close();
+    sender->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief An AODV-RPL Hop-by-hop Route (H=1) keeps carrying data after the
+ *        RREQ-Instance that discovered it has left, at every hop.
+ *
+ * The AODV-RPL analogue of RplP2pHopByHopRouteOutlivesTemporaryDagTestCase:
+ * RFC 9854 section 6.2.3/6.4.3's "the lifetime is set according to DODAG
+ * configuration (i.e., not the L field)" applies just as much to AODV-RPL's
+ * own route entries as to P2P-RPL's, so an RREQ-Instance reaching its own
+ * (typically much shorter) 'L' deadline and leaving must not disturb the
+ * Hop-by-hop Route it already established. The same four-node line as
+ * RplAodvHopByHopRouteCompletesTestCase, but AodvLifetime is set short and
+ * data is sent only once every node's own RREQ-Instance membership has
+ * already expired.
+ */
+class RplAodvHopByHopRouteOutlivesRreqInstanceTestCase : public TestCase
+{
+  public:
+    RplAodvHopByHopRouteOutlivesRreqInstanceTestCase();
+
+  private:
+    void DoRun() override;
+
+    /// @brief Count a datagram delivered at TargNode.
+    /// @param socket the receiving socket
+    void CountDelivery(Ptr<Socket> socket);
+
+    uint32_t m_delivered{0}; //!< datagrams delivered at TargNode
+};
+
+RplAodvHopByHopRouteOutlivesRreqInstanceTestCase::
+    RplAodvHopByHopRouteOutlivesRreqInstanceTestCase()
+    : TestCase("An AODV-RPL Hop-by-hop Route (H=1) outlives the RREQ-Instance that found it")
+{
+}
+
+void
+RplAodvHopByHopRouteOutlivesRreqInstanceTestCase::CountDelivery(Ptr<Socket> socket)
+{
+    Ptr<Packet> packet = socket->Recv();
+    while (packet)
+    {
+        m_delivered++;
+        packet = socket->Recv();
+    }
+}
+
+void
+RplAodvHopByHopRouteOutlivesRreqInstanceTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(4); // 0 = OrigNode and base root, 1 and 2 = relays, 3 = TargNode
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    auto blacklist = [&](uint32_t a, uint32_t b) {
+        Ptr<SimpleNetDevice> devA = DynamicCast<SimpleNetDevice>(devices.Get(a));
+        Ptr<SimpleNetDevice> devB = DynamicCast<SimpleNetDevice>(devices.Get(b));
+        channel->BlackList(devA, devB);
+        channel->BlackList(devB, devA);
+    };
+    blacklist(0, 2);
+    blacklist(0, 3);
+    blacklist(1, 3);
+
+    RplHelper rplHelper;
+    // RFC 9854 section 4.1's 'L' field: 0x01 encodes 16 seconds, ample
+    // margin over the discovery itself (a few hundred ms) and short enough
+    // that waiting well past it is not the dominant cost of the test.
+    rplHelper.Set("AodvLifetime", UintegerValue(1));
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(250));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> orig = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> relay1 = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> relay2 = nodes.Get(2)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> targ = nodes.Get(3)->GetObject<RplRoutingProtocol>();
+    Ipv6Address targAddress = targ->GetGlobalAddress();
+
+    RplRoutingProtocol::DodagKey key = orig->DiscoverRoute(targAddress, true);
+    NS_TEST_ASSERT_MSG_NE(key.dodagId, Ipv6Address::GetAny(), "The discovery did not start");
+
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    Ipv6Address nextHop;
+    uint8_t hopInstanceId = 0;
+    NS_TEST_ASSERT_MSG_EQ(orig->GetHopByHopRoute(targAddress, nextHop, hopInstanceId),
+                          true,
+                          "The discovery did not complete before waiting for the RREQ-Instance "
+                          "to expire");
+
+    // Wait well past AodvLifetime's own 60 seconds for every node's own
+    // RREQ-Instance membership to expire.
+    Simulator::Stop(Seconds(90));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(orig->IsJoinedTo(key.instanceId, key.dodagId),
+                          false,
+                          "OrigNode's own RREQ-Instance membership should have expired by now");
+    NS_TEST_ASSERT_MSG_EQ(relay1->IsJoinedTo(key.instanceId, key.dodagId),
+                          false,
+                          "relay1's own RREQ-Instance membership should have expired by now");
+    NS_TEST_ASSERT_MSG_EQ(relay2->IsJoinedTo(key.instanceId, key.dodagId),
+                          false,
+                          "relay2's own RREQ-Instance membership should have expired by now");
+    NS_TEST_ASSERT_MSG_EQ(targ->IsJoinedTo(key.instanceId, key.dodagId),
+                          false,
+                          "targ's own RREQ-Instance membership should have expired by now");
+
+    // The Hop-by-hop Route itself is unaffected: its own lifetime comes from
+    // the DODAG Configuration Option's Default Lifetime/Lifetime Unit, not
+    // the 'L' field that just took the RREQ-Instance membership away.
+    NS_TEST_ASSERT_MSG_EQ(orig->GetHopByHopRoute(targAddress, nextHop, hopInstanceId),
+                          true,
+                          "The Hop-by-hop Route did not outlive the RREQ-Instance membership");
+
+    uint16_t port = 4249;
+    Ptr<Socket> receiver = Socket::CreateSocket(nodes.Get(3), UdpSocketFactory::GetTypeId());
+    receiver->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), port));
+    receiver->SetRecvCallback(
+        MakeCallback(&RplAodvHopByHopRouteOutlivesRreqInstanceTestCase::CountDelivery, this));
+
+    Ptr<Socket> sender = Socket::CreateSocket(nodes.Get(0), UdpSocketFactory::GetTypeId());
+    sender->Connect(Inet6SocketAddress(targAddress, port));
+    sender->Send(Create<Packet>(64));
+
+    Simulator::Stop(Seconds(2));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(m_delivered,
+                          1,
+                          "Data did not reach TargNode after the RREQ-Instance had expired");
+
+    receiver->Close();
+    sender->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief A base-DODAG root that also joins another RREQ-Instance as an
  *        ordinary member must not crash when it loses that RREQ-Instance's
  *        last parent.
@@ -16079,6 +16357,8 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplAodvAsymmetricRouteCompletesTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRrepCompletesTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvHopByHopRouteCompletesTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplAodvHopByHopRouteDirectNeighbourTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplAodvHopByHopRouteOutlivesRreqInstanceTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplRootJoinsForeignRreqInstanceParentLossTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRrepInstanceRankLimitTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRrepInstanceAddressVectorFullTestCase, TestCase::Duration::QUICK);
