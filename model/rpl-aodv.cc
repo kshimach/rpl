@@ -12,8 +12,14 @@
  * design-constraints.md.
  *
  * Scope: source-routed (H=0) discovery for a single target, symmetric (S=1)
- * or asymmetric (S=0). Hop-by-hop routes (H=1) need storing mode, which
- * this module does not have at all. @see design-constraints.md.
+ * or asymmetric (S=0). Hop-by-hop routes (H=1) are not implemented yet --
+ * unlike P2P-RPL's own (RFC 6997, @see rpl-p2p.cc and design-constraints.md,
+ * which needs none of core RPL's own storing mode either), AODV-RPL's H=1
+ * is bidirectional and, for an asymmetric route, keys its downward route
+ * entry by the RREQ-Instance while the packet physically travels the
+ * separate RREP-Instance's own topology -- a genuine complication
+ * P2P-RPL's unidirectional, single-DODAG H=1 does not have. @see
+ * design-constraints.md.
  */
 
 #include "rpl-conf.h"

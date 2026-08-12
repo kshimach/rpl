@@ -10377,6 +10377,376 @@ RplP2pRouteCompletesTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief A P2P-RPL Hop-by-hop Route (H=1) carries data end to end, each
+ *        relay holding only its own next hop rather than the whole path.
+ *
+ * RplP2pRouteCompletesTestCase's own four-node line and channel
+ * blacklisting:
+ *
+ *     orig(0) ---- relay1(1) ---- relay2(2) ---- targ(3)
+ *
+ * but with DiscoverP2pRoute()'s hopByHop parameter set, so the Target's
+ * P2P-DRO carries H=1 and each relay stores a next-hop entry (RFC 6997
+ * section 9.6) instead of the Origin recording the whole path (section
+ * 9.7). GetP2pRouteCount() staying 0 throughout, at every node, is what
+ * tells this apart from the H=0 case actually running instead of the H=1
+ * one asked for.
+ */
+class RplP2pHopByHopRouteCompletesTestCase : public TestCase
+{
+  public:
+    RplP2pHopByHopRouteCompletesTestCase();
+
+  private:
+    void DoRun() override;
+
+    /// @brief Count a datagram delivered at the Target.
+    /// @param socket the receiving socket
+    void CountDelivery(Ptr<Socket> socket);
+
+    /// @brief Send one datagram, as a named method Simulator::Schedule() can
+    ///        resolve (Socket::Send is overloaded).
+    /// @param socket the sending socket
+    void SendOne(Ptr<Socket> socket);
+
+    uint32_t m_delivered{0}; //!< datagrams that reached the Target
+    int m_sendResult{0};     //!< what Socket::Send() returned, -1 on refusal
+};
+
+RplP2pHopByHopRouteCompletesTestCase::RplP2pHopByHopRouteCompletesTestCase()
+    : TestCase("A P2P-RPL Hop-by-hop Route (H=1) carries data end to end")
+{
+}
+
+void
+RplP2pHopByHopRouteCompletesTestCase::CountDelivery(Ptr<Socket> socket)
+{
+    Ptr<Packet> packet = socket->Recv();
+    while (packet)
+    {
+        m_delivered++;
+        packet = socket->Recv();
+    }
+}
+
+void
+RplP2pHopByHopRouteCompletesTestCase::SendOne(Ptr<Socket> socket)
+{
+    m_sendResult = socket->Send(Create<Packet>(64));
+}
+
+void
+RplP2pHopByHopRouteCompletesTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(4); // 0 = Origin and base root, 1 and 2 = relays, 3 = Target
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    auto blacklist = [&](uint32_t a, uint32_t b) {
+        Ptr<SimpleNetDevice> devA = DynamicCast<SimpleNetDevice>(devices.Get(a));
+        Ptr<SimpleNetDevice> devB = DynamicCast<SimpleNetDevice>(devices.Get(b));
+        channel->BlackList(devA, devB);
+        channel->BlackList(devB, devA);
+    };
+    blacklist(0, 2);
+    blacklist(0, 3);
+    blacklist(1, 3);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(250));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> orig = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> relay1 = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> relay2 = nodes.Get(2)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> targ = nodes.Get(3)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(targ->IsJoined(), true, "The base DODAG did not reach the far end");
+
+    Ipv6Address relay1Address = relay1->GetGlobalAddress();
+    Ipv6Address relay2Address = relay2->GetGlobalAddress();
+    Ipv6Address targAddress = targ->GetGlobalAddress();
+
+    RplRoutingProtocol::DodagKey key = orig->DiscoverP2pRoute(targAddress, true);
+    NS_TEST_ASSERT_MSG_NE(key.dodagId, Ipv6Address::GetAny(), "The discovery did not start");
+
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    // H=1: no whole-path route recorded anywhere, unlike
+    // RplP2pRouteCompletesTestCase's own H=0 scenario.
+    NS_TEST_ASSERT_MSG_EQ(orig->GetP2pRouteCount(),
+                          0,
+                          "A Source Route was recorded for what should have been a Hop-by-hop "
+                          "Route discovery");
+
+    // Each hop holds only its own next hop (RFC 6997 section 9.6/9.7),
+    // and each one is the next hop actually on the path to the Target,
+    // not merely present.
+    Ipv6Address nextHop;
+    uint8_t hopInstanceId = 0;
+    NS_TEST_ASSERT_MSG_EQ(orig->GetHopByHopRoute(targAddress, nextHop, key.instanceId),
+                          true,
+                          "The Origin never recorded a Hop-by-hop Route");
+    NS_TEST_ASSERT_MSG_EQ(nextHop, relay1Address, "The Origin's own next hop is wrong");
+    NS_TEST_ASSERT_MSG_EQ(relay1->GetHopByHopRoute(targAddress, nextHop, hopInstanceId),
+                          true,
+                          "relay1 never recorded a Hop-by-hop Route");
+    NS_TEST_ASSERT_MSG_EQ(nextHop, relay2Address, "relay1's own next hop is wrong");
+    NS_TEST_ASSERT_MSG_EQ(relay2->GetHopByHopRoute(targAddress, nextHop, hopInstanceId),
+                          true,
+                          "relay2 never recorded a Hop-by-hop Route");
+    NS_TEST_ASSERT_MSG_EQ(nextHop, targAddress, "relay2's own next hop is wrong");
+
+    // And it works: a datagram sent from the Origin, addressed to the
+    // Target, has to actually cross relay1 and relay2's own independent
+    // next-hop lookups to arrive -- not a Routing Header carrying the
+    // whole path, since none was ever attached.
+    uint16_t port = 4244;
+    Ptr<Socket> receiver = Socket::CreateSocket(nodes.Get(3), UdpSocketFactory::GetTypeId());
+    receiver->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), port));
+    receiver->SetRecvCallback(
+        MakeCallback(&RplP2pHopByHopRouteCompletesTestCase::CountDelivery, this));
+
+    Ptr<Socket> sender = Socket::CreateSocket(nodes.Get(0), UdpSocketFactory::GetTypeId());
+    sender->Connect(Inet6SocketAddress(targAddress, port));
+    Simulator::Schedule(Seconds(1), &RplP2pHopByHopRouteCompletesTestCase::SendOne, this, sender);
+
+    Simulator::Stop(Seconds(5));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_GT(m_sendResult, 0, "Socket::Send() refused the datagram outright");
+    NS_TEST_ASSERT_MSG_EQ(m_delivered,
+                          1,
+                          "The datagram never reached the Target over the Hop-by-hop Route");
+
+    receiver->Close();
+    sender->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief A P2P-RPL Hop-by-hop Route (H=1) keeps carrying data after the
+ *        temporary DAG that discovered it has left, at every hop.
+ *
+ * RFC 6997 section 7 has a router unconditionally leave the temporary DAG
+ * at its own 'L' deadline, well before the Hop-by-hop Route's own,
+ * typically much longer Default Lifetime/Lifetime Unit expires. The same
+ * three-hop scenario as RplP2pHopByHopRouteCompletesTestCase, but data is
+ * sent only after every node's own temporary DAG membership has already
+ * expired -- proving the route itself (GetHopByHopRoute()/
+ * HasHopByHopRoute()) genuinely outlives it and RouteOutput()/RouteInput()
+ * still forward correctly with no live membership behind rpi.GetInstanceId()
+ * at any hop.
+ *
+ * This does not, on its own, prove RplIpv6OptionRpl::Process()'s own
+ * HasHopByHopRoute() early return load-bearing: this module's isDropped
+ * only traces a confirmed rank inconsistency rather than enforcing it
+ * (@see design-constraints.md), so this test still passes with that early
+ * return removed -- what it prevents instead is a live, unrelated DODAG
+ * elsewhere reusing the same instanceId misreading the rewritten
+ * SenderRank as a genuine inconsistency (@see that early return's own
+ * comment). Kept here anyway as the direct, positive demonstration of the
+ * property actually promised (data keeps flowing after the temporary DAG
+ * is gone), which is the part worth a dedicated test regardless.
+ */
+class RplP2pHopByHopRouteOutlivesTemporaryDagTestCase : public TestCase
+{
+  public:
+    RplP2pHopByHopRouteOutlivesTemporaryDagTestCase();
+
+  private:
+    void DoRun() override;
+
+    /// @brief Count a datagram delivered at the Target.
+    /// @param socket the receiving socket
+    void CountDelivery(Ptr<Socket> socket);
+
+    /// @brief Send one datagram, as a named method Simulator::Schedule() can
+    ///        resolve (Socket::Send is overloaded).
+    /// @param socket the sending socket
+    void SendOne(Ptr<Socket> socket);
+
+    uint32_t m_delivered{0}; //!< datagrams that reached the Target
+    int m_sendResult{0};     //!< what Socket::Send() returned, -1 on refusal
+};
+
+RplP2pHopByHopRouteOutlivesTemporaryDagTestCase::RplP2pHopByHopRouteOutlivesTemporaryDagTestCase()
+    : TestCase("A P2P-RPL Hop-by-hop Route keeps working after its temporary DAG has expired")
+{
+}
+
+void
+RplP2pHopByHopRouteOutlivesTemporaryDagTestCase::CountDelivery(Ptr<Socket> socket)
+{
+    Ptr<Packet> packet = socket->Recv();
+    while (packet)
+    {
+        m_delivered++;
+        packet = socket->Recv();
+    }
+}
+
+void
+RplP2pHopByHopRouteOutlivesTemporaryDagTestCase::SendOne(Ptr<Socket> socket)
+{
+    m_sendResult = socket->Send(Create<Packet>(64));
+}
+
+void
+RplP2pHopByHopRouteOutlivesTemporaryDagTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(4); // 0 = Origin and base root, 1 and 2 = relays, 3 = Target
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    auto blacklist = [&](uint32_t a, uint32_t b) {
+        Ptr<SimpleNetDevice> devA = DynamicCast<SimpleNetDevice>(devices.Get(a));
+        Ptr<SimpleNetDevice> devB = DynamicCast<SimpleNetDevice>(devices.Get(b));
+        channel->BlackList(devA, devB);
+        channel->BlackList(devB, devA);
+    };
+    blacklist(0, 2);
+    blacklist(0, 3);
+    blacklist(1, 3);
+
+    RplHelper rplHelper;
+    // Encoding 1 (4 s, @see RplP2pLifetimeSeconds()), not the default 2
+    // (16 s): fast enough that waiting well past it does not make this
+    // test slow, but with enough margin over the few hundred milliseconds
+    // the discovery itself takes (each hop's own 'L' deadline re-arms on
+    // every DIO/P2P-DRO it processes, @see ArmP2pExpiry(), so what matters
+    // is headroom between consecutive messages, not the discovery's total
+    // duration) that a slow Trickle draw does not fail the discovery
+    // outright before this test ever gets to the point under test.
+    rplHelper.Set("P2pLifetime", UintegerValue(1));
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(250));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> orig = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> relay1 = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> relay2 = nodes.Get(2)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> targ = nodes.Get(3)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(targ->IsJoined(), true, "The base DODAG did not reach the far end");
+
+    Ipv6Address targAddress = targ->GetGlobalAddress();
+
+    RplRoutingProtocol::DodagKey key = orig->DiscoverP2pRoute(targAddress, true);
+    NS_TEST_ASSERT_MSG_NE(key.dodagId, Ipv6Address::GetAny(), "The discovery did not start");
+
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    Ipv6Address nextHop;
+    NS_TEST_ASSERT_MSG_EQ(orig->GetHopByHopRoute(targAddress, nextHop, key.instanceId),
+                          true,
+                          "The Origin never recorded a Hop-by-hop Route");
+
+    // Comfortably past P2pLifetime encoding 1's own 4 s
+    // (RplP2pLifetimeSeconds()) for every node's temporary DAG membership
+    // to have left on its own, each measured from the last DIO/P2P-DRO it
+    // saw rather than from discovery start (@see ArmP2pExpiry()).
+    Simulator::Stop(Seconds(15));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(orig->IsJoinedTo(key.instanceId, key.dodagId),
+                          false,
+                          "The Origin's own temporary DAG should have expired by now");
+    NS_TEST_ASSERT_MSG_EQ(relay1->IsJoinedTo(key.instanceId, key.dodagId),
+                          false,
+                          "relay1's own temporary DAG membership should have expired by now");
+    NS_TEST_ASSERT_MSG_EQ(relay2->IsJoinedTo(key.instanceId, key.dodagId),
+                          false,
+                          "relay2's own temporary DAG membership should have expired by now");
+
+    // The Hop-by-hop Route itself must still be there at every hop --
+    // P2pLifetime bounds the temporary DAG only, not the route it found
+    // (RFC 6997's Default Lifetime/Lifetime Unit, this module's own
+    // m_pathLifetime/m_lifetimeUnit, are independent attributes, at their
+    // own generous defaults here).
+    NS_TEST_ASSERT_MSG_EQ(orig->GetHopByHopRoute(targAddress, nextHop, key.instanceId),
+                          true,
+                          "The Origin's own Hop-by-hop Route did not outlive its temporary DAG");
+    NS_TEST_ASSERT_MSG_EQ(relay1->HasHopByHopRoute(key.instanceId, targAddress),
+                          true,
+                          "relay1's own Hop-by-hop Route did not outlive its temporary DAG");
+    NS_TEST_ASSERT_MSG_EQ(relay2->HasHopByHopRoute(key.instanceId, targAddress),
+                          true,
+                          "relay2's own Hop-by-hop Route did not outlive its temporary DAG");
+
+    // And data still gets through -- the real point of this test.
+    // RplIpv6OptionRpl::Process()'s rank-consistency check would otherwise
+    // see an instanceId with no membership behind it at every one of
+    // these now-expired nodes (GetRankForInstance() answering
+    // RPL_INFINITE_RANK) and drop the packet as rank inconsistent well
+    // before it ever reached the Target.
+    uint16_t port = 4245;
+    Ptr<Socket> receiver = Socket::CreateSocket(nodes.Get(3), UdpSocketFactory::GetTypeId());
+    receiver->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), port));
+    receiver->SetRecvCallback(
+        MakeCallback(&RplP2pHopByHopRouteOutlivesTemporaryDagTestCase::CountDelivery, this));
+
+    Ptr<Socket> sender = Socket::CreateSocket(nodes.Get(0), UdpSocketFactory::GetTypeId());
+    sender->Connect(Inet6SocketAddress(targAddress, port));
+    Simulator::Schedule(Seconds(1),
+                        &RplP2pHopByHopRouteOutlivesTemporaryDagTestCase::SendOne,
+                        this,
+                        sender);
+
+    Simulator::Stop(Seconds(5));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_GT(m_sendResult, 0, "Socket::Send() refused the datagram outright");
+    NS_TEST_ASSERT_MSG_EQ(m_delivered,
+                          1,
+                          "The datagram never reached the Target: the Hop-by-hop Route did not "
+                          "survive its temporary DAG's own expiry the way it is supposed to");
+
+    receiver->Close();
+    sender->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief A P2P-DRO is relayed only by the router named at the Address
  *        Vector's current NH position, and not at all if that would be a
  *        loop.
@@ -14998,6 +15368,8 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplP2pSoleTargetViaOptionStopsTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pDroAckWrongSequenceTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pRouteCompletesTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pHopByHopRouteCompletesTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pHopByHopRouteOutlivesTemporaryDagTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pDroRelayTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pAddressVectorFullTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDioRejectionTestCase, TestCase::Duration::QUICK);

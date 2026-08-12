@@ -125,6 +125,48 @@ RplIpv6OptionRpl::Process(Ptr<Packet> packet,
         return optionSize;
     }
 
+    // A Hop-by-hop Route (AODV-RPL RFC 9854 sections 6.2.3/6.4.3, P2P-RPL
+    // RFC 6997 sections 9.6/9.7) is its own, separate routing decision,
+    // kept alive by its own Default Lifetime rather than by the RREQ-
+    // Instance's/temporary DAG's own membership -- RFC 6997 section 7 has
+    // a Target unconditionally leave the temporary DAG at its 'L'
+    // deadline, typically well before the (often much longer) route it
+    // discovered is meant to expire, so this node's own membership under
+    // rpi.GetInstanceId() may already be gone by the time data actually
+    // flows over the route it found. The rank-consistency check below has
+    // no meaning for that state at all -- it exists to catch a route to
+    // the wrong root, something a Hop-by-hop Route's own, independently
+    // maintained next-hop table cannot suffer from -- so it is skipped
+    // entirely here, the same way it never runs at all for an H=0 source-
+    // routed packet (@see RplRoutingProtocol::PrepareOutgoingPacket()'s
+    // own "no RPL Option" branch). SenderRank is deliberately left
+    // untouched rather than refreshed to this node's own rank: nothing
+    // downstream ever reads it once Hop-by-hop routing has taken over for
+    // this Instance, since every hop takes this same early return.
+    //
+    // What this actually guards against, concretely: this module's own
+    // isDropped, below, only traces a confirmed rank inconsistency rather
+    // than enforcing it (@see design-constraints.md), so an expired
+    // membership's GetRankForInstance() answering RPL_INFINITE_RANK does
+    // not by itself cause a Hop-by-hop Route's packets to be dropped --
+    // confirmed by temporarily removing this early return and finding
+    // RplP2pHopByHopRouteOutlivesTemporaryDagTestCase still passed. What
+    // it does prevent is a downstream router that still holds a live,
+    // ordinary membership under the same reused-looking instanceId
+    // reading the rewritten (and, once one hop's own membership is gone,
+    // permanently RPL_INFINITE_RANK) SenderRank as a genuine
+    // inconsistency and resetting that unrelated DODAG's Trickle timer
+    // over it (@see NotifyRankInconsistency()) -- noise this module has
+    // no reason to accept just because a Hop-by-hop Route happens to be
+    // using the same Instance space.
+    if (rpl->HasHopByHopRoute(rpi.GetInstanceId(), ipv6Header.GetDestination()))
+    {
+        tail->AddHeader(rpi);
+        packet->RemoveAtEnd(packet->GetSize() - offset);
+        packet->AddAtEnd(tail);
+        return optionSize;
+    }
+
     bool down = rpi.GetDown();
     uint16_t senderRank = rpi.GetSenderRank();
     // Scoped to the DODAG this packet's own RPLInstanceID names, not

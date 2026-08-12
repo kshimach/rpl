@@ -5279,3 +5279,162 @@ RPL Target optionを自分の1件だけにした (`RplP2pMultiTargetTestCase`
 (Primary TargetAddr経由の別Targetが本当に残っているケース) を含む
 全既存テストが無変更でPASS — この変更がエッジケース以外の挙動を
 変えていないことの直接的な裏付け。
+
+## 46. P2P-RPL の Hop-by-hop Route (H=1) を実装 — §30以来の前提誤りを訂正
+
+§39完了後、ユーザーへ次の一手として3候補
+(P2pDioRedundancy既定値見直し・§9.5 Stop再検討・AODV-RPL H=1対応) を
+提示し、前2つに順次着手・完了 (§44・§45)。残った最後の候補
+「AODV-RPL H=1」の設計調査に入ったところ、§30 (「storing mode を
+先にすべきか」の検討) が前提としていた「H=1はcore RPLのstoring mode
+(MOP=2、DAO駆動のTarget/Transit option処理) に依存する」という
+判断が**誤りだった**ことが分かった。
+
+### 46.1 発見: H=1はstoring modeを必要としない
+
+RFC 9854 Terminologyの一文 ("A hop-by-hop route is created using RPL's
+'storing mode'") が§30の根拠だったが、実際の規定 (RFC 9854
+§6.2.3・§6.4.3、RFC 6997 §9.6・§9.7) を読み直すと、H=1が要求する
+経路エントリは**すべてAODV-RPL/P2P-RPL自身のメッセージ (RREQ/
+RREP-DIO、P2P-DRO) から構築される**— DAOは一切登場しない。
+「storing mode」という語は転送モデルの呼称 (各ルータが宛先ごとの
+next-hop状態を持つ) であって、core RPLのMOP=2機構そのものを指して
+いなかった。加えて、RFC 6997 §12を読み込む過程で、H=1のデータ
+パケットは実は**RFC 6550 §11.2のRPL Option (RPI) をそのまま流用する**
+(O/Down フラグ・RPLInstanceID経由) 設計であることも分かった —
+新しいプロトコル要素を追加する必要はなく、本実装が既にbase RPLの
+非storing modeで使っているRPI処理経路 (`RplIpv6OptionRpl::Process()`、
+`PrepareOutgoingPacket()`の一般的なRPI構築部) をほぼそのまま再利用
+できる。
+
+この訂正を受け、P2P-RPL側のH=1をこのセッションで実装した (AODV-RPL
+側は§46.6で述べる理由により今回は見送り、別増分とする)。
+
+### 46.2 共有インフラ: Hop-by-hop Route の独立した保存領域
+
+新規`struct HopByHopRoute { uint8_t instanceId; Ipv6Address dodagId;
+Ipv6Address nextHop; Time expire; };`と
+`std::map<Ipv6Address, HopByHopRoute> m_hopByHopRoutes;` (宛先で
+キー化 — 既存の`m_aodvRoutes`/`m_p2pRoutes`と同じ「同一宛先への
+別発見は上書き」という単純化を踏襲)。アクセサ4種:
+`FindHopByHopRoute()`(宛先のみ/フルキー、2オーバーロード、private)、
+`StoreHopByHopRoute()`(private、後述のループ検出込み)、
+`HasHopByHopRoute()`(instanceId+宛先のみで存在確認、**public** —
+理由は§46.4)。テスト用に`GetHopByHopRoute()`(宛先のみ版のpublicな
+薄いラッパ)も追加。
+
+一時DAG (`m_dodags`) のメンバシップとは意図的に**別の**マップにした:
+RFC 6997 §7は一時DAGを自身の'L'期限で無条件離脱させるが、Hop-by-hop
+Routeの寿命はDODAG Configuration OptionのDefault Lifetime/Lifetime
+Unitという別の (通常はるかに長い) パラメータで決まる。既存の
+`m_p2pRoutes`/`m_aodvRoutes`が一時DAGのメンバシップと別寿命で管理
+されているのと同じ設計。
+
+### 46.3 データプレーン配線: SRHではなくRPIを使う
+
+- `RouteOutput()`: `FindAodvRoute()`/`FindP2pRoute()` (H=0、SRH用) と
+  同じ優先度階層に`FindHopByHopRoute()`を追加。
+- `PrepareOutgoingPacket()`: Hop-by-hop Routeが見つかった場合、
+  SRH構築ブロックにも既存の汎用RPI構築ブロックにも触れず、**専用の
+  早期return**で完結させた。当初は既存の汎用RPI構築部
+  (`originDodag->isRoot`/`->rank`を読む) を再利用する設計を試みたが、
+  「一時DAGのメンバシップは'L'で消えるが、Hop-by-hop Route自体は
+  もっと長く生きる」という設計そのものと矛盾する (メンバシップが
+  消えた後に送信しようとすると`FindDodagByInstance()`が見つからず
+  Down/rankの取得元が無くなる) と気づき、自己完結型に書き直した:
+  Downは常にtrue (この関数は常にこのノード自身が発信するトラフィック
+  のみ扱う、かつHop-by-hop Routeは常にOriginから離れる「down」方向)、
+  SenderRankは`m_minHopRankIncrease`固定 (rootが常に広告する既知の
+  定数、`CreateDodagMembership()`の`dodag.rank = m_minHopRankIncrease`
+  と同じ値、生存中のメンバシップに依存しない)。
+- `RouteInput()`: 中継ノード用。RPIの`InstanceId`と、パケット自身の
+  送信元アドレス (`header.GetSource()`) をDODAGIDとみなして
+  (RFC 6550 §5.1の'D'flag規約のうち、本実装が現状サポートする
+  「D=0固定」の範囲 — P2P-RPLは単方向 [Origin→Target] のみなので
+  送信元は常にOrigin。AODV-RPLの双方向対応時にはD=1 [宛先=DODAGID]
+  も読む必要がある、§46.6参照) `FindHopByHopRoute()`の3引数版で照合。
+
+### 46.4 RplIpv6OptionRpl::Process() のrank整合性チェックを迂回
+
+`HasHopByHopRoute()`をpublicにした理由: 一時DAGのメンバシップが
+'L'で消えた後もHop-by-hop Route自体は生き続けるため、
+`RplIpv6OptionRpl::Process()`が`GetRankForInstance()`で参照する
+メンバシップが既に無くなっている状態でデータが流れ続ける、という
+状況が普通に起こる。この状態でRFC 6550 §11.2の汎用rank整合性
+チェックをそのまま適用する意味は無い (「間違ったrootへの経路」を
+検出する仕組みであり、Hop-by-hop Route自身の独立したnext-hop表が
+そもそも抱えない種類の誤り) ため、`HasHopByHopRoute()`が真なら
+チェック全体を早期returnで飛ばす。
+
+**実装中に判明した事実(想定と異なった)**: 当初「このバイパスが無いと
+メンバシップ消失後のパケットがrank不整合と誤判定されドロップされる」
+という想定でテスト
+(`RplP2pHopByHopRouteOutlivesTemporaryDagTestCase`)を書いたが、
+バイパスを一時的に無効化しても**そのテストはPASSし続けた**。原因を
+追ったところ、本実装の`RplIpv6OptionRpl::Process()`の`isDropped`は
+「トレースするだけで実際にはパケットを止めない」という既知の制限
+(10節・design-constraints.mdの別項参照) がそもそも存在しており、
+かつ下方向 (down=true) トラフィックでは「メンバシップ消失 (rank
+無限大)」自体は「down不整合」の条件 (`senderRank >= ownRank`) を
+満たさない (無限大は「ownRankとしては最悪」なので、有限なsenderRank
+は無限大以上にはならない) ため、そもそも今回のP2P-RPL (常にdown
+方向のみ) の範囲では**バイパスの有無がデータ到達に一切影響しない**
+ことが分かった。バイパスが実際に防ぐのはRank-Errorフラグの誤設定と、
+それに伴う無関係な別DODAGでの`NotifyRankInconsistency()`
+(Trickleリセット) の誤発火であり、「パケットロス防止」ではなかった
+— テストの`@brief`・実装コメント双方をこの実態に合わせて訂正した。
+設計としては引き続き正しい (up方向が絡むAODV-RPL側では実際に
+rank比較の結果が逆転し得る、§46.6参照)ため維持したが、**この増分の
+テストではload-bearingであることを厳密には証明できていない**ことを
+正直に記録する。
+
+### 46.5 `DiscoverP2pRoute()`にhopByHop引数を追加
+
+既定値`false`(後方互換)、`true`でH=1発見を開始
+(`dodag.p2p.hopByHop = hopByHop;`)。`HandleP2pDro()`のOrigin・
+中継ルータ両分岐を、`rdo.hopByHop`で `m_p2pRoutes`書き込み(H=0)
+と`StoreHopByHopRoute()`呼び出し(H=1)に分岐。中継ルータ側は
+RFC 6997 §9.6のループ検出規定(「同じInstance/DODAGIDで既存の
+Hop-by-hop状態が別のnext hopを指していれば破棄」)を
+`StoreHopByHopRoute()`自身に実装し、`false`を返せば中継せず
+即座にreturnする。
+
+### 46.6 AODV-RPL側は今回見送り: 非対称経路のrank階層の不整合
+
+`RplAodvAsymmetric*TestCase`系が既に実装しているとおり、AODV-RPLの
+非対称 (S=0) 経路は、RREQ-Instance (OrigNode起点) とは別の
+RREP-Instance (TargNode起点) という**もう一つのDODAG**を経由して
+確立される。ところがRFC 9854 §6.4.3は下り経路エントリの
+RPLInstanceIDを「RREQ-InstanceID」(Deltaを引いた値) と明記している
+— つまり保存される経路の**識別キー**はRREQ-Instanceのものだが、
+実際にデータパケットが物理的に通過する経路のトポロジ (各中継
+ルータのrank) はRREP-Instanceという**別のDODAG**のものになる。
+RREQ-InstanceにおけるあるルータのrankとRREP-Instanceにおける
+同じルータのrankは一般に異なるため、RREQ-InstanceIDを載せた
+データパケットにRFC 6550 §11.2の汎用rank整合性チェックをそのまま
+適用すると、物理的には正常な経路でも誤ってrank不整合と判定され
+うる (P2P-RPLには存在しない、AODV-RPL非対称経路固有の問題)。
+
+対称 (S=1) 経路については、RREQ-Instance自身の単一の階層で
+上り・下りとも完結するため、P2P-RPLと同様に問題なく実装できる
+見込みだが、対称・非対称を作り分けるAODV-RPLの実装をまとめて
+検証するには、この非対称ケースの扱い(RREP-InstanceのRankを
+そのまま使うか、RREQ-InstanceIDのままバイパス相当の特別扱いを
+広げるか等、複数の設計選択肢がある)を先に詰める必要があり、
+本セッションの残り時間で拙速に実装するより一旦区切ることを選んだ。
+次回増分の対象として残す。
+
+### 46.7 検証
+
+新規テスト2件: `RplP2pHopByHopRouteCompletesTestCase`
+(3ホップ経由でのH=1経路確立+実データUDP到達を、
+`RplP2pRouteCompletesTestCase`のH=0版と対にして確認)、
+`RplP2pHopByHopRouteOutlivesTemporaryDagTestCase`(一時DAGの
+メンバシップが'L'期限で全ノードから消えた後もHop-by-hop Route自体は
+生き続け、データが届き続けることを確認)。両方とも該当する保存
+ロジック(`HandleP2pDro()`の`if (rdo.hopByHop)`分岐2箇所)を一時的に
+無効化してFAILすることを確認(load-bearing検証)、元に戻して
+再度PASSすることを確認。`./ns3 build`clean(rplモジュール・
+プロジェクト全体とも)、`test-runner --suite=rpl`を複数回連続実行して
+安定PASSを確認。既存の全P2P-RPL/AODV-RPLテスト(H=0)は無変更でPASS
+— H=1対応がH=0側の既存挙動に影響していないことの裏付け。

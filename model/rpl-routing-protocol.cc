@@ -1216,8 +1216,8 @@ RplRoutingProtocol::SendDio(DodagMembership& dodag, Ipv6Address dst, uint32_t in
         // recorded on the way in, its own address already appended.
         P2pRdoOption rdo;
         rdo.reply = dodag.p2p.reply;
-        rdo.hopByHop = dodag.p2p.hopByHop; // always false; H=1 is out of scope
-        rdo.numRoutes = 0; // exactly one Source Route; N > 0 is out of scope
+        rdo.hopByHop = dodag.p2p.hopByHop; // 'H': DiscoverP2pRoute()'s own choice
+        rdo.numRoutes = 0; // exactly one Source/Hop-by-hop Route; N > 0 is out of scope
         // compr left at its default: P2pRdoSerialize() computes its own
         // from target/addressVector and this DIO's own DODAGID.
         rdo.lifetime = dodag.p2p.lifetimeField;
@@ -2399,6 +2399,81 @@ RplRoutingProtocol::ReadRpiInstanceId(Ptr<const Packet> p,
     return true;
 }
 
+bool
+RplRoutingProtocol::FindHopByHopRoute(Ipv6Address destination,
+                                      Ipv6Address& nextHop,
+                                      uint8_t& instanceId) const
+{
+    auto it = m_hopByHopRoutes.find(destination);
+    if (it == m_hopByHopRoutes.end() || it->second.expire <= Simulator::Now())
+    {
+        return false;
+    }
+    nextHop = it->second.nextHop;
+    instanceId = it->second.instanceId;
+    return true;
+}
+
+bool
+RplRoutingProtocol::GetHopByHopRoute(Ipv6Address destination,
+                                     Ipv6Address& nextHop,
+                                     uint8_t& instanceId) const
+{
+    return FindHopByHopRoute(destination, nextHop, instanceId);
+}
+
+bool
+RplRoutingProtocol::FindHopByHopRoute(uint8_t instanceId,
+                                      Ipv6Address dodagId,
+                                      Ipv6Address destination,
+                                      Ipv6Address& nextHop) const
+{
+    auto it = m_hopByHopRoutes.find(destination);
+    if (it == m_hopByHopRoutes.end() || it->second.expire <= Simulator::Now() ||
+        it->second.instanceId != instanceId || it->second.dodagId != dodagId)
+    {
+        return false;
+    }
+    nextHop = it->second.nextHop;
+    return true;
+}
+
+bool
+RplRoutingProtocol::HasHopByHopRoute(uint8_t instanceId, Ipv6Address destination) const
+{
+    auto it = m_hopByHopRoutes.find(destination);
+    return it != m_hopByHopRoutes.end() && it->second.expire > Simulator::Now() &&
+          it->second.instanceId == instanceId;
+}
+
+bool
+RplRoutingProtocol::StoreHopByHopRoute(uint8_t instanceId,
+                                       Ipv6Address dodagId,
+                                       Ipv6Address destination,
+                                       Ipv6Address nextHop,
+                                       Time lifetime)
+{
+    auto it = m_hopByHopRoutes.find(destination);
+    if (it != m_hopByHopRoutes.end() && it->second.expire > Simulator::Now() &&
+        it->second.instanceId == instanceId && it->second.dodagId == dodagId &&
+        it->second.nextHop != nextHop)
+    {
+        NS_LOG_LOGIC("Refusing a Hop-by-hop Route to "
+                    << destination << " under Instance " << +instanceId << "/" << dodagId
+                    << ": conflicts with the next hop " << it->second.nextHop
+                    << " already held (a loop, or an overlapping still-live route)");
+        return false;
+    }
+
+    HopByHopRoute route;
+    route.instanceId = instanceId;
+    route.dodagId = dodagId;
+    route.nextHop = nextHop;
+    route.expire = Simulator::Now() + lifetime;
+    m_hopByHopRoutes[destination] = route;
+    return true;
+}
+
 RplRoutingProtocol::DodagMembership*
 RplRoutingProtocol::FindRootDodagFor(Ipv6Address destination, std::vector<Ipv6Address>& hops)
 {
@@ -3148,6 +3223,25 @@ RplRoutingProtocol::RouteOutput(Ptr<Packet> p,
     }
 
     {
+        // A Hop-by-hop Route (H=1) AODV-RPL or P2P-RPL discovered: only
+        // this node's own next hop matters, unlike the two source-routed
+        // (H=0) cases just above, which resolve and carry the whole path.
+        // Same priority tier as those two -- it was asked for explicitly,
+        // for this destination.
+        Ipv6Address hopByHopNextHop;
+        uint8_t hopByHopInstanceId = 0;
+        if (FindHopByHopRoute(dst, hopByHopNextHop, hopByHopInstanceId))
+        {
+            NS_LOG_LOGIC("Routing " << dst << " over a Hop-by-hop Route via " << hopByHopNextHop);
+            Ptr<Ipv6Route> route = RouteToNeighbour(hopByHopInstanceId, hopByHopNextHop, dst);
+            if (route)
+            {
+                return route;
+            }
+        }
+    }
+
+    {
         std::vector<Ipv6Address> hops;
         if (DodagMembership* root = FindRootDodagFor(dst, hops))
         {
@@ -3247,6 +3341,45 @@ RplRoutingProtocol::PrepareOutgoingPacket(Ptr<Packet> packet, Ipv6Header& header
     // other node's traffic goes up, which needs no Routing Header. The
     // membership found here (if any) is reused below for the RPL Option
     // this same packet also needs, rather than resolving twice.
+    // A Hop-by-hop Route (H=1) AODV-RPL or P2P-RPL discovered: this
+    // function only ever runs for this node's own originated traffic
+    // (@see this function's own opening comment on route, resolved by
+    // RouteOutput()), and a Hop-by-hop Route only ever travels away from
+    // whichever node originated its discovery -- always "down" that node's
+    // own RREQ-Instance/temporary DAG, regardless of whether the
+    // membership that discovered it still exists by now (@see
+    // HasHopByHopRoute()'s own doc comment: its lifetime is independent
+    // and typically longer). That independence is exactly why this is
+    // self-contained rather than reusing the generic Down/rank resolution
+    // just below (which does depend on a live membership): Down is simply
+    // true, and the Sender Rank a root advertises is the fixed
+    // m_minHopRankIncrease every root uses (@see CreateDodagMembership()'s
+    // own dodag.rank = m_minHopRankIncrease for isRoot, unaffected by
+    // whether the specific membership that set it is still around).
+    // Needs no Routing Header at all -- every other hop resolves its own
+    // next hop fresh from its own copy of this same state (@see
+    // RouteInput()) -- so this returns immediately rather than falling
+    // through to the source-routed/generic-RPL-Option logic below.
+    Ipv6Address hopByHopNextHop;
+    uint8_t hopByHopInstanceId = 0;
+    if (FindHopByHopRoute(dst, hopByHopNextHop, hopByHopInstanceId))
+    {
+        RplPacketInfoHeader rpi;
+        rpi.SetDown(true);
+        rpi.SetInstanceId(hopByHopInstanceId);
+        rpi.SetSenderRank(m_minHopRankIncrease);
+
+        Ipv6ExtensionHopByHopHeader hbh;
+        hbh.AddOption(rpi);
+        hbh.SetNextHeader(innerNextHeader);
+        packet->AddHeader(hbh);
+        header.SetNextHeader(Ipv6Header::IPV6_EXT_HOP_BY_HOP);
+
+        NS_LOG_LOGIC("Attached an RPL Option for a Hop-by-hop Route to " << dst << " via "
+                                                                         << hopByHopNextHop);
+        return;
+    }
+
     std::vector<Ipv6Address> hops;
     uint8_t aodvInstanceId = 0;
     bool overAodvRoute = FindAodvRoute(dst, hops, aodvInstanceId);
@@ -3414,6 +3547,37 @@ RplRoutingProtocol::RouteInput(Ptr<const Packet> p,
             ecb(p, header, Socket::ERROR_NOROUTETOHOST);
         }
         return false;
+    }
+
+    // A Hop-by-hop Route (H=1) AODV-RPL or P2P-RPL established: checked
+    // first and returned on a match, since its destination (TargNode/
+    // Target) runs sideways between two arbitrary nodes and has nothing to
+    // do with the preferred-parent-based upward forwarding below -- unlike
+    // a source-routed (H=0) downward packet, which is never seen here at
+    // all (see that block's own comment), a Hop-by-hop one genuinely is:
+    // every hop looks its own next hop up fresh rather than the Routing
+    // Header being rewritten and re-injected one hop at a time. dodagId
+    // comes straight off the packet's own source address rather than a
+    // parsed 'D' flag: every Hop-by-hop Route this module currently
+    // establishes (P2P-RPL only, so far) has the Origin as the packet's
+    // source by construction (RFC 6997 section 12), the same D=0-always
+    // scope PrepareOutgoingPacket()'s own hop-by-hop branch shares; @see
+    // design-constraints.md.
+    uint8_t hopByHopInstanceId;
+    if (ReadRpiInstanceId(p, header, hopByHopInstanceId))
+    {
+        Ipv6Address hopByHopNextHop;
+        if (FindHopByHopRoute(hopByHopInstanceId, header.GetSource(), dst, hopByHopNextHop))
+        {
+            Ptr<Ipv6Route> route = RouteToNeighbour(hopByHopInstanceId, hopByHopNextHop, dst);
+            if (route)
+            {
+                NS_LOG_LOGIC("Forwarding " << dst << " over a Hop-by-hop Route via "
+                                           << hopByHopNextHop);
+                ucb(route->GetOutputDevice(), route, p, header);
+                return true;
+            }
+        }
     }
 
     // A source routed downward packet is never seen here: RFC 6554 processing

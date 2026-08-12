@@ -9,10 +9,10 @@
  * translation unit of their own only because rpl-routing-protocol.cc is
  * already some three thousand lines. @see design-constraints.md.
  *
- * Scope: source-routed (H=0) discovery for a single Target, a single Source
- * Route. Hop-by-hop routes (H=1) need storing mode, which this module does
- * not have at all -- the same reason AODV-RPL stays out of H=1 too.
- * @see design-constraints.md.
+ * Scope: a single Target, a single Source Route (H=0) or Hop-by-hop Route
+ * (H=1). Neither needs core RPL's own storing mode (MOP 2, DAO-driven) at
+ * all -- every field H=1 support needs comes from the P2P-RDO/P2P-DRO
+ * messages this module already exchanges; @see design-constraints.md.
  */
 
 #include "rpl-conf.h"
@@ -31,9 +31,9 @@ namespace rpl
 {
 
 RplRoutingProtocol::DodagKey
-RplRoutingProtocol::DiscoverP2pRoute(Ipv6Address target)
+RplRoutingProtocol::DiscoverP2pRoute(Ipv6Address target, bool hopByHop)
 {
-    NS_LOG_FUNCTION(this << target);
+    NS_LOG_FUNCTION(this << target << hopByHop);
 
     DodagKey empty{0, Ipv6Address::GetAny()};
 
@@ -106,7 +106,7 @@ RplRoutingProtocol::DiscoverP2pRoute(Ipv6Address target)
     dodag.p2p.maxRank = m_p2pMaxRank;
     dodag.p2p.lifetimeField = m_p2pLifetime;
     dodag.p2p.reply = true;
-    dodag.p2p.hopByHop = false;
+    dodag.p2p.hopByHop = hopByHop;
     // Empty at the Origin: "The Origin and Target addresses MUST NOT be
     // included in the Address vector" (RFC 6997 section 7), and only
     // Intermediate Routers append to it (section 9.4).
@@ -600,27 +600,56 @@ RplRoutingProtocol::HandleP2pDro(const RplP2pDroHeader& dro, Ipv6Address from, u
 
     if (dodag.p2p.isOrigin)
     {
-        // RFC 6997 section 9.7. rdo.addressVector is the fixed snapshot the
-        // Target built once (SendP2pDro()), already running Origin-outward
-        // -- unlike AODV-RPL's asymmetric RREP-Instance, whose own vector
-        // accumulates hop by hop during the flood back and so needs
-        // reversing at the OrigNode, this needs none (@see
-        // design-constraints.md).
-        P2pRoute route;
-        route.hops = rdo.addressVector;
-        route.hops.push_back(rdo.target);
-        route.instanceId = dodag.instanceId;
-        // "The lifetime is set according to DODAG configuration (i.e., not
-        // the L field)" -- RFC 9854 section 6.4.3's wording for the AODV-RPL
-        // analogue, and the same PathLifetime/lifetime unit a DAO-derived
-        // route gets; RFC 6997 has no equivalent sentence of its own but
-        // the same reasoning applies (the temporary DAG's own 'L' bounds
-        // discovery, not the route it finds).
-        route.expire = Simulator::Now() + Seconds(m_pathLifetime * m_lifetimeUnit);
-        m_p2pRoutes[rdo.target] = route;
+        if (rdo.hopByHop)
+        {
+            // RFC 6997 section 9.7: "the Origin MUST store in its memory
+            // the state for this Hop-by-hop Route in the manner described
+            // in Section 9.6" -- the same next-hop rule an intermediate
+            // router's own uses below, with the Origin standing in for
+            // "NH=0": the next hop is Address[1] (addressVector.front()),
+            // unless the vector is empty, i.e. the Target is a direct
+            // neighbour, in which case the Target itself is the next hop.
+            Ipv6Address nextHop =
+                rdo.addressVector.empty() ? rdo.target : rdo.addressVector.front();
+            if (!StoreHopByHopRoute(dodag.instanceId,
+                                    dodag.dodagId,
+                                    rdo.target,
+                                    nextHop,
+                                    Seconds(m_pathLifetime * m_lifetimeUnit)))
+            {
+                NS_LOG_LOGIC("Discarding a P2P-DRO establishing a Hop-by-hop Route that "
+                            "conflicts with one already held for "
+                            << rdo.target);
+                return;
+            }
+            NS_LOG_INFO("P2P-RPL Hop-by-hop Route discovery to "
+                        << rdo.target << " completed, next hop " << nextHop);
+        }
+        else
+        {
+            // RFC 6997 section 9.7. rdo.addressVector is the fixed
+            // snapshot the Target built once (SendP2pDro()), already
+            // running Origin-outward -- unlike AODV-RPL's asymmetric
+            // RREP-Instance, whose own vector accumulates hop by hop
+            // during the flood back and so needs reversing at the
+            // OrigNode, this needs none (@see design-constraints.md).
+            P2pRoute route;
+            route.hops = rdo.addressVector;
+            route.hops.push_back(rdo.target);
+            route.instanceId = dodag.instanceId;
+            // "The lifetime is set according to DODAG configuration (i.e.,
+            // not the L field)" -- RFC 9854 section 6.4.3's wording for
+            // the AODV-RPL analogue, and the same PathLifetime/lifetime
+            // unit a DAO-derived route gets; RFC 6997 has no equivalent
+            // sentence of its own but the same reasoning applies (the
+            // temporary DAG's own 'L' bounds discovery, not the route it
+            // finds).
+            route.expire = Simulator::Now() + Seconds(m_pathLifetime * m_lifetimeUnit);
+            m_p2pRoutes[rdo.target] = route;
 
-        NS_LOG_INFO("P2P-RPL route discovery to " << rdo.target << " completed over "
-                                                   << route.hops.size() << " hop(s)");
+            NS_LOG_INFO("P2P-RPL route discovery to " << rdo.target << " completed over "
+                                                       << route.hops.size() << " hop(s)");
+        }
 
         // RFC 6997 section 9.7: "If the A flag is set to one...the Origin
         // MUST generate a P2P-DRO-ACK message...and unicast the message to
@@ -693,10 +722,34 @@ RplRoutingProtocol::HandleP2pDro(const RplP2pDroHeader& dro, Ipv6Address from, u
         return;
     }
 
+    if (rdo.hopByHop)
+    {
+        // RFC 6997 section 9.6: "the router MUST store the state for the
+        // Forward Hop-by-hop Route carried inside the P2P-RDO... the IPv6
+        // address of the next hop, Address[NH+1] (unless the NH value
+        // equals the number of elements in the Address vector, in which
+        // case the Target itself is the next hop)". NH is still
+        // rdo.maxRankOrNh here (this node's own position, Address[NH]),
+        // not yet decremented -- Address[NH+1] is addressVector[NH] in
+        // the Address vector's own 0-indexed storage.
+        Ipv6Address nextHop = (rdo.maxRankOrNh == rdo.addressVector.size())
+                                  ? rdo.target
+                                  : rdo.addressVector[rdo.maxRankOrNh];
+        if (!StoreHopByHopRoute(dro.GetInstanceId(),
+                                dro.GetDodagId(),
+                                rdo.target,
+                                nextHop,
+                                Seconds(m_pathLifetime * m_lifetimeUnit)))
+        {
+            NS_LOG_LOGIC("Discarding a P2P-DRO establishing a Hop-by-hop Route that conflicts "
+                        "with one already held for "
+                        << rdo.target);
+            return;
+        }
+    }
+
     // "The router MUST decrement the NH field inside the P2P-RDO and send
-    // the P2P-DRO message further via link-local multicast" -- unchanged
-    // otherwise; H=1's Hop-by-hop routing state (the bullets in between,
-    // in section 9.6's own text) is out of scope.
+    // the P2P-DRO message further via link-local multicast."
     P2pRdoOption relayedRdo = rdo;
     relayedRdo.maxRankOrNh = static_cast<uint8_t>(rdo.maxRankOrNh - 1);
 

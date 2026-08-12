@@ -313,6 +313,47 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     uint16_t GetRankForInstance(uint8_t instanceId) const;
 
     /**
+     * @brief Whether this node holds a live Hop-by-hop Route (H=1) to a
+     *        destination under a given Instance, without needing its next
+     *        hop.
+     *
+     * Public (unlike StoreHopByHopRoute() and the FindHopByHopRoute()
+     * overloads) for RplIpv6OptionRpl::Process(), a different class
+     * entirely: a Hop-by-hop Route's own lifetime is independent of the
+     * RREQ-Instance's/temporary DAG's own membership (@see
+     * StoreHopByHopRoute()), so once one is established, RFC 6550 section
+     * 11.2's generic rank-consistency check has nothing meaningful left to
+     * compare against -- this is what lets Process() recognise that case
+     * and skip it, the same way it never runs at all for an H=0 source-
+     * routed packet (@see PrepareOutgoingPacket()'s own "no RPL Option"
+     * branch).
+     *
+     * @param instanceId the RPLInstanceID from the packet's own RPL Option
+     * @param destination the packet's own IPv6 destination address
+     * @return true if a live Hop-by-hop Route matches both
+     */
+    bool HasHopByHopRoute(uint8_t instanceId, Ipv6Address destination) const;
+
+    /**
+     * @brief Get the Hop-by-hop Route (H=1) this node holds to a
+     *        destination, if any, and which Instance it was found under.
+     *
+     * Exposed for tests and for inspecting a discovery's result, the
+     * Hop-by-hop counterpart of GetP2pRoute()/GetAodvRoute() -- unlike
+     * those, there is no whole path to return, only this node's own next
+     * hop, since that is all a Hop-by-hop Route ever keeps at any one
+     * router (@see HopByHopRoute).
+     *
+     * @param destination the destination to route to
+     * @param [out] nextHop the next hop's address
+     * @param [out] instanceId the RPLInstanceID the route was found under
+     * @return true if a live route was found
+     */
+    bool GetHopByHopRoute(Ipv6Address destination,
+                         Ipv6Address& nextHop,
+                         uint8_t& instanceId) const;
+
+    /**
      * @brief Whether this node is still waiting on a DAO-ACK for a specific
      *        DODAG's most recently sent DAO.
      * @param instanceId the RPLInstanceID of the DODAG
@@ -593,9 +634,9 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
 
     // P2P-RPL (RFC 6997). Implemented in model/rpl-p2p.cc, not
     // model/rpl-routing-protocol.cc, the same split rpl-aodv.cc keeps for
-    // AODV-RPL. Scoped to source-routed discovery (H=0) for a single Target
-    // and a single Source Route; @see design-constraints.md for what that
-    // leaves out and why.
+    // AODV-RPL. Scoped to a single Target and a single Source Route/Hop-by-
+    // hop Route; @see design-constraints.md for what that leaves out and
+    // why.
 
     /**
      * @brief Start a P2P-RPL route discovery towards a target.
@@ -603,15 +644,18 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      * Forms a temporary DAG -- a local RPL Instance rooted at this node, RFC
      * 6997 section 6.1 -- and starts Trickle-pacing P2P mode DIOs into it.
      * The discovery runs on its own from there; its result, once a P2P-DRO
-     * comes back, will be read with GetP2pRoute() (@see later increments;
-     * not implemented yet).
+     * comes back, is read with GetP2pRoute() (H=0) or is usable directly
+     * through RouteOutput() (H=1, @see HasHopByHopRoute()) once it exists.
      *
      * @param target the address to find a route to
+     * @param hopByHop RFC 6997 section 4's 'H' bit: false (the default) for
+     *        a Source Route (H=0), true for a Hop-by-hop Route (H=1) --
+     *        @see design-constraints.md for the tradeoff
      * @return the key of the temporary DAG, or a key whose dodagId is any()
      *         if the discovery could not be started (no global address to
      *         root it at, or no Local RPLInstanceID left to allocate)
      */
-    DodagKey DiscoverP2pRoute(Ipv6Address target);
+    DodagKey DiscoverP2pRoute(Ipv6Address target, bool hopByHop = false);
 
     /**
      * @brief Get the Address Vector a P2P-RPL temporary DAG has accumulated.
@@ -923,7 +967,7 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
             uint8_t maxRank{0};   //!< MaxRank, 0 meaning no limit
             uint8_t lifetimeField{0}; //!< the 'L' field this temporary DAG was opened with
             bool reply{true};         //!< 'R': whether the Target should send a P2P-DRO back
-            bool hopByHop{false};     //!< 'H': always false; H=1 is out of scope
+            bool hopByHop{false};     //!< 'H': false for a Source Route, true for a Hop-by-hop Route
             /// RFC 6997 sections 8/9.6/9.7: set once a P2P-DRO with 'S' = 1
             /// has been seen for this temporary DAG. ShouldRefuseP2pRdo()
             /// refuses every further P2P mode DIO once this is true -- the
@@ -1382,6 +1426,86 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     bool FindP2pRoute(Ipv6Address dst,
                       std::vector<Ipv6Address>& hops,
                       uint8_t& instanceId) const;
+
+    /**
+     * @brief Find the Hop-by-hop Route (H=1) to a destination, if this node
+     *        holds one under any Instance.
+     *
+     * AODV-RPL (RFC 9854 sections 6.2.3, 6.4.3) and P2P-RPL (RFC 6997
+     * sections 9.6, 9.7) both let a router keep only its own next hop for
+     * an H=1 route, rather than the whole path H=0 source routing carries
+     * -- @see HopByHopRoute. This overload is for a node's own originated
+     * traffic (RouteOutput()/PrepareOutgoingPacket()), which knows the
+     * destination but not which Instance found the route, the same shape
+     * FindAodvRoute()/FindP2pRoute() already have; @see the other overload
+     * for a transiting router, which already knows both from the packet's
+     * own RPL Option and IPv6 header.
+     *
+     * @param destination the destination to route to
+     * @param [out] nextHop the next hop's address (global; RouteToNeighbour()
+     *              converts it)
+     * @param [out] instanceId the RPLInstanceID the route was found under
+     * @return true if a live route was found
+     */
+    bool FindHopByHopRoute(Ipv6Address destination,
+                           Ipv6Address& nextHop,
+                           uint8_t& instanceId) const;
+
+    /**
+     * @brief Find the Hop-by-hop Route (H=1) a specific Instance holds to a
+     *        destination, if any.
+     *
+     * For a transiting router, which already knows instanceId (from the
+     * packet's own RPL Option) and dodagId (from the packet's own source
+     * address, this module's D=0-always scope for now, @see
+     * design-constraints.md) and must not act on some unrelated Instance's
+     * route to the same destination.
+     *
+     * @param instanceId the RPLInstanceID the route must have been found under
+     * @param dodagId the OrigNode/Origin the route's Instance belongs to
+     * @param destination the destination to route to
+     * @param [out] nextHop the next hop's address (global)
+     * @return true if a live route matching all three was found
+     */
+    bool FindHopByHopRoute(uint8_t instanceId,
+                           Ipv6Address dodagId,
+                           Ipv6Address destination,
+                           Ipv6Address& nextHop) const;
+
+    /**
+     * @brief Establish or refresh a Hop-by-hop Route (H=1), rejecting a
+     *        conflicting one.
+     *
+     * RFC 6997 section 9.6 (RFC 9854 sections 6.2.3/6.4.3 for the AODV-RPL
+     * analogue): "If the router already maintains a Hop-by-hop state
+     * listing the Target as the destination and carrying the same
+     * RPLInstanceID and DODAGID fields as the received P2P-DRO, and the
+     * next-hop information in the state does not match the next hop
+     * indicated in the received P2P-DRO, the router MUST discard the
+     * P2P-DRO message with no further processing" -- section 9.6 goes on
+     * to name the two ways this can happen (a previously undetected loop in
+     * the route being established, or an existing, still-live route to the
+     * same destination that partially overlaps this one), either of which
+     * makes this route unsafe to establish or relay further. A route under
+     * a different Instance (or DODAGID) to the same destination is a
+     * different, unrelated route, not a conflict, and is simply replaced
+     * (the same "last one wins" rule FindP2pRoute()'s own m_p2pRoutes
+     * already applies).
+     *
+     * @param instanceId the RPLInstanceID this route belongs to
+     * @param dodagId the OrigNode/Origin this route's Instance belongs to
+     * @param destination the destination this route leads to
+     * @param nextHop the next hop's address (global)
+     * @param lifetime how long this entry stays valid from now
+     * @return false if a conflicting route already existed and this one
+     *         must be discarded outright, true if it was established or
+     *         refreshed
+     */
+    bool StoreHopByHopRoute(uint8_t instanceId,
+                            Ipv6Address dodagId,
+                            Ipv6Address destination,
+                            Ipv6Address nextHop,
+                            Time lifetime);
 
     /**
      * @brief Arm the 'L' field's deadline for an RREQ-Instance.
@@ -2021,6 +2145,38 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     /// Configuration Option's Default Lifetime/Lifetime Unit (RFC 6997
     /// sections 9.6, 9.7).
     std::map<Ipv6Address, P2pRoute> m_p2pRoutes;
+
+    /// A Hop-by-hop Route (H=1) AODV-RPL or P2P-RPL established -- unlike
+    /// AodvRoute/P2pRoute above, each router along the path holds only its
+    /// own next hop, not the whole route (RFC 9854 sections 6.2.3/6.4.3,
+    /// RFC 6997 section 9.6/9.7): a data packet carries an RPL Option (RFC
+    /// 6553) naming the Instance instead of a Routing Header, and every hop
+    /// looks its own next hop up fresh. Neither protocol's H=1 support
+    /// needs core RPL's own storing mode (MOP 2, DAO-driven Target/Transit
+    /// options) at all: every field this state needs comes from the RREQ/
+    /// RREP-DIO or P2P-DRO messages the protocols already exchange; @see
+    /// design-constraints.md.
+    struct HopByHopRoute
+    {
+        uint8_t instanceId{0}; //!< the RREQ-Instance's/temporary DAG's own RPLInstanceID
+        Ipv6Address dodagId;   //!< the RREQ-Instance's/temporary DAG's own DODAGID (OrigNode/Origin)
+        Ipv6Address nextHop;   //!< the next hop's address, global (RouteToNeighbour() converts it)
+        Time expire;           //!< when this entry goes stale
+    };
+
+    /// Hop-by-hop Routes (H=1), keyed by destination -- the same "last one
+    /// wins" simplification m_aodvRoutes/m_p2pRoutes already make for their
+    /// own H=0 routes, accepted here for consistency rather than tracking
+    /// every (instanceId, dodagId) pair that might independently name the
+    /// same destination. Held separately from whichever RREQ-Instance/
+    /// temporary DAG established it for the same reason m_aodvRoutes/
+    /// m_p2pRoutes are: that membership is bounded by its own 'L' field,
+    /// while this route's lifetime instead comes from the DODAG
+    /// Configuration Option's Default Lifetime/Lifetime Unit -- often
+    /// meant to significantly outlive it, which is exactly why
+    /// HasHopByHopRoute() exists to let RplIpv6OptionRpl::Process() stop
+    /// relying on that membership still being there at all.
+    std::map<Ipv6Address, HopByHopRoute> m_hopByHopRoutes;
 
     // Policy attributes for the DAO/downward-route side, set once via
     // RplHelper and shared by whatever DODAG membership uses them. Nothing
