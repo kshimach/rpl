@@ -9990,6 +9990,114 @@ RplAodvRoutesInPrintedTablesTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief A P2P-RPL route the Origin discovered shows up in both
+ *        PrintRoutingTable() and PrintRoutingTableJson(), and only there --
+ *        not at the Target, which keeps no per-hop state of its own for a
+ *        Source Route (H=0) discovery.
+ *
+ * The P2P-RPL analogue of RplAodvRoutesInPrintedTablesTestCase: neither
+ * printer mentioned m_p2pRoutes at all before this, which is exactly the
+ * same gap that test's own doc comment describes for m_aodvRoutes -- a
+ * consumer of PrintRoutingTableJson() (ns3-editor's "RPL table" tab in
+ * particular) had no way to show a P2P-RPL discovery's result. m_p2pRoutes
+ * is node-level state independent of GetBaseDodag(), so it is written in
+ * both the joined and not-joined JSON shapes, the same as m_aodvRoutes.
+ */
+class RplP2pRoutesInPrintedTablesTestCase : public TestCase
+{
+  public:
+    RplP2pRoutesInPrintedTablesTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplP2pRoutesInPrintedTablesTestCase::RplP2pRoutesInPrintedTablesTestCase()
+    : TestCase("P2P-RPL discovered routes appear in PrintRoutingTable() and its JSON form")
+{
+}
+
+void
+RplP2pRoutesInPrintedTablesTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2); // 0 = Origin and base root, 1 = Target, one hop away
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    interfaces.SetForwarding(0, true);
+    interfaces.SetForwarding(1, true);
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> orig = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> targ = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(targ->IsJoined(), true, "The base DODAG did not reach the peer");
+    Ipv6Address targAddress = targ->GetGlobalAddress();
+
+    RplRoutingProtocol::DodagKey key = orig->DiscoverP2pRoute(targAddress);
+    NS_TEST_ASSERT_MSG_NE(key.dodagId, Ipv6Address::GetAny(), "The discovery did not start");
+
+    Simulator::Stop(Seconds(5));
+    Simulator::Run();
+
+    std::vector<Ipv6Address> hops;
+    NS_TEST_ASSERT_MSG_EQ(orig->GetP2pRoute(targAddress, hops),
+                          true,
+                          "The P2P-DRO never made it back to the Origin");
+
+    std::ostringstream targetLine;
+    targetLine << targAddress;
+
+    std::ostringstream text;
+    orig->PrintRoutingTable(Create<OutputStreamWrapper>(&text));
+    std::string dump = text.str();
+    NS_TEST_ASSERT_MSG_EQ(dump.find("P2P-RPL routes:") != std::string::npos,
+                          true,
+                          "The text routing table did not mention the discovered route: " << dump);
+    NS_TEST_ASSERT_MSG_EQ(dump.find(targetLine.str()) != std::string::npos,
+                          true,
+                          "The text routing table did not name the Target: " << dump);
+
+    std::ostringstream json;
+    orig->PrintRoutingTableJson(Create<OutputStreamWrapper>(&json));
+    std::string line = json.str();
+    NS_TEST_ASSERT_MSG_EQ(line.find("\"p2pRoutes\":[{") != std::string::npos,
+                          true,
+                          "The JSON snapshot's p2pRoutes array is empty: " << line);
+    NS_TEST_ASSERT_MSG_EQ(line.find(targetLine.str()) != std::string::npos,
+                          true,
+                          "The JSON snapshot did not name the Target: " << line);
+
+    // A Source Route (H=0) leaves no per-hop state at the Target (RFC 6997
+    // sections 9.6/9.7 build a route entry only for H=1).
+    std::ostringstream targJson;
+    targ->PrintRoutingTableJson(Create<OutputStreamWrapper>(&targJson));
+    NS_TEST_ASSERT_MSG_EQ(targJson.str().find("\"p2pRoutes\":[]") != std::string::npos,
+                          true,
+                          "The Target recorded a P2P-RPL route it should not have: "
+                              << targJson.str());
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief A P2P-RPL route discovery forms a temporary DAG at the Origin and
  *        floods a P2P mode DIO carrying the fixed values RFC 6997 section
  *        6.1 requires.
@@ -17080,7 +17188,8 @@ RplPrintRoutingTableJsonTestCase::DoRun()
                                                    "\"pathEtx\":",
                                                    "\"preferredParent\":",
                                                    "\"parents\":",
-                                                   "\"topology\":"};
+                                                   "\"topology\":",
+                                                   "\"p2pRoutes\":"};
 
     auto checkKeys = [&](const std::string& line, const std::string& what) {
         for (const auto& key : requiredKeys)
@@ -17303,6 +17412,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplAodvRrepInstanceAddressVectorFullTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRrepDuplicateRelayedOnceTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRoutesInPrintedTablesTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pRoutesInPrintedTablesTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pDiscoverRouteTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pFloodTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pMaxRankTestCase, TestCase::Duration::QUICK);

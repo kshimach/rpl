@@ -3945,6 +3945,25 @@ RplRoutingProtocol::PrintRoutingTable(Ptr<OutputStreamWrapper> stream, Time::Uni
         }
     }
 
+    // Not root-gated for the same reason the AODV-RPL routes above are not:
+    // a P2P-RPL (RFC 6997) route is discovered and held at whichever node
+    // called DiscoverP2pRoute(), which need not be the root at all.
+    if (!m_p2pRoutes.empty())
+    {
+        *os << "  P2P-RPL routes:" << std::endl;
+        Time now = Now();
+        for (const auto& [target, route] : m_p2pRoutes)
+        {
+            if (route.expire <= now)
+            {
+                continue;
+            }
+            *os << "    " << target << " over " << route.hops.size() << " hop(s), first via "
+                << route.hops.front() << ", temporary DAG instance " << +route.instanceId
+                << ", expires in " << (route.expire - now).As(unit) << std::endl;
+        }
+    }
+
     os->copyfmt(oldState);
 }
 
@@ -3992,6 +4011,36 @@ RplRoutingProtocol::PrintRoutingTableJson(Ptr<OutputStreamWrapper> stream) const
         *os << "]";
     };
 
+    // P2P-RPL (RFC 6997) routes, the same node-level, DODAG-membership-
+    // independent state as m_aodvRoutes above -- discovered and held at
+    // whichever node called DiscoverP2pRoute().
+    auto writeP2pRoutes = [&]() {
+        *os << "\"p2pRoutes\":[";
+        bool firstRoute = true;
+        Time now = Now();
+        for (const auto& [target, route] : m_p2pRoutes)
+        {
+            if (route.expire <= now)
+            {
+                continue;
+            }
+            *os << (firstRoute ? "" : ",") << "{\"target\":";
+            quoted(target);
+            *os << ",\"hops\":[";
+            bool firstHop = true;
+            for (const auto& hop : route.hops)
+            {
+                *os << (firstHop ? "" : ",");
+                quoted(hop);
+                firstHop = false;
+            }
+            *os << "],\"instance\":" << +route.instanceId
+                << ",\"expiresIn\":" << (route.expire - now).GetSeconds() << "}";
+            firstRoute = false;
+        }
+        *os << "]";
+    };
+
     *os << "{\"node\":" << m_ipv6->GetObject<Node>()->GetId()
         << ",\"time\":" << Now().GetSeconds() << ",\"role\":\""
         << (m_isRoot ? "root" : "router") << "\",\"joined\":";
@@ -4007,6 +4056,8 @@ RplRoutingProtocol::PrintRoutingTableJson(Ptr<OutputStreamWrapper> stream) const
                ",\"rank\":null,\"pathEtx\":null,\"preferredParent\":null"
                ",\"parents\":[],\"topology\":[],";
         writeAodvRoutes();
+        *os << ",";
+        writeP2pRoutes();
         *os << "}" << std::endl;
         os->copyfmt(oldState);
         return;
@@ -4093,6 +4144,8 @@ RplRoutingProtocol::PrintRoutingTableJson(Ptr<OutputStreamWrapper> stream) const
     }
     *os << "],";
     writeAodvRoutes();
+    *os << ",";
+    writeP2pRoutes();
     *os << "}" << std::endl;
 
     os->copyfmt(oldState);
