@@ -1966,13 +1966,9 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     /// own default DODAG Configuration Option: DIOIntervalMin 6, i.e. 64 ms.
     Time m_p2pDioIntervalMin;
     uint8_t m_p2pDioIntervalDoublings; //!< doublings for the P2P mode DIO Trickle timer
-    /// Redundancy constant k for P2P mode DIOs. RFC 6997 section 9.2
-    /// recommends 1, but this module's generic Trickle consistency hit
-    /// (shared with core RPL and AODV-RPL) does not implement that
-    /// section's own nuanced "consistent" definition, so k=1 ends up
-    /// suppressing a router's own first, most useful retransmission
-    /// whenever it hears its parent's unchanged one first; @see the
-    /// P2pDioRedundancy attribute and design-constraints.md.
+    /// Redundancy constant k for P2P mode DIOs, RFC 6997 section 9.2's own
+    /// recommended default of 1; @see the P2pDioRedundancy attribute and
+    /// design-constraints.md.
     uint8_t m_p2pDioRedundancy;
     uint8_t m_p2pMaxRank; //!< MaxRank put on P2P mode DIOs, 0 meaning no limit
     uint8_t m_p2pLifetime; //!< the 'L' field put on P2P mode DIOs, 0..3

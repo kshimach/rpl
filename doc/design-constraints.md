@@ -5115,3 +5115,88 @@ PASSし、42.2の設計判断(既存の`from != preferredParent`ガードで
 model/rpl-routing-protocol.h)は本節で変更していない — この監査は
 既存実装が正しいことをテストで実証したのみで、修正すべきバグは
 見つからなかった。
+
+## 44. §39.2で保留した`P2pDioRedundancy`既定値をRFC推奨の1へ変更
+
+§39で実装したRFC 6997 §9.2のTrickle一貫性4規則分類(rule 1〜4)は、
+`P2pDioRedundancy`が既定値0のままでは`ConsistencyHit()`が呼ばれるか
+どうか自体が送信抑制に一切影響しない
+(`RplTrickleTimer::TransmitEvent()`の抑制判定
+`m_redundancy == 0 || m_counter < m_redundancy`が`m_redundancy==0`の
+下では常に真になるため)。rule 2/3/4の違いを直接検証するテストが
+無いまま既定値変更を見送っていたのが§39.2の残課題で、ユーザーから
+提示された3候補のうち今回これに着手した。
+
+### 44.1 新規テスト: `RplP2pTrickleRuleSuppressionTestCase`
+
+rule 3 (親以外からの、自分以上に良いRankのDIO) が`ConsistencyHit()`を
+呼び実際に送信を抑制すること、rule 2 (親自身からの、改善しない
+再アナウンス) は呼ばず送信が通常どおり行われることを、
+`P2pDioRedundancy=1`の下で直接検証する。1ノード + 監視用peerの
+2ノード構成 (`RplAodvMultiArtStopsWhenExhaustedTestCase`と同じ recipe
+— 自ノード単体では自分の送信抑制を観測できないため)。2つの独立した
+一時DAG (別々のDODAGID) を同じノードに同時展開し、rule 3側と
+rule 2側の状態が互いに汚染しないようにした。
+
+タイミングは`RplTrickleTimerTestCase`の`suppressed`サブケース
+(既存、Trickle timer単体の抑制テスト) と同じ発想で確定的に構成: 1件目
+のDIOで新規discoveryに参加させ (rule 1、Trickle即座にImin=64msへ
+Reset)、5ms後 (I/2=32msより十分前、同じインターバル内に収まる) に
+2件目を届けてrule 2/3を発火させ、64msのインターバル境界を過ぎるが
+次インターバルの最短送信可能時刻 (64+32=96ms) より前の80ms時点で
+打ち切り、その区間の送信回数を監視ソケットで数える。
+
+### 44.2 このテストを書く過程で見つけたテスト自身のバグ2件 (実装は無傷)
+
+このテストは最初、2回とも誤った結果でPASS/FAILした — いずれも
+実装ではなく**このテスト自身の合成DIO構築ミス**が原因だった。
+`/protocol-test-matrix`のPhase 2 (プローブで先にバグを踏む) の
+趣旨どおり、実装を疑う前にテスト自身の前提を検証する形になった:
+
+1. **MaxRankIncreaseの取り違え**: 合成DIOの`DagConfiguration`に
+   AODV-RPL側テストの構築パターンをそのまま流用し、4番目の引数
+   (maxRankIncrease) を`RPL_MAX_RANKINC` (非ゼロ) のままにしていた。
+   RFC 6997 section 6.1は「the Origin MUST set the MaxRankIncrease
+   parameter to zero」と定めており、`ShouldRefuseP2pRdo()`は非ゼロを
+   即座に拒否する。結果、**4件の合成DIO全てが拒否され、一時DAGが
+   一つも形成されなかった**にもかかわらず、rule 3側の「送信0回」
+   アサーションだけは(何も起きなかったので)偶然PASSしてしまい、
+   rule 2側の「送信1回」アサーションでようやく異常に気づいた。
+   4番目の引数を0に修正。
+2. **Redundancy値の設定箇所の取り違え**: `rplHelper.Set("P2pDioRedundancy",
+   UintegerValue(1))`をノードに設定していたが、これは
+   `DiscoverP2pRoute()` (自ノードが一時DAGを**開始する**側) にしか
+   効かない。このテストのようにノードが**注入されたDIOに参加するだけ**
+   の一時DAGは、`JoinDodag()`/`HandleDio()`の
+   `dodag.dioRedundancy = dio.GetRedundancy();` により、**参加した
+   DIO自身のDODAG Configuration Optionが運ぶ値**で上書きされる
+   (dioIntervalMinが同じ経路で伝播するのと同じ規則)。合成DIOの
+   `SetDagConfiguration()`の3番目の引数を`RPL_DIO_REDUNDANCY`
+   (定数値0) のままにしていたため、属性で1を設定したつもりが実際には
+   0のまま送信され、rule 3のケースで抑制されず1回送信されてしまった。
+   合成DIO側の引数を1に修正し、ノード属性の設定行自体は削除した
+   (無意味だったため)。
+
+いずれもNS_LOGトレース (`RplTrickleTimer:TransmitEvent(this, m_counter,
+m_redundancy)`のNS_LOG_FUNCTION引数) で`m_redundancy`の実際の値を
+直接確認することで特定した。修正後、rule 3の`ConsistencyHit()`呼び
+出しを`if (false && ...)`で一時的に無効化し、このテストが正しく
+FAILすることを確認 (load-bearing検証)、元に戻して再度PASSすることを
+確認した。
+
+### 44.3 既定値の変更
+
+`P2pDioRedundancy`の既定値を0から1 (RFC 6997 section 9.2の推奨値)へ
+変更。属性のドキュメント文字列、および`m_p2pDioRedundancy`メンバの
+doc commentから「rule 2/3/4の区別が未実装なので0のままにしている」
+という、§39で実装済みになったにもかかわらず古いまま残っていた記述を
+除去した。
+
+### 44.4 検証
+
+新規テスト(`RplP2pTrickleRuleSuppressionTestCase`)追加、
+`P2pDioRedundancy`既定値変更後、`./ns3 build`clean(rplモジュール・
+プロジェクト全体とも)、`test-runner --suite=rpl`を複数回連続実行して
+安定PASSを確認。既定値変更後も既存テスト全件が無変更でPASSすることを
+確認済み — 事前の懸念(既定値を実際に1以上へ上げた場合の副作用が
+未検証だった、§39.2参照)が解消されたことも同時に裏付けられた。

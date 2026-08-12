@@ -299,20 +299,17 @@ RplRoutingProtocol::GetTypeId()
                           MakeUintegerAccessor(&RplRoutingProtocol::m_p2pDioIntervalDoublings),
                           MakeUintegerChecker<uint8_t>())
             .AddAttribute("P2pDioRedundancy",
-                          "Redundancy constant k of the P2P mode DIO Trickle timer. RFC 6997 "
-                          "section 9.2 recommends 1, but that assumes a router only counts a "
-                          "DIO as 'consistent' by section 9.2's own nuanced rule (a parent's "
-                          "unchanged re-announcement counts as neither consistent nor "
-                          "inconsistent, and has no effect on suppression). This module's "
-                          "generic Trickle consistency hit (HandleDio(), shared with core RPL "
-                          "and AODV-RPL) is not that selective -- it treats every DIO for the "
-                          "same DODAG as consistent -- so k=1 here ends up suppressing a "
-                          "router's own first, most useful retransmission whenever it happens "
-                          "to hear its parent's own periodic one first. Defaulting to 0 (never "
-                          "suppress), the same choice this module makes everywhere else, until "
-                          "section 9.2's own distinction is implemented; @see "
-                          "design-constraints.md.",
-                          UintegerValue(0),
+                          "Redundancy constant k of the P2P mode DIO Trickle timer, as RFC 6997 "
+                          "section 9.2 recommends (default 1). Suppression only works as "
+                          "intended because HandleDio() gives a P2P mode DIO section 9.2's own "
+                          "nuanced consistency rule instead of the generic one it shares with "
+                          "core RPL and AODV-RPL (which treats every DIO for the same DODAG as "
+                          "consistent): a parent's own unchanged re-announcement counts as "
+                          "neither consistent nor inconsistent and has no effect on suppression, "
+                          "so k=1 does not end up suppressing a router's own first, most useful "
+                          "retransmission merely because it happened to hear its parent's "
+                          "periodic one first. @see design-constraints.md.",
+                          UintegerValue(1),
                           MakeUintegerAccessor(&RplRoutingProtocol::m_p2pDioRedundancy),
                           MakeUintegerChecker<uint8_t>())
             .AddAttribute("P2pMaxRank",

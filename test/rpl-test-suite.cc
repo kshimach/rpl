@@ -8856,6 +8856,239 @@ RplP2pMaxRankTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief RFC 6997 section 9.2's rule 3 (a non-parent's at-least-as-good P2P
+ *        mode DIO) counts as Trickle-consistent and can suppress a
+ *        transmission; rule 2 (the parent's own non-improving re-
+ *        announcement) does not.
+ *
+ * design-constraints.md section 39.2 implemented HandleDio()'s own 4-rule
+ * classification for a P2P mode DIO's Trickle consistency but left the
+ * P2pDioRedundancy default at 0 (never suppress), because at that setting
+ * ConsistencyHit() being called or not has no observable effect at all --
+ * RplTrickleTimer::TransmitEvent() only ever checks
+ * "m_redundancy == 0 || m_counter < m_redundancy", which is unconditionally
+ * true whenever m_redundancy is 0. This is the test that was missing before
+ * changing the default: with P2pDioRedundancy raised to 1 for the duration
+ * of this test only, rule 3 firing must suppress the following
+ * transmission and rule 2 firing must not.
+ *
+ * One node under test, a peer that doubles as both the fabricated
+ * neighbours' relay and the monitor for anything the node under test
+ * transmits (RplAodvMultiArtStopsWhenExhaustedTestCase's own two-node
+ * recipe, needed here for the same reason: a lone node cannot observe
+ * whether it suppressed its own transmission). Two independent temporary
+ * DAGs (different fabricated DODAGIDs) so the rule-3 and rule-2 halves
+ * cannot contaminate each other's Trickle state.
+ */
+class RplP2pTrickleRuleSuppressionTestCase : public TestCase
+{
+  public:
+    RplP2pTrickleRuleSuppressionTestCase();
+
+  private:
+    void DoRun() override;
+
+    /**
+     * @brief Count a P2P mode DIO seen at the monitor, by DODAGID.
+     * @param socket the monitoring socket
+     */
+    void CountP2pDio(Ptr<Socket> socket);
+
+    /// P2P mode DIOs seen at the monitor, keyed by DODAGID (one temporary
+    /// DAG per sub-case, so counts never mix).
+    std::map<Ipv6Address, uint32_t> m_p2pDioCount;
+};
+
+RplP2pTrickleRuleSuppressionTestCase::RplP2pTrickleRuleSuppressionTestCase()
+    : TestCase("RFC 6997 section 9.2 rule 3 suppresses a P2P mode DIO under P2pDioRedundancy, "
+               "rule 2 does not")
+{
+}
+
+void
+RplP2pTrickleRuleSuppressionTestCase::CountP2pDio(Ptr<Socket> socket)
+{
+    Address sender;
+    Ptr<Packet> packet = socket->RecvFrom(sender);
+    if (!packet)
+    {
+        return;
+    }
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ipv6Header);
+    Icmpv6Header icmpv6Header;
+    packet->RemoveHeader(icmpv6Header);
+    if (icmpv6Header.GetType() != ICMPV6_RPL || icmpv6Header.GetCode() != RPL_CODE_DIO)
+    {
+        return;
+    }
+    RplDioHeader dio;
+    packet->RemoveHeader(dio);
+    if (dio.HasP2pRdo())
+    {
+        m_p2pDioCount[dio.GetDodagId()]++;
+    }
+}
+
+void
+RplP2pTrickleRuleSuppressionTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2); // 0 = the node under test, 1 = peer/monitor
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    // Raised from the default of 0 for this test only: at 0, whether
+    // ConsistencyHit() is called or not (the very thing under test) has no
+    // observable effect on transmission at all. @see design-constraints.md
+    // section 39.2/43 (or wherever the default itself is documented).
+    //
+    // Set inside each fabricated DIO's own DODAG Configuration option
+    // below, not via a P2pDioRedundancy attribute on this helper: that
+    // attribute only seeds dodag.dioRedundancy for a temporary DAG this
+    // node *originates* (DiscoverP2pRoute()); a temporary DAG this node
+    // only *joins*, as every one of them is in this test, takes its
+    // dioRedundancy from the DIO that formed it instead
+    // (JoinDodag()/HandleDio()'s own "propagate the root's Trickle
+    // parameters to every joiner" rule, the same one dioIntervalMin
+    // follows) -- found by this test itself keeping the attribute at 1 yet
+    // observing m_redundancy=0 in the Trickle timer's own NS_LOG_FUNCTION
+    // trace, since RPL_DIO_REDUNDANCY (0) was still what the fabricated
+    // DIO's own DagConfiguration carried.
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    interfaces.SetForwarding(0, true);
+    interfaces.SetForwarding(1, true);
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    Ptr<Node> node = nodes.Get(0);
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoined(), true, "The base DODAG never formed");
+
+    Ipv6Address nodeLinkLocal = node->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    Ptr<Socket> monitor = Socket::CreateSocket(nodes.Get(1), Ipv6RawSocketFactory::GetTypeId());
+    monitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    monitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    monitor->BindToNetDevice(nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+    monitor->SetRecvCallback(
+        MakeCallback(&RplP2pTrickleRuleSuppressionTestCase::CountP2pDio, this));
+
+    auto buildRdo = [&](Ipv6Address origin, uint16_t rank) {
+        RplDioHeader dio;
+        dio.SetInstanceId(0x81);
+        dio.SetVersionNumber(0);
+        dio.SetRank(rank);
+        dio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+        dio.SetGrounded(true);
+        dio.SetDodagId(origin);
+        dio.SetDtsn(0);
+        // Imin 64 ms (2^6), 0 doublings: Imax stays 64 ms, so the single
+        // interval this test observes never grows out from under it.
+        // MaxRankIncrease 0, not RPL_MAX_RANKINC: RFC 6997 section 6.1
+        // requires it for a P2P mode DIO ("the Origin MUST set the
+        // MaxRankIncrease parameter to zero"), and ShouldRefuseP2pRdo()
+        // refuses a nonzero one outright -- found by this test itself
+        // refusing every delivery and both assertions passing vacuously
+        // (nothing had joined at all) until this was fixed. Redundancy 1,
+        // not RPL_DIO_REDUNDANCY (0): this is the field this test actually
+        // depends on, propagated into dodag.dioRedundancy by JoinDodag()/
+        // HandleDio() for every node that joins off this DIO -- @see this
+        // test's own P2pDioRedundancy comment above for why the node
+        // attribute alone does not reach a joined (non-origin) membership.
+        dio.SetDagConfiguration(0,
+                                6,
+                                1,
+                                0,
+                                RPL_MIN_HOPRANKINC,
+                                RPL_OCP_OF0,
+                                RPL_DEFAULT_LIFETIME,
+                                RPL_DEFAULT_LIFETIME_UNIT);
+        P2pRdoOption rdo;
+        rdo.reply = false; // this test only cares about the RREQ-DIO side
+        rdo.hopByHop = false;
+        rdo.numRoutes = 0;
+        rdo.lifetime = 0; // no limit, keeps this test's timing simple
+        rdo.maxRankOrNh = 0; // no limit
+        rdo.target = origin; // a harmless placeholder no one here is
+        rdo.addressVector = {};
+        dio.SetP2pRdo(rdo);
+        return dio;
+    };
+    auto deliver = [&](Time at, Ipv6Address from, Ipv6Address origin, uint16_t rank) {
+        Simulator::Schedule(at,
+                            &DeliverRawRplMessage<RplDioHeader>,
+                            node,
+                            1,
+                            buildRdo(origin, rank),
+                            static_cast<uint8_t>(RPL_CODE_DIO),
+                            from,
+                            nodeLinkLocal);
+    };
+
+    Ipv6Address neighbourA("fe80::a");
+    Ipv6Address neighbourB("fe80::b");
+
+    // Rule 3: the first DIO (from A) joins the temporary DAG and resets
+    // Trickle to Imin (rule 1, "the first receipt...is always considered
+    // inconsistent"). The second, delivered 5 ms later -- comfortably
+    // before Imin/2 = 32 ms, so it lands in the same fresh interval -- is
+    // from a different neighbour (B, so not rule 2's "from the parent")
+    // and advertises the very same Rank A did, which is at least as good
+    // as this node's own resulting Rank: rule 3, ConsistencyHit(). With
+    // P2pDioRedundancy=1, m_counter(1) is no longer < m_redundancy(1), so
+    // the transmission due somewhere in [32, 64) ms is suppressed.
+    Ipv6Address originRule3("2001:9:3::1");
+    deliver(Seconds(0), neighbourA, originRule3, RPL_MIN_HOPRANKINC);
+    deliver(MilliSeconds(5), neighbourB, originRule3, RPL_MIN_HOPRANKINC);
+
+    // Rule 2 (the control): the same recipe, but the second DIO comes from
+    // A again -- the same neighbour as the first, i.e. "from the parent" --
+    // with a Rank that does not improve on it either. Rule 2 is neither
+    // consistent nor inconsistent, so ConsistencyHit() is never called;
+    // m_counter stays 0 < m_redundancy(1), and the transmission proceeds
+    // normally.
+    Ipv6Address originRule2("2001:9:2::1");
+    deliver(Seconds(0), neighbourA, originRule2, RPL_MIN_HOPRANKINC);
+    deliver(MilliSeconds(5), neighbourA, originRule2, RPL_MIN_HOPRANKINC);
+
+    // Stopped at 80 ms: past the 64 ms interval boundary, so whatever this
+    // interval's transmission slot decided has already happened, but
+    // before the next interval's own earliest possible slot at 64 + 32 =
+    // 96 ms, so that interval's own (unsuppressed, since its counter has
+    // since reset to 0) transmission cannot leak into this count.
+    Simulator::Stop(MilliSeconds(80));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(m_p2pDioCount[originRule3],
+                          0,
+                          "Rule 3 (a non-parent's at-least-as-good DIO) should have counted as "
+                          "Trickle-consistent and suppressed this interval's transmission");
+    NS_TEST_ASSERT_MSG_EQ(m_p2pDioCount[originRule2],
+                          1,
+                          "Rule 2 (the parent's own non-improving re-announcement) must not "
+                          "count as consistent: the transmission should have gone out normally");
+
+    monitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief A P2P-RPL Target answers a P2P mode DIO with a P2P-DRO carrying
  *        the fixed values RFC 6997 section 8.2 requires, its Address
  *        Vector trimmed of the Target's own trailing entry.
@@ -14547,6 +14780,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplP2pDiscoverRouteTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pFloodTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pMaxRankTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pTrickleRuleSuppressionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pDroGeneratedTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pDroRetryTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pMultiTargetTestCase, TestCase::Duration::QUICK);
