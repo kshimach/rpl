@@ -30,7 +30,23 @@
  * the RREQ-InstanceID regardless of which DODAG built it, which is what
  * lets HasHopByHopRoute()'s rank-check bypass work for both without ever
  * comparing the RREQ-Instance's and RREP-Instance's unrelated Rank
- * hierarchies. @see design-constraints.md.
+ * hierarchies.
+ *
+ * Also implements the Gratuitous RREP (G-RREP) shortcut of RFC 9854 section
+ * 7: an intermediate router relaying an RREQ that already caches a fresh
+ * enough Hop-by-hop Route to the target (from some earlier, unrelated
+ * discovery) answers OrigNode directly, without waiting for the discovery
+ * to reach TargNode and a real RREP to come all the way back
+ * (SendAodvGratuitousRrep(), triggered from HandleAodvRreq()). Only
+ * meaningful for H=1: an H=0 relay never caches anything to answer from.
+ * Deliberately NOT implemented: section 7's own further optimization of
+ * unicast-relaying the RREQ itself along the cached route hop by hop
+ * (rather than continuing to rely on the ordinary multicast Trickle flood
+ * that still, independently, reaches TargNode either way) -- correctness
+ * does not depend on it, and it would risk confusing the preferred-parent
+ * tracking downstream nodes already do for the multicast copy, by having
+ * the same RREQ-Instance arrive over two different paths. @see
+ * design-constraints.md.
  */
 
 #include "rpl-conf.h"
@@ -663,6 +679,31 @@ RplRoutingProtocol::HandleAodvRreq(const RplDioHeader& dio, Ipv6Address from, ui
                         << key.dodagId);
             return;
         }
+
+        // RFC 9854 section 7: this router MAY short-circuit with a
+        // Gratuitous RREP (G-RREP) if it already holds a downward
+        // Hop-by-hop Route to the target -- from some earlier, unrelated
+        // discovery -- at least as fresh as what OrigNode already knows.
+        // "At least as fresh" is read off the RREQ-DIO's own ART option
+        // destSeqNo (0 meaning "no known information", section 4.3), not
+        // the RREQ option's own Orig SeqNo just stored above -- that is
+        // OrigNode's freshness, a different node's entirely. Only
+        // meaningful for H=1: an H=0 relay never caches a route at all, so
+        // it can never be "already holding one" here (@see
+        // design-constraints.md). Not attempted for the TargNode itself
+        // (isTarget): it answers for real, via SendAodvRrep() below, once
+        // matchedThisTime is known.
+        auto cachedRoute = m_hopByHopRoutes.find(dodag.aodv.target);
+        if (!dodag.aodv.isTarget && cachedRoute != m_hopByHopRoutes.end() &&
+            cachedRoute->second.expire > Simulator::Now() &&
+            !RplSequenceNewer(dio.GetArt().destSeqNo, cachedRoute->second.seqNo))
+        {
+            SendAodvGratuitousRrep(dodag,
+                                   key,
+                                   dodag.aodv.target,
+                                   cachedRoute->second.seqNo,
+                                   from);
+        }
     }
     else
     {
@@ -752,6 +793,63 @@ RplRoutingProtocol::SendAodvRrepTo(const DodagMembership& dodag,
     packet->AddHeader(dio);
     SendRplMessageOn(interface, packet, RPL_CODE_DIO, linkLocal);
     NS_LOG_INFO("Sent an RREP towards the OrigNode via " << nextHop);
+}
+
+void
+RplRoutingProtocol::SendAodvGratuitousRrep(DodagMembership& dodag,
+                                           DodagKey key,
+                                           Ipv6Address target,
+                                           uint8_t targetSeqNo,
+                                           Ipv6Address upwardNextHop)
+{
+    NS_LOG_FUNCTION(this << +key.instanceId << key.dodagId << target << upwardNextHop);
+
+    RplDioHeader rrep;
+    // RFC 9854 section 6.3.3: Delta stays 0 here for the same reason
+    // SendAodvRrep()'s own symmetric branch does -- no RREP-Instance DODAG
+    // is ever built for a Gratuitous RREP to collide with either.
+    rrep.SetInstanceId(key.instanceId);
+    rrep.SetVersionNumber(0);
+    rrep.SetRank(m_minHopRankIncrease);
+    rrep.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+    rrep.SetGrounded(true);
+    rrep.SetDtsn(0);
+    // RFC 9854 section 4.2: "TargNode sets one of its IPv6 addresses in the
+    // DODAGID field of the RREP-DIO message" -- this router is speaking on
+    // TargNode's own behalf (section 7), not answering for itself, so this
+    // is target rather than this node's own address (@see SendAodvRrep(),
+    // whose ordinary RREP-DIO uses its own).
+    rrep.SetDodagId(target);
+
+    RplDioHeader::RrepOption option;
+    option.gratuitous = true;        // RFC 9854 section 7's 'G' bit
+    option.hopByHop = dodag.aodv.hopByHop; // always true in practice, @see the caller
+    option.lifetime = dodag.aodv.lifetimeField;
+    option.rankLimit = dodag.aodv.rankLimit;
+    option.delta = 0;
+    // Empty: a Gratuitous RREP for H=1 carries no Address Vector, the same
+    // reason an ordinary H=1 RREP does not (RFC 9854 section 4.1). Source-
+    // routed (H=0) Gratuitous RREPs are out of scope here; @see
+    // design-constraints.md for why H=1 is this feature's only realistic
+    // trigger in this module regardless.
+    rrep.SetRrep(option);
+
+    RplDioHeader::ArtOption art;
+    // "Sequence Number for the last route that OrigNode stored to the
+    // Destination" (section 4.3) is what an ordinary RREP's own ART option
+    // carries too -- read from the cached route this router already held
+    // rather than from this node's own m_aodvSeqNo, since this router is
+    // not TargNode and has no Sequence Number of TargNode's to increment;
+    // it can only vouch for the freshness of the route it is offering.
+    art.destSeqNo = targetSeqNo;
+    art.prefixLength = 0;
+    art.target = key.dodagId; // the RREQ-Instance's DODAGID is OrigNode
+    rrep.SetArt(art);
+
+    NS_LOG_INFO("Answering the RREQ for " << target << " with a Gratuitous RREP over a cached "
+                                          "route, sent upward via "
+                                          << upwardNextHop);
+    SendAodvRrepTo(dodag, rrep, upwardNextHop);
 }
 
 void

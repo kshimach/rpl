@@ -8598,6 +8598,210 @@ RplAodvHopByHopRouteOutlivesRreqInstanceTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief An intermediate router that already caches a Hop-by-hop Route to
+ *        the target short-circuits a new RREQ with a Gratuitous RREP
+ *        (G-RREP), before the discovery it is relaying completes.
+ *
+ * RFC 9854 section 7: an intermediate router MAY unicast a G-RREP (the
+ * RREP option's own 'G' bit) back towards OrigNode as soon as it finds it
+ * already holds a downward route to the target at least as fresh as what
+ * OrigNode already knows -- read off the RREQ-DIO's own ART option
+ * destSeqNo (0 meaning "no known information"), not the RREQ option's own
+ * Orig SeqNo, a different node's freshness entirely.
+ *
+ * Three nodes in a line, relay in the middle:
+ *
+ *     origB(0) ---- relay(1) ---- targ(2)
+ *
+ * relay first runs its own, unrelated H=1 discovery to targ (one hop,
+ * direct), populating its own cache. Only then does origB start its own
+ * discovery for the same target -- relay, receiving origB's RREQ, already
+ * holds a fresh-enough cached route and answers directly rather than
+ * waiting for the RREQ to reach targ and a real RREP to come all the way
+ * back. Monitored at origB's own interface (an ICMPv6 raw socket, the same
+ * technique RplAodvAsymmetricRrepInstanceTestCase uses) for an incoming
+ * RREP-carrying DIO with the 'G' bit set, and confirms the resulting
+ * downward Hop-by-hop Route actually carries data.
+ */
+class RplAodvGratuitousRrepTestCase : public TestCase
+{
+  public:
+    RplAodvGratuitousRrepTestCase();
+
+  private:
+    void DoRun() override;
+
+    /// @brief Note whether an RREP-carrying DIO seen at the monitor is
+    ///        gratuitous.
+    /// @param socket the monitoring socket
+    void CountRrepDio(Ptr<Socket> socket);
+
+    /// @brief Count a datagram delivered at TargNode.
+    /// @param socket the receiving socket
+    void CountDelivery(Ptr<Socket> socket);
+
+    uint32_t m_rrepDioCount{0};      //!< RREP-carrying DIOs seen at the monitor
+    uint32_t m_gratuitousCount{0};   //!< of those, how many had 'G' set
+    uint32_t m_delivered{0};         //!< datagrams that reached TargNode
+};
+
+RplAodvGratuitousRrepTestCase::RplAodvGratuitousRrepTestCase()
+    : TestCase("An AODV-RPL intermediate router answers a cached-route RREQ with a Gratuitous "
+               "RREP")
+{
+}
+
+void
+RplAodvGratuitousRrepTestCase::CountRrepDio(Ptr<Socket> socket)
+{
+    Address sender;
+    Ptr<Packet> packet = socket->RecvFrom(sender);
+    if (!packet)
+    {
+        return;
+    }
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ipv6Header);
+    Icmpv6Header icmpv6Header;
+    packet->RemoveHeader(icmpv6Header);
+    if (icmpv6Header.GetType() != ICMPV6_RPL || icmpv6Header.GetCode() != RPL_CODE_DIO)
+    {
+        return;
+    }
+    RplDioHeader dio;
+    packet->RemoveHeader(dio);
+    if (dio.HasRrep())
+    {
+        m_rrepDioCount++;
+        if (dio.GetRrep().gratuitous)
+        {
+            m_gratuitousCount++;
+        }
+    }
+}
+
+void
+RplAodvGratuitousRrepTestCase::CountDelivery(Ptr<Socket> socket)
+{
+    Ptr<Packet> packet = socket->Recv();
+    while (packet)
+    {
+        m_delivered++;
+        packet = socket->Recv();
+    }
+}
+
+void
+RplAodvGratuitousRrepTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(3); // 0 = origB and base root, 1 = relay, 2 = targ
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    Ptr<SimpleNetDevice> devA = DynamicCast<SimpleNetDevice>(devices.Get(0));
+    Ptr<SimpleNetDevice> devC = DynamicCast<SimpleNetDevice>(devices.Get(2));
+    channel->BlackList(devA, devC);
+    channel->BlackList(devC, devA);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(250));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> origB = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> relay = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> targ = nodes.Get(2)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(targ->IsJoined(), true, "The base DODAG did not reach the far end");
+
+    Ipv6Address targAddress = targ->GetGlobalAddress();
+
+    // relay's own, unrelated discovery: one hop, direct to targ, populating
+    // relay's own cache the way any ordinary H=1 discovery would.
+    RplRoutingProtocol::DodagKey relayKey = relay->DiscoverRoute(targAddress, true);
+    NS_TEST_ASSERT_MSG_NE(relayKey.dodagId, Ipv6Address::GetAny(), "relay's discovery did not "
+                                                                   "start");
+
+    Simulator::Stop(Seconds(5));
+    Simulator::Run();
+
+    Ipv6Address nextHop;
+    uint8_t hopInstanceId = 0;
+    NS_TEST_ASSERT_MSG_EQ(relay->GetHopByHopRoute(targAddress, nextHop, hopInstanceId),
+                          true,
+                          "relay never cached its own route to targ");
+
+    // Now watch origB's own interface for the G-RREP that should follow.
+    Ptr<Socket> monitor = Socket::CreateSocket(nodes.Get(0), Ipv6RawSocketFactory::GetTypeId());
+    monitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    monitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    monitor->BindToNetDevice(nodes.Get(0)->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+    monitor->SetRecvCallback(MakeCallback(&RplAodvGratuitousRrepTestCase::CountRrepDio, this));
+
+    RplRoutingProtocol::DodagKey origKey = origB->DiscoverRoute(targAddress, true);
+    NS_TEST_ASSERT_MSG_NE(origKey.dodagId, Ipv6Address::GetAny(), "origB's discovery did not "
+                                                                  "start");
+
+    Simulator::Stop(Seconds(2));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_GT_OR_EQ(m_rrepDioCount, 1, "No RREP-DIO reached origB at all");
+    NS_TEST_ASSERT_MSG_GT_OR_EQ(m_gratuitousCount,
+                               1,
+                               "relay never answered origB's RREQ with a Gratuitous RREP, "
+                               "despite already caching a route to targ");
+
+    NS_TEST_ASSERT_MSG_EQ(origB->GetHopByHopRoute(targAddress, nextHop, hopInstanceId),
+                          true,
+                          "The Gratuitous RREP did not leave origB with a downward Hop-by-hop "
+                          "Route");
+    NS_TEST_ASSERT_MSG_EQ(hopInstanceId,
+                          origKey.instanceId,
+                          "The route's own instanceId should be origB's RREQ-InstanceID");
+
+    // And it works: relay's own next hop (one radio hop from origB) has to
+    // be exercised for a datagram to arrive.
+    uint16_t port = 4251;
+    Ptr<Socket> receiver = Socket::CreateSocket(nodes.Get(2), UdpSocketFactory::GetTypeId());
+    receiver->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), port));
+    receiver->SetRecvCallback(MakeCallback(&RplAodvGratuitousRrepTestCase::CountDelivery, this));
+
+    Ptr<Socket> sender = Socket::CreateSocket(nodes.Get(0), UdpSocketFactory::GetTypeId());
+    sender->Connect(Inet6SocketAddress(targAddress, port));
+    sender->Send(Create<Packet>(64));
+
+    Simulator::Stop(Seconds(2));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(m_delivered,
+                          1,
+                          "Data did not reach targ over the route the Gratuitous RREP provided");
+
+    monitor->Close();
+    receiver->Close();
+    sender->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief A base-DODAG root that also joins another RREQ-Instance as an
  *        ordinary member must not crash when it loses that RREQ-Instance's
  *        last parent.
@@ -16711,6 +16915,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplAodvHopByHopRouteCompletesTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvHopByHopRouteDirectNeighbourTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvHopByHopRouteOutlivesRreqInstanceTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplAodvGratuitousRrepTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplRootJoinsForeignRreqInstanceParentLossTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRrepInstanceRankLimitTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRrepInstanceAddressVectorFullTestCase, TestCase::Duration::QUICK);

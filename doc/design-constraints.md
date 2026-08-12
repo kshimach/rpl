@@ -3696,6 +3696,14 @@ G-RREP を実装するなら、この中継ノードだけ「多重化して flo
 storing mode 対応で per-destination next-hop テーブルを持つように
 なったとき)、その基盤の上に G-RREP を足す方が筋が良い。
 
+**続報 (§52)**: H=1 完了後、この「per-destination next-hop
+テーブル」(`m_hopByHopRoutes`) が実際に揃ったため実装した。
+ただし当時懸念した「RREQ 伝播の中心的な仕組みへの新しい分岐」は
+G-RREP 送信自体には不要と判明 (`SendDio()` は元々 unicast 対応、
+`HandleDio()` の RREQ 分岐も toMulticast 不問) — G-RREP の
+送信のみを実装し、RFC がさらに規定する「RREQ 自体の unicast 中継」
+は干渉リスクを理由に今回も見送った (§52.5)。
+
 ### 35.14 複数 ART (§6.2.2 のターゲット集合積集合) も実装を見送った
 
 §35.11 の 4 番目の項目として調べたが、これも着手時の「小さい項目」
@@ -5926,3 +5934,110 @@ load-bearing検証のため`dodag.preferredParent`を`from`に一時的に
 `test-runner --suite=rpl`を複数回連続実行して安定PASSを確認。
 既存の全P2P-RPL/AODV-RPLテスト(H=0対称・非対称、H=1対称・非対称)
 は無変更でPASS。
+
+## 52. Gratuitous RREP (RFC 9854 section 7) を実装
+
+§35.13で一度見送った機能。当時の見送り理由(「RREQ伝播の中心的な
+仕組みに新しい分岐を持ち込む規模の変更になる」)を今回のH=1完了後に
+再検討したところ、想定より軽い実装で済むことが分かった。
+
+### 52.1 §35.13時点の見立てが外れていた点
+
+- **ワイヤ形式は既に存在**: `RplDioHeader::RrepOption::gratuitous`
+  ('G'フラグ、`RPL_AODV_G_FLAG`)はシリアライズ/デシリアライズとも
+  実装済みで、2箇所(`rpl-aodv.cc`/`rpl-routing-protocol.cc`)で
+  `false`固定にしていただけだった。
+- **RREQのunicast中継先自体は既存**: `SendDio(dodag, dst, interface)`
+  は元々unicast対応(`interface != 0`のとき`SendRplMessageOn()`)。
+  「新規インフラが要る」という§35.13の懸念は、正確には
+  「RREQをunicastで**中継**する経路」であって「unicast送信機能
+  そのもの」ではなかった — この区別を最初の設計検討で見誤っていた。
+- **受信側もほぼ無改造で動く**: `HandleDio()`のRREQ分岐は
+  `toMulticast`で場合分けしていない(RREP分岐だけがsymmetric判定に
+  使っている)ため、unicastで届いたRREQでも既存の`HandleAodvRreq()`
+  にそのまま到達する。
+
+### 52.2 H=1限定である理由(構造的な帰結)
+
+§7の発火条件「中継ルータが既にTargNodeへの上り・下り経路ペアを
+持っている」は、この実装では`m_hopByHopRoutes`(H=1専用)にしか
+存在しない — H=0の中継ルータは`m_aodvRoutes`(OrigNodeのみが
+保持)に何も書き込まないため、構造的に「既に経路を持っている」
+状態になり得ない。H=1を前提にした実装とし、H=0側は対象外とした。
+
+### 52.3 鮮度判定: 比較対象はOrig SeqNoではなくART option の destSeqNo
+
+RFC本文「the Destination Sequence Number is at least as large as the
+Sequence Number in the RREQ-DIO message」は一見Orig SeqNo
+(OrigNode自身の鮮度)と比較するように読めるが、それでは
+比較対象のノードが噛み合わない(OrigNodeの鮮度とTargNodeへの
+経路の鮮度は無関係)。正しくはRREQ-DIOのART option自身が持つ
+`destSeqNo`フィールド(§4.3: OrigNodeが知っているTargNodeの
+Sequence Number、未知なら0)と比較する — 中継ルータの持つ
+キャッシュ経路の`seqNo`(`HopByHopRoute::seqNo`、TargNodeの
+Dest SeqNo)が、OrigNodeの持つ知識以上に新しければ発火する。
+判定式は`!RplSequenceNewer(art.destSeqNo, cached.seqNo)`。
+
+### 52.4 実装
+
+- `SendAodvGratuitousRrep(dodag, key, target, targetSeqNo, upwardNextHop)`
+  新設: `SendAodvRrep()`のH=1対称分岐とほぼ同形だが3点異なる —
+  `gratuitous=true`、DODAGIDは中継ルータ自身ではなく`target`
+  (TargNode自身の代弁のため)、ART`destSeqNo`はキャッシュ経路の
+  `seqNo`(自分の`m_aodvSeqNo`ではない — 自分はTargNodeでは
+  ないため増分する権利が無く、あくまでキャッシュ経路の鮮度を
+  代弁するだけ)。送信先(`SendAodvRrepTo()`のnextHop引数)は
+  「たった今`HandleAodvRreq()`が確立した自分自身の上り経路」
+  (`from`)であり、キャッシュ経路のnext hop(`target`方向)とは
+  別物 — 実装の最初のドラフトでこの2つを取り違えるバグを自己発見
+  し、ビルド前に修正した(引数名を`targetNextHop`から
+  `upwardNextHop`へ変更し、意味を明確化)。
+- `HandleAodvRreq()`: 上り経路のstore成功直後、`dodag.aodv.target`
+  への既存キャッシュを`m_hopByHopRoutes`から直接検索し、
+  条件(期限内・鮮度十分・自分がTargNode自身でない)を満たせば
+  `SendAodvGratuitousRrep()`を呼ぶ。
+- G-RREPの上流中継(「An upstream intermediate router that receives
+  such a G-RREP MUST also generate a G-RREP and send it further
+  upstream」): **無改造で動く**ことをコード読解で確認した —
+  `HandleAodvRrep()`の中継ルータ分岐は受信した`dio`オブジェクトを
+  そのまま`SendAodvRrepTo(dodag, dio, nextHop)`に渡して中継して
+  おり、'G'フラグを含む全フィールドがそのまま転送される。
+
+### 52.5 見送り: RREQ自体のunicast中継(§7後半)
+
+RFC本文はG-RREPを送るだけでなく、その中継ルータが「自分の知っている
+経路に沿ってRREQ自体もunicastで中継する」ことも規定している
+(TargNodeまでの各ホップが新しい下り経路エントリを作りながら中継)。
+これは意図的に実装しなかった:
+
+- **正しさには不要**: この機能を実装しなくても、既存のTrickle
+  multicast floodが同じRREQを(別経路経由であれ)TargNodeまで
+  独立に届け、TargNode自身の上り経路も通常どおり確立される。
+  G-RREPはOrigNodeに経路を**早く**渡す最適化であり、G-RREPの
+  有無自体は発見の正しさに影響しない。
+- **既存のpreferredParent追跡との干渉リスク**: 実装すると、
+  同じRREQ-Instanceが「通常のmulticast flood経由」と
+  「G-RREPに伴うunicast中継経由」の**2経路**で下流ノードに届く
+  ことになる。`HandleAodvRreq()`の「fromがpreferredParentと
+  一致しなければ無視」ガードは、2つの経路が異なるタイミング・
+  異なるrankで届くケースを想定した設計になっておらず、
+  意図しないpreferredParentの揺れを招く恐れがある。
+- **判断**: RFC自身が"MAY"の最適化として位置づけている部分であり、
+  実装コストと干渉リスクに見合う効果が無いと判断した。§35.13/
+  §48.8と同じ「地雷埋めより明記して除外」の方針を踏襲する。
+
+### 52.6 テスト
+
+新規テスト`RplAodvGratuitousRrepTestCase`: 3ノード直線
+(origB(0)--relay(1)--targ(2))。relayが自身の(無関係な)H=1発見を
+先に完了させてキャッシュを作った後、origBが同じtargへの発見を
+開始 — relayがorigBのRREQ処理中にキャッシュヒットし、G-RREPを
+即座に返すことを、origB側のICMPv6監視ソケット(`gratuitous`
+フラグの検査)で確認。加えてorigBが実際に機能する下り経路を得て
+データが届くことも確認。トリガー条件の呼び出しを
+`if (false && ...)`へ一時的に無効化してこのテストがFAILすることを
+確認(load-bearing検証)、元に戻して再度PASSを確認。
+
+`./ns3 build`(rplモジュール・プロジェクト全体とも)、
+`test-runner --suite=rpl`を複数回連続実行して安定PASSを確認。
+既存の全P2P-RPL/AODV-RPLテストは無変更でPASS。

@@ -1413,6 +1413,31 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
                         Ipv6Address nextHop);
 
     /**
+     * @brief Unicast a Gratuitous RREP-DIO (G-RREP) back towards OrigNode,
+     *        answering on a cached route's own behalf (RFC 9854 section 7).
+     *
+     * Called by HandleAodvRreq() when this router, mid-way through relaying
+     * an RREQ it was never itself the target of, already holds a downward
+     * Hop-by-hop Route to @p target at least as fresh as what OrigNode
+     * already knows -- so the discovery need not run to completion before
+     * OrigNode gets a usable route.
+     *
+     * @param dodag the RREQ-Instance the G-RREP answers, for its parent set
+     * @param key the RREQ-Instance's own key
+     * @param target the TargNode this router is vouching for
+     * @param targetSeqNo the cached route's own Sequence Number for @p
+     *        target, carried as the G-RREP's own Dest SeqNo
+     * @param upwardNextHop this router's own next hop towards OrigNode --
+     *        where the G-RREP-DIO is actually unicast to, not towards @p
+     *        target
+     */
+    void SendAodvGratuitousRrep(DodagMembership& dodag,
+                                DodagKey key,
+                                Ipv6Address target,
+                                uint8_t targetSeqNo,
+                                Ipv6Address upwardNextHop);
+
+    /**
      * @brief Find the AODV-RPL source route to a destination, if one is held.
      * @param dst the destination
      * @param [out] hops the route as link-local addresses, the form
