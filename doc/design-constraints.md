@@ -5131,12 +5131,16 @@ model/rpl-routing-protocol.h)は本節で変更していない — この監査�
 
 rule 3 (親以外からの、自分以上に良いRankのDIO) が`ConsistencyHit()`を
 呼び実際に送信を抑制すること、rule 2 (親自身からの、改善しない
-再アナウンス) は呼ばず送信が通常どおり行われることを、
-`P2pDioRedundancy=1`の下で直接検証する。1ノード + 監視用peerの
-2ノード構成 (`RplAodvMultiArtStopsWhenExhaustedTestCase`と同じ recipe
-— 自ノード単体では自分の送信抑制を観測できないため)。2つの独立した
-一時DAG (別々のDODAGID) を同じノードに同時展開し、rule 3側と
-rule 2側の状態が互いに汚染しないようにした。
+再アナウンス) とrule 4 (親以外からの、自分より悪いRankのDIO) は
+どちらも呼ばず送信が通常どおり行われることを、`P2pDioRedundancy=1`の
+下で直接検証する。rule 4も加えたのは、rule 3のRank比較
+(`dio.GetRank() <= after.rank`) が本当に排他的か — 親以外からのDIOを
+Rankに関係なく一律consistent扱いしていないか — の境界値確認のため。
+1ノード + 監視用peerの2ノード構成
+(`RplAodvMultiArtStopsWhenExhaustedTestCase`と同じ recipe — 自ノード
+単体では自分の送信抑制を観測できないため)。3つの独立した一時DAG
+(別々のDODAGID、rule毎に1つ) を同じノードに同時展開し、互いの
+Trickle状態が汚染しないようにした。
 
 タイミングは`RplTrickleTimerTestCase`の`suppressed`サブケース
 (既存、Trickle timer単体の抑制テスト) と同じ発想で確定的に構成: 1件目

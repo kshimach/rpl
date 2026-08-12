@@ -8858,8 +8858,8 @@ RplP2pMaxRankTestCase::DoRun()
  *
  * @brief RFC 6997 section 9.2's rule 3 (a non-parent's at-least-as-good P2P
  *        mode DIO) counts as Trickle-consistent and can suppress a
- *        transmission; rule 2 (the parent's own non-improving re-
- *        announcement) does not.
+ *        transmission; rules 2 and 4 (the parent's own non-improving
+ *        re-announcement, and a non-parent's worse-Rank DIO) do not.
  *
  * design-constraints.md section 39.2 implemented HandleDio()'s own 4-rule
  * classification for a P2P mode DIO's Trickle consistency but left the
@@ -8870,15 +8870,17 @@ RplP2pMaxRankTestCase::DoRun()
  * true whenever m_redundancy is 0. This is the test that was missing before
  * changing the default: with P2pDioRedundancy raised to 1 for the duration
  * of this test only, rule 3 firing must suppress the following
- * transmission and rule 2 firing must not.
+ * transmission, and rules 2 and 4 firing must not -- the latter checking
+ * that the else-if's own Rank comparison is genuinely exclusive rather
+ * than treating every non-parent DIO alike regardless of Rank.
  *
  * One node under test, a peer that doubles as both the fabricated
  * neighbours' relay and the monitor for anything the node under test
  * transmits (RplAodvMultiArtStopsWhenExhaustedTestCase's own two-node
  * recipe, needed here for the same reason: a lone node cannot observe
- * whether it suppressed its own transmission). Two independent temporary
- * DAGs (different fabricated DODAGIDs) so the rule-3 and rule-2 halves
- * cannot contaminate each other's Trickle state.
+ * whether it suppressed its own transmission). Three independent temporary
+ * DAGs (different fabricated DODAGIDs), one per rule under test, so none
+ * of their Trickle state can contaminate another's.
  */
 class RplP2pTrickleRuleSuppressionTestCase : public TestCase
 {
@@ -9064,6 +9066,17 @@ RplP2pTrickleRuleSuppressionTestCase::DoRun()
     deliver(Seconds(0), neighbourA, originRule2, RPL_MIN_HOPRANKINC);
     deliver(MilliSeconds(5), neighbourA, originRule2, RPL_MIN_HOPRANKINC);
 
+    // Rule 4 (the boundary the else-if's own condition draws): a non-parent
+    // again, but this time advertising a worse Rank than this node's own
+    // resulting one -- the mirror image of rule 3's condition
+    // (dio.GetRank() <= after.rank), checking that the comparison is
+    // genuinely exclusive rather than firing for every non-parent DIO
+    // regardless of Rank.
+    Ipv6Address neighbourC("fe80::c");
+    Ipv6Address originRule4("2001:9:4::1");
+    deliver(Seconds(0), neighbourA, originRule4, RPL_MIN_HOPRANKINC);
+    deliver(MilliSeconds(5), neighbourC, originRule4, 1000);
+
     // Stopped at 80 ms: past the 64 ms interval boundary, so whatever this
     // interval's transmission slot decided has already happened, but
     // before the next interval's own earliest possible slot at 64 + 32 =
@@ -9080,6 +9093,10 @@ RplP2pTrickleRuleSuppressionTestCase::DoRun()
                           1,
                           "Rule 2 (the parent's own non-improving re-announcement) must not "
                           "count as consistent: the transmission should have gone out normally");
+    NS_TEST_ASSERT_MSG_EQ(m_p2pDioCount[originRule4],
+                          1,
+                          "Rule 4 (a non-parent's worse-Rank DIO) must not count as consistent "
+                          "either: the transmission should have gone out normally");
 
     monitor->Close();
     Simulator::Destroy();
