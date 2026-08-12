@@ -1200,14 +1200,23 @@ RplRoutingProtocol::HandleAodvRrepInstance(const RplDioHeader& dio,
     if (rrep.hopByHop)
     {
         // RFC 9854 section 6.4.3: "For an asymmetric route, the Next Hop is
-        // the preferred parent in the DODAG of RREP-Instance" -- not from,
-        // unlike the symmetric case's HandleAodvRrep(): the RREP-Instance
-        // is flooded rather than unicast hop-by-hop, so from is merely
-        // whichever copy is being processed right now, while
-        // dodag.preferredParent is the one SelectPreferredParent() (run by
-        // HandleDio() immediately before this function, on every DIO) has
-        // already resolved to the best Rank seen so far. The RPLInstanceID
-        // is the RREQ-InstanceID (pairedInstanceId) regardless of which
+        // the preferred parent in the DODAG of RREP-Instance" -- read as
+        // dodag.preferredParent rather than from, unlike the symmetric
+        // case's HandleAodvRrep(): the RREP-Instance is flooded rather than
+        // unicast hop-by-hop, so from is merely whichever copy is being
+        // processed right now, while dodag.preferredParent is the one
+        // SelectPreferredParent() (run by HandleDio() immediately before
+        // this function, on every DIO) has already resolved to the best
+        // Rank seen so far. The alreadyProcessed guard above already keeps
+        // the two equal at this specific point (a worse-Rank copy is
+        // refused before reaching here, so from always matches whatever
+        // dodag.preferredParent already was), which is why
+        // RplAodvAsymmetricHopByHopRouteFollowsParentTestCase cannot
+        // independently observe this choice over from -- dodag.preferredParent
+        // is still the right one to read: correct by construction rather
+        // than by coincidence with a guard that could change independently
+        // of this line. The RPLInstanceID is the RREQ-InstanceID
+        // (pairedInstanceId) regardless of which
         // DODAG -- RREQ-Instance or RREP-Instance -- established the entry
         // (sections 6.2.3 and 6.4.3 agree on this), which is exactly what
         // lets HasHopByHopRoute()'s bypass work here despite the

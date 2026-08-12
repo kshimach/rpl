@@ -5763,6 +5763,159 @@ RplAodvHopByHopStaleSeqNoRejectedTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief An asymmetric AODV-RPL Hop-by-hop Route's downward next hop
+ *        follows a switch to a better preferred parent within the
+ *        RREP-Instance's own topology.
+ *
+ * RFC 9854 section 6.4.3: an asymmetric route's downward next hop is "the
+ * preferred parent in the DODAG of RREP-Instance", read fresh from
+ * dodag.preferredParent every time HandleAodvRrepInstance() stores it --
+ * unlike the symmetric case, which can just use from because the RREP-DIO
+ * there is unicast hop-by-hop (@see design-constraints.md section 50.2).
+ * This is what makes that design sound even when the RREP-Instance's own
+ * flood reaches a router from more than one neighbour: a worse-Rank copy
+ * arrives first and is joined, then a better-Rank copy arrives from a
+ * different neighbour and SelectPreferredParent() switches to it (the same
+ * scenario RplAodvAddressVectorFollowsParentTestCase covers for the RREQ
+ * side) -- the stored downward route has to follow that switch, not stay
+ * pinned to whichever neighbour's copy happened to be processed first.
+ *
+ * Delivered directly (DeliverRawRplMessage(), multicast so it reads as RFC
+ * 9854 section 6.3.2's flood) to a single node under test, acting as an
+ * intermediate router for a fabricated RREP-Instance neither OrigNode nor
+ * TargNode itself.
+ */
+class RplAodvAsymmetricHopByHopRouteFollowsParentTestCase : public TestCase
+{
+  public:
+    RplAodvAsymmetricHopByHopRouteFollowsParentTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplAodvAsymmetricHopByHopRouteFollowsParentTestCase::
+    RplAodvAsymmetricHopByHopRouteFollowsParentTestCase()
+    : TestCase("An asymmetric AODV-RPL Hop-by-hop Route's downward next hop follows the "
+               "RREP-Instance's own preferred parent")
+{
+}
+
+void
+RplAodvAsymmetricHopByHopRouteFollowsParentTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(1);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.AssignWithoutAddress(devices);
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    Simulator::Stop(Seconds(2));
+    Simulator::Run();
+
+    Ptr<Node> node = nodes.Get(0);
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+
+    static constexpr uint8_t RREQ_INSTANCE = 0x81;
+    static constexpr uint8_t DELTA = 3;
+    static constexpr uint8_t RREP_INSTANCE = static_cast<uint8_t>(RREQ_INSTANCE + DELTA);
+    Ipv6Address targNode("2001:9::1");  // the RREP-Instance's own DODAGID
+    Ipv6Address origNode("2001:9::99"); // a fake OrigNode, not this node
+    Ipv6Address neighbourA("fe80::a");  // worse: rank 384
+    Ipv6Address neighbourB("fe80::b");  // better: rank 128
+
+    auto buildRrep = [&](uint16_t rank, uint8_t seqNo) {
+        RplDioHeader dio;
+        dio.SetInstanceId(RREP_INSTANCE);
+        dio.SetVersionNumber(0);
+        dio.SetRank(rank);
+        dio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+        dio.SetDodagId(targNode);
+        dio.SetDtsn(0);
+        dio.SetDagConfiguration(0,
+                                8,
+                                RPL_DIO_REDUNDANCY,
+                                RPL_MAX_RANKINC,
+                                RPL_MIN_HOPRANKINC,
+                                RPL_OCP_OF0,
+                                RPL_DEFAULT_LIFETIME,
+                                RPL_DEFAULT_LIFETIME_UNIT);
+        RplDioHeader::RrepOption rrep;
+        rrep.gratuitous = false;
+        rrep.hopByHop = true;
+        rrep.lifetime = 0; // no limit, keeps this test's timing simple
+        rrep.rankLimit = 0;
+        rrep.delta = DELTA;
+        // Left empty: RFC 9854 section 4.1's "In hop-by-hop mode (H=1),
+        // this field MUST be set to zero and ignored".
+        dio.SetRrep(rrep);
+        RplDioHeader::ArtOption art;
+        art.destSeqNo = seqNo;
+        art.prefixLength = 0;
+        art.target = origNode;
+        dio.SetArt(art);
+        return dio;
+    };
+    auto deliverRrep = [&](Ipv6Address from, uint16_t rank, uint8_t seqNo) {
+        Simulator::Schedule(Seconds(0),
+                            &DeliverRawRplMessage<RplDioHeader>,
+                            node,
+                            1,
+                            buildRrep(rank, seqNo),
+                            static_cast<uint8_t>(RPL_CODE_DIO),
+                            from,
+                            Ipv6Address(RPL_ALL_NODES_MULTICAST));
+        Simulator::Stop(MilliSeconds(10));
+        Simulator::Run();
+    };
+
+    // First delivery, from A: establishes the downward route, next hop A.
+    deliverRrep(neighbourA, 384, 5);
+    Ipv6Address nextHop;
+    uint8_t instanceId = 0;
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetHopByHopRoute(targNode, nextHop, instanceId),
+                          true,
+                          "The first RREP-Instance DIO did not establish a downward Hop-by-hop "
+                          "Route");
+    NS_TEST_ASSERT_MSG_EQ(nextHop, neighbourA, "Wrong next hop after the first delivery");
+    NS_TEST_ASSERT_MSG_EQ(instanceId,
+                          RREQ_INSTANCE,
+                          "The stored instanceId should be the RREQ-InstanceID (Delta "
+                          "subtracted), not the RREP-Instance's own");
+
+    // Second delivery, from B: a better Rank (128 < 384). Same Dest SeqNo as
+    // the first, so this pins down that the switch follows from
+    // SelectPreferredParent() choosing the better neighbour, not from a
+    // seqNo-freshness win.
+    deliverRrep(neighbourB, 128, 5);
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetRankIn(RREP_INSTANCE, targNode),
+                          256,
+                          "The preferred parent did not switch to the better neighbour B");
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetHopByHopRoute(targNode, nextHop, instanceId),
+                          true,
+                          "The downward Hop-by-hop Route disappeared after the switch");
+    NS_TEST_ASSERT_MSG_EQ(nextHop,
+                          neighbourB,
+                          "The downward next hop did not follow the switch to the better "
+                          "preferred parent B");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief An AODV-RPL route discovery floods an RREQ outward, each hop
  *        appending its own address to the Address Vector.
  *
@@ -16542,6 +16695,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplAodvMopAcceptedTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvAddressVectorFollowsParentTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvHopByHopStaleSeqNoRejectedTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplAodvAsymmetricHopByHopRouteFollowsParentTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRreqFloodTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvMultiArtIntersectionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvMultiArtTwoTargetsAnsweredTestCase, TestCase::Duration::QUICK);

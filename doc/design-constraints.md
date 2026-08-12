@@ -5857,3 +5857,72 @@ RREP-InstanceのものではなくRREQ-InstanceIDであること、(4) Sビッ�
 無変更でPASS — S=0時に上り経路構築のゲートを撤廃した変更が、
 既存のH=0非対称シナリオの挙動(§6.2.4のS bit伝播ロジック自体は
 無変更)に影響していないことの裏付け。
+
+## 51. `/protocol-test-matrix`でAODV-RPL H=1非対称対応(§50)を監査
+
+### 51.1 `hopByHop`コピー忘れの横展開確認
+
+§50.4で見つけたバグ(`HandleAodvRrepInstance()`での
+`dodag.aodv.hopByHop`コピー忘れ)と同種のバグが他に残っていないか、
+`.hopByHop`を全参照箇所で横展開した。DIOから読んだ`hopByHop`を
+`dodag.*.hopByHop`へ永続化する箇所は5箇所
+(`DiscoverRoute()`/`HandleAodvRreq()`/`StartAodvRrepInstance()`/
+`HandleAodvRrepInstance()`、および`DiscoverP2pRoute()`) — 全て
+正しくコピーされていることを確認した(P2P-RPL側の対応する箇所は
+§46時点で既に正しく実装済み)。同種のバグはこれ以上見つからなかった。
+
+### 51.2 新規テスト: RREP-Instance自身のpreferredParent切り替え追従
+
+`RplAodvAsymmetricHopByHopRouteFollowsParentTestCase`
+(`RplAodvAddressVectorFollowsParentTestCase`と同型の単一ノード
+直接注入)を追加。悪いrank(384)の隣接ノードAからのRREP-Instance
+DIOで下り経路を確立した後、良いrank(128)の隣接ノードBから届いた
+2件目が`SelectPreferredParent()`によるpreferredParent切り替えを
+正しく引き起こし、下り経路のnext hopもBへ追従することを確認。
+
+### 51.3 発見: `from`と`dodag.preferredParent`は現在の実装では区別不能
+
+load-bearing検証のため`dodag.preferredParent`を`from`に一時的に
+差し替えたところ、51.2のテストは**PASSしたまま**だった。原因を
+分析: `alreadyProcessed && from != dodag.preferredParent`という
+既存ガード(H=0側から踏襲、H=1側でも同じ構造を再利用)が、
+「`from`が現在の`preferredParent`と一致しない限りstore呼び出し
+自体に到達させない」設計になっているため、store呼び出しが実際に
+走る時点では`from == dodag.preferredParent`が**ガード自身によって
+既に保証されている** — つまりこの実装の現状では、store呼び出しの
+引数として`from`を使っても`dodag.preferredParent`を使っても
+観測可能な違いが無い。
+
+これは§49.3で記録した「異なるInstanceIDが衝突でなく別ルートとして
+扱われることの独立検証不能性」と同じ種類の発見であり、対処も
+同じ考え方を採った: **実装は`dodag.preferredParent`のまま維持**した
+(RFC 9854 §6.4.3の逐語に忠実であり、かつ将来ガード側の実装が変わった
+場合にも壊れない「構造的に正しい」書き方であるため — `from`は
+「たまたま今のガードと整合しているから正しく見えるだけ」の脆い
+実装になる)。テストが独立に区別できない理由と、それでも
+`dodag.preferredParent`を選んだ理由の両方を実装コードのコメントに
+追記した。
+
+### 51.4 意図的にテストを追加しなかった項目
+
+- **RREP-Instance自身の下り経路が、RREP-Instanceメンバシップの
+  'L'期限を生き延びること**: §49で追加した
+  `RplAodvHopByHopRouteOutlivesRreqInstanceTestCase`
+  (RREQ-Instance側)と全く同じメカニズム(`ArmAodvExpiry()`による
+  メンバシップ寿命と、`StoreHopByHopRoute()`の
+  `m_pathLifetime`/`m_lifetimeUnit`由来の経路寿命が独立)を
+  RREP-Instance側のメンバシップに対して再利用しているだけであり、
+  Increment B固有の新しい分岐は無い。同じ性質を2つ目のテストで
+  再証明する限界効用は低いと判断し、専用テストは見送った。
+- **RankLimitの境界(非対称RREP-InstanceでのH=1)**:
+  `ShouldRefuseAodvRrep()`のRankLimitチェック自体はH=1対応前から
+  既に存在し(§50で変更していない)、H=0側で境界値テストが既に
+  存在する。H=1固有の分岐は無いため、RankLimit境界の追加テストは
+  見送った。
+
+### 51.5 検証
+
+`./ns3 build`(rplモジュール・プロジェクト全体とも)、
+`test-runner --suite=rpl`を複数回連続実行して安定PASSを確認。
+既存の全P2P-RPL/AODV-RPLテスト(H=0対称・非対称、H=1対称・非対称)
+は無変更でPASS。
