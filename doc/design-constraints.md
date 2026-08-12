@@ -6041,3 +6041,58 @@ RFC本文はG-RREPを送るだけでなく、その中継ルータが「自分�
 `./ns3 build`(rplモジュール・プロジェクト全体とも)、
 `test-runner --suite=rpl`を複数回連続実行して安定PASSを確認。
 既存の全P2P-RPL/AODV-RPLテストは無変更でPASS。
+
+## 53. `/protocol-test-matrix`でGratuitous RREP(§52)を監査
+
+RFC 9854 §7を再確認しつつ、§52完了時点で手薄だった境界値・
+状態遷移系を優先して埋めた。
+
+### 53.1 新規テスト2件
+
+- `RplAodvGratuitousRrepFreshnessBoundaryTestCase`(境界値): 単一
+  ノードへの合成RREQ+RREP注入でキャッシュ経路のSeqNoを`5`に
+  固定した上で、(1)問い合わせ側ART`destSeqNo=5`(等しい)は発火
+  すること、(2)`destSeqNo=6`(キャッシュより新しい)は発火
+  **しない**ことを、同一キャッシュに対して確認。RFC本文
+  「at least as large as」が等号を含む、という読みを直接検証する。
+  `!=`条件を追加して等号ケースを意図的に弾く形へ一時的に改変し、
+  このテストがFAILすることを確認(load-bearing検証)、元に戻して
+  再度PASSを確認。
+- `RplAodvGratuitousRrepThenRealRrepTestCase`(状態遷移系):
+  `RplAodvGratuitousRrepTestCase`と同じ3ノード構成で、G-RREPが
+  先着した後、通常のTrickle multicast floodが独立に継続し
+  targから本物のRREP-DIOが遅れて届く状況を意図的に長めに待って
+  発生させ、`dodag.aodv.rrepHandled`の重複排除がこの新しい
+  組み合わせでも正しく働き、経路状態が壊れないことを確認。
+  `rrepHandled`のガード自体を一時的に無効化したところ、この
+  テスト単体のFAILではなく**スイート全体がクラッシュ**した
+  (`NS_ASSERT failed, cond="m_head != 0xffff"`、
+  `src/network/model/packet-metadata.cc`)— 同一DIOオブジェクトが
+  複数回処理・中継されることでパケットメタデータの内部不変条件が
+  破れるためと見られる。このガードが単なる無駄防止ではなく
+  安定性そのものに関わることを裏付ける、想定より強い
+  load-bearing確認になった。ガードを元に戻し、再度3回連続PASSを
+  確認。
+
+### 53.2 意図的にテストを追加しなかった項目
+
+- **複数の中継ルータが同時にキャッシュを持つ場合の重複G-RREP**:
+  OrigNodeに複数のG-RREPが別々の中継ルータから届く状況は、
+  53.1で確認した`rrepHandled`による重複排除の仕組みを複数の
+  "早着"側で踏むだけであり、"本物のRREPが遅れて届く"53.1の
+  シナリオと本質的に同じ保護機構を別の角度から踏むに過ぎない。
+  独立したテストを追加する限界効用は低いと判断した。
+- **`isTarget`時にG-RREPチェックが正しくスキップされる境界**:
+  `HandleAodvRreq()`の`!dodag.aodv.isTarget`ガードはコード読解で
+  正しさを確認済み。加えて、これまでに追加した全ての対称H=1
+  end-to-endテスト(`RplAodvHopByHopRouteCompletesTestCase`等)は
+  TargNode自身が`SendAodvRrep()`経由で正常に応答することを
+  既に確認しており、G-RREPチェックが誤発火してこれらのテストを
+  壊すようなことがあれば既に検出されていたはずである。専用の
+  境界値テストは見送った。
+
+### 53.3 検証
+
+`./ns3 build`(rplモジュール・プロジェクト全体とも)、
+`test-runner --suite=rpl`を複数回連続実行して安定PASSを確認。
+既存の全P2P-RPL/AODV-RPLテストは無変更でPASS。

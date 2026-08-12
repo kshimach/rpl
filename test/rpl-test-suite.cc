@@ -8802,6 +8802,386 @@ RplAodvGratuitousRrepTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief A Gratuitous RREP (G-RREP) fires exactly at RFC 9854 section 7's
+ *        own freshness boundary: "at least as large as" includes equal,
+ *        but not an incoming RREQ that already claims to know better.
+ *
+ * The cached route this router already holds is established via direct
+ * synthetic RREQ+RREP injection (DeliverRawRplMessage(), the same style
+ * RplAodvAsymmetricHopByHopRouteFollowsParentTestCase uses), which is what
+ * makes its own Sequence Number precisely controllable rather than
+ * whatever a real round trip through TargNode would happen to produce.
+ * Both the equal case and the strictly-newer case are checked against the
+ * very same cached route, ruling out a test that only demonstrates one
+ * side of the boundary by coincidence of setup.
+ *
+ * Two nodes: node (under test) and neighbour, a real one so the resulting
+ * G-RREP -- unicast to whichever address last supplied a fresh-enough
+ * RREQ -- actually has somewhere to be captured and inspected.
+ */
+class RplAodvGratuitousRrepFreshnessBoundaryTestCase : public TestCase
+{
+  public:
+    RplAodvGratuitousRrepFreshnessBoundaryTestCase();
+
+  private:
+    void DoRun() override;
+
+    /// @brief Note whether an RREP-carrying DIO seen at the monitor is
+    ///        gratuitous.
+    /// @param socket the monitoring socket
+    void CountRrepDio(Ptr<Socket> socket);
+
+    uint32_t m_rrepDioCount{0};    //!< RREP-carrying DIOs seen at the monitor
+    uint32_t m_gratuitousCount{0}; //!< of those, how many had 'G' set
+};
+
+RplAodvGratuitousRrepFreshnessBoundaryTestCase::RplAodvGratuitousRrepFreshnessBoundaryTestCase()
+    : TestCase("A Gratuitous RREP fires on an equal Dest SeqNo, not a strictly newer one")
+{
+}
+
+void
+RplAodvGratuitousRrepFreshnessBoundaryTestCase::CountRrepDio(Ptr<Socket> socket)
+{
+    Address sender;
+    Ptr<Packet> packet = socket->RecvFrom(sender);
+    if (!packet)
+    {
+        return;
+    }
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ipv6Header);
+    Icmpv6Header icmpv6Header;
+    packet->RemoveHeader(icmpv6Header);
+    if (icmpv6Header.GetType() != ICMPV6_RPL || icmpv6Header.GetCode() != RPL_CODE_DIO)
+    {
+        return;
+    }
+    RplDioHeader dio;
+    packet->RemoveHeader(dio);
+    if (dio.HasRrep())
+    {
+        m_rrepDioCount++;
+        if (dio.GetRrep().gratuitous)
+        {
+            m_gratuitousCount++;
+        }
+    }
+}
+
+void
+RplAodvGratuitousRrepFreshnessBoundaryTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2); // 0 = node under test and base root, 1 = neighbour
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(2));
+    Simulator::Run();
+
+    Ptr<Node> node = nodes.Get(0);
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+    Ipv6Address nodeLinkLocal = node->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address neighbourLinkLocal =
+        nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    static constexpr uint8_t CACHE_INSTANCE = 0x81;
+    static constexpr uint8_t QUERY_INSTANCE_A = 0x85;
+    static constexpr uint8_t QUERY_INSTANCE_B = 0x86;
+    static constexpr uint8_t CACHED_SEQNO = 5;
+    Ipv6Address cacheOrigin("2001:9::1");  // the discovery that seeds the cache
+    Ipv6Address target("2001:9::99");      // this node is neither -- purely a relay
+    Ipv6Address cacheFrom("fe80::c");      // this cache's own next hop, disposable
+
+    auto buildRreq = [&](uint8_t instanceId, Ipv6Address dodagId, uint8_t artSeqNo) {
+        RplDioHeader dio;
+        dio.SetInstanceId(instanceId);
+        dio.SetVersionNumber(0);
+        dio.SetRank(RPL_MIN_HOPRANKINC);
+        dio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+        dio.SetDodagId(dodagId);
+        dio.SetDtsn(0);
+        dio.SetDagConfiguration(0,
+                                8,
+                                RPL_DIO_REDUNDANCY,
+                                RPL_MAX_RANKINC,
+                                RPL_MIN_HOPRANKINC,
+                                RPL_OCP_OF0,
+                                RPL_DEFAULT_LIFETIME,
+                                RPL_DEFAULT_LIFETIME_UNIT);
+        RplDioHeader::RreqOption rreq;
+        rreq.symmetric = true;
+        rreq.hopByHop = true;
+        rreq.compr = 0;
+        rreq.lifetime = 0; // no limit, keeps this test's timing simple
+        rreq.rankLimit = 0;
+        rreq.origSeqNo = 1;
+        dio.SetRreq(rreq);
+        RplDioHeader::ArtOption art;
+        art.destSeqNo = artSeqNo;
+        art.prefixLength = 0;
+        art.target = target;
+        dio.SetArt(art);
+        return dio;
+    };
+    auto buildRrep = [&](uint8_t instanceId, Ipv6Address dodagId, uint8_t destSeqNo) {
+        RplDioHeader dio;
+        dio.SetInstanceId(instanceId);
+        dio.SetVersionNumber(0);
+        dio.SetRank(RPL_MIN_HOPRANKINC);
+        dio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+        dio.SetDodagId(dodagId);
+        dio.SetDtsn(0);
+        RplDioHeader::RrepOption rrep;
+        rrep.gratuitous = false;
+        rrep.hopByHop = true;
+        rrep.lifetime = 0;
+        rrep.rankLimit = 0;
+        rrep.delta = 0;
+        dio.SetRrep(rrep);
+        RplDioHeader::ArtOption art;
+        art.destSeqNo = destSeqNo;
+        art.prefixLength = 0;
+        art.target = cacheOrigin;
+        dio.SetArt(art);
+        return dio;
+    };
+
+    // Seed the cache: a synthetic RREQ (establishing the membership and this
+    // node's own upward route towards cacheOrigin) followed by a synthetic
+    // RREP (establishing the downward Hop-by-hop Route this test's own
+    // Gratuitous RREP checks will be answered from), both unrelated to
+    // either query that follows.
+    DeliverRawRplMessage<RplDioHeader>(node,
+                                       1,
+                                       buildRreq(CACHE_INSTANCE, cacheOrigin, 0),
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       cacheFrom,
+                                       nodeLinkLocal);
+    DeliverRawRplMessage<RplDioHeader>(node,
+                                       1,
+                                       buildRrep(CACHE_INSTANCE, target, CACHED_SEQNO),
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       cacheFrom,
+                                       nodeLinkLocal);
+    Simulator::Stop(MilliSeconds(10));
+    Simulator::Run();
+
+    Ipv6Address nextHop;
+    uint8_t hopInstanceId = 0;
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetHopByHopRoute(target, nextHop, hopInstanceId),
+                          true,
+                          "The synthetic setup did not leave a cached downward route");
+    NS_TEST_ASSERT_MSG_EQ(nextHop, cacheFrom, "Wrong cached next hop after setup");
+
+    Ptr<Socket> monitor = Socket::CreateSocket(nodes.Get(1), Ipv6RawSocketFactory::GetTypeId());
+    monitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    monitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    monitor->BindToNetDevice(nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+    monitor->SetRecvCallback(
+        MakeCallback(&RplAodvGratuitousRrepFreshnessBoundaryTestCase::CountRrepDio, this));
+
+    // Query A: a different OrigNode and RREQ-Instance, ART destSeqNo equal
+    // to the cached route's own (5 == 5). RFC 9854 section 7's own "at
+    // least as large as" includes equal -- this MUST fire.
+    Ipv6Address origA("2001:9::10");
+    DeliverRawRplMessage<RplDioHeader>(node,
+                                       1,
+                                       buildRreq(QUERY_INSTANCE_A, origA, CACHED_SEQNO),
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       neighbourLinkLocal,
+                                       nodeLinkLocal);
+    Simulator::Stop(MilliSeconds(10));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(m_rrepDioCount, 1, "No RREP-DIO was sent for the equal-SeqNo query");
+    NS_TEST_ASSERT_MSG_EQ(m_gratuitousCount,
+                          1,
+                          "An equal Dest SeqNo (RFC 9854 section 7's own \"at least as large "
+                          "as\") should still fire the Gratuitous RREP");
+
+    // Query B: yet another OrigNode and RREQ-Instance, ART destSeqNo one
+    // past the cached route's own (6 > 5) -- OrigNode already claims to
+    // know a fresher route than this one can offer. MUST NOT fire.
+    Ipv6Address origB("2001:9::11");
+    DeliverRawRplMessage<RplDioHeader>(
+        node,
+        1,
+        buildRreq(QUERY_INSTANCE_B, origB, static_cast<uint8_t>(CACHED_SEQNO + 1)),
+        static_cast<uint8_t>(RPL_CODE_DIO),
+        neighbourLinkLocal,
+        nodeLinkLocal);
+    Simulator::Stop(MilliSeconds(10));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(m_rrepDioCount,
+                          1,
+                          "A strictly newer Dest SeqNo than the cached route's own should not "
+                          "have produced a Gratuitous RREP");
+    NS_TEST_ASSERT_MSG_EQ(m_gratuitousCount, 1, "The Gratuitous count should not have changed");
+
+    monitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief A Gratuitous RREP that answers OrigNode first is not disturbed by
+ *        the real RREP-DIO from TargNode arriving later.
+ *
+ * A Gratuitous RREP is deliberately not exclusive of the ordinary
+ * discovery: this module keeps relaying the RREQ over the normal multicast
+ * Trickle flood regardless (RFC 9854 section 7's own further optimization
+ * of unicast-relaying the RREQ along the cached route is out of scope,
+ * @see design-constraints.md), so TargNode still eventually receives it and
+ * answers for real -- after OrigNode already has a route from the G-RREP.
+ * DodagMembership::AodvRreqState::rrepHandled, the same repeat guard
+ * RplAodvRrepDuplicateRelayedOnceTestCase already covers for the ordinary
+ * case, has to keep that late arrival from disturbing the state the G-RREP
+ * already established.
+ *
+ * The same three-node line as RplAodvGratuitousRrepTestCase
+ * (origB(0)--relay(1)--targ(2)), just waited on for long enough after
+ * starting origB's own discovery for the ordinary flood to also reach targ
+ * and a real RREP-DIO to come all the way back, on top of the G-RREP that
+ * arrives first.
+ */
+class RplAodvGratuitousRrepThenRealRrepTestCase : public TestCase
+{
+  public:
+    RplAodvGratuitousRrepThenRealRrepTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplAodvGratuitousRrepThenRealRrepTestCase::RplAodvGratuitousRrepThenRealRrepTestCase()
+    : TestCase("A late real RREP-DIO does not disturb a Gratuitous RREP's own state")
+{
+}
+
+void
+RplAodvGratuitousRrepThenRealRrepTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(3); // 0 = origB and base root, 1 = relay, 2 = targ
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    Ptr<SimpleNetDevice> devA = DynamicCast<SimpleNetDevice>(devices.Get(0));
+    Ptr<SimpleNetDevice> devC = DynamicCast<SimpleNetDevice>(devices.Get(2));
+    channel->BlackList(devA, devC);
+    channel->BlackList(devC, devA);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(250));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> origB = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> relay = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> targ = nodes.Get(2)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(targ->IsJoined(), true, "The base DODAG did not reach the far end");
+
+    Ipv6Address targAddress = targ->GetGlobalAddress();
+    Ipv6Address relayLinkLocal =
+        nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    // relay's own, unrelated discovery seeds its cache exactly as
+    // RplAodvGratuitousRrepTestCase's own does.
+    RplRoutingProtocol::DodagKey relayKey = relay->DiscoverRoute(targAddress, true);
+    NS_TEST_ASSERT_MSG_NE(relayKey.dodagId, Ipv6Address::GetAny(), "relay's discovery did not "
+                                                                   "start");
+
+    Simulator::Stop(Seconds(5));
+    Simulator::Run();
+
+    Ipv6Address nextHop;
+    uint8_t hopInstanceId = 0;
+    NS_TEST_ASSERT_MSG_EQ(relay->GetHopByHopRoute(targAddress, nextHop, hopInstanceId),
+                          true,
+                          "relay never cached its own route to targ");
+
+    RplRoutingProtocol::DodagKey origKey = origB->DiscoverRoute(targAddress, true);
+    NS_TEST_ASSERT_MSG_NE(origKey.dodagId, Ipv6Address::GetAny(), "origB's discovery did not "
+                                                                  "start");
+
+    // Long enough for the G-RREP to arrive almost immediately, and then for
+    // the ordinary Trickle flood to also reach targ and its own real
+    // RREP-DIO to come all the way back -- RplAodvHopByHopRouteCompletesTest
+    // Case's own end-to-end discovery over this many hops completes well
+    // within 10 seconds, so this leaves ample margin for the second,
+    // slower arrival on top of that.
+    Simulator::Stop(Seconds(15));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(origB->GetHopByHopRoute(targAddress, nextHop, hopInstanceId),
+                          true,
+                          "The downward Hop-by-hop Route disappeared once the real RREP-DIO "
+                          "arrived");
+    NS_TEST_ASSERT_MSG_EQ(nextHop,
+                          relayLinkLocal,
+                          "The route should still point at relay, whichever RREP -- Gratuitous "
+                          "or real -- last happened to win rrepHandled's repeat guard");
+    NS_TEST_ASSERT_MSG_EQ(hopInstanceId,
+                          origKey.instanceId,
+                          "The route's own instanceId should still be origB's RREQ-InstanceID");
+
+    // And data still flows: the state the late real RREP-DIO found was not
+    // left half-updated or otherwise broken.
+    uint16_t port = 4252;
+    Ptr<Socket> receiver = Socket::CreateSocket(nodes.Get(2), UdpSocketFactory::GetTypeId());
+    receiver->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), port));
+    Ptr<Socket> sender = Socket::CreateSocket(nodes.Get(0), UdpSocketFactory::GetTypeId());
+    sender->Connect(Inet6SocketAddress(targAddress, port));
+    int sendResult = sender->Send(Create<Packet>(64));
+    NS_TEST_ASSERT_MSG_GT(sendResult, 0, "Socket::Send() refused the datagram outright");
+
+    receiver->Close();
+    sender->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief A base-DODAG root that also joins another RREQ-Instance as an
  *        ordinary member must not crash when it loses that RREQ-Instance's
  *        last parent.
@@ -16916,6 +17296,8 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplAodvHopByHopRouteDirectNeighbourTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvHopByHopRouteOutlivesRreqInstanceTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvGratuitousRrepTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplAodvGratuitousRrepFreshnessBoundaryTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplAodvGratuitousRrepThenRealRrepTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplRootJoinsForeignRreqInstanceParentLossTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRrepInstanceRankLimitTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRrepInstanceAddressVectorFullTestCase, TestCase::Duration::QUICK);
