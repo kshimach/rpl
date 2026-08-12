@@ -5666,6 +5666,13 @@ D=0固定という既存動作に対して安全なno-opであることの裏付
 属性とH=1の組み合わせのテストは次回増分 ("Increment B") へ
 持ち越す。
 
+**続報 (§50)**: 後日Increment Bとして実装した。当初想定していた
+「非対称固有の複雑さ」は主にnext hopの取得元(§6.4.3: 対称は
+`from`、非対称はRREP-Instance自身のpreferredParent)の違いに
+限られ、それ以外は§48で確立した共有インフラ(D flag、seqNo鮮度
+チェック、RPLInstanceIDのRREQ-Instance固定)がそのまま再利用
+できた。
+
 ## 49. `/protocol-test-matrix`でAODV-RPL H=1対応(§48)を監査
 
 RFC 9854 §6.2.1/6.2.3/6.3.1/6.4.3/6.4.4を原文で再確認した上で、
@@ -5759,3 +5766,94 @@ RFC 9854 §6.2.1/6.2.3/6.3.1/6.4.3/6.4.4を原文で再確認した上で、
 `./ns3 build`(rplモジュール・プロジェクト全体とも)、
 `test-runner --suite=rpl`を複数回連続実行して安定PASSを確認。
 既存の全P2P-RPL/AODV-RPLテスト(H=0、H=1双方)は無変更でPASS。
+
+## 50. AODV-RPL H=1を非対称(S=0)経路にも拡張 ("Increment B")
+
+§48.8で見送った非対称経路のH=1対応を実装した。
+
+### 50.1 §48自身の境界設定の誤りが判明
+
+RFC 9854 §6.2.3の逐語("If the H bit is set to 1...the router MUST
+build or update its upward route entry towards OrigNode")を読み直すと、
+上り経路エントリの構築はS bitに一切条件付けられていない —
+S bitが影響するのは§6.2.4(どの応答方式を使うか)のみ。ところが
+§48の`ShouldRefuseAodvRreq()`実装は`rreq.hopByHop && !rreq.symmetric`
+を無条件に拒否していた — これはS=0に**一度**でも遷移した時点で、
+それより下流の全ルータが(本来なら構築できるはずの)上り経路すら
+一切持てなくなる、意図以上に広い拒否範囲だった。Increment Bでは
+この事前ゲート自体を撤廃した(`ShouldRefuseAodvRrep()`側の
+`if (rrep.hopByHop) {...refuse...}`も同様に撤廃)。
+
+### 50.2 下り経路のnext hop: 対称はfrom、非対称はpreferredParent
+
+RFC 9854 §6.4.3「For an asymmetric route, the Next Hop is the
+preferred parent in the DODAG of RREP-Instance」— 対称経路の
+RREP-DIOはホップバイホップでunicastされるため`from`がそのまま
+next hop(§48で実装済み)だが、非対称経路のRREP-Instanceは
+TargNode自身がrootする**別のDODAGとしてflood**される(RFC 9854
+§6.3.2)。floodなので複数コピーが複数の隣接ノードから届きうり、
+`from`は「たまたま今処理しているコピーの送信元」でしかない —
+使うべきは`SelectPreferredParent()`(このRREP-Instance自身の
+トポロジに対して、`HandleDio()`が本関数呼び出し直前に毎回実行
+済み)が確定させた`dodag.preferredParent`。
+
+RPLInstanceIDは対称・非対称いずれでも「RREQ-InstanceID」を
+そのまま使う(§6.2.3/§6.4.3で共通)— これは§48.1で確認した
+「`HasHopByHopRoute()`バイパスはrank比較を一切しない」という
+事実と合わせ、RREP-Instance自身のrank階層(RREQ-Instanceとは
+無関係)がバイパスの正しさに影響しないことを改めて裏付ける —
+§46.6が当初懸念した「rank階層の不整合」は、この実装方式である
+限りそもそも問題にならない。
+
+### 50.3 実装
+
+- `ShouldRefuseAodvRreq()`/`ShouldRefuseAodvRrep()`: H=1拒否ゲート
+  両方を撤廃(§50.1)。
+- `StartAodvRrepInstance()`: 新規RREP-Instanceメンバシップに
+  `rrepDodag.aodv.hopByHop = rreqDodag.aodv.hopByHop;`をコピー。
+- `SendDio()`のRREP-DIO分岐(`rpl-routing-protocol.cc`):
+  `rrep.hopByHop`をハードコード`false`から
+  `dodag.aodv.hopByHop`に変更。
+- `HandleAodvRrepInstance()`: H=0のAddress Vector空判定の代わりに
+  `HasHopByHopRoute(pairedInstanceId, key.dodagId)`を「既に処理済み」
+  信号として使う(§48の`HandleAodvRreq()`と同型の対応)。
+  `rrep.hopByHop`が立っている場合、`dodag.preferredParent`をnext hop
+  として`StoreHopByHopRoute()`を呼ぶ — OrigNode・中継ルータ問わず
+  同じ1箇所で(§48の対称側が`HandleAodvRrep()`で両者を統合したのと
+  同じ構造)。
+
+### 50.4 テスト作成中に発見した実装バグ1件(§48と同型)
+
+`HandleAodvRrepInstance()`のフィールドコピー箇所に
+**`dodag.aodv.hopByHop = rrep.hopByHop;`を書き忘れていた**
+— §48.6で見つけたのと全く同じ形のバグ。この結果、TargNode自身の
+RREP-Instanceメンバシップ(`StartAodvRrepInstance()`側)は正しく
+`hopByHop=true`を持つが、中継ルータが`HandleAodvRrepInstance()`
+経由でこのRREP-Instanceに参加する際、自分のメンバシップの
+`hopByHop`が既定値`false`のままになり、`SendDio()`での再送出時に
+H=0として中継されてしまう — OrigNodeが受け取る頃にはH=0の
+RREP-DIOになっており、`m_aodvRoutes`(H=0)にルートが記録され、
+Hop-by-hop Route側は一切確立されない、という形で新規テスト
+`RplAodvAsymmetricHopByHopRouteCompletesTestCase`が検出した。
+1行追加で修正、`if (false) dodag.aodv.hopByHop = ...;`へ一時的に
+無効化してこのテストがFAILすることを確認(load-bearing検証)、
+元に戻して再度PASSを確認。
+
+### 50.5 テスト
+
+新規テスト`RplAodvAsymmetricHopByHopRouteCompletesTestCase`
+(既存`RplAodvAsymmetricRouteCompletesTestCase`のH=1版、同一4ノード
+直線・同一`AodvForceAsymmetric`設定を再利用 — この属性とH=1の
+組み合わせも同時に検証): (1) H=0ルートが記録されていないこと、
+(2) 各ルータの下り経路next hopがRREP-Instance自身のpreferredParent
+チェーンと一致すること(§50.2)、(3) 保存されたinstanceIdが
+RREP-InstanceのものではなくRREQ-InstanceIDであること、(4) Sビットが
+経路途中で0に変わったにもかかわらず全ホップで上り経路が形成される
+こと(§50.1)、(5) 実データがTargNodeまで届くことを確認。
+
+`./ns3 build`(rplモジュール・プロジェクト全体とも)、
+`test-runner --suite=rpl`を複数回連続実行して安定PASSを確認。
+既存の全P2P-RPL/AODV-RPLテスト(H=0対称・非対称、H=1対称)は
+無変更でPASS — S=0時に上り経路構築のゲートを撤廃した変更が、
+既存のH=0非対称シナリオの挙動(§6.2.4のS bit伝播ロジック自体は
+無変更)に影響していないことの裏付け。

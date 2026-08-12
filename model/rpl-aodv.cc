@@ -11,20 +11,26 @@
  * rpl-routing-protocol.cc is already some three thousand lines. @see
  * design-constraints.md.
  *
- * Scope: source-routed (H=0) discovery for a single target, symmetric (S=1)
- * or asymmetric (S=0); and, for the symmetric case, Hop-by-hop routes (H=1)
- * as well, sharing RplRoutingProtocol::m_hopByHopRoutes with P2P-RPL's own
- * (RFC 6997, @see rpl-p2p.cc, which needs none of core RPL's own storing
- * mode either). Unlike P2P-RPL's unidirectional, single-DODAG H=1, AODV-RPL's
- * is bidirectional (RFC 6550 section 5.1's Local RPLInstanceID 'D' flag: set
- * for the upward route, clear for the downward one), which is what
- * HandleAodvRreq()'s own upward entry and HandleAodvRrep()'s own downward
- * one each account for. Asymmetric (S=0) H=1 stays out of scope for now --
- * it additionally keys its downward route entry by the RREQ-Instance while
- * the packet physically travels the separate RREP-Instance's own topology, a
- * genuine complication P2P-RPL's own H=1 does not have -- so
- * HandleAodvRrepInstance() and StartAodvRrepInstance() are untouched by any
- * of this. @see design-constraints.md.
+ * Scope: source-routed (H=0) and Hop-by-hop (H=1) discovery for a single
+ * target, both symmetric (S=1) and asymmetric (S=0). H=1 shares
+ * RplRoutingProtocol::m_hopByHopRoutes with P2P-RPL's own (RFC 6997, @see
+ * rpl-p2p.cc, which needs none of core RPL's own storing mode either).
+ * Unlike P2P-RPL's unidirectional, single-DODAG H=1, AODV-RPL's is
+ * bidirectional (RFC 6550 section 5.1's Local RPLInstanceID 'D' flag: set
+ * for the upward route, clear for the downward one). The upward route entry
+ * (RFC 9854 section 6.2.3) is built the same way regardless of S --
+ * HandleAodvRreq() -- since the RFC's own upward-route step has no S bit
+ * qualifier at all, only section 6.2.4's choice of which reply mechanism to
+ * use does. The downward route entry (section 6.4.3) differs by S: a
+ * symmetric route's RREP-DIO is unicast hop-by-hop, so the sender is
+ * already the next hop by construction (HandleAodvRrep()); an asymmetric
+ * one floods a separate RREP-Instance DODAG rooted at TargNode, so the next
+ * hop instead has to be that DODAG's own preferred parent
+ * (HandleAodvRrepInstance()) -- both keep the entry's own RPLInstanceID as
+ * the RREQ-InstanceID regardless of which DODAG built it, which is what
+ * lets HasHopByHopRoute()'s rank-check bypass work for both without ever
+ * comparing the RREQ-Instance's and RREP-Instance's unrelated Rank
+ * hierarchies. @see design-constraints.md.
  */
 
 #include "rpl-conf.h"
@@ -265,20 +271,6 @@ RplRoutingProtocol::ShouldRefuseAodvRreq(const RplDioHeader& dio, Ipv6Address fr
         return true;
     }
 
-    // The asymmetric case (S=0) additionally needs the RREP-Instance's own
-    // downward entry keyed by the RREQ-Instance (RFC 9854 section 6.4.3), a
-    // genuine complication P2P-RPL's unidirectional H=1 does not have --
-    // not yet implemented, so refused here for now; @see
-    // design-constraints.md. The symmetric case (S=1, Increment A's scope)
-    // has no such complication: OrigNode and TargNode each need only their
-    // own next hop, exactly like P2P-RPL's H=1 already working.
-    if (rreq.hopByHop && !rreq.symmetric)
-    {
-        NS_LOG_LOGIC("Refusing an asymmetric RREQ asking for a hop-by-hop route (H=1), not yet "
-                     "implemented");
-        return true;
-    }
-
     // No Compr check here: RplDioHeader::Deserialize() already reconstructs
     // full addresses from whatever Compr the sender used (RFC 9854 section
     // 4.1's "elided octets are shared with the IPv6 address in the
@@ -390,11 +382,6 @@ RplRoutingProtocol::ShouldRefuseAodvRrep(const RplDioHeader& dio, Ipv6Address fr
     }
 
     const RplDioHeader::RrepOption& rrep = dio.GetRrep();
-    if (rrep.hopByHop)
-    {
-        NS_LOG_LOGIC("Refusing an RREP asking for hop-by-hop routing");
-        return true;
-    }
 
     // RFC 9854 section 6.4.1: "An intermediate router MUST discard an RREP
     // if one of its addresses is present in the Address Vector". On an
@@ -854,6 +841,12 @@ RplRoutingProtocol::StartAodvRrepInstance(const DodagMembership& rreqDodag, Doda
     rrepDodag.aodv.target = ownAddress; // the TargNode is this node
     rrepDodag.aodv.isOrigin = false;
     rrepDodag.aodv.isTarget = true;
+    // Carried over from the RREQ-Instance: SendDio() re-emits this on every
+    // RREP-DIO transmission the same way it does for the RREQ side, and
+    // HandleAodvRrepInstance() reads it to decide whether to build an H=0
+    // AodvRoute (from the flooded Address Vector) or an H=1 downward
+    // HopByHopRoute (from the preferred parent) once the flood completes.
+    rrepDodag.aodv.hopByHop = rreqDodag.aodv.hopByHop;
     // Empty at the root: section 6.4.4 has only the routers the RREP passes
     // through append to it, the mirror of the RREQ's own rule.
     rrepDodag.aodv.addressVector.clear();
@@ -1174,10 +1167,18 @@ RplRoutingProtocol::HandleAodvRrepInstance(const RplDioHeader& dio,
         return;
     }
 
+    uint8_t pairedInstanceId = static_cast<uint8_t>(dio.GetInstanceId() - rrep.delta);
+
     // First arrival: record what this instance is. Re-recorded on a later,
     // better copy the same way HandleAodvRreq() does, which is what keeps
-    // the Address Vector in step with the preferred parent.
-    if (!dodag.aodv.addressVector.empty() && from != dodag.preferredParent)
+    // the Address Vector in step with the preferred parent. H=1 keeps no
+    // Address Vector to read this from (@see below), so the equivalent
+    // "already processed at least one copy" signal is instead whether this
+    // router has already recorded a downward Hop-by-hop Route for this
+    // exact RREP-Instance's own TargNode.
+    bool alreadyProcessed = rrep.hopByHop ? HasHopByHopRoute(pairedInstanceId, key.dodagId)
+                                          : !dodag.aodv.addressVector.empty();
+    if (alreadyProcessed && from != dodag.preferredParent)
     {
         NS_LOG_LOGIC("Already in RREP-Instance " << +key.instanceId
                                                   << " via a better parent than " << from
@@ -1186,14 +1187,66 @@ RplRoutingProtocol::HandleAodvRrepInstance(const RplDioHeader& dio,
     }
 
     dodag.aodv.isRrepInstance = true;
-    dodag.aodv.pairedInstanceId = static_cast<uint8_t>(dio.GetInstanceId() - rrep.delta);
+    dodag.aodv.pairedInstanceId = pairedInstanceId;
     dodag.aodv.origNode = dio.GetArt().target;
     dodag.aodv.origSeqNo = dio.GetArt().destSeqNo;
     dodag.aodv.rankLimit = rrep.rankLimit;
     dodag.aodv.lifetimeField = rrep.lifetime;
+    dodag.aodv.hopByHop = rrep.hopByHop; // SendDio() re-emits this, propagating H onward
     dodag.aodv.target = key.dodagId; // an RREP-Instance is rooted at the TargNode
     dodag.aodv.isTarget = false;
     dodag.aodv.isOrigin = IsOwnAddress(dodag.aodv.origNode);
+
+    if (rrep.hopByHop)
+    {
+        // RFC 9854 section 6.4.3: "For an asymmetric route, the Next Hop is
+        // the preferred parent in the DODAG of RREP-Instance" -- not from,
+        // unlike the symmetric case's HandleAodvRrep(): the RREP-Instance
+        // is flooded rather than unicast hop-by-hop, so from is merely
+        // whichever copy is being processed right now, while
+        // dodag.preferredParent is the one SelectPreferredParent() (run by
+        // HandleDio() immediately before this function, on every DIO) has
+        // already resolved to the best Rank seen so far. The RPLInstanceID
+        // is the RREQ-InstanceID (pairedInstanceId) regardless of which
+        // DODAG -- RREQ-Instance or RREP-Instance -- established the entry
+        // (sections 6.2.3 and 6.4.3 agree on this), which is exactly what
+        // lets HasHopByHopRoute()'s bypass work here despite the
+        // RREP-Instance's own Rank hierarchy being unrelated to the
+        // RREQ-Instance's (@see design-constraints.md for why the Rank
+        // mismatch this was once thought to block on does not matter to a
+        // bypass that never compares Ranks at all).
+        if (!StoreHopByHopRoute(pairedInstanceId,
+                               dodag.aodv.origNode,
+                               key.dodagId,
+                               dodag.preferredParent,
+                               Seconds(m_pathLifetime * m_lifetimeUnit),
+                               true,
+                               dodag.aodv.origSeqNo))
+        {
+            NS_LOG_LOGIC("Discarding an RREP-Instance DIO establishing a Hop-by-hop Route that "
+                        "conflicts with or is staler than one already held for "
+                        << key.dodagId);
+            return;
+        }
+
+        ArmAodvExpiry(dodag, key);
+
+        if (dodag.aodv.isOrigin)
+        {
+            NS_LOG_INFO("Asymmetric Hop-by-hop Route discovery to "
+                        << key.dodagId << " completed, next hop " << dodag.preferredParent);
+        }
+        else
+        {
+            NS_LOG_INFO("Joined RREP-Instance " << +key.instanceId << " at " << key.dodagId
+                                                << " heading for OrigNode " << dodag.aodv.origNode);
+        }
+        // Nothing else transmits here: this membership's own Trickle timer,
+        // reset by HandleDio() when the preferred parent was chosen,
+        // multicasts the RREP-DIO onward with SendDio() filling in the
+        // options -- the same division of labour the H=0 branch below uses.
+        return;
+    }
 
     // Section 6.4.4: "If H=0, the intermediate router MUST include the
     // address of the interface receiving the RREP-DIO into the Address

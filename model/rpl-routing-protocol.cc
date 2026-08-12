@@ -1143,7 +1143,7 @@ RplRoutingProtocol::SendDio(DodagMembership& dodag, Ipv6Address dst, uint32_t in
         // case below is.
         RplDioHeader::RrepOption rrep;
         rrep.gratuitous = false; // section 7's Gratuitous RREP is out of scope
-        rrep.hopByHop = false;   // matching the RREQ's own H bit
+        rrep.hopByHop = dodag.aodv.hopByHop; // matching the RREQ's own H bit
         rrep.lifetime = dodag.aodv.lifetimeField;
         rrep.rankLimit = dodag.aodv.rankLimit;
         // Section 6.3.3: Delta is what the TargNode added to the

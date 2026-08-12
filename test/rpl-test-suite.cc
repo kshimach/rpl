@@ -7566,6 +7566,203 @@ RplAodvAsymmetricRouteCompletesTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief An asymmetric AODV-RPL Hop-by-hop Route (H=1) discovery completes,
+ *        using the RREP-Instance's own preferred parent as the downward next
+ *        hop, and carries data ("Increment B").
+ *
+ * The H=1 analogue of RplAodvAsymmetricRouteCompletesTestCase, on the same
+ * four-node line with AodvForceAsymmetric set the same way (every node but
+ * the OrigNode). RFC 9854 section 6.4.3: "For an asymmetric route, the Next
+ * Hop [of the downward route entry] is the preferred parent in the DODAG of
+ * RREP-Instance" -- unlike the symmetric case, where the RREP-DIO is
+ * unicast hop-by-hop so the sender (from) already is the next hop by
+ * construction, the RREP-Instance is a flooded DODAG, so what matters is
+ * dodag.preferredParent as SelectPreferredParent() has resolved it, not
+ * whichever copy HandleAodvRrepInstance() happens to be processing. Getting
+ * that backwards is exactly the kind of thing that looks plausible in the
+ * stored state but delivers nothing, which is why this checks a datagram
+ * actually arriving, not just the recorded next hops.
+ *
+ * Also confirms the upward route toward OrigNode still forms at every hop
+ * despite the S bit clearing partway through the discovery: RFC 9854
+ * section 6.2.3's own upward-route-building step has no S bit qualifier at
+ * all, unlike section 6.2.4's choice of which kind of reply to generate --
+ * this module used to (incorrectly) refuse H=1 outright once S cleared,
+ * fixed as part of enabling this increment.
+ */
+class RplAodvAsymmetricHopByHopRouteCompletesTestCase : public TestCase
+{
+  public:
+    RplAodvAsymmetricHopByHopRouteCompletesTestCase();
+
+  private:
+    void DoRun() override;
+
+    /// @brief Count a datagram delivered at the TargNode.
+    /// @param socket the receiving socket
+    void CountDelivery(Ptr<Socket> socket);
+
+    uint32_t m_delivered{0}; //!< datagrams that reached the TargNode
+};
+
+RplAodvAsymmetricHopByHopRouteCompletesTestCase::RplAodvAsymmetricHopByHopRouteCompletesTestCase()
+    : TestCase("An asymmetric AODV-RPL Hop-by-hop Route (H=1) uses the preferred parent and "
+               "carries data")
+{
+}
+
+void
+RplAodvAsymmetricHopByHopRouteCompletesTestCase::CountDelivery(Ptr<Socket> socket)
+{
+    Ptr<Packet> packet = socket->Recv();
+    while (packet)
+    {
+        m_delivered++;
+        packet = socket->Recv();
+    }
+}
+
+void
+RplAodvAsymmetricHopByHopRouteCompletesTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(4); // 0 = OrigNode and base root, 1 and 2 = relays, 3 = TargNode
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    auto blacklist = [&](uint32_t a, uint32_t b) {
+        Ptr<SimpleNetDevice> devA = DynamicCast<SimpleNetDevice>(devices.Get(a));
+        Ptr<SimpleNetDevice> devB = DynamicCast<SimpleNetDevice>(devices.Get(b));
+        channel->BlackList(devA, devB);
+        channel->BlackList(devB, devA);
+    };
+    blacklist(0, 2);
+    blacklist(0, 3);
+    blacklist(1, 3);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(250));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> orig = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> relay1 = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> relay2 = nodes.Get(2)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> targ = nodes.Get(3)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(targ->IsJoined(), true, "The base DODAG did not reach the far end");
+
+    for (uint32_t i = 1; i < nodes.GetN(); i++)
+    {
+        nodes.Get(i)->GetObject<RplRoutingProtocol>()->SetAttribute("AodvForceAsymmetric",
+                                                                    BooleanValue(true));
+    }
+
+    Ipv6Address origAddress = orig->GetGlobalAddress();
+    Ipv6Address targAddress = targ->GetGlobalAddress();
+    Ipv6Address origLinkLocal =
+        nodes.Get(0)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address relay1LinkLocal =
+        nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address relay2LinkLocal =
+        nodes.Get(2)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address targLinkLocal =
+        nodes.Get(3)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    RplRoutingProtocol::DodagKey rreqKey = orig->DiscoverRoute(targAddress, true);
+    NS_TEST_ASSERT_MSG_NE(rreqKey.dodagId, Ipv6Address::GetAny(), "The discovery did not start");
+
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    // No H=0 route recorded anywhere.
+    NS_TEST_ASSERT_MSG_EQ(orig->GetAodvRouteCount(), 0, "A source-routed route was recorded");
+
+    // The downward route toward TargNode, from each router's own preferred
+    // parent in the RREP-Instance -- link-local, the same reason the
+    // symmetric case's own upward/downward entries are (@see
+    // RplAodvHopByHopRouteCompletesTestCase, no Address Vector to draw a
+    // global address from).
+    Ipv6Address nextHop;
+    uint8_t hopInstanceId = 0;
+    NS_TEST_ASSERT_MSG_EQ(orig->GetHopByHopRoute(targAddress, nextHop, hopInstanceId),
+                          true,
+                          "OrigNode never recorded a downward Hop-by-hop Route");
+    NS_TEST_ASSERT_MSG_EQ(nextHop, relay1LinkLocal, "OrigNode's own downward next hop is wrong");
+    NS_TEST_ASSERT_MSG_EQ(hopInstanceId,
+                          rreqKey.instanceId,
+                          "The stored instanceId should be the RREQ-InstanceID, not the "
+                          "RREP-Instance's own");
+
+    NS_TEST_ASSERT_MSG_EQ(relay1->GetHopByHopRoute(targAddress, nextHop, hopInstanceId),
+                          true,
+                          "relay1 never recorded a downward Hop-by-hop Route");
+    NS_TEST_ASSERT_MSG_EQ(nextHop, relay2LinkLocal, "relay1's own downward next hop is wrong");
+
+    NS_TEST_ASSERT_MSG_EQ(relay2->GetHopByHopRoute(targAddress, nextHop, hopInstanceId),
+                          true,
+                          "relay2 never recorded a downward Hop-by-hop Route");
+    NS_TEST_ASSERT_MSG_EQ(nextHop, targLinkLocal, "relay2's own downward next hop is wrong");
+
+    // The upward route toward OrigNode still forms at every hop, despite S
+    // clearing partway through -- section 6.2.3 is unconditional on S.
+    NS_TEST_ASSERT_MSG_EQ(relay1->GetHopByHopRoute(origAddress, nextHop, hopInstanceId),
+                          true,
+                          "relay1 never recorded an upward Hop-by-hop Route");
+    NS_TEST_ASSERT_MSG_EQ(nextHop, origLinkLocal, "relay1's own upward next hop is wrong");
+    NS_TEST_ASSERT_MSG_EQ(relay2->GetHopByHopRoute(origAddress, nextHop, hopInstanceId),
+                          true,
+                          "relay2 never recorded an upward Hop-by-hop Route");
+    NS_TEST_ASSERT_MSG_EQ(nextHop, relay1LinkLocal, "relay2's own upward next hop is wrong");
+    NS_TEST_ASSERT_MSG_EQ(targ->GetHopByHopRoute(origAddress, nextHop, hopInstanceId),
+                          true,
+                          "targ never recorded an upward Hop-by-hop Route");
+    NS_TEST_ASSERT_MSG_EQ(nextHop, relay2LinkLocal, "targ's own upward next hop is wrong");
+
+    // And it works: a datagram sent to the TargNode has to traverse both
+    // relays via their own independent next-hop lookups, not a Routing
+    // Header (none was ever attached).
+    uint16_t port = 4250;
+    Ptr<Socket> receiver = Socket::CreateSocket(nodes.Get(3), UdpSocketFactory::GetTypeId());
+    receiver->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), port));
+    receiver->SetRecvCallback(
+        MakeCallback(&RplAodvAsymmetricHopByHopRouteCompletesTestCase::CountDelivery, this));
+
+    Ptr<Socket> sender = Socket::CreateSocket(nodes.Get(0), UdpSocketFactory::GetTypeId());
+    sender->Connect(Inet6SocketAddress(targAddress, port));
+    sender->Send(Create<Packet>(64));
+
+    Simulator::Stop(Seconds(2));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(m_delivered,
+                          1,
+                          "The datagram never reached the TargNode over the asymmetric "
+                          "Hop-by-hop Route");
+
+    receiver->Close();
+    sender->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief An AODV-RPL discovery completes end to end: the RREP comes back
  *        along the Address Vector and the route it delivers carries data.
  *
@@ -16355,6 +16552,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplAodvAsymmetricRrepInstanceTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvAsymmetricRrepFloodTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvAsymmetricRouteCompletesTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplAodvAsymmetricHopByHopRouteCompletesTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRrepCompletesTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvHopByHopRouteCompletesTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvHopByHopRouteDirectNeighbourTestCase, TestCase::Duration::QUICK);
