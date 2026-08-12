@@ -181,6 +181,19 @@ RplRoutingProtocol::MatchesP2pTarget(const RplDioHeader& dio) const
 }
 
 bool
+RplRoutingProtocol::HasOtherP2pTargets(const DodagMembership& dodag) const
+{
+    for (const auto& target : dodag.p2p.additionalTargets)
+    {
+        if (!IsOwnAddress(target))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool
 RplRoutingProtocol::ShouldRefuseP2pRdo(const RplDioHeader& dio, Ipv6Address from) const
 {
     DodagKey key{dio.GetInstanceId(), dio.GetDodagId()};
@@ -307,14 +320,15 @@ RplRoutingProtocol::HandleP2pRdo(const RplDioHeader& dio, Ipv6Address from, uint
     // @see MatchesP2pTarget()) remain undiscovered, in which case RFC 6997
     // section 9.5 has it continue "as an Intermediate Router would": still
     // accumulating and re-advertising the Address Vector below, for
-    // whichever other Target(s) are further along. additionalTargets is
-    // last known from whenever this node most recently processed a DIO for
-    // this temporary DAG (rebuilt fresh below, the same "state from the
-    // last DIO" contract addressVector already has), so an empty one here
-    // means either this is the single-Target case HandleAodvRreq()'s own
-    // isTarget repeat check mirrors, or every other Target this node once
-    // knew about is gone from the DIOs it has heard since.
-    if (dodag.p2p.isTarget && dodag.p2p.additionalTargets.empty())
+    // whichever other Target(s) are further along. HasOtherP2pTargets()
+    // reads additionalTargets as last known from whenever this node most
+    // recently processed a DIO for this temporary DAG (rebuilt fresh below,
+    // the same "state from the last DIO" contract addressVector already
+    // has), so false here means either this is the single-Target case
+    // HandleAodvRreq()'s own isTarget repeat check mirrors, or every other
+    // Target this node once knew about is gone from the DIOs it has heard
+    // since -- either way, nothing left to relay onward for.
+    if (dodag.p2p.isTarget && !HasOtherP2pTargets(dodag))
     {
         NS_LOG_LOGIC("Already the Target of temporary DAG " << +key.instanceId
                                                              << ", ignoring a repeat");
@@ -462,8 +476,12 @@ RplRoutingProtocol::SendP2pDro(DodagMembership& dodag, DodagKey key)
     // already selected the desired number of routes". The second half is
     // always true in this implementation's scope (N=0 meaning exactly one
     // route), so this reduces to "no other Targets are named" --
-    // additionalTargets being empty, section 9.3's own condition for it.
-    dro.SetStop(dodag.p2p.additionalTargets.empty());
+    // HasOtherP2pTargets() being false, the more permissive reading of
+    // section 9.3's own condition for it (@see its own doc comment and
+    // design-constraints.md for why a plain additionalTargets.empty()
+    // check is not enough: this node's own matched entry, when matched
+    // only via an RPL Target option, is never filtered out of that list).
+    dro.SetStop(!HasOtherP2pTargets(dodag));
     dro.SetAckRequested(m_p2pDroAckRequested);
     dro.SetSequence(dodag.p2p.droSequence);
     // "the router recognizes itself as the Origin" by matching the P2P-DRO's

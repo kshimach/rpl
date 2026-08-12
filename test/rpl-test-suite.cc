@@ -9769,6 +9769,199 @@ RplP2pMultiTargetRelayTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief A Target matched only through an RPL Target option, with no other
+ *        Target left outstanding, sets the Stop flag and treats a repeat
+ *        DIO as the ordinary single-Target repeat case does.
+ *
+ * design-constraints.md sections 41.3/45: RFC 6997 section 9.5's own Stop-
+ * eligibility wording ("a unicast address of the router as the TargetAddr
+ * inside the P2P-RDO with no additional Targets specified via RPL Target
+ * options") and its "MUST NOT forward...if no other Targets are to be
+ * discovered" condition are both worded around the primary-TargetAddr
+ * case; read completely literally, neither could ever be satisfied for a
+ * Target matched only via a Target option, since additionalTargets never
+ * filters out this node's own matched entry (RplP2pMultiTargetTestCase's
+ * own scenario, but that one always keeps a second, genuinely different
+ * Target option outstanding, so it never exercises this specific edge).
+ * HasOtherP2pTargets() is the more permissive reading this module settles
+ * on instead: "is there a Target *other than me* still outstanding".
+ *
+ * Same two-node, one-way-blacklisted construction as
+ * RplP2pMultiTargetTestCase, but with a single RPL Target option naming
+ * only this node, and the same DIO delivered twice to also confirm the
+ * repeat guard now short-circuits (rather than reprocessing indefinitely
+ * for as long as the membership exists, the way it did before this
+ * change, @see design-constraints.md section 41.2's droSequence overflow).
+ */
+class RplP2pSoleTargetViaOptionStopsTestCase : public TestCase
+{
+  public:
+    RplP2pSoleTargetViaOptionStopsTestCase();
+
+  private:
+    void DoRun() override;
+
+    /// @brief Count a P2P-DRO seen at the monitor, capturing the first.
+    /// @param socket the monitoring socket
+    void CaptureDro(Ptr<Socket> socket);
+
+    uint32_t m_droCount{0};     //!< P2P-DROs seen at the monitor
+    RplP2pDroHeader m_captured; //!< the first one seen
+};
+
+RplP2pSoleTargetViaOptionStopsTestCase::RplP2pSoleTargetViaOptionStopsTestCase()
+    : TestCase("A Target matched only via an RPL Target option, with none other outstanding, "
+               "sets Stop and treats a repeat as already-answered")
+{
+}
+
+void
+RplP2pSoleTargetViaOptionStopsTestCase::CaptureDro(Ptr<Socket> socket)
+{
+    Address sender;
+    Ptr<Packet> packet = socket->RecvFrom(sender);
+    if (!packet)
+    {
+        return;
+    }
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ipv6Header);
+    Icmpv6Header icmpv6Header;
+    packet->RemoveHeader(icmpv6Header);
+    if (icmpv6Header.GetType() != ICMPV6_RPL || icmpv6Header.GetCode() != RPL_CODE_P2P_DRO)
+    {
+        return;
+    }
+    if (m_droCount == 0)
+    {
+        packet->RemoveHeader(m_captured);
+    }
+    m_droCount++;
+}
+
+void
+RplP2pSoleTargetViaOptionStopsTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.AssignWithoutAddress(devices);
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    Ptr<Node> node = nodes.Get(1);
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoined(), true, "The base DODAG did not reach node 1");
+
+    Ptr<SimpleNetDevice> dev0 = DynamicCast<SimpleNetDevice>(devices.Get(0));
+    Ptr<SimpleNetDevice> dev1 = DynamicCast<SimpleNetDevice>(devices.Get(1));
+    channel->BlackList(dev0, dev1);
+
+    Ptr<Socket> monitor = Socket::CreateSocket(nodes.Get(0), Ipv6RawSocketFactory::GetTypeId());
+    monitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    monitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    monitor->BindToNetDevice(nodes.Get(0)->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+    monitor->SetRecvCallback(
+        MakeCallback(&RplP2pSoleTargetViaOptionStopsTestCase::CaptureDro, this));
+
+    Ipv6Address origin("2001:9::1");         // no real node owns this address
+    Ipv6Address primaryTarget("2001:9::99"); // unrelated to node 1
+    Ipv6Address neighbour("fe80::a");
+    static constexpr uint8_t INSTANCE = 0x81;
+
+    RplDioHeader dio;
+    dio.SetInstanceId(INSTANCE);
+    dio.SetVersionNumber(0);
+    dio.SetRank(RPL_MIN_HOPRANKINC);
+    dio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+    dio.SetGrounded(true);
+    dio.SetDodagId(origin);
+    dio.SetDtsn(0);
+    dio.SetDagConfiguration(4,
+                            6,
+                            0,
+                            0,
+                            RPL_MIN_HOPRANKINC,
+                            RPL_OCP_OF0,
+                            RPL_DEFAULT_LIFETIME,
+                            RPL_DEFAULT_LIFETIME_UNIT);
+    P2pRdoOption rdo;
+    rdo.reply = true;
+    rdo.hopByHop = false;
+    rdo.numRoutes = 0;
+    rdo.lifetime = 2;
+    rdo.maxRankOrNh = 3;
+    rdo.target = primaryTarget; // not node 1 -- only the Target option below is
+    rdo.addressVector = {};
+    dio.SetP2pRdo(rdo);
+
+    RplDioHeader::TargetOption ownTarget;
+    ownTarget.target = rpl->GetGlobalAddress();
+    dio.AddTarget(ownTarget); // the only Target option: nothing else outstanding
+
+    DeliverRawRplMessage<RplDioHeader>(node,
+                                       1,
+                                       dio,
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       neighbour,
+                                       Ipv6Address(RPL_ALL_NODES_MULTICAST));
+
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsP2pTarget(INSTANCE, origin),
+                          true,
+                          "The node did not recognise itself as a Target via the RPL Target "
+                          "option");
+
+    // SendP2pDro()'s multicast is scheduled onto the channel, not delivered
+    // synchronously (@see RplP2pDroAckWrongSequenceTestCase's own comment).
+    Simulator::Stop(MilliSeconds(10));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(m_droCount, 1, "No P2P-DRO was ever sent");
+    NS_TEST_ASSERT_MSG_EQ(m_captured.GetStop(),
+                          true,
+                          "'S' should have been set: this node is the only Target outstanding, "
+                          "even though it was named only via an RPL Target option rather than "
+                          "the P2P-RDO's own primary TargetAddr");
+
+    // The same DIO again: RFC 6997 section 9.5's "MUST NOT forward...if no
+    // other Targets are to be discovered" should now bite the same way it
+    // already does for a Target named via the primary TargetAddr, so this
+    // must be silently ignored as an already-answered repeat, not
+    // reprocessed into a second P2P-DRO.
+    DeliverRawRplMessage<RplDioHeader>(node,
+                                       1,
+                                       dio,
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       neighbour,
+                                       Ipv6Address(RPL_ALL_NODES_MULTICAST));
+    Simulator::Stop(MilliSeconds(10));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(m_droCount,
+                          1,
+                          "A repeat DIO for the same sole Target-option match produced a second "
+                          "P2P-DRO: the repeat guard should have short-circuited it");
+
+    monitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief A P2P-DRO-ACK for the wrong sequence is ignored, not mistaken for
  *        the one actually outstanding.
  *
@@ -14802,6 +14995,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplP2pDroRetryTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pMultiTargetTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pMultiTargetRelayTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pSoleTargetViaOptionStopsTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pDroAckWrongSequenceTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pRouteCompletesTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pDroRelayTestCase, TestCase::Duration::QUICK);

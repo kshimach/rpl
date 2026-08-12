@@ -915,8 +915,10 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
             /// already has -- RFC 6997 has no rule removing an entry once
             /// it matches this router (unlike AODV-RPL's ART, @see
             /// design-constraints.md), so this is always this DIO's raw
-            /// list. Empty is what section 9.5's "no other Targets...
-            /// specified via RPL Target options" checks for.
+            /// list, this node's own matched entry included whenever it
+            /// was matched via a Target option rather than the primary
+            /// TargetAddr above. @see HasOtherP2pTargets() for what
+            /// "nothing else outstanding" actually checks against this.
             std::vector<Ipv6Address> additionalTargets;
             uint8_t maxRank{0};   //!< MaxRank, 0 meaning no limit
             uint8_t lifetimeField{0}; //!< the 'L' field this temporary DAG was opened with
@@ -1153,6 +1155,33 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      * @return true if one of this node's own addresses is named
      */
     bool MatchesP2pTarget(const RplDioHeader& dio) const;
+
+    /**
+     * @brief Whether a temporary DAG's own additionalTargets record still
+     *        names a Target other than this node.
+     *
+     * RFC 6997 section 9.5's Stop-eligibility condition ("this router is
+     * the only Target specified...i.e., the corresponding DIO specified a
+     * unicast address of the router as the TargetAddr inside the P2P-RDO
+     * with no additional Targets specified via RPL Target options") and
+     * its "MUST NOT forward a P2P mode DIO any further" condition are both
+     * worded around the primary-TargetAddr case, and read literally would
+     * never be satisfiable for a Target matched only through an RPL Target
+     * option: additionalTargets carries every RPL Target option this DIO
+     * named, including this node's own matched entry (never filtered out,
+     * @see DodagMembership::P2pState::additionalTargets), so a plain
+     * emptiness check can never be true once this node has matched itself
+     * that way. This is the more permissive reading design-constraints.md
+     * settles on: "is there a Target other than me still outstanding",
+     * which reduces to the literal reading whenever this node's own
+     * address is not among the entries at all (the original, common case
+     * of a single Target named via the primary TargetAddr, where
+     * additionalTargets is simply empty either way).
+     *
+     * @param dodag the temporary DAG membership to check
+     * @return true if additionalTargets names a Target other than this node
+     */
+    bool HasOtherP2pTargets(const DodagMembership& dodag) const;
 
     /**
      * @brief Act on an RREP-DIO travelling back towards the OrigNode.

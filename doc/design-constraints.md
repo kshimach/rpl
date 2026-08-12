@@ -5204,3 +5204,78 @@ doc commentから「rule 2/3/4の区別が未実装なので0のままにして�
 安定PASSを確認。既定値変更後も既存テスト全件が無変更でPASSすることを
 確認済み — 事前の懸念(既定値を実際に1以上へ上げた場合の副作用が
 未検証だった、§39.2参照)が解消されたことも同時に裏付けられた。
+
+## 45. §41.3で記録したRFC 6997 §9.5 Stop適格条件の文言上の限界を解消
+
+ユーザーから提示された残り2候補(本節、AODV-RPL H=1対応)のうち、
+本節に着手した。§41.3で意図的に未解決のまま記録した限界: RFC 6997
+§9.5のStopフラグ適格条件 ("this router is the only Target
+specified...i.e., the corresponding DIO specified a unicast address of
+the router as the TargetAddr **inside the P2P-RDO** with no additional
+Targets specified via RPL Target options") と、同じ§9.5の「他に
+発見すべきTargetが無ければP2P mode DIOを転送してはならない」条件は、
+どちらも文言上**Primary TargetAddr経由で一致した場合**を前提にして
+おり、RPL Target optionのみで一致したTargetについては文字通り読むと
+決して満たせない — `additionalTargets`は自分の一致分を除外しない
+生のリストのままなので(既存の設計、AODV-RPLの必須ART自己削除との
+明確な違い)、自分がそこに載っている限り空にはならない。
+
+### 45.1 採用した解釈と実装
+
+§41.3が候補として挙げていた、より寛容な解釈 (「additionalTargetsから
+自分自身の一致分を除外したリストが空か」) を採用した。新規private
+ヘルパー`HasOtherP2pTargets(const DodagMembership& dodag) const`
+(`model/rpl-p2p.cc`、宣言は`model/rpl-routing-protocol.h`) を追加し、
+`additionalTargets`を舐めて自分以外のエントリが1件でもあるかを返す。
+既存のPrimary TargetAddr経由のみの単純ケース (`additionalTargets`が
+そもそも空) では`HasOtherP2pTargets()`は常にfalseを返し、従来の
+`additionalTargets.empty()`と完全に同じ結果になる — つまりこの変更は
+「RPL Target optionのみで一致した」エッジケースだけに作用し、既存の
+挙動を変えない。2箇所を置き換えた:
+
+1. `HandleP2pRdo()`の repeat ガード:
+   `if (dodag.p2p.isTarget && dodag.p2p.additionalTargets.empty())` を
+   `if (dodag.p2p.isTarget && !HasOtherP2pTargets(dodag))` に。
+2. `SendP2pDro()`のStopフラグ計算:
+   `dro.SetStop(dodag.p2p.additionalTargets.empty())` を
+   `dro.SetStop(!HasOtherP2pTargets(dodag))` に。
+
+副次効果として、§41.2で見つけたdroSequence溢れ(2ビットフィールドへの
+オーバーフロー)の**根本原因そのもの**を解消した: あの節の原因は
+「RPL Target optionのみで一致した単独Targetのrepeatガードが決して
+真にならず、DIOが再処理されるたびにdroSequence++が走り続ける」
+ことだった。本節の修正でrepeatガードが正しく短絡するようになった
+ため、この特定のケース(単独TargetがTarget option経由でのみ一致)では
+droSequence++がそもそも複数回走らなくなる。ただし本当に複数の
+Targetが残っている(§42/§43のAODV-RPL側とは異なりP2P-RPL自体は
+自己削除規定を持たないため、他のTargetが残っている限りrepeat
+ガードは正しく開いたまま)場合は引き続きdroSequence++が繰り返し
+走りうるので、2ビット境界でのマスクラップ自体は削除せず維持している
+(そちらのケースでは今も load-bearing)。
+
+### 45.2 新規テスト: `RplP2pSoleTargetViaOptionStopsTestCase`
+
+`RplP2pMultiTargetTestCase`と同じ2ノード・片方向blacklist構成だが、
+RPL Target optionを自分の1件だけにした (`RplP2pMultiTargetTestCase`
+は常にもう1件の本物の別Targetを残しているため、この特定のエッジ
+ケースを踏んでいなかった)。検証項目:
+
+- `IsP2pTarget()`がtrueになること(既存動作、回帰確認)。
+- 送信されたP2P-DROの`GetStop()`が**true**になること(本節の変更
+  対象そのもの)。
+- 同じDIOを2回目に届けても、2件目のP2P-DROが送信されないこと
+  (repeatガードが正しく短絡することの確認 — §41.2のdroSequence
+  溢れシナリオが実際に解消されたことの間接的な裏付けでもある)。
+
+`HasOtherP2pTargets()`を一時的に旧来の`additionalTargets.empty()`と
+同じ結果を返すよう書き換え、このテストが単独でFAILすることを確認
+(load-bearing検証)、元に戻して再度PASSすることを確認した。
+
+### 45.3 検証
+
+`./ns3 build`clean(rplモジュール・プロジェクト全体とも)、
+`test-runner --suite=rpl`・`test.py -s rpl`を複数回連続実行して
+安定PASSを確認。既存の`RplP2pMultiTargetTestCase`
+(Primary TargetAddr経由の別Targetが本当に残っているケース) を含む
+全既存テストが無変更でPASS — この変更がエッジケース以外の挙動を
+変えていないことの直接的な裏付け。
