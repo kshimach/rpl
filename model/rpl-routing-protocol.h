@@ -536,11 +536,15 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      * stale.
      *
      * @param target the address to find a route to
+     * @param hopByHop RFC 9854 section 4.1's 'H' bit: false (the default)
+     *        for a Source Route (H=0), true for a Hop-by-hop Route (H=1) --
+     *        @see design-constraints.md for the tradeoff, and
+     *        DiscoverP2pRoute()'s own matching parameter
      * @return the key of the RREQ-Instance, or a key whose dodagId is any()
      *         if the discovery could not be started (no global address to
      *         root it at, or no Local RPLInstanceID left to allocate)
      */
-    DodagKey DiscoverRoute(Ipv6Address target);
+    DodagKey DiscoverRoute(Ipv6Address target, bool hopByHop = false);
 
     /**
      * @brief Get the Address Vector an RREQ-Instance has accumulated.
@@ -864,6 +868,12 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
             uint8_t origSeqNo{0};
             uint8_t rankLimit{0}; //!< RankLimit, 0 meaning no limit
             uint8_t lifetimeField{0}; //!< the 'L' field this instance was opened with
+            /// RFC 9854 section 4.1's 'H' bit: false for a Source Route
+            /// (H=0), true for a Hop-by-hop Route (H=1) -- @see
+            /// design-constraints.md, and P2pState::hopByHop's matching
+            /// field. Increment A's scope: symmetric discoveries only, @see
+            /// isRrepInstance's own doc comment.
+            bool hopByHop{false};
             Ipv6Address target;   //!< the first ART target ever seen for this instance; logging/RREP-Instance use only, @see targets below
 
             /// Every ART target this router still has to relay onward for
@@ -1474,38 +1484,58 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
 
     /**
      * @brief Establish or refresh a Hop-by-hop Route (H=1), rejecting a
-     *        conflicting one.
+     *        conflicting or stale one.
      *
-     * RFC 6997 section 9.6 (RFC 9854 sections 6.2.3/6.4.3 for the AODV-RPL
-     * analogue): "If the router already maintains a Hop-by-hop state
-     * listing the Target as the destination and carrying the same
-     * RPLInstanceID and DODAGID fields as the received P2P-DRO, and the
-     * next-hop information in the state does not match the next hop
-     * indicated in the received P2P-DRO, the router MUST discard the
-     * P2P-DRO message with no further processing" -- section 9.6 goes on
-     * to name the two ways this can happen (a previously undetected loop in
-     * the route being established, or an existing, still-live route to the
-     * same destination that partially overlaps this one), either of which
-     * makes this route unsafe to establish or relay further. A route under
-     * a different Instance (or DODAGID) to the same destination is a
-     * different, unrelated route, not a conflict, and is simply replaced
-     * (the same "last one wins" rule FindP2pRoute()'s own m_p2pRoutes
-     * already applies).
+     * P2P-RPL (RFC 6997 section 9.6, no @p seqNo of its own) and AODV-RPL
+     * (RFC 9854 sections 6.2.1/6.2.3/6.4.3) validate a would-be update
+     * against whatever the router already holds differently, so this
+     * function runs one of two mutually exclusive checks depending on
+     * whether @p hasSeqNo is set:
+     *
+     * - Without a sequence number (P2P-RPL): "If the router already
+     *   maintains a Hop-by-hop state listing the Target as the destination
+     *   and carrying the same RPLInstanceID and DODAGID fields as the
+     *   received P2P-DRO, and the next-hop information in the state does
+     *   not match the next hop indicated in the received P2P-DRO, the
+     *   router MUST discard the P2P-DRO message with no further
+     *   processing" (section 9.6) -- a previously undetected loop, or an
+     *   existing, still-live route that partially overlaps this one.
+     * - With a sequence number (AODV-RPL): "the router MUST drop the RREQ
+     *   message if the Orig SeqNo field of the RREQ is older than the
+     *   SeqNo value that X has stored for a route to OrigNode" (section
+     *   6.2.1), read together with section 6.2.3's "a stale Sequence
+     *   Number (i.e., incoming Sequence Number is less than the currently
+     *   stored Sequence Number of the route entry) MUST be deleted" --
+     *   unlike P2P-RPL's next-hop check, an incoming Sequence Number that
+     *   is newer than or equal to what is already held is accepted and
+     *   overwrites the entry even if the next hop differs, since a fresher
+     *   route is expected to legitimately supersede an older one.
+     *
+     * Either way, a route under a different Instance (or DODAGID) to the
+     * same destination is a different, unrelated route, not a conflict,
+     * and is simply replaced (the same "last one wins" rule
+     * FindP2pRoute()'s own m_p2pRoutes already applies).
      *
      * @param instanceId the RPLInstanceID this route belongs to
      * @param dodagId the OrigNode/Origin this route's Instance belongs to
      * @param destination the destination this route leads to
      * @param nextHop the next hop's address (global)
      * @param lifetime how long this entry stays valid from now
-     * @return false if a conflicting route already existed and this one
-     *         must be discarded outright, true if it was established or
-     *         refreshed
+     * @param hasSeqNo true to validate/store @p seqNo AODV-RPL style
+     *        instead of P2P-RPL's next-hop-conflict check
+     * @param seqNo the Orig SeqNo this update carries, meaningful only
+     *        when @p hasSeqNo is true
+     * @return false if a conflicting or stale route already existed and
+     *         this one must be discarded outright, true if it was
+     *         established or refreshed
      */
     bool StoreHopByHopRoute(uint8_t instanceId,
                             Ipv6Address dodagId,
                             Ipv6Address destination,
                             Ipv6Address nextHop,
-                            Time lifetime);
+                            Time lifetime,
+                            bool hasSeqNo = false,
+                            uint8_t seqNo = 0);
 
     /**
      * @brief Arm the 'L' field's deadline for an RREQ-Instance.
@@ -2160,8 +2190,17 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     {
         uint8_t instanceId{0}; //!< the RREQ-Instance's/temporary DAG's own RPLInstanceID
         Ipv6Address dodagId;   //!< the RREQ-Instance's/temporary DAG's own DODAGID (OrigNode/Origin)
-        Ipv6Address nextHop;   //!< the next hop's address, global (RouteToNeighbour() converts it)
+        /// The next hop's address. Global when P2P-RPL (or AODV-RPL's own
+        /// H=0 relay) found it from an Address Vector entry, link-local
+        /// when AODV-RPL's H=1 stored it straight from the DIO's own
+        /// sender (@see HandleAodvRreq()/HandleAodvRrep(), which have no
+        /// Address Vector to draw a global address from at all, H=1's
+        /// whole point) -- RouteToNeighbour() accepts either form
+        /// (its own neighbour.IsLinkLocal() check).
+        Ipv6Address nextHop;
         Time expire;           //!< when this entry goes stale
+        uint8_t seqNo{0};      //!< AODV-RPL's Orig SeqNo (RFC 9854 sections 6.2.1/6.2.3); unused by
+                                //!< P2P-RPL, which has no sequence number of its own
     };
 
     /// Hop-by-hop Routes (H=1), keyed by destination -- the same "last one

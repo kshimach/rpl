@@ -12,14 +12,19 @@
  * design-constraints.md.
  *
  * Scope: source-routed (H=0) discovery for a single target, symmetric (S=1)
- * or asymmetric (S=0). Hop-by-hop routes (H=1) are not implemented yet --
- * unlike P2P-RPL's own (RFC 6997, @see rpl-p2p.cc and design-constraints.md,
- * which needs none of core RPL's own storing mode either), AODV-RPL's H=1
- * is bidirectional and, for an asymmetric route, keys its downward route
- * entry by the RREQ-Instance while the packet physically travels the
- * separate RREP-Instance's own topology -- a genuine complication
- * P2P-RPL's unidirectional, single-DODAG H=1 does not have. @see
- * design-constraints.md.
+ * or asymmetric (S=0); and, for the symmetric case, Hop-by-hop routes (H=1)
+ * as well, sharing RplRoutingProtocol::m_hopByHopRoutes with P2P-RPL's own
+ * (RFC 6997, @see rpl-p2p.cc, which needs none of core RPL's own storing
+ * mode either). Unlike P2P-RPL's unidirectional, single-DODAG H=1, AODV-RPL's
+ * is bidirectional (RFC 6550 section 5.1's Local RPLInstanceID 'D' flag: set
+ * for the upward route, clear for the downward one), which is what
+ * HandleAodvRreq()'s own upward entry and HandleAodvRrep()'s own downward
+ * one each account for. Asymmetric (S=0) H=1 stays out of scope for now --
+ * it additionally keys its downward route entry by the RREQ-Instance while
+ * the packet physically travels the separate RREP-Instance's own topology, a
+ * genuine complication P2P-RPL's own H=1 does not have -- so
+ * HandleAodvRrepInstance() and StartAodvRrepInstance() are untouched by any
+ * of this. @see design-constraints.md.
  */
 
 #include "rpl-conf.h"
@@ -61,9 +66,9 @@ RplRoutingProtocol::IsOwnAddress(Ipv6Address address) const
 }
 
 RplRoutingProtocol::DodagKey
-RplRoutingProtocol::DiscoverRoute(Ipv6Address target)
+RplRoutingProtocol::DiscoverRoute(Ipv6Address target, bool hopByHop)
 {
-    NS_LOG_FUNCTION(this << target);
+    NS_LOG_FUNCTION(this << target << hopByHop);
 
     DodagKey empty{0, Ipv6Address::GetAny()};
 
@@ -134,6 +139,7 @@ RplRoutingProtocol::DiscoverRoute(Ipv6Address target)
     dodag.aodv.origSeqNo = m_aodvSeqNo;
     dodag.aodv.rankLimit = m_aodvRankLimit;
     dodag.aodv.lifetimeField = m_aodvLifetime;
+    dodag.aodv.hopByHop = hopByHop;
     dodag.aodv.target = target;
     // A single-entry record: this module's own DiscoverRoute() only ever
     // starts a discovery for one target at a time (RFC 9854 section 6.1's
@@ -259,13 +265,17 @@ RplRoutingProtocol::ShouldRefuseAodvRreq(const RplDioHeader& dio, Ipv6Address fr
         return true;
     }
 
-    // Out of scope, and refused rather than half-honoured: a hop-by-hop
-    // route needs the per-destination next-hop state of storing mode, which
-    // this module does not have at all. @see design-constraints.md.
-    if (rreq.hopByHop)
+    // The asymmetric case (S=0) additionally needs the RREP-Instance's own
+    // downward entry keyed by the RREQ-Instance (RFC 9854 section 6.4.3), a
+    // genuine complication P2P-RPL's unidirectional H=1 does not have --
+    // not yet implemented, so refused here for now; @see
+    // design-constraints.md. The symmetric case (S=1, Increment A's scope)
+    // has no such complication: OrigNode and TargNode each need only their
+    // own next hop, exactly like P2P-RPL's H=1 already working.
+    if (rreq.hopByHop && !rreq.symmetric)
     {
-        NS_LOG_LOGIC("Refusing an RREQ asking for a hop-by-hop route (H=1), which needs storing "
-                     "mode");
+        NS_LOG_LOGIC("Refusing an asymmetric RREQ asking for a hop-by-hop route (H=1), not yet "
+                     "implemented");
         return true;
     }
 
@@ -275,15 +285,40 @@ RplRoutingProtocol::ShouldRefuseAodvRreq(const RplDioHeader& dio, Ipv6Address fr
     // DODAGID"), so rreq.addressVector below is always full addresses
     // regardless of what was actually on the wire.
 
-    // RFC 9854 section 6.2.1: "When H=0 in the incoming RREQ, the router
-    // MUST drop the RREQ-DIO if one of its addresses is present in the
-    // Address Vector." The route would otherwise loop back through here.
-    for (const auto& hop : rreq.addressVector)
+    if (rreq.hopByHop)
     {
-        if (IsOwnAddress(hop))
+        // RFC 9854 section 6.2.1: "When H=1 in the incoming RREQ, the
+        // router MUST drop the RREQ message if the Orig SeqNo field of the
+        // RREQ is older than the SeqNo value that X has stored for a route
+        // to OrigNode." No route stored for this OrigNode yet is not stale
+        // by definition. Read directly off m_hopByHopRoutes rather than
+        // through FindHopByHopRoute()/HasHopByHopRoute(), neither of which
+        // exposes the stored seqNo a caller would need to compare against.
+        auto stored = m_hopByHopRoutes.find(dio.GetDodagId());
+        if (stored != m_hopByHopRoutes.end() && stored->second.expire > Simulator::Now() &&
+            RplSequenceNewer(stored->second.seqNo, rreq.origSeqNo))
         {
-            NS_LOG_LOGIC("Refusing an RREQ whose Address Vector already holds " << hop);
+            NS_LOG_LOGIC("Refusing an RREQ with a stale Orig SeqNo "
+                        << +rreq.origSeqNo << " for OrigNode " << dio.GetDodagId()
+                        << ", already holding " << +stored->second.seqNo);
             return true;
+        }
+    }
+    else
+    {
+        // RFC 9854 section 6.2.1: "When H=0 in the incoming RREQ, the
+        // router MUST drop the RREQ-DIO if one of its addresses is present
+        // in the Address Vector." The route would otherwise loop back
+        // through here. Not meaningful for H=1, whose Address Vector stays
+        // empty throughout (RFC 9854 section 4.1: "In hop-by-hop mode
+        // (H=1), this field MUST be set to zero and ignored").
+        for (const auto& hop : rreq.addressVector)
+        {
+            if (IsOwnAddress(hop))
+            {
+                NS_LOG_LOGIC("Refusing an RREQ whose Address Vector already holds " << hop);
+                return true;
+            }
         }
     }
 
@@ -501,7 +536,13 @@ RplRoutingProtocol::HandleAodvRreq(const RplDioHeader& dio, Ipv6Address from, ui
     // RFC 9854 section 6.2.1's own MaxUsefulRank language backs this: a
     // router already in the instance re-evaluates a later RREQ against the
     // best Rank it has seen, it does not simply keep the first one.
-    if (!dodag.aodv.addressVector.empty() && from != dodag.preferredParent)
+    // H=1 keeps no Address Vector to read this from (@see below), so the
+    // equivalent "already processed at least one copy" signal is instead
+    // whether this router has already recorded an upward Hop-by-hop Route
+    // for this exact RREQ-Instance.
+    bool aodvAlreadyProcessed = rreq.hopByHop ? HasHopByHopRoute(key.instanceId, key.dodagId)
+                                              : !dodag.aodv.addressVector.empty();
+    if (aodvAlreadyProcessed && from != dodag.preferredParent)
     {
         NS_LOG_LOGIC("Already part of RREQ-Instance "
                     << +key.instanceId << " via a better parent than " << from
@@ -512,6 +553,7 @@ RplRoutingProtocol::HandleAodvRreq(const RplDioHeader& dio, Ipv6Address from, ui
     dodag.aodv.origSeqNo = rreq.origSeqNo;
     dodag.aodv.rankLimit = rreq.rankLimit;
     dodag.aodv.lifetimeField = rreq.lifetime;
+    dodag.aodv.hopByHop = rreq.hopByHop; // SendDio() re-emits this, propagating H onward
     dodag.aodv.target = dio.GetArt().target;
     dodag.aodv.isOrigin = false;
 
@@ -609,31 +651,61 @@ RplRoutingProtocol::HandleAodvRreq(const RplDioHeader& dio, Ipv6Address from, ui
     // to the contrary is received" (section 5). @see design-constraints.md.
     dodag.aodv.symmetric = rreq.symmetric && !m_aodvForceAsymmetric;
 
-    // RFC 9854 section 6.2.5: "the intermediate router MUST append the
-    // address of its interface receiving the RREQ-DIO into the Address
-    // Vector". A global address, not the link-local the DIO arrived from:
-    // the vector becomes a source route later, and every entry has to be
-    // reachable from more than one hop away.
-    Ipv6Address ownAddress = GetGlobalAddressIn(dodag);
-    if (ownAddress.IsAny())
+    if (rreq.hopByHop)
     {
-        NS_LOG_LOGIC("No global address to put in the Address Vector yet");
-        return;
+        // RFC 9854 sections 4.1/6.2.5: "In hop-by-hop mode (H=1), this
+        // field MUST be set to zero and ignored" -- no Address Vector
+        // maintenance at all. Instead, record this node's own next hop
+        // toward OrigNode (section 6.2.3): from, the neighbour this RREQ-
+        // DIO copy was accepted from (the guard above already refused any
+        // copy not from dodag.preferredParent). Passed through as received
+        // rather than resolved to a global address first: RouteToNeighbour()
+        // accepts either form (its own neighbour.IsLinkLocal() check), and
+        // InterfaceForNeighbour() matches on the interface identifier
+        // shared by both forms regardless.
+        if (!StoreHopByHopRoute(key.instanceId,
+                               key.dodagId,
+                               key.dodagId,
+                               from,
+                               Seconds(m_pathLifetime * m_lifetimeUnit),
+                               true,
+                               rreq.origSeqNo))
+        {
+            NS_LOG_LOGIC("Discarding an RREQ-DIO establishing a Hop-by-hop Route that conflicts "
+                        "with or is staler than one already held for OrigNode "
+                        << key.dodagId);
+            return;
+        }
     }
+    else
+    {
+        // RFC 9854 section 6.2.5: "the intermediate router MUST append the
+        // address of its interface receiving the RREQ-DIO into the Address
+        // Vector". A global address, not the link-local the DIO arrived
+        // from: the vector becomes a source route later, and every entry
+        // has to be reachable from more than one hop away.
+        Ipv6Address ownAddress = GetGlobalAddressIn(dodag);
+        if (ownAddress.IsAny())
+        {
+            NS_LOG_LOGIC("No global address to put in the Address Vector yet");
+            return;
+        }
 
-    dodag.aodv.addressVector = rreq.addressVector;
-    if (dodag.aodv.addressVector.size() >= RplDioHeader::AODV_ADDRESS_VECTOR_MAX_ENTRIES)
-    {
-        // The option's own 8-bit Opt Data Len cannot describe another entry.
-        // The RankLimit normally stops a discovery long before this, so
-        // reaching it means the limit was configured away (0, "no limit").
-        NS_LOG_WARN("The Address Vector is full at "
-                    << dodag.aodv.addressVector.size()
-                    << " entries; leaving RREQ-Instance " << +key.instanceId);
-        LeaveDodag(key, false);
-        return;
+        dodag.aodv.addressVector = rreq.addressVector;
+        if (dodag.aodv.addressVector.size() >= RplDioHeader::AODV_ADDRESS_VECTOR_MAX_ENTRIES)
+        {
+            // The option's own 8-bit Opt Data Len cannot describe another
+            // entry. The RankLimit normally stops a discovery long before
+            // this, so reaching it means the limit was configured away (0,
+            // "no limit").
+            NS_LOG_WARN("The Address Vector is full at "
+                        << dodag.aodv.addressVector.size()
+                        << " entries; leaving RREQ-Instance " << +key.instanceId);
+            LeaveDodag(key, false);
+            return;
+        }
+        dodag.aodv.addressVector.push_back(ownAddress);
     }
-    dodag.aodv.addressVector.push_back(ownAddress);
 
     ArmAodvExpiry(dodag, key);
 
@@ -848,7 +920,7 @@ RplRoutingProtocol::SendAodvRrep(DodagMembership& dodag, DodagKey key)
 
     RplDioHeader::RrepOption option;
     option.gratuitous = false; // section 7's Gratuitous RREP is out of scope
-    option.hopByHop = false;   // "MUST be set to be the same as the H bit in the RREQ option"
+    option.hopByHop = dodag.aodv.hopByHop; // "MUST be set to be the same as the H bit in the RREQ option"
     // compr left at its default: RplDioHeader::Serialize() computes its own
     // from the addresses below and m_dodagId, ignoring this field.
     option.lifetime = dodag.aodv.lifetimeField;
@@ -857,7 +929,9 @@ RplRoutingProtocol::SendAodvRrep(DodagMembership& dodag, DodagKey key)
     // "for a symmetric route, it is the Address Vector when the RREQ-DIO
     // arrives at the TargNode, unchanged during the transmission to the
     // OrigNode" (RFC 9854 section 4.2). That vector already ends with this
-    // node, appended when the RREQ arrived.
+    // node, appended when the RREQ arrived -- empty throughout for H=1
+    // (section 4.1: "In hop-by-hop mode (H=1), this field MUST be set to
+    // zero and ignored"), since HandleAodvRreq() never populates it then.
     option.addressVector = dodag.aodv.addressVector;
     rrep.SetRrep(option);
 
@@ -871,14 +945,28 @@ RplRoutingProtocol::SendAodvRrep(DodagMembership& dodag, DodagKey key)
     art.target = key.dodagId; // the RREQ-Instance's DODAGID is the OrigNode
     rrep.SetArt(art);
 
-    // The next hop back is the entry before this node's own in the Address
-    // Vector, or the OrigNode itself when this node is the only entry.
-    const std::vector<Ipv6Address>& hops = dodag.aodv.addressVector;
-    NS_ASSERT_MSG(!hops.empty(), "The TargNode is not in its own Address Vector");
-    Ipv6Address nextHop = hops.size() >= 2 ? hops[hops.size() - 2] : key.dodagId;
+    // The next hop back: for a Source Route (H=0), the entry before this
+    // node's own in the Address Vector, or the OrigNode itself when this
+    // node is the only entry; for a Hop-by-hop Route (H=1), the upward
+    // route HandleAodvRreq() already recorded when this RREQ-DIO was
+    // accepted (RFC 9854 section 6.3.1: "the RREP-DIO message is unicast to
+    // the Next Hop according to the Address Vector (H=0) or the route entry
+    // (H=1)").
+    Ipv6Address nextHop;
+    if (dodag.aodv.hopByHop)
+    {
+        bool found = FindHopByHopRoute(key.instanceId, key.dodagId, key.dodagId, nextHop);
+        NS_ASSERT_MSG(found, "HandleAodvRreq() must have stored the upward route by now");
+    }
+    else
+    {
+        const std::vector<Ipv6Address>& hops = dodag.aodv.addressVector;
+        NS_ASSERT_MSG(!hops.empty(), "The TargNode is not in its own Address Vector");
+        nextHop = hops.size() >= 2 ? hops[hops.size() - 2] : key.dodagId;
+    }
 
-    NS_LOG_INFO("Answering the RREQ for " << dodag.aodv.target << " with an RREP over "
-                                          << hops.size() << " hop(s)");
+    NS_LOG_INFO("Answering the RREQ for " << dodag.aodv.target << " with an RREP, next hop "
+                                          << nextHop);
     SendAodvRrepTo(dodag, rrep, nextHop);
 }
 
@@ -897,14 +985,12 @@ RplRoutingProtocol::HandleAodvRrep(const RplDioHeader& dio, Ipv6Address from, ui
         NS_LOG_WARN("Dropping an RREP-DIO with no ART option");
         return;
     }
-    if (rrep.hopByHop)
-    {
-        NS_LOG_LOGIC("Dropping an RREP asking for hop-by-hop routing");
-        return;
-    }
     // No Compr check here, matching ShouldRefuseAodvRreq(): rrep.addressVector
     // is already full addresses regardless of what Compr the wire used (@see
-    // RplDioHeader::Deserialize()).
+    // RplDioHeader::Deserialize()). Asymmetric H=1 stays out of scope (@see
+    // ShouldRefuseAodvRreq()'s matching guard); this function only ever
+    // handles the symmetric case (HandleDio() dispatches here for a unicast
+    // RREP-DIO specifically), so no further check is needed here for that.
 
     // Section 6.3.3 in reverse: the RREQ-InstanceID is the RREP's own
     // RPLInstanceID less Delta, wrapping the way the addition did.
@@ -941,11 +1027,46 @@ RplRoutingProtocol::HandleAodvRrep(const RplDioHeader& dio, Ipv6Address from, ui
     }
     dodag.aodv.rrepHandled = true;
 
+    // RFC 9854 sections 6.2.3/6.4.3: an H=1 route entry records only each
+    // router's own next hop, unlike H=0's whole path, so every router the
+    // RREP passes through -- OrigNode included -- stores its own downward
+    // entry toward TargNode here, pointing at from: one hop closer to
+    // TargNode than this router is, since the RREP travels that direction
+    // back from wherever it originated. dodag.aodv.target already names
+    // TargNode, set from the RREQ-Instance's own ART option this same
+    // membership recorded (DiscoverRoute() at the OrigNode,
+    // HandleAodvRreq() everywhere else). destSeqNo is TargNode's own
+    // Sequence Number, the freshness this specific (downward) direction is
+    // judged by, the same way Orig SeqNo judges the upward one.
+    if (rrep.hopByHop)
+    {
+        if (!StoreHopByHopRoute(rreqInstanceId,
+                               origNode,
+                               dodag.aodv.target,
+                               from,
+                               Seconds(m_pathLifetime * m_lifetimeUnit),
+                               true,
+                               dio.GetArt().destSeqNo))
+        {
+            NS_LOG_LOGIC("Discarding an RREP establishing a Hop-by-hop Route that conflicts "
+                        "with or is staler than one already held for "
+                        << dodag.aodv.target);
+            return;
+        }
+    }
+
     // RFC 9854 section 6.4.2: "The router next checks if one of its
     // addresses is included in the ART option. If it is included, this
     // router is the OrigNode of the route discovery."
     if (IsOwnAddress(origNode))
     {
+        if (rrep.hopByHop)
+        {
+            NS_LOG_INFO("Hop-by-hop Route discovery to " << dodag.aodv.target
+                                                          << " completed, next hop " << from);
+            return;
+        }
+
         if (rrep.addressVector.empty())
         {
             NS_LOG_WARN("Dropping an RREP that carries no route at all");
@@ -972,35 +1093,48 @@ RplRoutingProtocol::HandleAodvRrep(const RplDioHeader& dio, Ipv6Address from, ui
     }
 
     // An intermediate router: pass it on, unchanged, one hop further back.
-    // Nothing is recorded here -- RFC 9854 section 6.4.3 builds a route
-    // entry only when H=1, which is exactly what source routing exists to
-    // avoid.
-    //
-    // Section 6.4.1's "An intermediate router MUST discard an RREP if one of
-    // its addresses is present in the Address Vector" is deliberately NOT
-    // applied. On a symmetric route the Address Vector is the one the RREQ
-    // accumulated on the way out (section 4.2), so by construction it holds
-    // every intermediate router: read literally that rule would discard the
-    // RREP at the first hop back and no symmetric discovery could ever
-    // complete. It is a loop check for the asymmetric case, where the RREP
-    // floods and accumulates a vector of its own. @see design-constraints.md.
-    const std::vector<Ipv6Address>& hops = rrep.addressVector;
-    size_t ownIndex = hops.size();
-    for (size_t i = 0; i < hops.size(); i++)
+    Ipv6Address nextHop;
+    if (rrep.hopByHop)
     {
-        if (IsOwnAddress(hops[i]))
+        // RFC 9854 section 6.4.4: "the local route entry" -- this node's
+        // own upward Hop-by-hop Route toward OrigNode, recorded by
+        // HandleAodvRreq() when the original RREQ-DIO passed through here.
+        if (!FindHopByHopRoute(rreqInstanceId, origNode, origNode, nextHop))
         {
-            ownIndex = i;
-            break;
+            NS_LOG_LOGIC("Dropping an RREP for " << origNode
+                        << ": no upward Hop-by-hop Route recorded for it");
+            return;
         }
     }
-    if (ownIndex == hops.size())
+    else
     {
-        NS_LOG_LOGIC("Dropping an RREP whose Address Vector does not run through this node");
-        return;
+        // Section 6.4.1's "An intermediate router MUST discard an RREP if one
+        // of its addresses is present in the Address Vector" is deliberately
+        // NOT applied. On a symmetric route the Address Vector is the one the
+        // RREQ accumulated on the way out (section 4.2), so by construction
+        // it holds every intermediate router: read literally that rule would
+        // discard the RREP at the first hop back and no symmetric discovery
+        // could ever complete. It is a loop check for the asymmetric case,
+        // where the RREP floods and accumulates a vector of its own. @see
+        // design-constraints.md.
+        const std::vector<Ipv6Address>& hops = rrep.addressVector;
+        size_t ownIndex = hops.size();
+        for (size_t i = 0; i < hops.size(); i++)
+        {
+            if (IsOwnAddress(hops[i]))
+            {
+                ownIndex = i;
+                break;
+            }
+        }
+        if (ownIndex == hops.size())
+        {
+            NS_LOG_LOGIC("Dropping an RREP whose Address Vector does not run through this node");
+            return;
+        }
+        nextHop = ownIndex >= 1 ? hops[ownIndex - 1] : origNode;
     }
 
-    Ipv6Address nextHop = ownIndex >= 1 ? hops[ownIndex - 1] : origNode;
     NS_LOG_INFO("Relaying an RREP for " << origNode << " onward via " << nextHop);
     SendAodvRrepTo(dodag, dio, nextHop);
 }

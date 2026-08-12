@@ -5424,6 +5424,14 @@ RREQ-InstanceにおけるあるルータのrankとRREP-Instanceにおける
 本セッションの残り時間で拙速に実装するより一旦区切ることを選んだ。
 次回増分の対象として残す。
 
+**訂正 (§48.1)**: 後日の設計検討で、上記の懸念は実は**非対称
+ケースにしか当てはまらない**ことが判明した。`HasHopByHopRoute()`
+バイパスはrankそのものを比較しておらず、RREQ-InstanceIDで独立
+した経路storeにヒットするかどうかしか見ていないため、対称経路は
+この懸念の影響を受けずに実装できる。§48でAODV-RPL側の対称H=1
+("Increment A")を実装した。非対称側 (本節で述べた懸念が実際に
+当てはまるケース)は"Increment B"として引き続き見送り。
+
 ### 46.7 検証
 
 新規テスト2件: `RplP2pHopByHopRouteCompletesTestCase`
@@ -5494,3 +5502,166 @@ Hop-by-hop状態が別のnext hopを指していれば破棄」)を対象に監�
 clean(rplモジュール・プロジェクト全体とも)、`test-runner
 --suite=rpl`を複数回連続実行して安定PASSを確認。既存の全P2P-RPL/
 AODV-RPLテストは無変更でPASS。
+
+## 48. AODV-RPL側のHop-by-hop Route (H=1) を実装 (対称経路のみ、Increment A)
+
+§46.6で見送ったAODV-RPL側のH=1について、対称(S=1)・非対称(S=0)を
+分割した上で、対称側("Increment A")を実装した。非対称側は
+§48.5で述べるとおり引き続き見送り。
+
+### 48.1 §46.6の結論は非対称ケースにしか当てはまらないと判明
+
+§46.6は「RREQ-InstanceのrankとRREP-Instanceのrankが一般に異なる
+ため、RFC 6550 §11.2の汎用rank整合性チェックがRREQ-InstanceIDを
+載せたデータパケットに対して誤判定しうる」ことを理由に、AODV-RPL
+側のH=1全体を見送っていた。しかし`HasHopByHopRoute()`バイパス
+(§46.4)は、rankを比較する対象ではなく**独立した経路store
+(`m_hopByHopRoutes`)にRREQ-InstanceIDそのものでヒットするか**
+だけを見ている — つまりrankの階層がRREQ-Instance/RREP-Instance
+のどちらのものであっても、経路storeへのヒットさえ確認できれば
+汎用チェック自体を丸ごとバイパスできる。対称経路(RREQ-Instance
+単独で上り・下り完結、RREP-Instanceという別DODAGを経由しない)は
+この非対称固有の問題を最初から抱えていないため、§46.6の懸念は
+非対称ケースにしか当てはまらず、対称ケースはP2P-RPLと同様に
+何の障害もなく実装できることが分かった。
+
+### 48.2 RFC 6550 §5.1 'D' フラグの統一設計
+
+AODV-RPLのH=1はP2P-RPLと異なり双方向 (OrigNode<->TargNode) が
+必要 — RREQ-Instance一つのDODAGID (OrigNode) に対し、上り
+(TargNode→OrigNode方向)と下り(OrigNode→TargNode方向)の両方の
+経路を各ルータが持つ必要がある。これを区別するのがRFC 6550
+§5.1のLocal RPLInstanceID自身の'D'フラグ (RPI自身の'O'/Downフラグ
+とは別物): 「データパケットにおいて、DODAGIDが送信元か宛先かを示す」。
+
+3種の経路エントリ全てで以下の統一規則が成り立つことを確認した:
+
+| 経路 | destination | dodagId | D |
+|---|---|---|---|
+| P2P-RPL forward (§9.6/9.7) | Target | Origin | 0 |
+| AODV-RPL 上り (§6.2.3) | OrigNode | OrigNode | 1 |
+| AODV-RPL 下り (§6.4.3) | TargNode | OrigNode | 0 |
+
+**"D=1 <=> dodagId == destination"**。さらにRPI自身のDown('O')フラグ
+とDフラグは常に互いに補数の関係にある (down = !D) ことも導出できた
+ため、実装は1つのbool (`down`)を計算し、`rpi.SetDown(down)`と
+Dフラグのビット操作の両方に使い回している
+(`PrepareOutgoingPacket()`のHop-by-hop Route分岐、
+`RouteInput()`のHop-by-hopルックアップ両方)。
+
+実装箇所: `RplPacketInfoHeader::SetInstanceId()`に渡す前に
+`RPL_LOCAL_INSTANCE_D_FLAG` (0x40)をOR/マスクする。ストアされる
+`HopByHopRoute::instanceId`は常にD=0 (RFC 6550 §5.1「制御メッセージ
+では常に0」の慣習を経路storeにも適用) — 受信側 (`RouteInput()`、
+`RplIpv6OptionRpl::Process()`の`HasHopByHopRoute()`呼び出し)は
+Dビットを読んでdodagId (送信元/宛先のどちらか)を選び分けた後、
+比較のためにDビットをマスクして落とす。
+
+### 48.3 RFC 9854 §6.2.1/§6.2.3のOrig SeqNo鮮度チェック
+
+P2P-RPLにはシーケンス番号の概念が無いが、AODV-RPLは持つ
+(`rreq.origSeqNo`)。`StoreHopByHopRoute()`に`hasSeqNo`/`seqNo`
+引数を追加し、P2P-RPL側の「next hop不一致なら破棄」ルール(§46.2)
+とは別に、AODV-RPL側は「保存済みseqNoより新しければnext hopが
+変わっても上書き、古ければ破棄」という鮮度ベースのルールを
+選べるようにした(既存呼び出しは全て`hasSeqNo=false`のまま
+後方互換)。加えて`ShouldRefuseAodvRreq()`にRFC 9854 §6.2.1
+「Orig SeqNoが保存値より古ければRREQ自体をjoinの前に破棄する」
+という事前ゲートを追加 — `StoreHopByHopRoute()`自身の鮮度
+チェックだけでも経路の上書きは防げるが、事前ゲートが無いと
+古いRREQでもpreferred parentの切り替え・Trickleリセット等の
+無駄な副作用が起きてしまう(§48.6のテストでこの2つの違いを
+実際に確認した)。
+
+### 48.4 対称経路の実装 (`HandleAodvRreq()`/`SendAodvRrep()`/`HandleAodvRrep()`)
+
+- `AodvRreqState`に`hopByHop`フィールド追加、`DiscoverRoute()`に
+  `hopByHop`引数追加(既定`false`、`DiscoverP2pRoute()`と同型)。
+- `ShouldRefuseAodvRreq()`: H=1の無条件拒否を撤廃、非対称
+  (`!rreq.symmetric`)の場合のみ拒否するよう限定。Address Vector
+  ループチェック(RFC 9854 §6.2.1「H=0のとき」)をH=0限定に変更、
+  H=1側は§48.3の鮮度チェックに置き換え。
+- `HandleAodvRreq()`: H=1のときAddress Vector積み上げを一切せず
+  (§4.1「H=1ではこのフィールドは0固定・無視」)、代わりに上り
+  経路 (destination=dodagId=OrigNode, nextHop=`from`)を
+  `StoreHopByHopRoute()`で記録。
+- `SendAodvRrep()`: `option.hopByHop`を`dodag.aodv.hopByHop`から
+  設定 (既存は`false`固定だった)。next hopの決定をH=1では
+  Address Vectorのインデックス計算ではなく、§48.2で記録した
+  自分の上り経路エントリから取得するよう分岐。
+- `HandleAodvRrep()`: H=1の無条件拒否を撤廃。RREPが通過する
+  全ルータ (OrigNode含む) で下り経路 (destination=TargNode,
+  dodagId=OrigNode, nextHop=`from`)を記録するステップを追加。
+  中継ルータがRREPをさらに中継する際のnext hopも、Address
+  Vectorのインデックス計算ではなく自分の上り経路エントリから
+  取得 (RFC 9854 §6.4.4「the local route entry」)。
+
+### 48.5 next hopはlink-local (globalへの変換手段が無いため)
+
+P2P-RPLのH=1やAODV-RPLのH=0はAddress Vectorのエントリ (常に
+global アドレス)からnext hopを得るが、AODV-RPLのH=1は
+Address Vector自体を持たない (§4.1により空固定)ため、next hopは
+DIOの送信元 (`from`、link-local)から直接取ることになる。
+このモジュールには「link-localからglobalを逆算する」手段が
+存在しない (`Parent`構造体もlink-localしか保持していない) ため、
+`HopByHopRoute::nextHop`にlink-localアドレスをそのまま格納する
+設計とした。`RouteToNeighbour()`自身が`neighbour.IsLinkLocal()`で
+link-local/global両対応であることを確認済みであり、実害は無い —
+`HopByHopRoute::nextHop`のドキュメントコメントを「global または
+link-local、`RouteToNeighbour()`がどちらも受け付ける」に修正した。
+
+### 48.6 テスト作成中に発見した実装バグ1件
+
+`HandleAodvRreq()`で`dodag.aodv.origSeqNo`等の各フィールドを
+コピーする際、**`dodag.aodv.hopByHop = rreq.hopByHop;`を書き
+忘れていた**。この結果、OrigNodeから直接聞いた最初の1ホップ
+(relay1)は正しくH=1で参加するが、`SendDio()`の再送信時に
+`dodag.aodv.hopByHop`が既定値`false`のままなので**2ホップ目
+以降にはH=0として中継されてしまう** — `RplAodvHopByHopRoute
+CompletesTestCase`(4ノード直線、`RplAodvRrepCompletesTestCase`の
+H=1版)で、relay1の上り経路だけが確立されrelay2/targには何も
+確立されないという形で検出した。1行追加で修正、
+`if (false) dodag.aodv.hopByHop = ...;`へ一時的に無効化して
+このテストがFAILすることを確認(load-bearing検証)、元に戻して
+再度PASSを確認。
+
+### 48.7 検証
+
+新規テスト2件:
+- `RplAodvHopByHopRouteCompletesTestCase`:
+  `RplAodvRrepCompletesTestCase`と同じ4ノード直線
+  (orig--relay1--relay2--targ)でH=1発見を行い、(1)`m_aodvRoutes`
+  (H=0)が空であること、(2)全ルータでAddress Vectorが空のまま
+  であること、(3)各ルータの上り/下りnext hopが正しいこと、
+  (4)実際にUDPデータが**双方向とも**(OrigNode→TargNode、
+  TargNode→OrigNode)届くことを確認。§48.6のバグをこのテストで
+  発見・修正。
+- `RplAodvHopByHopStaleSeqNoRejectedTestCase`: 単一ノードへの
+  合成RREQ-DIO注入 (`RplAodvAddressVectorFollowsParentTestCase`
+  と同型)。1回目(rank 384, SeqNo 5)で経路確立、2回目
+  (より良いrank 128だがより古いSeqNo 3)は`ShouldRefuseAodvRreq()`
+  のjoin前ゲートで即座に拒否されること(経路のnext hopも
+  joinしたrankも変化しないこと)、3回目(同じrank 128だが
+  より新しいSeqNo 7)は正しく受理され経路が切り替わることを
+  確認。2回目の検証では「経路のnext hopが変わらない」ことに
+  加え「joinしたrankも変わらない」ことを別途確認しており、
+  これは`StoreHopByHopRoute()`自身の鮮度チェック(§48.3)だけが
+  効いていて事前ゲート自体は素通りしている、という誤った
+  load-bearing性の錯覚を防ぐため — 実際、事前ゲートを一時的に
+  `if (false && ...)`で無効化したところ、rankチェックの方だけが
+  正しくFAILすることを確認した(経路のnext hopチェックは
+  `StoreHopByHopRoute()`自身の鮮度チェックにより偶然PASSし
+  続けた)。
+
+`./ns3 build`(rplモジュール・プロジェクト全体とも)、
+`test-runner --suite=rpl`を複数回連続実行して安定PASSを確認。
+既存の全P2P-RPL/AODV-RPLテスト(H=0、および§46/§47のP2P-RPL H=1)
+は無変更でPASS — 共有インフラ(§48.2のDフラグ処理)がP2P-RPLの
+D=0固定という既存動作に対して安全なno-opであることの裏付け。
+
+### 48.8 引き続き見送り: 非対称(S=0)経路のH=1、"Increment B"
+
+`HandleAodvRrepInstance()`/`StartAodvRrepInstance()`は今回
+一切変更していない。非対称H=1、および`AodvForceAsymmetric`
+属性とH=1の組み合わせのテストは次回増分 ("Increment B") へ
+持ち越す。

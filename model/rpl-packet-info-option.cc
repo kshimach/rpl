@@ -159,7 +159,17 @@ RplIpv6OptionRpl::Process(Ptr<Packet> packet,
     // over it (@see NotifyRankInconsistency()) -- noise this module has
     // no reason to accept just because a Hop-by-hop Route happens to be
     // using the same Instance space.
-    if (rpl->HasHopByHopRoute(rpi.GetInstanceId(), ipv6Header.GetDestination()))
+    // rpi.GetInstanceId() carries RFC 6550 section 5.1's Local RPLInstanceID
+    // 'D' flag as received (set for AODV-RPL's upward route, RFC 9854
+    // section 6.2.3), but a stored Hop-by-hop Route's own instanceId is
+    // always kept D=0 (@see RplRoutingProtocol::RouteInput()'s matching
+    // comment); masked off here so a D=1 packet still matches it.
+    uint8_t hopByHopInstanceId = rpi.GetInstanceId();
+    if (hopByHopInstanceId & RPL_LOCAL_INSTANCE_FLAG)
+    {
+        hopByHopInstanceId &= static_cast<uint8_t>(~RPL_LOCAL_INSTANCE_D_FLAG);
+    }
+    if (rpl->HasHopByHopRoute(hopByHopInstanceId, ipv6Header.GetDestination()))
     {
         tail->AddHeader(rpi);
         packet->RemoveAtEnd(packet->GetSize() - offset);

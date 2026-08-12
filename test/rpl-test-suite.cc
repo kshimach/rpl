@@ -5602,6 +5602,167 @@ RplAodvAddressVectorFollowsParentTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief An AODV-RPL Hop-by-hop Route (H=1) rejects a stale Orig SeqNo,
+ *        keeping the fresher route it already holds.
+ *
+ * RFC 9854 section 6.2.1: "When H=1 in the incoming RREQ, the router MUST
+ * drop the RREQ message if the Orig SeqNo field of the RREQ is older than
+ * the SeqNo value that X has stored for a route to OrigNode." Delivered
+ * directly (DeliverRawRplMessage(), bypassing the channel) to a single node
+ * under test, the same style RplAodvAddressVectorFollowsParentTestCase uses
+ * for its own AODV-RPL bookkeeping.
+ *
+ * The second (stale) delivery deliberately offers a better Rank than the
+ * first: if section 6.2.1's own staleness check were not run at all,
+ * SelectPreferredParent() would happily switch to it on Rank alone, so the
+ * route staying unchanged proves the staleness check itself is what stops
+ * it, not an incidental loss on Rank. The third delivery, from the same
+ * better-Rank neighbour but with a fresher Orig SeqNo, then confirms the
+ * check is not simply refusing that neighbour outright.
+ */
+class RplAodvHopByHopStaleSeqNoRejectedTestCase : public TestCase
+{
+  public:
+    RplAodvHopByHopStaleSeqNoRejectedTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplAodvHopByHopStaleSeqNoRejectedTestCase::RplAodvHopByHopStaleSeqNoRejectedTestCase()
+    : TestCase("An AODV-RPL Hop-by-hop Route (H=1) rejects a stale Orig SeqNo")
+{
+}
+
+void
+RplAodvHopByHopStaleSeqNoRejectedTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(1);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.AssignWithoutAddress(devices);
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    Simulator::Stop(Seconds(2));
+    Simulator::Run();
+
+    Ptr<Node> node = nodes.Get(0);
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+    Ipv6Address nodeLinkLocal = node->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    static constexpr uint8_t RREQ_INSTANCE = 0x81;
+    Ipv6Address origNode("2001:9::1");
+    Ipv6Address neighbourA("fe80::a"); // first offer, kept
+    Ipv6Address neighbourB("fe80::b"); // second/third offer: better Rank
+
+    auto buildRreq = [&](uint16_t rank, uint8_t seqNo) {
+        RplDioHeader dio;
+        dio.SetInstanceId(RREQ_INSTANCE);
+        dio.SetVersionNumber(0);
+        dio.SetRank(rank);
+        dio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+        dio.SetDodagId(origNode);
+        dio.SetDtsn(0);
+        dio.SetDagConfiguration(0,
+                                8,
+                                RPL_DIO_REDUNDANCY,
+                                RPL_MAX_RANKINC,
+                                RPL_MIN_HOPRANKINC,
+                                RPL_OCP_OF0,
+                                RPL_DEFAULT_LIFETIME,
+                                RPL_DEFAULT_LIFETIME_UNIT);
+        RplDioHeader::RreqOption rreq;
+        rreq.symmetric = true;
+        rreq.hopByHop = true;
+        rreq.compr = 0;
+        rreq.lifetime = 0; // no limit, keeps this test's timing simple
+        rreq.rankLimit = 0;
+        rreq.origSeqNo = seqNo;
+        // Left empty: RFC 9854 section 4.1's "In hop-by-hop mode (H=1),
+        // this field MUST be set to zero and ignored".
+        dio.SetRreq(rreq);
+        RplDioHeader::ArtOption art;
+        art.destSeqNo = 0;
+        art.prefixLength = 0;
+        art.target = Ipv6Address("2001:9::99"); // a fake target, not this node
+        dio.SetArt(art);
+        return dio;
+    };
+    auto deliverRreq = [&](Ipv6Address from, uint16_t rank, uint8_t seqNo) {
+        Simulator::Schedule(Seconds(0),
+                            &DeliverRawRplMessage<RplDioHeader>,
+                            node,
+                            1,
+                            buildRreq(rank, seqNo),
+                            static_cast<uint8_t>(RPL_CODE_DIO),
+                            from,
+                            nodeLinkLocal);
+        Simulator::Stop(MilliSeconds(10));
+        Simulator::Run();
+    };
+
+    // First delivery, from A: establishes the upward route, Orig SeqNo 5.
+    deliverRreq(neighbourA, 384, 5);
+    Ipv6Address nextHop;
+    uint8_t instanceId = 0;
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetHopByHopRoute(origNode, nextHop, instanceId),
+                          true,
+                          "The first RREQ-DIO did not establish an upward Hop-by-hop Route");
+    NS_TEST_ASSERT_MSG_EQ(nextHop, neighbourA, "Wrong next hop after the first delivery");
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetRankIn(RREQ_INSTANCE, origNode),
+                          512,
+                          "Did not join the RREQ-Instance via A at the expected rank");
+
+    // Second delivery, from B: a better Rank (128 < 384) but a staler Orig
+    // SeqNo (3 < 5). RFC 9854 section 6.2.1 has this dropped outright,
+    // before ShouldRefuseAodvRreq() even lets it join -- the route must
+    // still point at A afterward, and -- checked separately from that,
+    // since StoreHopByHopRoute()'s own internal staleness check would also
+    // catch this on its own even if ShouldRefuseAodvRreq()'s pre-join gate
+    // did not run at all -- the preferred parent (and so the joined rank)
+    // must not have switched to B either, proving it is genuinely the
+    // pre-join gate stopping this, not a same-outcome coincidence from the
+    // later check alone.
+    deliverRreq(neighbourB, 128, 3);
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetHopByHopRoute(origNode, nextHop, instanceId),
+                          true,
+                          "The stale RREQ-DIO's rejection should not have removed the route");
+    NS_TEST_ASSERT_MSG_EQ(nextHop,
+                          neighbourA,
+                          "A stale Orig SeqNo was accepted, overwriting a fresher route");
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetRankIn(RREQ_INSTANCE, origNode),
+                          512,
+                          "The stale RREQ-DIO's better Rank switched the preferred parent to B, "
+                          "meaning ShouldRefuseAodvRreq() let it join instead of dropping it "
+                          "outright");
+
+    // Third delivery, from B again: the same better Rank, but now a fresher
+    // Orig SeqNo (7 > 5) -- accepted, and the route switches to B.
+    deliverRreq(neighbourB, 128, 7);
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetHopByHopRoute(origNode, nextHop, instanceId),
+                          true,
+                          "A fresher RREQ-DIO should still leave an upward Hop-by-hop Route");
+    NS_TEST_ASSERT_MSG_EQ(nextHop,
+                          neighbourB,
+                          "A fresher Orig SeqNo from a better Rank was not accepted");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief An AODV-RPL route discovery floods an RREQ outward, each hop
  *        appending its own address to the Address Vector.
  *
@@ -7567,6 +7728,241 @@ RplAodvRrepCompletesTestCase::DoRun()
 
     receiver->Close();
     sender->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief AODV-RPL's own Hop-by-hop Route (H=1) discovery completes a
+ *        symmetric route and carries data end to end in both directions.
+ *
+ * The AODV-RPL analogue of RplP2pHopByHopRouteCompletesTestCase, over the
+ * same four-node line RplAodvRrepCompletesTestCase's own H=0 test uses:
+ *
+ *     orig(0) ---- relay1(1) ---- relay2(2) ---- targ(3)
+ *
+ * Unlike P2P-RPL's H=1, which only ever travels one way (Origin to Target,
+ * RFC 6997 sections 9.6/9.7), AODV-RPL's is bidirectional (RFC 9854 section
+ * 4.1's 'D' flag): OrigNode needs a downward route to TargNode and TargNode
+ * needs an upward one back to OrigNode, and every router in between holds
+ * both, recorded from opposite ends -- the upward one when the RREQ-DIO
+ * passed through (HandleAodvRreq()), the downward one when the RREP-DIO
+ * passed back through (HandleAodvRrep()). @see design-constraints.md.
+ */
+class RplAodvHopByHopRouteCompletesTestCase : public TestCase
+{
+  public:
+    RplAodvHopByHopRouteCompletesTestCase();
+
+  private:
+    void DoRun() override;
+
+    /// @brief Count a datagram delivered at either end.
+    /// @param socket the receiving socket
+    void CountDelivery(Ptr<Socket> socket);
+
+    /// @brief Send one datagram, as a named method Simulator::Schedule() can
+    ///        resolve (Socket::Send is overloaded).
+    /// @param socket the sending socket
+    void SendOne(Ptr<Socket> socket);
+
+    uint32_t m_delivered{0}; //!< datagrams delivered, either direction
+};
+
+RplAodvHopByHopRouteCompletesTestCase::RplAodvHopByHopRouteCompletesTestCase()
+    : TestCase("An AODV-RPL Hop-by-hop Route (H=1) carries data end to end, both directions")
+{
+}
+
+void
+RplAodvHopByHopRouteCompletesTestCase::CountDelivery(Ptr<Socket> socket)
+{
+    Ptr<Packet> packet = socket->Recv();
+    while (packet)
+    {
+        m_delivered++;
+        packet = socket->Recv();
+    }
+}
+
+void
+RplAodvHopByHopRouteCompletesTestCase::SendOne(Ptr<Socket> socket)
+{
+    socket->Send(Create<Packet>(64));
+}
+
+void
+RplAodvHopByHopRouteCompletesTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(4); // 0 = OrigNode and base root, 1 and 2 = relays, 3 = TargNode
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    auto blacklist = [&](uint32_t a, uint32_t b) {
+        Ptr<SimpleNetDevice> devA = DynamicCast<SimpleNetDevice>(devices.Get(a));
+        Ptr<SimpleNetDevice> devB = DynamicCast<SimpleNetDevice>(devices.Get(b));
+        channel->BlackList(devA, devB);
+        channel->BlackList(devB, devA);
+    };
+    blacklist(0, 2);
+    blacklist(0, 3);
+    blacklist(1, 3);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(250));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> orig = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> relay1 = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> relay2 = nodes.Get(2)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> targ = nodes.Get(3)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(targ->IsJoined(), true, "The base DODAG did not reach the far end");
+
+    Ipv6Address origAddress = orig->GetGlobalAddress();
+    Ipv6Address targAddress = targ->GetGlobalAddress();
+
+    // AODV-RPL's H=1 has no Address Vector to draw a global next-hop
+    // address from at all (that is the whole point), so it records each
+    // hop's own link-local address instead, straight off the DIO's own
+    // sender -- unlike P2P-RPL's H=1 and AODV-RPL's own H=0, both of which
+    // resolve a global address out of an Address Vector entry (@see
+    // HopByHopRoute::nextHop's own doc comment).
+    Ipv6Address origLinkLocal =
+        nodes.Get(0)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address relay1LinkLocal =
+        nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address relay2LinkLocal =
+        nodes.Get(2)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address targLinkLocal =
+        nodes.Get(3)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    RplRoutingProtocol::DodagKey key = orig->DiscoverRoute(targAddress, true);
+    NS_TEST_ASSERT_MSG_NE(key.dodagId, Ipv6Address::GetAny(), "The discovery did not start");
+
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    // No H=0 route recorded anywhere: RFC 9854 sections 6.2.3/6.4.3's own
+    // per-hop next-hop entries replace it entirely for H=1.
+    NS_TEST_ASSERT_MSG_EQ(orig->GetAodvRouteCount(), 0, "A source-routed route was recorded");
+    NS_TEST_ASSERT_MSG_EQ(relay1->GetAodvRouteCount(), 0, "relay1 recorded a source-routed route");
+    NS_TEST_ASSERT_MSG_EQ(relay2->GetAodvRouteCount(), 0, "relay2 recorded a source-routed route");
+    NS_TEST_ASSERT_MSG_EQ(targ->GetAodvRouteCount(), 0, "targ recorded a source-routed route");
+
+    // The Address Vector stays empty throughout, at every router (RFC 9854
+    // section 4.1: "In hop-by-hop mode (H=1), this field MUST be set to
+    // zero and ignored").
+    std::vector<Ipv6Address> addressVector;
+    NS_TEST_ASSERT_MSG_EQ(
+        orig->GetAodvAddressVector(key.instanceId, origAddress, addressVector) &&
+            addressVector.empty(),
+        true,
+        "OrigNode's Address Vector should stay empty for H=1");
+    NS_TEST_ASSERT_MSG_EQ(
+        relay1->GetAodvAddressVector(key.instanceId, origAddress, addressVector) &&
+            addressVector.empty(),
+        true,
+        "relay1's Address Vector should stay empty for H=1");
+    NS_TEST_ASSERT_MSG_EQ(
+        relay2->GetAodvAddressVector(key.instanceId, origAddress, addressVector) &&
+            addressVector.empty(),
+        true,
+        "relay2's Address Vector should stay empty for H=1");
+    NS_TEST_ASSERT_MSG_EQ(
+        targ->GetAodvAddressVector(key.instanceId, origAddress, addressVector) &&
+            addressVector.empty(),
+        true,
+        "targ's Address Vector should stay empty for H=1");
+
+    // Each router's own next hop, in whichever direction(s) it needs one:
+    // OrigNode and every relay need a downward one toward TargNode, and
+    // every relay and TargNode need an upward one toward OrigNode -- but
+    // OrigNode needs no upward one (it is already there) and TargNode needs
+    // no downward one (nothing downstream of it to relay for).
+    Ipv6Address nextHop;
+    uint8_t hopInstanceId = 0;
+    NS_TEST_ASSERT_MSG_EQ(orig->GetHopByHopRoute(targAddress, nextHop, hopInstanceId),
+                          true,
+                          "OrigNode never recorded a downward Hop-by-hop Route");
+    NS_TEST_ASSERT_MSG_EQ(nextHop, relay1LinkLocal, "OrigNode's own downward next hop is wrong");
+    NS_TEST_ASSERT_MSG_EQ(hopInstanceId, key.instanceId, "OrigNode's own instanceId is wrong");
+
+    NS_TEST_ASSERT_MSG_EQ(relay1->GetHopByHopRoute(origAddress, nextHop, hopInstanceId),
+                          true,
+                          "relay1 never recorded an upward Hop-by-hop Route");
+    NS_TEST_ASSERT_MSG_EQ(nextHop, origLinkLocal, "relay1's own upward next hop is wrong");
+    NS_TEST_ASSERT_MSG_EQ(relay1->GetHopByHopRoute(targAddress, nextHop, hopInstanceId),
+                          true,
+                          "relay1 never recorded a downward Hop-by-hop Route");
+    NS_TEST_ASSERT_MSG_EQ(nextHop, relay2LinkLocal, "relay1's own downward next hop is wrong");
+
+    NS_TEST_ASSERT_MSG_EQ(relay2->GetHopByHopRoute(origAddress, nextHop, hopInstanceId),
+                          true,
+                          "relay2 never recorded an upward Hop-by-hop Route");
+    NS_TEST_ASSERT_MSG_EQ(nextHop, relay1LinkLocal, "relay2's own upward next hop is wrong");
+    NS_TEST_ASSERT_MSG_EQ(relay2->GetHopByHopRoute(targAddress, nextHop, hopInstanceId),
+                          true,
+                          "relay2 never recorded a downward Hop-by-hop Route");
+    NS_TEST_ASSERT_MSG_EQ(nextHop, targLinkLocal, "relay2's own downward next hop is wrong");
+
+    NS_TEST_ASSERT_MSG_EQ(targ->GetHopByHopRoute(origAddress, nextHop, hopInstanceId),
+                          true,
+                          "targ never recorded an upward Hop-by-hop Route");
+    NS_TEST_ASSERT_MSG_EQ(nextHop, relay2LinkLocal, "targ's own upward next hop is wrong");
+
+    // And the route works, both directions: two hops of relaying each way,
+    // so a delivery only arrives if every hop's own RPI-based lookup (not a
+    // Routing Header, unlike H=0) found the right next hop -- including
+    // reading RFC 6550 section 5.1's 'D' flag correctly to tell the two
+    // directions apart at every relay.
+    uint16_t downPort = 4246;
+    Ptr<Socket> downReceiver = Socket::CreateSocket(nodes.Get(3), UdpSocketFactory::GetTypeId());
+    downReceiver->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), downPort));
+    downReceiver->SetRecvCallback(
+        MakeCallback(&RplAodvHopByHopRouteCompletesTestCase::CountDelivery, this));
+    Ptr<Socket> downSender = Socket::CreateSocket(nodes.Get(0), UdpSocketFactory::GetTypeId());
+    downSender->Connect(Inet6SocketAddress(targAddress, downPort));
+    Simulator::Schedule(Seconds(1), &RplAodvHopByHopRouteCompletesTestCase::SendOne, this, downSender);
+
+    uint16_t upPort = 4247;
+    Ptr<Socket> upReceiver = Socket::CreateSocket(nodes.Get(0), UdpSocketFactory::GetTypeId());
+    upReceiver->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), upPort));
+    upReceiver->SetRecvCallback(
+        MakeCallback(&RplAodvHopByHopRouteCompletesTestCase::CountDelivery, this));
+    Ptr<Socket> upSender = Socket::CreateSocket(nodes.Get(3), UdpSocketFactory::GetTypeId());
+    upSender->Connect(Inet6SocketAddress(origAddress, upPort));
+    Simulator::Schedule(Seconds(1), &RplAodvHopByHopRouteCompletesTestCase::SendOne, this, upSender);
+
+    Simulator::Stop(Seconds(5));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(m_delivered,
+                          2,
+                          "Data did not reach both ends over the discovered Hop-by-hop Route");
+
+    downReceiver->Close();
+    downSender->Close();
+    upReceiver->Close();
+    upSender->Close();
     Simulator::Destroy();
 }
 
@@ -15670,6 +16066,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplReadRpiInstanceIdRejectsWrongOptionTypeTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvMopAcceptedTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvAddressVectorFollowsParentTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplAodvHopByHopStaleSeqNoRejectedTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRreqFloodTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvMultiArtIntersectionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvMultiArtTwoTargetsAnsweredTestCase, TestCase::Duration::QUICK);
@@ -15681,6 +16078,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplAodvAsymmetricRrepFloodTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvAsymmetricRouteCompletesTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRrepCompletesTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplAodvHopByHopRouteCompletesTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplRootJoinsForeignRreqInstanceParentLossTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRrepInstanceRankLimitTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRrepInstanceAddressVectorFullTestCase, TestCase::Duration::QUICK);
