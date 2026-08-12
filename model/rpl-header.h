@@ -48,7 +48,7 @@ namespace rpl
 struct P2pRdoOption
 {
     bool reply{true};      //!< 'R': the Target(s) may send P2P-DRO messages back
-    bool hopByHop{false};  //!< 'H': 1 hop-by-hop, 0 source routed (only H=0 is implemented)
+    bool hopByHop{false};  //!< 'H': 1 for a Hop-by-hop Route, 0 for a Source Route
     /// 'N', 2 bits: one plus this many Source Routes are requested per
     /// Target. Always sent as 0 (exactly one route) and ignored on receipt;
     /// @see design-constraints.md for why more are out of scope.

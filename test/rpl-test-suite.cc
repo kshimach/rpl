@@ -10996,6 +10996,335 @@ RplP2pDroRelayTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief A Hop-by-hop Route (H=1) whose stored next hop conflicts with a
+ *        later P2P-DRO's own is discarded and not relayed, but a repeat
+ *        naming the very same next hop is not mistaken for a conflict, and
+ *        a different RPLInstanceID/DODAGID to the same destination is a
+ *        different, unrelated route rather than a conflict at all.
+ *
+ * RFC 6997 section 9.6: "If the router already maintains a Hop-by-hop
+ * state listing the Target as the destination and carrying the same
+ * RPLInstanceID and DODAGID fields as the received P2P-DRO, and the
+ * next-hop information in the state does not match the next hop indicated
+ * in the received P2P-DRO, the router MUST discard the P2P-DRO message
+ * with no further processing" -- design-constraints.md section 46
+ * implemented this (StoreHopByHopRoute()) alongside the end-to-end
+ * delivery increment but left it without a dedicated test of its own,
+ * since RplP2pHopByHopRouteCompletesTestCase's own three-node line never
+ * gives one router two different candidate next hops for the same route
+ * to begin with.
+ *
+ * One router under test, joined to a single fabricated temporary DAG, fed
+ * a sequence of hand-built P2P-DROs naming it at the Address Vector's
+ * current NH position -- RplP2pDroRelayTestCase's own two-node
+ * (monitor) infrastructure, but state deliberately kept across sub-cases
+ * this time (unlike that test's own "fresh Origin per call" isolation),
+ * since what is under test here only exists across more than one
+ * delivery.
+ */
+class RplP2pHopByHopRouteConflictTestCase : public TestCase
+{
+  public:
+    RplP2pHopByHopRouteConflictTestCase();
+
+  private:
+    void DoRun() override;
+
+    /// @brief Count a relayed P2P-DRO seen at the monitor.
+    /// @param socket the monitoring socket
+    void CaptureDro(Ptr<Socket> socket);
+
+    /**
+     * @brief Deliver one fabricated H=1 P2P-DRO naming the node under test
+     *        at the Address Vector's current NH position, and report
+     *        whether it relayed.
+     *
+     * @param node the node under test
+     * @param origin the temporary DAG's own DODAGID
+     * @param target the Target this Hop-by-hop Route leads to
+     * @param beforeSelf addresses of convenience placed before the node's
+     *                    own entry in the Address Vector
+     * @param afterSelf addresses of convenience placed after the node's
+     *                   own entry -- the first of these (if any) is what
+     *                   Address[NH+1] resolves the next hop to
+     * @return true if a relayed copy was captured at the monitor
+     */
+    bool TryDeliver(Ptr<Node> node,
+                    Ipv6Address origin,
+                    Ipv6Address target,
+                    const std::vector<Ipv6Address>& beforeSelf,
+                    const std::vector<Ipv6Address>& afterSelf);
+
+    bool m_seenRelay{false}; //!< a relayed P2P-DRO was captured
+};
+
+RplP2pHopByHopRouteConflictTestCase::RplP2pHopByHopRouteConflictTestCase()
+    : TestCase("A conflicting next hop for an existing Hop-by-hop Route is discarded, a "
+               "repeat of the same one is not, and a different Instance is a different route")
+{
+}
+
+void
+RplP2pHopByHopRouteConflictTestCase::CaptureDro(Ptr<Socket> socket)
+{
+    Address sender;
+    Ptr<Packet> packet = socket->RecvFrom(sender);
+    if (!packet)
+    {
+        return;
+    }
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ipv6Header);
+    Icmpv6Header icmpv6Header;
+    packet->RemoveHeader(icmpv6Header);
+    if (icmpv6Header.GetType() != ICMPV6_RPL || icmpv6Header.GetCode() != RPL_CODE_P2P_DRO)
+    {
+        return;
+    }
+    m_seenRelay = true;
+}
+
+bool
+RplP2pHopByHopRouteConflictTestCase::TryDeliver(Ptr<Node> node,
+                                                Ipv6Address origin,
+                                                Ipv6Address target,
+                                                const std::vector<Ipv6Address>& beforeSelf,
+                                                const std::vector<Ipv6Address>& afterSelf)
+{
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+    Ipv6Address neighbour("fe80::a");
+    static constexpr uint8_t INSTANCE = 0x81;
+
+    RplP2pDroHeader dro;
+    dro.SetInstanceId(INSTANCE);
+    dro.SetDodagId(origin);
+    P2pRdoOption rdo;
+    rdo.reply = false;
+    rdo.hopByHop = true;
+    rdo.target = target;
+    for (const auto& hop : beforeSelf)
+    {
+        rdo.addressVector.push_back(hop);
+    }
+    rdo.addressVector.push_back(rpl->GetGlobalAddress());
+    for (const auto& hop : afterSelf)
+    {
+        rdo.addressVector.push_back(hop);
+    }
+    // 1-indexed "Address[NH]" naming this node's own, just-appended entry.
+    rdo.maxRankOrNh = static_cast<uint8_t>(beforeSelf.size() + 1);
+    dro.SetP2pRdo(rdo);
+
+    m_seenRelay = false;
+    DeliverRawRplMessage<RplP2pDroHeader>(node,
+                                          1,
+                                          dro,
+                                          static_cast<uint8_t>(RPL_CODE_P2P_DRO),
+                                          neighbour,
+                                          Ipv6Address(RPL_ALL_NODES_MULTICAST));
+
+    // DeliverRawRplMessage() delivers synchronously, but a relay this node
+    // decides to send goes out through SimpleChannel::Send(), which
+    // schedules delivery via Simulator::ScheduleWithContext() rather than
+    // calling the receiving device directly -- so it needs a further
+    // Simulator::Run() to actually reach the monitor (@see
+    // RplP2pDroRelayTestCase's own TryRelay(), the same recipe). Stop()
+    // takes a delay *relative to now*, not an absolute time -- an earlier
+    // draft passed Simulator::Now() + Seconds(1) here, which (being
+    // itself relative) compounded on every call across this test's own
+    // several sequential deliveries into the same membership, each
+    // successive gap between deliveries roughly doubling and eventually
+    // running well past every relevant Trickle/staleness margin. Plain
+    // Seconds(1), the same as RplP2pDroRelayTestCase's own TryRelay(),
+    // is correct.
+    Simulator::Stop(Seconds(1));
+    Simulator::Run();
+
+    return m_seenRelay;
+}
+
+void
+RplP2pHopByHopRouteConflictTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2); // 0 = the router under test, 1 = a real neighbour to monitor from
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.AssignWithoutAddress(devices);
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    Simulator::Stop(Seconds(2));
+    Simulator::Run();
+
+    Ptr<Node> node = nodes.Get(0);
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+
+    Ptr<Socket> monitor = Socket::CreateSocket(nodes.Get(1), Ipv6RawSocketFactory::GetTypeId());
+    monitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    monitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    monitor->BindToNetDevice(nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+    monitor->SetRecvCallback(
+        MakeCallback(&RplP2pHopByHopRouteConflictTestCase::CaptureDro, this));
+
+    static constexpr uint8_t INSTANCE = 0x81;
+    Ipv6Address origin("2001:9::1");
+    Ipv6Address otherOrigin("2001:9::9");
+    Ipv6Address target("2001:9::dead:2");
+    Ipv6Address hopA("2001:9::a0");
+    Ipv6Address hopB("2001:9::b0");
+    Ipv6Address hopC("2001:9::c0");
+
+    // A P2P-DRO is only ever acted on if a matching temporary DAG
+    // membership already exists (RFC 6997 sections 9.6/9.7), so join one
+    // first, as an ordinary relay (the fabricated Target is never this
+    // node) -- the same fixture RplP2pDroRelayTestCase's own TryRelay()
+    // uses, joined once here rather than per delivery, since this test's
+    // whole point is state persisting across more than one.
+    RplDioHeader joinDio;
+    joinDio.SetInstanceId(INSTANCE);
+    joinDio.SetVersionNumber(0);
+    joinDio.SetRank(RPL_MIN_HOPRANKINC);
+    joinDio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+    joinDio.SetGrounded(true);
+    joinDio.SetDodagId(origin);
+    joinDio.SetDtsn(0);
+    joinDio.SetDagConfiguration(4, 6, 0, 0, RPL_MIN_HOPRANKINC, RPL_OCP_OF0, 0xFF, 0xFFFF);
+    P2pRdoOption joinRdo;
+    joinRdo.reply = true;
+    joinRdo.hopByHop = true;
+    joinRdo.maxRankOrNh = 0; // no limit
+    joinRdo.lifetime = 3;    // 64 s (@see RplP2pLifetimeSeconds()), ample margin
+    joinRdo.target = Ipv6Address("2001:9::dead:1"); // never this node
+    joinDio.SetP2pRdo(joinRdo);
+    RplDioHeader otherJoinDio = joinDio;
+    otherJoinDio.SetDodagId(otherOrigin);
+
+    // Delivered from a one-shot fabricated neighbour ("fe80::a", never a
+    // real node), which goes stale and drops out of this node's own
+    // dodag.parents for either membership after about 2 s (2 x Imax,
+    // Imax = Imin x 2^doublings = 64 ms x 2^4 from the DagConfiguration
+    // above) -- SelectPreferredParent() then loses the last parent and
+    // poisons the membership out from under this test, exactly the
+    // design-constraints.md section 42.3 hazard, here newly reachable
+    // because this test (unlike RplP2pDroRelayTestCase's own TryRelay(),
+    // which joins fresh and delivers within under a second every single
+    // call) keeps one membership alive across several deliveries in a
+    // row. Re-delivered every 100 ms, for both DODAGIDs, for the whole
+    // test's duration, to keep "fe80::a" looking alive throughout.
+    for (uint32_t i = 0; i < 50; i++)
+    {
+        Simulator::Schedule(MilliSeconds(100 * i),
+                            &DeliverRawRplMessage<RplDioHeader>,
+                            node,
+                            1,
+                            joinDio,
+                            static_cast<uint8_t>(RPL_CODE_DIO),
+                            Ipv6Address("fe80::a"),
+                            Ipv6Address(RPL_ALL_NODES_MULTICAST));
+        Simulator::Schedule(MilliSeconds(100 * i),
+                            &DeliverRawRplMessage<RplDioHeader>,
+                            node,
+                            1,
+                            otherJoinDio,
+                            static_cast<uint8_t>(RPL_CODE_DIO),
+                            Ipv6Address("fe80::a"),
+                            Ipv6Address(RPL_ALL_NODES_MULTICAST));
+    }
+    Simulator::Stop(MilliSeconds(50));
+    Simulator::Run();
+    NS_ASSERT_MSG(rpl->IsJoinedTo(INSTANCE, origin), "Failed to set up this test's fixture");
+    NS_ASSERT_MSG(rpl->IsJoinedTo(INSTANCE, otherOrigin),
+                 "Failed to set up this test's second fixture");
+
+    // First delivery: establishes the Hop-by-hop Route, next hop hopB
+    // (Address[NH+1]). Nothing stored yet to conflict with, so this
+    // relays.
+    bool firstRelayed = TryDeliver(node, origin, target, {hopA}, {hopB});
+    NS_TEST_ASSERT_MSG_EQ(firstRelayed, true, "The first delivery, with nothing to conflict "
+                                              "against yet, was not relayed");
+    Ipv6Address nextHop;
+    uint8_t hopInstanceId = 0;
+    NS_TEST_ASSERT_MSG_EQ(rpl->HasHopByHopRoute(INSTANCE, target),
+                          true,
+                          "The first delivery did not establish a Hop-by-hop Route");
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetHopByHopRoute(target, nextHop, hopInstanceId),
+                          true,
+                          "The first delivery did not establish a Hop-by-hop Route");
+    NS_TEST_ASSERT_MSG_EQ(nextHop, hopB, "Wrong next hop recorded from the first delivery");
+
+    // Second delivery: same Instance/DODAGID/Target, but a different
+    // Address Vector around this node's own entry, so Address[NH+1]
+    // resolves to hopC instead of hopB -- a genuine conflict. RFC 6997
+    // section 9.6: MUST discard with no further processing, so this must
+    // not relay, and the originally stored next hop (hopB) must survive
+    // untouched.
+    bool conflictingRelayed = TryDeliver(node, origin, target, {hopB}, {hopC});
+    NS_TEST_ASSERT_MSG_EQ(conflictingRelayed,
+                          false,
+                          "A P2P-DRO conflicting with an already-established Hop-by-hop Route "
+                          "was relayed instead of discarded");
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetHopByHopRoute(target, nextHop, hopInstanceId),
+                          true,
+                          "The Hop-by-hop Route disappeared after the conflicting delivery");
+    NS_TEST_ASSERT_MSG_EQ(nextHop,
+                          hopB,
+                          "The conflicting delivery overwrote the original next hop instead of "
+                          "being discarded");
+
+    // Third delivery: the exact same Address Vector as the first
+    // (next hop still hopB) -- an ordinary retransmission, not a
+    // conflict, since the stored and incoming next hop agree. Must relay
+    // normally and leave the route exactly as it was.
+    bool repeatRelayed = TryDeliver(node, origin, target, {hopA}, {hopB});
+    NS_TEST_ASSERT_MSG_EQ(repeatRelayed,
+                          true,
+                          "A repeat delivery naming the very same next hop was mistaken for a "
+                          "conflict and discarded instead of relayed");
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetHopByHopRoute(target, nextHop, hopInstanceId),
+                          true,
+                          "The Hop-by-hop Route disappeared after the repeat delivery");
+    NS_TEST_ASSERT_MSG_EQ(nextHop, hopB, "The repeat delivery changed the stored next hop");
+
+    // Fourth delivery: a different DODAGID (a different, unrelated
+    // Origin, already joined by the keep-alive loop above) naming the
+    // very same Target, with yet another next hop (hopC). RFC 6997
+    // section 9.6's own conflict rule is scoped to "the same
+    // RPLInstanceID and DODAGID fields" -- a different DODAGID is a
+    // different route to the same destination, not a conflict, the same
+    // "last one wins" rule this module's own m_p2pRoutes/m_aodvRoutes
+    // already apply for their own H=0 routes (@see design-constraints.md
+    // section 46.6's own note on this). Must relay, and must replace what
+    // was stored under the destination.
+    bool otherInstanceRelayed = TryDeliver(node, otherOrigin, target, {hopA}, {hopC});
+    NS_TEST_ASSERT_MSG_EQ(otherInstanceRelayed,
+                          true,
+                          "A Hop-by-hop Route to the same destination under a different Instance "
+                          "was treated as a conflict instead of a different, unrelated route");
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetHopByHopRoute(target, nextHop, hopInstanceId),
+                          true,
+                          "The Hop-by-hop Route to the shared destination disappeared");
+    NS_TEST_ASSERT_MSG_EQ(nextHop,
+                          hopC,
+                          "The different-Instance delivery to the same destination did not "
+                          "replace the stored route the way an unrelated route should");
+
+    monitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief A router leaves rather than joins a temporary DAG whose P2P mode
  *        DIO Address Vector already has no room left for its own entry.
  *
@@ -15371,6 +15700,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplP2pHopByHopRouteCompletesTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pHopByHopRouteOutlivesTemporaryDagTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pDroRelayTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pHopByHopRouteConflictTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pAddressVectorFullTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDioRejectionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplParentLossRejoinTestCase, TestCase::Duration::QUICK);
