@@ -484,6 +484,26 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
                                     Ipv6Address dst) const;
 
     /**
+     * @brief RouteToNeighbour(), for a neighbour no Parent set names.
+     *
+     * A Storing mode (RFC 6550 section 9.8) downward route's own next hop is
+     * a child, never a member of dodag.parents (that set is upward-facing
+     * only), so InterfaceForNeighbour()'s lookup would not find it -- HandleDao()
+     * instead records which interface each DownwardRoute's own next hop was
+     * last heard on directly, at the same time it learns the address, and
+     * this overload takes that interface as given rather than searching for
+     * it.
+     *
+     * @param interface the interface to send out, already known
+     * @param neighbour the address of the neighbour to send to
+     * @param dst the destination to put in the route
+     * @return the route, nullptr if interface is 0
+     */
+    Ptr<Ipv6Route> RouteToNeighbourOn(uint32_t interface,
+                                      Ipv6Address neighbour,
+                                      Ipv6Address dst) const;
+
+    /**
      * @brief Read the RPLInstanceID out of a packet's own RPL Option.
      *
      * A relaying/forwarding node needs to know which DODAG a packet
@@ -706,6 +726,36 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      */
     uint32_t GetP2pRouteCount() const;
 
+    /**
+     * @brief Get a Storing mode (RFC 6550 section 9.8) downward route this
+     *        node itself forwards data over.
+     *
+     * Unlike GetP2pRoute()/GetAodvRoute(), held by every non-leaf node in
+     * the DODAG, not just an Origin/OrigNode: Storing mode routes downward
+     * by ordinary next-hop forwarding at every hop, there is no single
+     * "holds the whole path" node the way source routing has.
+     *
+     * @param instanceId the RPLInstanceID of the DODAG
+     * @param dodagId the DODAGID of the DODAG
+     * @param target the address the route leads to
+     * @param [out] nextHop the child this route was learned from
+     * @return true if a live route is held; expired ones are dropped and
+     *         reported as absent
+     */
+    bool GetDownwardRoute(uint8_t instanceId,
+                          Ipv6Address dodagId,
+                          Ipv6Address target,
+                          Ipv6Address& nextHop) const;
+
+    /**
+     * @brief How many live Storing mode downward routes this node holds
+     *        for a DODAG.
+     * @param instanceId the RPLInstanceID of the DODAG
+     * @param dodagId the DODAGID of the DODAG
+     * @return the number of routes, expired ones excluded
+     */
+    uint32_t GetDownwardRouteCount(uint8_t instanceId, Ipv6Address dodagId) const;
+
   protected:
     void DoInitialize() override;
     void DoDispose() override;
@@ -838,8 +888,27 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
          */
         Timer globalRepairEvent{Timer::CANCEL_ON_DESTROY};
 
-        /// The root only: which parent each node reports sitting under.
+        /// The root only, Non-Storing mode: which parent each node reports
+        /// sitting under.
         std::map<Ipv6Address, TopologyEntry> topology;
+
+        /// Storing mode (RFC 6550 section 9.8) only, every node including
+        /// the root: a downward route this node itself forwards data over,
+        /// learned from a DAO a child sent (directly, for the child's own
+        /// address, or relayed, for a target further down the child's own
+        /// sub-DODAG). Unlike topology above (root-only, parent-keyed, used
+        /// only to build a source route), this is consulted by every node's
+        /// own RouteInput()/RouteOutput() directly -- storing mode routes
+        /// downward by ordinary next-hop forwarding, no Routing Header at
+        /// all. @see DownwardRoute.
+        struct DownwardRoute
+        {
+            Ipv6Address nextHop;   //!< the child this was learned from, link-local
+            uint32_t interface{0}; //!< which interface nextHop was heard on
+            uint8_t pathSequence{0}; //!< path sequence of the DAO this came from
+            Time expire;            //!< when the entry goes stale
+        };
+        std::map<Ipv6Address, DownwardRoute> downwardRoutes;
 
         /**
          * @brief AODV-RPL (RFC 9854) state, meaningful only while
@@ -1733,10 +1802,51 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     bool SelectPreferredParent(DodagMembership& dodag);
 
     /**
+     * @brief Build and unicast one DAO, RFC 6550 section 6.4/9.8.
+     *
+     * The wire-format and destination-resolution core SendDao(), DaoRetry()
+     * and the Storing mode relay path in HandleDao() all share. Sequencing
+     * and DAO-ACK/retry state are each caller's own concern, not this
+     * function's: a Storing mode relay shares dodag.daoSequence's counter
+     * (RFC 6550 section 6.4's DAOSequence has no separate "which target"
+     * concept) but never sets @p ackRequested, so it is deliberately passed
+     * the current value rather than a freshly incremented one -- letting a
+     * relay's own transmissions advance the counter would desync it from
+     * whatever value SendDao()'s own pending self-advertisement is still
+     * waiting to see acknowledged, and HandleDaoAck() would then never match
+     * it. A relayed DAO's own DAOSequence value therefore is not
+     * meaningfully unique per message, a deliberate simplification: nothing
+     * in this module ever needs to distinguish one from another, since none
+     * of them request an acknowledgement to begin with.
+     *
+     * @param dodag the DODAG to send on behalf of
+     * @param target the address being advertised: this node's own in the
+     *        ordinary case, or a downstream node's in a Storing mode relay
+     * @param sequence the DAOSequence to stamp on the wire
+     * @param pathSequence the Transit Information's own Path Sequence
+     * @param pathLifetimeField the Transit Information's own Path Lifetime
+     *        field, 0 for a No-Path
+     * @param ackRequested the 'K' bit
+     */
+    void SendDaoMessage(DodagMembership& dodag,
+                        Ipv6Address target,
+                        uint8_t sequence,
+                        uint8_t pathSequence,
+                        uint8_t pathLifetimeField,
+                        bool ackRequested);
+
+    /**
      * @brief Advertise this node to the root, RFC 6550 section 6.4.
      *
-     * The DAO travels to the DODAGID like any other upward traffic, so every
-     * node on the way just forwards it and only the root ever reads it.
+     * In Non-Storing mode the DAO travels to the DODAGID like any other
+     * upward traffic, so every node on the way just forwards it and only
+     * the root ever reads it. In Storing mode (RFC 6550 section 9.8) it is
+     * instead unicast one hop, to the preferred parent, which reads it and
+     * relays its own DAO further up in turn (HandleDao()) -- and, since a
+     * parent switch leaves whatever this node's own downwardRoutes table
+     * already relayed unknown to the new parent, this also re-sends one for
+     * every entry still live in it, the same as the periodic refresh
+     * (DaoTimerExpire()) does.
      *
      * @param dodag the DODAG membership to advertise
      */
@@ -1788,11 +1898,23 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     void GlobalRepairFire(DodagKey key);
 
     /**
-     * @brief Act on a received DAO. Only the root ever gets one.
+     * @brief Act on a received DAO.
+     *
+     * Non-Storing mode: only the root ever gets one, and only to learn its
+     * source-routing topology. Storing mode (RFC 6550 section 9.8): every
+     * non-leaf node gets one, from each of its own children, and stores (or
+     * withdraws) a downward route in dodag.downwardRoutes -- propagating a
+     * fresh DAO of its own to its preferred parent whenever that changes
+     * anything, unless this node is itself the root.
+     *
      * @param dao the DAO
      * @param from the address of the node that advertised itself
+     * @param interface which interface @p from was heard on -- Storing
+     *        mode's own downward routes need it (@see
+     *        DodagMembership::DownwardRoute), unlike Non-Storing mode's
+     *        topology, which only ever needs addresses
      */
-    void HandleDao(const RplDaoHeader& dao, Ipv6Address from);
+    void HandleDao(const RplDaoHeader& dao, Ipv6Address from, uint32_t interface);
 
     /**
      * @brief Act on a received DAO-ACK, i.e. stop retrying.
@@ -2097,6 +2219,10 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     // DodagMembership member initializer -- so it does not need a scalar
     // counterpart the way these two do.
     uint16_t m_ocp;                //!< objective code point in use
+    /// Mode of Operation the root advertises (RPL_MOP_NON_STORING or
+    /// RPL_MOP_STORING_NO_MULTICAST); every other node adopts whatever MOP
+    /// the DIO it joins on advertises instead, the same as m_ocp.
+    uint8_t m_mop;
     uint16_t m_minHopRankIncrease; //!< MinHopRankIncrease, also the rank of the root
 
     Time m_dioIntervalMin;         //!< Trickle Imin for DIOs

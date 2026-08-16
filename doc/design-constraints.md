@@ -6096,3 +6096,193 @@ RFC 9854 §7を再確認しつつ、§52完了時点で手薄だった境界値�
 `./ns3 build`(rplモジュール・プロジェクト全体とも)、
 `test-runner --suite=rpl`を複数回連続実行して安定PASSを確認。
 既存の全P2P-RPL/AODV-RPLテストは無変更でPASS。
+
+## 54. base RPLのStoring mode (RFC 6550 section 9.8, MOP=2) を実装
+
+これまでのbase RPLはNon-Storing mode (MOP=1) のみ対応しており、
+root以外のノードは下り経路について一切の状態を持たなかった。
+AODV-RPL/P2P-RPLのH=1インフラ(§46/§48)とは意図的に別物として
+設計されているコアRPL自身のStoring modeを新規実装した。
+
+### 54.1 `downwardRoutes`テーブルの設計 — `topology`との役割分担
+
+`DodagMembership`に新規`downwardRoutes`(`std::map<Ipv6Address,
+DownwardRoute>`、`DownwardRoute{nextHop, interface, pathSequence,
+expire}`)を追加した。既存の`topology`(root専用、Non-Storing modeの
+送信元ルーティング計算にのみ使う)とは完全に別テーブルとし、
+`HandleDao()`は`dodag->mop`で分岐して一方にのみ書く(§54.5)。
+
+root自身もStoring modeでは`downwardRoutes`を使う — root含め全ての
+非leafノードが同じ仕組みで下り経路を持つのがStoring modeの本質
+(RFC 6550 section 9.2 rule 4)であり、「rootだけ特別」という
+Non-Storing mode由来の非対称性を持ち込まない設計とした。
+
+### 54.2 `SendDaoMessage()`共有ヘルパーと、`SendNoPathDao()`が
+     あえて共有しない理由
+
+`SendDao()`/`DaoRetry()`/`HandleDao()`のStoring modeリレー経路の
+3箇所は、ワイヤフォーマット構築と宛先解決(Storing modeなら
+preferred parentへlink-local一発送信、Non-Storingならroot
+(dodagId)へ多ホップ送信)が完全に同一のため、新規`SendDaoMessage()`
+に共通化した。宛先は常に`dodag.preferredParent`から解決する。
+
+一方`SendNoPathDao(dodag, viaParent)`はこの共有から意図的に外した:
+呼び出し時点で`dodag.preferredParent`が既に(離脱しつつある
+`viaParent`とは別の)新しい親に切り替わっている場合があり、
+撤回(No-Path)は`dodag.preferredParent`ではなく`viaParent`
+(離脱前に実際に経由していた親)へ送らなければならない。
+`SendDaoMessage()`の「常にpreferredParent」という単純化はこの
+ケースに合わないため、`SendNoPathDao()`は自前のヘッダ構築と
+宛先解決を保持しつつ、Storing mode分岐だけ追加した。
+
+### 54.3 DAOSequence非インクリメント設計(リレーDAO)
+
+RFC 6550 section 6.4のDAOSequenceはメッセージ単位・送信者単位の
+カウンタで、DAO-ACK突き合わせ(`HandleDaoAck()`の
+`daoAck.GetSequence() != dodag->daoSequence`)にのみ使われる。
+Storing modeのリレー(他ノードの経路を代理で再広告するDAO)が
+このカウンタを自分の判断でインクリメントしてしまうと、
+自分自身の自己広告DAOが待っているDAO-ACKの照合がズレて
+永久に届かなくなる。そのため全てのリレーDAOは
+(1) ACKを要求しない(`ackRequested=false`)、(2)
+`dodag.daoSequence`を現在値のまま(インクリメントせずに)使う、
+という2点を徹底した — `DaoRetry()`の既存の再送ロジック
+(既存のDAOSequenceを読むだけでインクリメントしない)と同じ
+考え方の横展開である。Path Sequence(`TopologyEntry::pathSequence`
+/ `DownwardRoute::pathSequence`)とは別物であり、こちらは
+originator(経路の実際の持ち主)がparent切り替え時にのみ
+インクリメントし(`SelectPreferredParent()`)、中継者はコピーして
+転送するだけ、という既存の区別をStoring modeでもそのまま踏襲した。
+
+### 54.4 スコープ修正: 「複数target再広告」は当初の想定より
+     前倒しで必須と判明
+
+当初の実装計画では、マルチホップの下り経路伝播そのものを
+「増分2」として後回しにし、まず「単一ホップの自己DAO送受信」
+だけを増分1として先に完成させる想定だった。しかし実装検討の
+過程で、**伝播の仕組みが無ければStoring modeは1ホップより深い
+DODAGで実質的に機能しない**(あるノードの子孫の存在は、直近の
+親にしか知られず、それ以上上には一切伝わらない)ことに気づいた。
+これは実用に耐えない制約であり、当初「複数target再広告」と
+呼んでいたものの実体は「マルチホップ伝播そのもの」であって、
+真に後回しにできるのは「複数ターゲットを1つのワイヤメッセージへ
+集約する」という帯域最適化(RFC上もMUSTではない)だけだと判断し、
+計画を修正した。
+
+結果として、ワイヤフォーマットは1メッセージ1ターゲットのまま
+(`RplDaoHeader`自体は無変更)、`SendDao()`が自己広告DAOに加えて
+`dodag.downwardRoutes`の生存エントリ1件ごとに個別のDAO
+メッセージを送るループを持つ設計とした(§54.6)。この修正は
+ユーザーへ再確認せず実装内で判断したが、既に承認された計画の
+実装可能性を保つための自然な補正であり、当初計画が「Storing mode
+自体は動くが1ホップ限定」という無意味な区切りになることを避けた。
+
+### 54.5 `HandleDao()`のゲート拡張とDAO-ACKのインターフェース修正
+
+- DODAG解決ゲートを`it->second.isRoot`から
+  `it->second.isRoot || it->second.mop ==
+  RPL_MOP_STORING_NO_MULTICAST`へ拡張(D flag有無の両分岐とも)。
+  Storing modeではroot以外の全ノードもDAOを受理する必要がある
+  ため。
+- DAO-ACK返信を`SendRplMessageUnicast()`固定から、Storing mode時は
+  `SendRplMessageOn(interface, ...)`へ分岐。理由:
+  `SendRplMessageUnicast()`は宛先に関わらず`m_ifcToSocket`の
+  「最初のインターフェース」を使う実装になっている
+  (`rpl-routing-protocol.cc`該当箇所、既知の制限として以前から
+  コメントで記録済み)。Non-Storing modeのDAO-ACK宛先(`from`)は
+  常にglobalアドレスであり実IPルーティングが正しい経路を解決する
+  ため実害は無いが、Storing modeのDAOは常にlink-local一発
+  (RFC 6550 section 9.1 rule 4)であり、複数インターフェース持ちの
+  ノードでは「最初のインターフェース」が実際に`from`へ届く
+  インターフェースとは限らない。DAO自体が届いた`interface`
+  引数(§54.6で`RecvRpl()`から`HandleDao()`へ新規に通すように
+  なった)をそのままACK返信にも使うことで解決した。
+
+### 54.6 データプレーン統合
+
+`PrepareOutgoingPacket()`/`RouteOutput()`/`RouteInput()`それぞれに
+Storing mode専用の分岐を追加し、既存のAODV-RPL/P2P-RPLのH=1
+チェックと同じ優先順位帯(既存のNon-Storing送信元ルーティング
+フォールバックより前)に置いた。Storing modeの下り経路には
+Routing Headerを一切使わない(RFC 6550 section 9.8: 各ホップが
+`downwardRoutes`を都度引き直す)ため、`PrepareOutgoingPacket()`の
+新規分岐はRPL Optionだけを付けて即returnする — 既存のH=1
+Hop-by-hop Route分岐と同じ形。root以外の中継ノードが自分の子孫
+宛てにトラフィックを発信するケース向けに、`down`フラグは
+`originDodag->isRoot`に頼らず常に`true`で構築している(root
+以外のノードもStoring modeでは正当な下り送信元になりうるため)。
+
+新規追加した`RouteToNeighbourOn(interface, neighbour, dst)`
+(既存の`RouteToNeighbour()`系オーバーロードが`dodag.parents`
+[上り方向の隣接]しか検索しないため、下り方向の子への経路解決には
+使えないことを確認した上で追加)を、この3箇所全てで下り経路構築に
+使っている。
+
+### 54.7 `Mop`属性の新設 — rootがStoring modeを広告する手段が
+     存在しなかった
+
+実装・テストの途中で、base DODAGのroot形成コード
+(`HandleDadSuccess()`)が`CreateDodagMembership(key,
+RPL_MOP_NON_STORING)`とMOPをハードコードしていることに気づいた。
+`HandleDio()`側でStoring modeのDIOを受理できるようにしても、
+root自身がStoring modeを広告する手段がなければ機能全体が
+到達不能になる。既存の`Ocp`属性と全く同じパターンで新規`Mop`
+属性(既定値`RPL_MOP_NON_STORING`、後方互換)を追加し、
+`RplHelper::Set("Mop", UintegerValue(RPL_MOP_STORING_NO_MULTICAST))`
+でroot形成前に設定できるようにした。
+
+### 54.8 既存テストの更新
+
+`RplDioRejectionTestCase`(「HandleDio()が拒否すべきDIO」)が
+「Storing modeのDIOは参加しない」ことを前提としたアサーションを
+持っていたため、これをMOP 3(`RPL_MOP_STORING_MULTICAST`、
+マルチキャスト付きStoring mode、今回未実装)に差し替えた。
+「未実装のMOPは拒否される」というテストの本来の意図は保ったまま、
+対象MOPだけを今回実装した範囲の外側へ動かした形になる。
+
+### 54.9 新規テストと検証
+
+`RplStoringModeDownwardRouteTestCase`: root--relay1--relay2--leafの
+4ノード直線でStoring modeのDODAGを形成し、(1)`topology`が空の
+ままであること(Non-Storing側の仕組みが一切使われないことの
+確認)、(2)root/relay1/relay2それぞれの`downwardRoutes`が
+正しいnext hopを持つこと — 特にrootのleafへの経路がrelay1
+経由になっている(直接ではない)ことが、マルチホップ伝播
+(§54.4)が実際に機能している証拠、(3)`PrepareOutgoingPacket()`が
+2ホップ先の宛先に対してもRouting Headerを付けないこと、
+(4)実際のUDPソケットで上り・下り両方向のデータが2ホップ
+リレーを経て届くこと、を確認した。
+
+load-bearing検証: `HandleDao()`のStoring mode分岐全体を
+`if (false && storing)`で無効化したところ、テストは静かに
+FAILするのではなくクラッシュ(`NS_ASSERT failed, cond="m_ptr"`)
+した — `downwardRoutes`が空のまま`topology`側に不整合な形で
+データが書かれ、その後の経路解決のどこかでnullptr相当を
+参照した結果と見られる。修正が本質的に必要であることの
+確認としては十分と判断し、クラッシュの正確な発生箇所までは
+追わずに元へ戻した(§ns3-debug-pitfalls スキルの「クラッシュは
+まずテスト失敗に格下げできないか疑う」という指針は、今回は
+自分で意図的に壊した実験であり実装側の未知のバグ調査ではない
+ため、そのまま採用しなかった)。
+
+`./ns3 build`(rplモジュール・プロジェクト全体とも)、
+`test-runner --suite=rpl`を複数回実行して安定PASSを確認。
+既存の全テスト(`RplDioRejectionTestCase`の更新後を含む)は
+PASS。
+
+### 54.10 今回見送った項目
+
+- **MOP 3 (Storing mode with multicast)**: マルチキャストDAO
+  自体が未実装であり、当初計画どおり対象外。
+- **RFC 6550 section 11.2.2.3 (DAO Inconsistency Detection and
+  Recovery)**: RPIの'F' (Forwarding-Error) フラグを使った
+  Storing mode専用の修復機構。既存の'R' (rank inconsistency)
+  フラグが「trace はするが強制はしない」という既知の未実装
+  (§12.2)と同種の、意図的に対象外とした項目。
+- **複数ターゲットの1メッセージ集約**: §54.4で述べた通り、
+  マルチホップ伝播そのものは今回の対象に含めたが、複数の
+  `downwardRoutes`エントリを1つのDAOメッセージへ集約する
+  帯域最適化(RFC上は任意)は次回増分へ持ち越す。
+- **`/protocol-test-matrix`による深掘り監査**: このセッションの
+  標準運用(§40/§41/§43/§47/§49/§51/§53)に従い、本実装の
+  コミット後に別途実施する。

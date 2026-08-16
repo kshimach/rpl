@@ -2840,6 +2840,246 @@ RplDodagFormationTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief Build a Storing mode (RFC 6550 section 9.8) DODAG over a line of
+ *        four nodes and check that every non-leaf node's own downward route
+ *        table -- not the root-only topology Non-Storing mode uses -- is
+ *        what carries data both ways.
+ *
+ *     root(0) ---- relay1(1) ---- relay2(2) ---- leaf(3)
+ *
+ * Unlike RplDodagFormationTestCase's Non-Storing DODAG, where only the root
+ * ever learns anything and every downward packet carries its own path in a
+ * Routing Header, here every one of relay1/relay2/root has to learn its own
+ * next hop toward leaf from the DAOs relay2/relay1 each relay in turn (RFC
+ * 6550 section 9.8 rule 2) -- root's own route to leaf, two hops away, is
+ * the one assertion RplDodagFormationTestCase has no equivalent of at all,
+ * since Non-Storing mode never needs an intermediate router to know
+ * anything.
+ */
+class RplStoringModeDownwardRouteTestCase : public TestCase
+{
+  public:
+    RplStoringModeDownwardRouteTestCase();
+
+  private:
+    void DoRun() override;
+
+    /// @brief Count a datagram delivered at either end.
+    /// @param socket the receiving socket
+    void CountDelivery(Ptr<Socket> socket);
+
+    /// @brief Send one datagram, as a named method Simulator::Schedule() can
+    ///        resolve (Socket::Send is overloaded).
+    /// @param socket the sending socket
+    void SendOne(Ptr<Socket> socket);
+
+    uint32_t m_delivered{0}; //!< datagrams delivered, either direction
+};
+
+RplStoringModeDownwardRouteTestCase::RplStoringModeDownwardRouteTestCase()
+    : TestCase("A Storing mode DODAG learns downward routes at every hop and carries data both "
+              "ways")
+{
+}
+
+void
+RplStoringModeDownwardRouteTestCase::CountDelivery(Ptr<Socket> socket)
+{
+    Ptr<Packet> packet = socket->Recv();
+    while (packet)
+    {
+        m_delivered++;
+        packet = socket->Recv();
+    }
+}
+
+void
+RplStoringModeDownwardRouteTestCase::SendOne(Ptr<Socket> socket)
+{
+    socket->Send(Create<Packet>(64));
+}
+
+void
+RplStoringModeDownwardRouteTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(4); // 0 = root, 1 and 2 = relays, 3 = leaf
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    auto blacklist = [&](uint32_t a, uint32_t b) {
+        Ptr<SimpleNetDevice> devA = DynamicCast<SimpleNetDevice>(devices.Get(a));
+        Ptr<SimpleNetDevice> devB = DynamicCast<SimpleNetDevice>(devices.Get(b));
+        channel->BlackList(devA, devB);
+        channel->BlackList(devB, devA);
+    };
+    blacklist(0, 2);
+    blacklist(0, 3);
+    blacklist(1, 3);
+
+    RplHelper rplHelper;
+    rplHelper.Set("Mop", UintegerValue(RPL_MOP_STORING_NO_MULTICAST));
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(250));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> root = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> relay1 = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> relay2 = nodes.Get(2)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> leaf = nodes.Get(3)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(leaf->IsJoined(), true, "The Storing mode DODAG did not reach the far end");
+
+    Ipv6Address dodagId = root->GetGlobalAddress();
+    Ipv6Address relay1Address = relay1->GetGlobalAddress();
+    Ipv6Address relay2Address = relay2->GetGlobalAddress();
+    Ipv6Address leafAddress = leaf->GetGlobalAddress();
+
+    Ipv6Address relay1LinkLocal =
+        nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address relay2LinkLocal =
+        nodes.Get(2)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address leafLinkLocal =
+        nodes.Get(3)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    // Non-Storing mode's own root-only topology plays no part here at all
+    // (@see HandleDao()'s mode branch): everything this DODAG learned went
+    // into downwardRoutes instead.
+    NS_TEST_ASSERT_MSG_EQ(root->GetTopologySize(),
+                          0,
+                          "A Storing mode root should never populate the Non-Storing topology");
+
+    // The root: two direct entries (relay1, its own child) and one relayed
+    // one (leaf, relay1's own child) -- three descendants total, but only
+    // two DAOs ever cross this link at a time, since relay1 relays leaf's
+    // own DAO onward under its own DAOSequence rather than root learning
+    // about relay2 and leaf as separate hops.
+    Ipv6Address nextHop;
+    NS_TEST_ASSERT_MSG_EQ(
+        root->GetDownwardRoute(RPL_DEFAULT_INSTANCE, dodagId, relay1Address, nextHop),
+        true,
+        "The root never learned a downward route to relay1");
+    NS_TEST_ASSERT_MSG_EQ(nextHop, relay1LinkLocal, "The root's route to relay1 is not direct");
+
+    NS_TEST_ASSERT_MSG_EQ(
+        root->GetDownwardRoute(RPL_DEFAULT_INSTANCE, dodagId, relay2Address, nextHop),
+        true,
+        "The root never learned a downward route to relay2");
+    NS_TEST_ASSERT_MSG_EQ(nextHop,
+                          relay1LinkLocal,
+                          "The root's route to relay2 should go through relay1, not direct");
+
+    NS_TEST_ASSERT_MSG_EQ(
+        root->GetDownwardRoute(RPL_DEFAULT_INSTANCE, dodagId, leafAddress, nextHop),
+        true,
+        "The root never learned a downward route to the leaf, two hops away");
+    NS_TEST_ASSERT_MSG_EQ(nextHop,
+                          relay1LinkLocal,
+                          "The root's route to the leaf should go through relay1, not direct");
+
+    // relay1: itself excluded, two descendants (relay2 direct, leaf relayed
+    // through relay2).
+    NS_TEST_ASSERT_MSG_EQ(
+        relay1->GetDownwardRoute(RPL_DEFAULT_INSTANCE, dodagId, relay2Address, nextHop),
+        true,
+        "relay1 never learned a downward route to relay2");
+    NS_TEST_ASSERT_MSG_EQ(nextHop, relay2LinkLocal, "relay1's route to relay2 is not direct");
+    NS_TEST_ASSERT_MSG_EQ(
+        relay1->GetDownwardRoute(RPL_DEFAULT_INSTANCE, dodagId, leafAddress, nextHop),
+        true,
+        "relay1 never learned a downward route to the leaf");
+    NS_TEST_ASSERT_MSG_EQ(nextHop,
+                          relay2LinkLocal,
+                          "relay1's route to the leaf should go through relay2, not direct");
+
+    // relay2: one descendant, the leaf, direct.
+    NS_TEST_ASSERT_MSG_EQ(relay2->GetDownwardRouteCount(RPL_DEFAULT_INSTANCE, dodagId),
+                          1,
+                          "relay2 should know of exactly one descendant, the leaf");
+    NS_TEST_ASSERT_MSG_EQ(
+        relay2->GetDownwardRoute(RPL_DEFAULT_INSTANCE, dodagId, leafAddress, nextHop),
+        true,
+        "relay2 never learned a downward route to the leaf");
+    NS_TEST_ASSERT_MSG_EQ(nextHop, leafLinkLocal, "relay2's route to the leaf is not direct");
+
+    // The leaf has no descendants of its own.
+    NS_TEST_ASSERT_MSG_EQ(leaf->GetDownwardRouteCount(RPL_DEFAULT_INSTANCE, dodagId),
+                          0,
+                          "The leaf should know of no descendants");
+
+    // A downward packet from the root needs no Routing Header at all (RFC
+    // 6550 section 9.8): only the RPL Option, the same size
+    // RplDodagFormationTestCase's own direct-child case ends up with, even
+    // though the leaf here sits two hops out.
+    Ipv6Header header;
+    header.SetDestination(leafAddress);
+    header.SetNextHeader(17); // UDP, as an example inner protocol
+    Socket::SocketErrno sockerr;
+    Ptr<Packet> downward = Create<Packet>();
+    Ptr<Ipv6Route> route = root->RouteOutput(downward, header, nullptr, sockerr);
+    NS_TEST_ASSERT_MSG_EQ(route != nullptr, true, "The root has no route down to the leaf");
+    NS_TEST_ASSERT_MSG_EQ(route->GetGateway(),
+                          relay1LinkLocal,
+                          "The packet for the leaf does not leave towards relay1");
+    root->PrepareOutgoingPacket(downward, header, route);
+    NS_TEST_ASSERT_MSG_EQ(downward->GetSize(),
+                          8,
+                          "A Storing mode downward packet should carry no Routing Header");
+    NS_TEST_ASSERT_MSG_EQ(header.GetDestination(),
+                          leafAddress,
+                          "A Storing mode downward packet's wire destination should stay the "
+                          "leaf itself, not rewritten to the first hop");
+
+    // And the route works, both directions, over real UDP sockets: two hops
+    // of relaying each way, so a delivery only arrives if RouteInput()'s new
+    // downwardRoutes lookup found the right next hop at both relay1 and
+    // relay2 in turn.
+    uint16_t downPort = 4248;
+    Ptr<Socket> downReceiver = Socket::CreateSocket(nodes.Get(3), UdpSocketFactory::GetTypeId());
+    downReceiver->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), downPort));
+    downReceiver->SetRecvCallback(
+        MakeCallback(&RplStoringModeDownwardRouteTestCase::CountDelivery, this));
+    Ptr<Socket> downSender = Socket::CreateSocket(nodes.Get(0), UdpSocketFactory::GetTypeId());
+    downSender->Connect(Inet6SocketAddress(leafAddress, downPort));
+    Simulator::Schedule(Seconds(1), &RplStoringModeDownwardRouteTestCase::SendOne, this, downSender);
+
+    uint16_t upPort = 4249;
+    Ptr<Socket> upReceiver = Socket::CreateSocket(nodes.Get(0), UdpSocketFactory::GetTypeId());
+    upReceiver->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), upPort));
+    upReceiver->SetRecvCallback(
+        MakeCallback(&RplStoringModeDownwardRouteTestCase::CountDelivery, this));
+    Ptr<Socket> upSender = Socket::CreateSocket(nodes.Get(3), UdpSocketFactory::GetTypeId());
+    upSender->Connect(Inet6SocketAddress(dodagId, upPort));
+    Simulator::Schedule(Seconds(1), &RplStoringModeDownwardRouteTestCase::SendOne, this, upSender);
+
+    Simulator::Stop(Seconds(5));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(m_delivered,
+                          2,
+                          "Both the downward and the upward datagram should have been delivered");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief A node in radio range of two independent DODAG roots joins both at
  *        once, and each root's own topology genuinely learns about it.
  *
@@ -13258,12 +13498,14 @@ RplDioRejectionTestCase::DoRun()
         Simulator::Run();
     };
 
-    // Storing mode: not implemented here, so nothing about this DIO may be
-    // acted on, not even to join the DODAG it advertises.
-    send(buildDio(dodagId, 1, RPL_MIN_HOPRANKINC, RPL_MOP_STORING_NO_MULTICAST));
+    // Storing mode with multicast (MOP 3): not implemented here (only MOP 2,
+    // storing without multicast, is -- @see RplStoringModeDownwardRouteTestCase),
+    // so nothing about this DIO may be acted on, not even to join the DODAG
+    // it advertises.
+    send(buildDio(dodagId, 1, RPL_MIN_HOPRANKINC, RPL_MOP_STORING_MULTICAST));
     NS_TEST_ASSERT_MSG_EQ(node->IsJoined(),
                           false,
-                          "A DIO advertising storing mode was joined anyway");
+                          "A DIO advertising storing mode with multicast was joined anyway");
 
     // Likewise a mode of operation with no downward routes at all.
     send(buildDio(dodagId, 1, RPL_MIN_HOPRANKINC, RPL_MOP_NO_DOWNWARD_ROUTES));
@@ -17373,6 +17615,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplPrepareOutgoingPacketNonRplInterfaceTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplTrickleTimerTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDodagFormationTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplStoringModeDownwardRouteTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplMultiDodagTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplCreateLocalDodagTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplCreateLocalDodagClearsDFlagTestCase, TestCase::Duration::QUICK);
