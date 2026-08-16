@@ -2059,18 +2059,20 @@ RplRoutingProtocol::SendDao(DodagMembership& dodag)
     // comment for why.
     if (storing)
     {
-        Time now = Simulator::Now();
+        // @see PurgeDownwardRoutes()'s own doc comment: this loop already
+        // walks the whole map, so sweeping expired entries out here is
+        // free, and it is the only periodic touchpoint most nodes (every
+        // non-root one) ever have. Every entry left afterwards is live, so
+        // nothing further needs to check its own expiry below.
+        PurgeDownwardRoutes(dodag);
         for (const auto& [downstreamTarget, route] : dodag.downwardRoutes)
         {
-            if (route.expire > now)
-            {
-                SendDaoMessage(dodag,
-                              downstreamTarget,
-                              dodag.daoSequence,
-                              route.pathSequence,
-                              m_pathLifetime,
-                              false);
-            }
+            SendDaoMessage(dodag,
+                          downstreamTarget,
+                          dodag.daoSequence,
+                          route.pathSequence,
+                          m_pathLifetime,
+                          false);
         }
     }
 }
@@ -2183,19 +2185,18 @@ RplRoutingProtocol::DaoRetry(DodagKey key)
 
     dodag.daoRetriesLeft--;
 
-    RplDaoHeader dao;
-    dao.SetInstanceId(dodag.instanceId);
-    dao.SetDodagId(dodag.dodagId);
-    dao.SetSequence(dodag.daoSequence);
-    dao.SetAckRequested(true);
-    dao.SetTarget(GetGlobalAddressIn(dodag));
-    dao.SetTransitInformation(GlobalAddressOf(dodag, dodag.preferredParent),
-                              dodag.pathSequence,
-                              m_pathLifetime);
-
-    Ptr<Packet> packet = Create<Packet>();
-    packet->AddHeader(dao);
-    SendRplMessageUnicast(packet, RPL_CODE_DAO, dodag.dodagId);
+    // Routed through the same mode-aware helper SendDao() uses (@see its
+    // own doc comment): a hand-built, always-Non-Storing DAO here would
+    // violate RFC 6550 section 9.8 rule 1 (Transit Information's parent
+    // field must be empty in Storing mode) and section 9.1 rule 4 (Storing
+    // mode's own DAO must be addressed link-local, one hop, not to the
+    // root's global DODAGID) every time a retry is needed in Storing mode.
+    SendDaoMessage(dodag,
+                  GetGlobalAddressIn(dodag),
+                  dodag.daoSequence,
+                  dodag.pathSequence,
+                  m_pathLifetime,
+                  true);
 
     dodag.daoRetryEvent.Cancel();
     dodag.daoRetryEvent.Schedule(m_daoAckTimeout);
@@ -2535,6 +2536,27 @@ RplRoutingProtocol::PurgeTopology(DodagMembership& dodag)
     {
         it = (it->second.expire <= now) ? dodag.topology.erase(it) : std::next(it);
     }
+}
+
+void
+RplRoutingProtocol::PurgeDownwardRoutes(DodagMembership& dodag)
+{
+    Time now = Simulator::Now();
+    for (auto it = dodag.downwardRoutes.begin(); it != dodag.downwardRoutes.end();)
+    {
+        it = (it->second.expire <= now) ? dodag.downwardRoutes.erase(it) : std::next(it);
+    }
+}
+
+const RplRoutingProtocol::DodagMembership::DownwardRoute*
+RplRoutingProtocol::FindDownwardRoute(const DodagMembership& dodag, Ipv6Address target) const
+{
+    auto it = dodag.downwardRoutes.find(target);
+    if (it == dodag.downwardRoutes.end() || it->second.expire <= Simulator::Now())
+    {
+        return nullptr;
+    }
+    return &it->second;
 }
 
 RplRoutingProtocol::DodagMembership*
@@ -3493,22 +3515,22 @@ RplRoutingProtocol::RouteOutput(Ptr<Packet> p,
         // never populates, since HandleDao() writes a change to
         // dodag->downwardRoutes instead of dodag->topology when storing,
         // so FindRootDodagFor() would never succeed for it anyway.
-        Ipv6Address downwardNextHop;
-        uint32_t downwardInterface = 0;
+        //
+        // Purged here the same way FindRootDodagFor() purges topology just
+        // below: the root has no daoEvent of its own (@see
+        // PurgeDownwardRoutes()'s own doc comment) to otherwise ever sweep
+        // its downwardRoutes at all.
+        const DodagMembership::DownwardRoute* downward = nullptr;
         if (dodag && dodag->mop == RPL_MOP_STORING_NO_MULTICAST)
         {
-            auto route = dodag->downwardRoutes.find(dst);
-            if (route != dodag->downwardRoutes.end() && route->second.expire > Simulator::Now())
-            {
-                downwardNextHop = route->second.nextHop;
-                downwardInterface = route->second.interface;
-            }
+            PurgeDownwardRoutes(*dodag);
+            downward = FindDownwardRoute(*dodag, dst);
         }
-        if (!downwardNextHop.IsAny())
+        if (downward)
         {
             NS_LOG_LOGIC("Routing " << dst << " over a Storing mode downward route via "
-                                    << downwardNextHop);
-            Ptr<Ipv6Route> route = RouteToNeighbourOn(downwardInterface, downwardNextHop, dst);
+                                    << downward->nextHop);
+            Ptr<Ipv6Route> route = RouteToNeighbourOn(downward->interface, downward->nextHop, dst);
             if (route)
             {
                 return route;
@@ -3935,21 +3957,18 @@ RplRoutingProtocol::RouteInput(Ptr<const Packet> p,
     // CreateLocalDodag()-formed one.
     {
         const DodagMembership* base = GetBaseDodag();
-        if (base && base->mop == RPL_MOP_STORING_NO_MULTICAST)
+        const DodagMembership::DownwardRoute* route =
+            (base && base->mop == RPL_MOP_STORING_NO_MULTICAST) ? FindDownwardRoute(*base, dst)
+                                                                : nullptr;
+        if (route)
         {
-            auto route = base->downwardRoutes.find(dst);
-            if (route != base->downwardRoutes.end() && route->second.expire > Simulator::Now())
+            Ptr<Ipv6Route> ipv6Route = RouteToNeighbourOn(route->interface, route->nextHop, dst);
+            if (ipv6Route)
             {
-                Ptr<Ipv6Route> ipv6Route =
-                    RouteToNeighbourOn(route->second.interface, route->second.nextHop, dst);
-                if (ipv6Route)
-                {
-                    NS_LOG_LOGIC("Forwarding " << dst << " over a Storing mode downward route "
-                                                          "via "
-                                               << route->second.nextHop);
-                    ucb(ipv6Route->GetOutputDevice(), ipv6Route, p, header);
-                    return true;
-                }
+                NS_LOG_LOGIC("Forwarding " << dst << " over a Storing mode downward route via "
+                                           << route->nextHop);
+                ucb(ipv6Route->GetOutputDevice(), ipv6Route, p, header);
+                return true;
             }
         }
     }
@@ -4174,12 +4193,12 @@ RplRoutingProtocol::GetDownwardRoute(uint8_t instanceId,
     {
         return false;
     }
-    auto route = it->second.downwardRoutes.find(target);
-    if (route == it->second.downwardRoutes.end() || route->second.expire <= Simulator::Now())
+    const DodagMembership::DownwardRoute* route = FindDownwardRoute(it->second, target);
+    if (!route)
     {
         return false;
     }
-    nextHop = route->second.nextHop;
+    nextHop = route->nextHop;
     return true;
 }
 
@@ -4282,6 +4301,32 @@ RplRoutingProtocol::PrintRoutingTable(Ptr<OutputStreamWrapper> stream, Time::Uni
             else
             {
                 *os << (entry.expire - Now()).As(unit);
+            }
+            *os << std::endl;
+        }
+    }
+
+    // Not root-gated like the Non-Storing topology above: Storing mode (RFC
+    // 6550 section 9.8) has every non-root, non-leaf node -- not only the
+    // root -- keep its own downward routes.
+    if (!dodag->downwardRoutes.empty())
+    {
+        *os << "  Storing mode downward routes:" << std::endl;
+        Time now = Now();
+        for (const auto& [target, route] : dodag->downwardRoutes)
+        {
+            if (route.expire <= now)
+            {
+                continue;
+            }
+            *os << "    " << target << " via " << route.nextHop << ", expires in ";
+            if (route.expire == Time::Max())
+            {
+                *os << "never";
+            }
+            else
+            {
+                *os << (route.expire - now).As(unit);
             }
             *os << std::endl;
         }
@@ -4415,7 +4460,7 @@ RplRoutingProtocol::PrintRoutingTableJson(Ptr<OutputStreamWrapper> stream) const
         // fields either way rather than branching on "joined" first.
         *os << ",\"dodagId\":null,\"instance\":null,\"version\":null,\"ocp\":null"
                ",\"rank\":null,\"pathEtx\":null,\"preferredParent\":null"
-               ",\"parents\":[],\"topology\":[],";
+               ",\"parents\":[],\"topology\":[],\"downwardRoutes\":[],";
         writeAodvRoutes();
         *os << ",";
         writeP2pRoutes();
@@ -4499,6 +4544,34 @@ RplRoutingProtocol::PrintRoutingTableJson(Ptr<OutputStreamWrapper> stream) const
         else
         {
             *os << (entry.expire - Now()).GetSeconds();
+        }
+        *os << "}";
+        first = false;
+    }
+    *os << "],\"downwardRoutes\":[";
+
+    // Storing mode (RFC 6550 section 9.8) only, and -- unlike topology
+    // above -- not root-only: every non-root, non-leaf node keeps this.
+    first = true;
+    Time downwardNow = Now();
+    for (const auto& [target, route] : dodag->downwardRoutes)
+    {
+        if (route.expire <= downwardNow)
+        {
+            continue;
+        }
+        *os << (first ? "" : ",") << "{\"target\":";
+        quoted(target);
+        *os << ",\"nextHop\":";
+        quoted(route.nextHop);
+        *os << ",\"pathSequence\":" << +route.pathSequence << ",\"expiresIn\":";
+        if (route.expire == Time::Max())
+        {
+            *os << "null";
+        }
+        else
+        {
+            *os << (route.expire - downwardNow).GetSeconds();
         }
         *os << "}";
         first = false;

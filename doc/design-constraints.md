@@ -6396,3 +6396,111 @@ load-bearing検証: §55.1の修正を`if (false && ...)`ではなく
 `test-runner --suite=rpl`を複数回実行して安定PASSを確認。
 既存の全テスト(§54で追加した`RplStoringModeDownwardRouteTestCase`
 含む)はPASS。
+
+## 56. `/code-review`による独立監査(§54実装・§55自己監査とは別コンテキスト)で
+     `DaoRetry()`の重大な移行漏れを発見
+
+§54(実装)・§55(自己監査`/protocol-test-matrix`)はいずれも
+同一コンテキスト(同じセッション、同じ会話)内で行った。ユーザーから
+「実装者と監査者が同一人格では、RFC仕様の誤読を実装・テスト双方に
+一貫して持ち込んでいても自己検出できないのでは」という指摘を受け、
+`/code-review`(実装を書いていない別コンテキストのエージェントが
+finder/verifierを担当する設計)による独立レビューを別途実施した。
+
+### 56.1 発見した重大バグ: `DaoRetry()`がStoring mode対応から
+     漏れていた
+
+`SendDao()`/`HandleDao()`のリレー経路はいずれも新設の
+`SendDaoMessage()`ヘルパー経由でStoring mode対応済みだったが、
+**`DaoRetry()`だけが元のNon-Storing専用実装のまま未修整で残って
+いた**。具体的には、Storing modeであっても無条件に
+`dao.SetTransitInformation(GlobalAddressOf(dodag,
+dodag.preferredParent), ...)`(RFC 6550 section 9.8 rule 1
+違反 — Transit InformationのParent Address subfieldは空でなければ
+ならない)、`SendRplMessageUnicast(packet, RPL_CODE_DAO,
+dodag.dodagId)`(section 9.1 rule 4違反 — Storing modeのDAOは
+link-local・1ホップでなければならない)を送り続けていた。
+
+**具体的な障害シナリオ**: root(0)--relay(1)--probe(2)の
+Storing modeで、probeの自己広告DAOに対するDAO-ACKが遅延・
+消失し`DaoRetry()`が発火すると、この再送DAOはrelayの
+`HandleDao()`を一切経由せず、通常のIP転送でrelay経由root直接
+届いてしまう。rootの`HandleDao()`はこれを受理し、
+`downwardRoutes[probeAddress].nextHop`にprobe**自身のグローバル
+アドレス**を記録する — 実際にはStoring modeのどの中継リレーも
+広告していない、根拠のない「1ホップ隣人」がrootの経路表に
+紛れ込む。以降`RouteToNeighbourOn()`がこの偽next hopへ到達を
+試みても、実際には2ホップ先のprobeへのlink-local隣接関係など
+存在しないため、下り方向のトラフィックが黙ってブラックホール化
+する。
+
+`SendDao()`自身の初回送信は正しくStoring mode対応済みのため、
+**ACK-ACKタイムアウト無し(理想的なネットワーク)では表面化せず、
+再送が実際に発火する状況でのみ顕在化する**という性質があり、
+§54・§55のいずれの自己監査(いずれもDAO-ACKロスや再送を意図的に
+発生させるテストを含んでいなかった)でも見逃されていた。
+
+### 56.2 修正
+
+`DaoRetry()`を`SendDaoMessage()`経由に書き換え、`SendDao()`と
+完全に同じ宛先解決ロジックを共有する形にした。
+
+### 56.3 新規テスト:
+     `RplStoringModeDaoRetryTestCase`
+
+root(0)--relay(1)--probe(2)のStoring mode 3ノード直線で、
+`DaoAckTimeout`を短く設定し`DaoRetry()`を確実に発火させる。
+
+当初`DaoAckTimeout=1ms`のみで発火させようとしたが、
+`SimpleChannel`の既定Delayが0のため、DAO-ACKの往復が実質瞬時に
+完了し再送タイマーとの競合に負ける(=再送が発火しない)ケースが
+あることが判明した。`channel->SetAttribute("Delay",
+TimeValue(Seconds(1)))`で明示的な伝搬遅延を与え、往復に
+最低2秒かかる状況を作った上で`DaoAckTimeout=200ms`とすることで、
+再送が確実に(タイミング依存でなく構造的に)発火するようにした。
+
+検証内容: 再送発火後、rootが学習するprobeへの経路の`nextHop`が
+relayのlink-localアドレスであること(=relay経由で正しく学習した)
+を確認。バグがあれば`nextHop`はprobe自身のglobalアドレスになる
+(実測: `2001:1::200:ff:fe00:3`、期待値
+`fe80::200:ff:fe00:2`)。
+
+load-bearing検証: `DaoRetry()`の修正を旧実装(Non-Storing専用の
+ハードコード)に戻したところ、このテストが上記の実測値どおりに
+明確にFAILすることを確認、修正を元に戻して再度PASSを確認。
+
+### 56.4 副次的に発見・修正した項目(重大度は56.1より低い)
+
+- **`PrintRoutingTable()`/`PrintRoutingTableJson()`が
+  `downwardRoutes`を一切出力していなかった**: AODV-RPL/P2P-RPL
+  経路を追加した際(既存コミット)の確立済みパターンから外れて
+  いた。両関数に`downwardRoutes`セクションを追加(root限定ではなく
+  全非leafノードで出力、AODV/P2P経路と同じroot非限定の扱い)。
+- **`DownwardRoute`構造体自身のDoxygenコメントが欠落**:
+  `downwardRoutes`メンバ用に書いたコメントブロックが構造体定義の
+  直前に置かれており、Doxygen上は構造体自身にひもづき、
+  `downwardRoutes`メンバ自体は無コメントになっていた
+  (AGENTS.mdのコーディング規約「全メンバ変数にDoxygenコメント
+  必須」違反)。構造体自身の簡潔な説明と、`downwardRoutes`
+  メンバ自身の詳細説明を分離した。
+- **`downwardRoutes`に期限切れエントリの掃除機構が無かった**:
+  `topology`側の`PurgeTopology()`に相当するものが無く、No-Path
+  DAOを一度も送らずに消える子孫(クラッシュ・電波到達範囲外への
+  移動等)のエントリが、シミュレーション終了まで残り続ける
+  (実害はlookup側で`expire`チェック済みなので誤動作はしないが、
+  長時間・高頻度な参加離脱を伴うシナリオでのメモリ増大)。
+  `PurgeDownwardRoutes()`を新設し、`SendDao()`のStoring mode
+  ループ(既に全件走査済みなので便乗可能)と、`RouteOutput()`の
+  下り経路ルックアップ箇所(rootは`daoEvent`を持たないため
+  他に周期的な掃除機会が無い)の2箇所から呼ぶようにした。
+- **`RouteOutput()`/`RouteInput()`/`GetDownwardRoute()`が同じ
+  「targetを検索し期限切れなら無視」ロジックを3箇所で重複実装
+  していた**: `FindDownwardRoute()`という共有プライベートヘルパー
+  (`const DodagMembership::DownwardRoute*`を返す)を新設し、
+  3箇所全てをこれ経由に統一した。
+
+### 56.5 検証
+
+`./ns3 build`(rplモジュール・プロジェクト全体とも)、
+`test-runner --suite=rpl`を複数回実行して安定PASSを確認。
+既存の全テスト(§54・§55で追加したものを含む)はPASS。

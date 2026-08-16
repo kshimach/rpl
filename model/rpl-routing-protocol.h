@@ -892,6 +892,18 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
         /// sitting under.
         std::map<Ipv6Address, TopologyEntry> topology;
 
+        /**
+         * @brief One entry in downwardRoutes: a downward route this node
+         *        itself forwards data over.
+         */
+        struct DownwardRoute
+        {
+            Ipv6Address nextHop;   //!< the child this was learned from, link-local
+            uint32_t interface{0}; //!< which interface nextHop was heard on
+            uint8_t pathSequence{0}; //!< path sequence of the DAO this came from
+            Time expire;            //!< when the entry goes stale
+        };
+
         /// Storing mode (RFC 6550 section 9.8) only, every node including
         /// the root: a downward route this node itself forwards data over,
         /// learned from a DAO a child sent (directly, for the child's own
@@ -900,14 +912,7 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
         /// only to build a source route), this is consulted by every node's
         /// own RouteInput()/RouteOutput() directly -- storing mode routes
         /// downward by ordinary next-hop forwarding, no Routing Header at
-        /// all. @see DownwardRoute.
-        struct DownwardRoute
-        {
-            Ipv6Address nextHop;   //!< the child this was learned from, link-local
-            uint32_t interface{0}; //!< which interface nextHop was heard on
-            uint8_t pathSequence{0}; //!< path sequence of the DAO this came from
-            Time expire;            //!< when the entry goes stale
-        };
+        /// all.
         std::map<Ipv6Address, DownwardRoute> downwardRoutes;
 
         /**
@@ -1929,6 +1934,44 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      *              only the root holds a topology in non-storing mode)
      */
     void PurgeTopology(DodagMembership& dodag);
+
+    /**
+     * @brief Drop the Storing mode downward route entries whose lifetime has
+     *        run out.
+     *
+     * The Storing mode counterpart of PurgeTopology(): an expired entry is
+     * already excluded from every lookup (GetDownwardRoute(),
+     * RouteOutput()/RouteInput()'s own inline checks), so without this call
+     * it never causes a wrong routing decision -- only unbounded growth of
+     * dodag.downwardRoutes over a long-running, high-churn deployment, from
+     * descendants that disappear without ever sending a No-Path DAO. Called
+     * from SendDao()'s own storing-mode loop (@see its own doc comment),
+     * which already walks the whole map every DaoInterval, and from
+     * RouteOutput()'s downward-route lookup, since the root has no
+     * daoEvent of its own (SendDao() returns immediately for dodag.isRoot,
+     * SelectPreferredParent() never schedules one) and so would otherwise
+     * never purge anything at all.
+     *
+     * @param dodag the DODAG membership to purge
+     */
+    void PurgeDownwardRoutes(DodagMembership& dodag);
+
+    /**
+     * @brief Look up a live Storing mode downward route.
+     *
+     * The one lookup (find the target, reject it if expired) GetDownwardRoute(),
+     * RouteOutput() and RouteInput() all need -- RouteOutput()/RouteInput()
+     * also need the interface GetDownwardRoute()'s own public, nextHop-only
+     * signature has no way to return, so this is the shared internal form
+     * all three are built on rather than three independent copies of the
+     * same two-line check.
+     *
+     * @param dodag the DODAG membership to look in
+     * @param target the destination to look up
+     * @return the route, or nullptr if none is stored or it has expired
+     */
+    const DodagMembership::DownwardRoute* FindDownwardRoute(const DodagMembership& dodag,
+                                                             Ipv6Address target) const;
 
     /**
      * @brief Find a membership by its RPLInstanceID alone.

@@ -3273,6 +3273,123 @@ RplStoringModeStaleDaoAndNoPathTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief DaoRetry() addresses a Storing mode retry the same mode-aware way
+ *        SendDao() does -- link-local to the preferred parent, not globally
+ *        to the root.
+ *
+ * root(0)--relay(1)--probe(2), Storing mode, with DaoAckTimeout set to a
+ * handful of milliseconds so every DAO-ACK is certain to be judged lost and
+ * DaoRetry() fires for real, deterministically, without needing to actually
+ * drop a packet on the channel.
+ *
+ * Caught by an independent review of the Storing mode implementation
+ * (@see design-constraints.md section 56): DaoRetry() was never updated
+ * alongside SendDao()/HandleDao()'s own relay path to route through the new
+ * SendDaoMessage() helper, so it kept building the original Non-Storing-only
+ * DAO -- global Transit Information parent field (RFC 6550 section 9.8 rule
+ * 1 violated) addressed to the root's own global DODAGID (section 9.1 rule 4
+ * violated) -- on every retry. Reaching the root directly bypasses relay's
+ * own HandleDao() entirely (ordinary IP forwarding carries it straight
+ * through), so the root ends up storing probe's own *global* address as the
+ * next hop for probe -- a bogus one-hop "neighbour" no Storing mode relay
+ * ever actually advertised, silently blackholing every downward packet to
+ * probe once RouteToNeighbourOn() tries to reach it.
+ */
+class RplStoringModeDaoRetryTestCase : public TestCase
+{
+  public:
+    RplStoringModeDaoRetryTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplStoringModeDaoRetryTestCase::RplStoringModeDaoRetryTestCase()
+    : TestCase("A Storing mode DAO retry is addressed link-local to the preferred parent, not "
+              "globally to the root")
+{
+}
+
+void
+RplStoringModeDaoRetryTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(3); // 0 = root, 1 = relay, 2 = probe
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    // SimpleChannel's own default Delay is zero, so a DAO-ACK round trip
+    // (probe -> relay, then straight back, one hop each way in Storing
+    // mode) would otherwise complete instantly -- racing, and usually
+    // winning, against any DaoAckTimeout short enough to be practical for a
+    // test. An explicit, non-trivial delay makes the round trip (2 * this,
+    // at least) reliably longer than DaoAckTimeout below, so DaoRetry() is
+    // guaranteed to fire before any real reply could possibly arrive.
+    channel->SetAttribute("Delay", TimeValue(Seconds(1)));
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    Ptr<SimpleNetDevice> first = DynamicCast<SimpleNetDevice>(devices.Get(0));
+    Ptr<SimpleNetDevice> last = DynamicCast<SimpleNetDevice>(devices.Get(2));
+    channel->BlackList(first, last);
+    channel->BlackList(last, first);
+
+    RplHelper rplHelper;
+    rplHelper.Set("Mop", UintegerValue(RPL_MOP_STORING_NO_MULTICAST));
+    // Shorter than the >= 2 s a real DAO-ACK round trip now takes (@see the
+    // channel Delay above), forcing DaoRetry() to run at least once,
+    // deterministically, for both relay's and probe's own
+    // self-advertisements, without depending on real packet loss.
+    rplHelper.Set("DaoAckTimeout", TimeValue(MilliSeconds(200)));
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(200));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> root = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> relay = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> probe = nodes.Get(2)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(probe->IsJoined(), true, "The probe never joined the Storing mode DODAG");
+
+    Ipv6Address dodagId = root->GetGlobalAddress();
+    Ipv6Address probeAddress = probe->GetGlobalAddress();
+    Ipv6Address relayLinkLocal =
+        nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    // With the bug, a globally-addressed retry from probe reaches root
+    // directly, and root records probe's own *global* address as the next
+    // hop -- observably different from the correct outcome, root learning
+    // of probe only through relay's own relayed DAO, next hop relay's
+    // link-local address.
+    Ipv6Address nextHop;
+    NS_TEST_ASSERT_MSG_EQ(root->GetDownwardRoute(RPL_DEFAULT_INSTANCE, dodagId, probeAddress, nextHop),
+                          true,
+                          "The root never learned a downward route to the probe at all");
+    NS_TEST_ASSERT_MSG_EQ(
+        nextHop,
+        relayLinkLocal,
+        "The root's route to the probe does not go through relay's own link-local address -- a "
+        "Storing mode DAO retry addressed itself globally, straight to the root, bypassing "
+        "relay's own HandleDao() entirely");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief A node in radio range of two independent DODAG roots joins both at
  *        once, and each root's own topology genuinely learns about it.
  *
@@ -17810,6 +17927,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplDodagFormationTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplStoringModeDownwardRouteTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplStoringModeStaleDaoAndNoPathTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplStoringModeDaoRetryTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplMultiDodagTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplCreateLocalDodagTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplCreateLocalDodagClearsDFlagTestCase, TestCase::Duration::QUICK);
