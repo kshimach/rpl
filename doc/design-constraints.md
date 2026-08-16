@@ -6286,3 +6286,113 @@ PASS。
 - **`/protocol-test-matrix`による深掘り監査**: このセッションの
   標準運用(§40/§41/§43/§47/§49/§51/§53)に従い、本実装の
   コミット後に別途実施する。
+
+## 55. `/protocol-test-matrix`でStoring mode(§54)を監査、実バグ1件を発見
+
+RFC 6550 section 9.8/9.2/9.1/7.1/7.2の原文を再確認しつつ、§54完了時点
+で手薄だった箇所を優先して埋めた。
+
+### 55.1 発見したバグ: `changed`判定がRFC 9.2.2の「new」定義を
+     満たしていなかった
+
+`HandleDao()`のStoring mode分岐で、上流へ再伝播すべきか
+(`changed`)を`isNewTarget || nextHopChanged || noPath`として
+実装していた。しかしRFC 6550 section 9.2.2は「Storing modeにおいて
+DAOが"new"(section 9.8 rule 2の"the node itself advertises"が
+変わった、再伝播に値する)とみなされるのは(1) it has a newer Path
+Sequence number、(2) it has additional Path Control bits、(3) it
+is a No-Path DAO message that removes the last Downward route to a
+prefix、の3条件のいずれか」と明確に定義している。「next hopが
+変わった」はこの3条件のいずれにも該当しない。
+
+具体的な不具合シナリオ: 同じ子から、同じtargetについて、next hopは
+変わらないままPath Sequenceだけがより新しい値に更新されたDAO
+(=RFC 9.2.1が許す「occasion に応じたrefresh」)は、
+`isNewTarget=false`・`nextHopChanged=false`・`noPath=false`となり
+`changed=false`と判定され、**上流のDAO parentへ一切再伝播されない**。
+この結果、祖先ノードは古いPath Sequenceのまま取り残され、そのノード
+に対する以降のNo-Path撤回(祖先目線では「知らない古いPath Sequence
+より新しい」と誤判定される)が誤って受理・棄却される等、上位ノード
+の状態がずれたまま同期しなくなる。
+
+修正: `changed = (order == RplSequenceOrder::GREATER) || noPath;`
+(`order`は既存の`RplSequenceCompare()`の戻り値)。`isNewTarget`は
+既にコード上`order`を強制的に`GREATER`にする実装だったため、この
+書き換えで`isNewTarget`の意味も自動的に包含される。`nextHopChanged`
+単独(Path Sequenceが同じで next hop だけ異なる)はRFC上「new」の
+根拠に含まれないため、意図的に伝播条件から外した — 上流ノードは
+「このノードの子孫がどの子経由で自分の下流にいるか」ではなく
+「まだ到達可能か」にしか関心が無く、next hopの変更だけでは上流の
+知る情報に実害が無いため。
+
+### 55.2 検討したが問題なしと確認した項目
+
+- **parent切替時のwithdraw/re-advertise順序レース**(RFC 6550
+  section 9.2.1): `SendNoPathDao()`と`SelectPreferredParent()`の
+  既存(Storing mode実装以前からの)呼び出し順序を全3箇所
+  (`HandleDio()`の無限rank検出、`SelectPreferredParent()`の
+  stale neighbour pruning、同関数の「最後の親を失った」ケース)
+  で確認した結果、いずれも撤回側の`++dodag.pathSequence`
+  (`SendNoPathDao()`内)が、乗り換え側の`++dodag.pathSequence`
+  (`SelectPreferredParent()`の`parentChanged`ブロック)より必ず
+  プログラム順で先に実行される構造になっており、撤回のPath
+  Sequenceが常に再広告のそれより小さい値になることを確認した。
+  Non-Storing modeで既に成立していたこの順序保証はStoring mode側
+  にもそのまま持ち込まれる。
+- **`SendDaoMessage()`が`dodag.preferredParent`未設定(Any())で
+  呼ばれるケース**(`DaoRetry()`経由): `dodag.preferredParent`が
+  Any()になりうるのは`SelectPreferredParent()`の「最後の親を失った」
+  分岐のみであり、その分岐は必ず`LeaveDodag()`を呼んで
+  `DodagMembership`自体を`m_dodags`から消去する
+  (`NS_ASSERT_MSG`で存在を強制する既存の前提)。`DaoRetry()`は
+  タイマー発火時にまず`m_dodags.find(key)`で存在確認するため、
+  この状態には到達しないことをコード読解で確認した。
+- **DAOSequence共有によるDAO-ACK誤照合**: リレーDAOは常に
+  `ackRequested=false`で送信され、かつ`HandleDao()`のACK返信は
+  `dao.GetAckRequested()`の場合のみ発火する(このモジュール自身は
+  一度も無条件ACKを送らない)ため、リレーDAOに対するACKがそもそも
+  生成されない。自己DAO(K=1)とリレーDAO(K=0)が同じ
+  `dodag.daoSequence`値を共有していても、`HandleDaoAck()`が誤照合
+  する経路は存在しないことを確認した。
+- **`Mop`属性に未実装値(例: `RPL_MOP_STORING_MULTICAST`=3)を
+  設定した場合のroot側の挙動**: 属性自体に値の範囲チェックは
+  無い(既存の`Ocp`属性も同様に無制限)。rootがMOP=3を広告しても
+  `HandleDio()`側は§54.8で確認した通り確実に拒否するため、参加者
+  ゼロのroot単独DODAGという形で明確に(サイレントにではなく)
+  壊れる。既存`Ocp`属性の未実装値と同じ扱いであり、属性層でなく
+  DIO受信側で弾くという既存の設計方針と整合しているため、修正は
+  不要と判断した。
+
+### 55.3 新規テスト
+
+`RplStoringModeStaleDaoAndNoPathTestCase`: root(0)--relay(1)--
+probe(2)のStoring modeの3ノード直線に対し、`HandleDao()`を
+`SendRawRplMessage<RplDaoHeader>()`で直接駆動する(架空のtarget
+アドレスを使い、DODAG形成時に何がオーガニックに広告されたかに
+一切依存しない)。検証した象限:
+
+1. 新規target(Path Sequence 5)がrelay/root両方に伝播すること。
+2. **同一next hopのままPath Sequenceだけ更新(5→7)されたDAOが
+   root(2ホップ先)まで伝播すること** — §55.1のバグを検出した
+   直接の項目。root自身のPath Sequenceを直接読むアクセサが無い
+   ため、relay(node 1)自身の実アドレスを騙ってrootへ直接
+   Path Sequence 6のNo-Pathを注入し、「7より古いので無視される
+   (=refreshが伝播していれば7になっているはず)」ことを間接的に
+   確認する手法を採った。
+3. 古いPath Sequence(3、7より前)のDAOが無視されること。
+4. 古いPath SequenceのNo-Path(4)も同様に無視される(撤回だから
+   といって鮮度チェックを免除されないこと)。
+5. 真に新しいNo-Path(8)がrelayから即座に消え、rootまで2ホップ
+   伝播すること。
+
+load-bearing検証: §55.1の修正を`if (false && ...)`ではなく
+`changed`の計算式自体を旧実装に戻す形で一時的に無効化したところ、
+このテストの2番目の検証(手順2)が明確にFAILすることを確認、
+修正を元に戻して再度PASSを確認。
+
+### 55.4 検証
+
+`./ns3 build`(rplモジュール・プロジェクト全体とも)、
+`test-runner --suite=rpl`を複数回実行して安定PASSを確認。
+既存の全テスト(§54で追加した`RplStoringModeDownwardRouteTestCase`
+含む)はPASS。

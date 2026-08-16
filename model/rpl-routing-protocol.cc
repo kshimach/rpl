@@ -2325,15 +2325,24 @@ RplRoutingProtocol::HandleDao(const RplDaoHeader& dao, Ipv6Address from, uint32_
         }
         else
         {
-            bool isNewTarget = existingRoute == dodag->downwardRoutes.end();
-            bool nextHopChanged = !isNewTarget && existingRoute->second.nextHop != from;
-            // RFC 6550 section 9.8 rule 2: propagate only when this DAO
-            // "would change the set of prefixes that the node itself
-            // advertises" -- a plain refresh from the same child, same Path
-            // Sequence, changes nothing, and re-advertising it up the tree
-            // on every one would turn every periodic self-DAO into a storm
-            // that grows with the tree's own depth.
-            changed = isNewTarget || nextHopChanged || noPath;
+            // RFC 6550 section 9.2.2: in Storing mode, a DAO is "new" (and
+            // so, per section 9.8 rule 2, worth telling the preferred
+            // parent about) exactly when it "has a newer Path Sequence
+            // number" or "is a No-Path DAO message that removes the last
+            // Downward route to a prefix" -- order == GREATER is exactly
+            // "newer Path Sequence" (it is also how a brand new target is
+            // represented above, so this covers that case too). A plain
+            // refresh with an unchanged Path Sequence (order == EQUAL)
+            // changes nothing worth propagating, and re-advertising it up
+            // the tree on every one would turn every periodic self-DAO into
+            // a storm that grows with the tree's own depth. A same-Path-
+            // Sequence report from a *different* nextHop is accepted below
+            // (the most recent sender is trusted) but is deliberately not
+            // treated as "new" either: nothing upstream of this node cares
+            // which of its own children it relays through, only that it
+            // still can, which order == GREATER-or-noPath already covers
+            // whenever that stops being true.
+            changed = order == RplSequenceOrder::GREATER || noPath;
 
             if (noPath)
             {

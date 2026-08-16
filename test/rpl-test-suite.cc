@@ -3080,6 +3080,199 @@ RplStoringModeDownwardRouteTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief Storing mode's downward route table rejects a stale Path Sequence,
+ *        propagates a genuinely newer one even when the next hop has not
+ *        changed, and a No-Path withdrawal removes an entry two hops up.
+ *
+ * root(0)--relay(1)--probe(2), the same shape RplStoringModeDownwardRouteTestCase
+ * uses, but this test drives HandleDao() directly with hand-built DAOs (all
+ * "from" probe, RFC 6550 section 9.1 rule 4's link-local addressing) for a
+ * fictitious target neither node ever organically advertises, so every Path
+ * Sequence value in this test is exactly what this test says it is rather
+ * than whatever DODAG formation happened to leave behind.
+ *
+ * RFC 6550 section 9.2.2 defines a Storing mode DAO as "new" -- worth
+ * generating a fresh DAO of one's own over, per section 9.8 rule 2 -- when
+ * it "has a newer Path Sequence number" or "is a No-Path DAO message that
+ * removes the last Downward route to a prefix". Both are exercised here:
+ * the first DAO below is a newer sequence with no other change at all
+ * (same reporting node, same fictitious target), which HandleDao()'s own
+ * "changed" computation has to catch even though the next hop is identical
+ * to whatever might already be stored.
+ */
+class RplStoringModeStaleDaoAndNoPathTestCase : public TestCase
+{
+  public:
+    RplStoringModeStaleDaoAndNoPathTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplStoringModeStaleDaoAndNoPathTestCase::RplStoringModeStaleDaoAndNoPathTestCase()
+    : TestCase("Storing mode rejects a stale DAO and propagates a No-Path withdrawal two hops up")
+{
+}
+
+void
+RplStoringModeStaleDaoAndNoPathTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(3); // 0 = root, 1 = relay, 2 = probe
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    Ptr<SimpleNetDevice> first = DynamicCast<SimpleNetDevice>(devices.Get(0));
+    Ptr<SimpleNetDevice> last = DynamicCast<SimpleNetDevice>(devices.Get(2));
+    channel->BlackList(first, last);
+    channel->BlackList(last, first);
+
+    RplHelper rplHelper;
+    rplHelper.Set("Mop", UintegerValue(RPL_MOP_STORING_NO_MULTICAST));
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(200));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> root = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> relay = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> probe = nodes.Get(2)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(probe->IsJoined(), true, "The probe never joined the Storing mode DODAG");
+
+    Ipv6Address dodagId = root->GetGlobalAddress();
+    Ipv6Address probeLinkLocal =
+        nodes.Get(2)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address relayLinkLocal =
+        nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address rootLinkLocal =
+        nodes.Get(0)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    // A fictitious target neither node ever organically advertises, the
+    // same style RplComputeSourceRouteFailureTestCase's own cycleA/cycleB
+    // use: nothing about it depends on what DODAG formation happened to do.
+    Ipv6Address fictitious("2001:1::ff:fe00:aa");
+
+    auto sendDaoFrom = [&](Ptr<Node> sender,
+                           Ipv6Address senderLinkLocal,
+                           Ipv6Address dst,
+                           uint8_t pathSequence,
+                           uint8_t pathLifetime) {
+        RplDaoHeader dao;
+        dao.SetInstanceId(RPL_DEFAULT_INSTANCE);
+        dao.SetDodagId(dodagId);
+        dao.SetSequence(1);
+        dao.SetTarget(fictitious);
+        dao.SetTransitInformation(Ipv6Address::GetAny(), pathSequence, pathLifetime);
+        Simulator::Schedule(Seconds(0),
+                            &SendRawRplMessage<RplDaoHeader>,
+                            sender,
+                            1,
+                            dao,
+                            static_cast<uint8_t>(RPL_CODE_DAO),
+                            senderLinkLocal,
+                            dst);
+        Simulator::Stop(MilliSeconds(50));
+        Simulator::Run();
+    };
+    auto sendDao = [&](uint8_t pathSequence, uint8_t pathLifetime) {
+        sendDaoFrom(nodes.Get(2), probeLinkLocal, relayLinkLocal, pathSequence, pathLifetime);
+    };
+
+    Ipv6Address nextHop;
+
+    // A brand new target (order == GREATER, since nothing is stored yet):
+    // accepted at relay, and -- since HandleDao()'s own "changed" ==
+    // (order == GREATER || noPath) -- propagated up to root too, two hops
+    // from probe.
+    sendDao(5, RPL_DEFAULT_LIFETIME);
+    NS_TEST_ASSERT_MSG_EQ(relay->GetDownwardRoute(RPL_DEFAULT_INSTANCE, dodagId, fictitious, nextHop),
+                          true,
+                          "relay did not accept a brand new target");
+    NS_TEST_ASSERT_MSG_EQ(nextHop, probeLinkLocal, "relay's next hop for it is wrong");
+    NS_TEST_ASSERT_MSG_EQ(root->GetDownwardRoute(RPL_DEFAULT_INSTANCE, dodagId, fictitious, nextHop),
+                          true,
+                          "root never learned the fictitious target two hops out");
+
+    // A refresh from the very same next hop, only a newer Path Sequence (7
+    // > 5): RFC 6550 section 9.2.2 defines this alone -- "it has a newer
+    // Path Sequence number" -- as "new" and so, per section 9.8 rule 2,
+    // worth telling the preferred parent about, even though nothing about
+    // *which* neighbour relay reaches it through has changed at all.
+    sendDao(7, RPL_DEFAULT_LIFETIME);
+    NS_TEST_ASSERT_MSG_EQ(relay->GetDownwardRoute(RPL_DEFAULT_INSTANCE, dodagId, fictitious, nextHop),
+                          true,
+                          "relay dropped the target on its own refresh");
+
+    // Whether that refresh actually reached root cannot be read directly
+    // off GetDownwardRoute() (it returns the next hop, not the stored Path
+    // Sequence), so it is probed indirectly: a hand-built No-Path,
+    // impersonating relay's own real link-local address straight to root,
+    // carrying a Path Sequence (6) that sits strictly between the original
+    // advertisement (5) and the refresh (7). If the refresh propagated,
+    // root's own stored Path Sequence is 7 and this probe (6 < 7) is stale
+    // and must be ignored, leaving root's entry standing. If the refresh
+    // did not propagate, root would still be sitting on the original 5, the
+    // probe's 6 would look newer, and root would incorrectly drop the
+    // entry -- exactly the bug this test exists to catch.
+    sendDaoFrom(nodes.Get(1), relayLinkLocal, rootLinkLocal, 6, 0);
+    NS_TEST_ASSERT_MSG_EQ(
+        root->GetDownwardRoute(RPL_DEFAULT_INSTANCE, dodagId, fictitious, nextHop),
+        true,
+        "root's own copy of the target was not refreshed to the newer Path Sequence: a "
+        "same-next-hop refresh was not propagated up from relay");
+
+    // A strictly older Path Sequence (3 < 7, RFC 6550 section 7.1): must be
+    // ignored outright, leaving the stored entry exactly as it was.
+    sendDao(3, RPL_DEFAULT_LIFETIME);
+    NS_TEST_ASSERT_MSG_EQ(relay->GetDownwardRoute(RPL_DEFAULT_INSTANCE, dodagId, fictitious, nextHop),
+                          true,
+                          "relay dropped the target on a stale DAO");
+
+    // A No-Path with a Path Sequence (4) still older than what is stored
+    // (7): the withdrawal itself must be judged stale the same way an
+    // ordinary refresh would be, or the entry would be removable by an
+    // attacker (or a reordered stale message) replaying an old sequence
+    // number with the Path Lifetime field zeroed.
+    sendDao(4, 0);
+    NS_TEST_ASSERT_MSG_EQ(
+        relay->GetDownwardRoute(RPL_DEFAULT_INSTANCE, dodagId, fictitious, nextHop),
+        true,
+        "A stale No-Path (lower Path Sequence than what is stored) removed the entry anyway");
+
+    // A genuinely newer No-Path (8 > 7): accepted, removed from relay, and
+    // -- RFC 6550 section 9.8 rule 2's "Such a change includes receiving a
+    // No-Path DAO" -- propagated up to root, which must lose the entry too.
+    sendDao(8, 0);
+    NS_TEST_ASSERT_MSG_EQ(
+        relay->GetDownwardRoute(RPL_DEFAULT_INSTANCE, dodagId, fictitious, nextHop),
+        false,
+        "A genuinely newer No-Path did not remove relay's own entry");
+    NS_TEST_ASSERT_MSG_EQ(
+        root->GetDownwardRoute(RPL_DEFAULT_INSTANCE, dodagId, fictitious, nextHop),
+        false,
+        "The No-Path withdrawal was not propagated two hops up to root");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief A node in radio range of two independent DODAG roots joins both at
  *        once, and each root's own topology genuinely learns about it.
  *
@@ -17616,6 +17809,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplTrickleTimerTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDodagFormationTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplStoringModeDownwardRouteTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplStoringModeStaleDaoAndNoPathTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplMultiDodagTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplCreateLocalDodagTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplCreateLocalDodagClearsDFlagTestCase, TestCase::Duration::QUICK);
