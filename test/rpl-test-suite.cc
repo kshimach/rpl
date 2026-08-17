@@ -18173,6 +18173,176 @@ RplDtsnOwnIncrementWrapTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief A DAO parent that increments its DTSN faster than the DelayDAO
+ *        jitter window (RFC 6550 section 9.6 rules 1-2 impose no rate
+ *        limit of their own) must not be able to perpetually defer this
+ *        node's own DAO refresh by repeatedly cancelling and re-arming it
+ *        -- the refresh has to coalesce into one send instead.
+ */
+class RplDtsnRapidBumpCoalescedTestCase : public TestCase
+{
+  public:
+    RplDtsnRapidBumpCoalescedTestCase();
+
+  private:
+    void DoRun() override;
+
+    /**
+     * @brief Count a DAO delivered to the monitoring socket.
+     * @param socket the monitoring socket
+     */
+    void RecordDao(Ptr<Socket> socket);
+
+    uint32_t m_daoCount{0}; //!< DAOs observed at the root
+};
+
+RplDtsnRapidBumpCoalescedTestCase::RplDtsnRapidBumpCoalescedTestCase()
+    : TestCase("Rapid DTSN increments from a DAO parent coalesce into one DAO refresh, not one "
+              "per increment and not none at all")
+{
+}
+
+void
+RplDtsnRapidBumpCoalescedTestCase::RecordDao(Ptr<Socket> socket)
+{
+    Ptr<Packet> packet = socket->Recv();
+    while (packet)
+    {
+        Ipv6Header ipv6Header;
+        if (packet->RemoveHeader(ipv6Header) != 0)
+        {
+            Icmpv6Header icmpv6Header;
+            if (packet->RemoveHeader(icmpv6Header) != 0 &&
+                icmpv6Header.GetType() == ICMPV6_RPL && icmpv6Header.GetCode() == RPL_CODE_DAO)
+            {
+                m_daoCount++;
+            }
+        }
+        packet = socket->Recv();
+    }
+}
+
+void
+RplDtsnRapidBumpCoalescedTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2); // 0 = root (the DAO parent), 1 = child
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    rplHelper.Set("DioIntervalMin", TimeValue(MilliSeconds(256)));
+    rplHelper.Set("DioIntervalDoublings", UintegerValue(2));
+
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Ptr<Node> rootNode = nodes.Get(0);
+    Ptr<Node> childNode = nodes.Get(1);
+
+    Ptr<Socket> daoMonitor = Socket::CreateSocket(rootNode, Ipv6RawSocketFactory::GetTypeId());
+    daoMonitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    daoMonitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    daoMonitor->BindToNetDevice(rootNode->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+    daoMonitor->SetRecvCallback(MakeCallback(&RplDtsnRapidBumpCoalescedTestCase::RecordDao, this));
+
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> root = rootNode->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> child = childNode->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(child->IsJoined(), true, "The child never joined the DODAG");
+
+    Ipv6Address rootLinkLocal =
+        rootNode->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address childLinkLocal =
+        childNode->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    uint32_t daoCountBeforeBumps = m_daoCount;
+
+    // 150 hand-built DIOs from the root, DTSN 1 through 150, 20 ms apart (3
+    // s of continuous bumping) -- standing in for a misbehaving or actively
+    // adversarial DAO parent, since RFC 6550 imposes no rate limit of its
+    // own on how often a legitimate one may increment its DTSN. Each one
+    // individually satisfies rule 2's "hears... increment its DTSN", and
+    // would, pre-fix, unconditionally cancel and re-arm dodag->daoEvent
+    // every time.
+    //
+    // Counter-intuitively, the bug this guards against makes the DAO
+    // refresh fire LESS often under a rapid burst, not more: with an
+    // unconditional cancel-and-rearm, a pending send only ever survives to
+    // actually fire if that particular jitter draw happens to be shorter
+    // than the gap before the next bump cancels it again -- a narrow
+    // window each time, so most of a long burst's individual arm attempts
+    // are wasted. The fix does not depend on any one draw being short: the
+    // first bump in a pending cycle arms it once, every later bump in the
+    // same cycle is a no-op (gated by daoRefreshPending), and the pending
+    // send always gets to actually fire on its own schedule regardless of
+    // how many more bumps arrive while it waits -- so the number of
+    // completed refreshes over one fixed-length burst is governed by the
+    // burst's own duration divided by the average jitter draw, not by how
+    // often cancellation gets a chance to interrupt one. For this stream
+    // (AssignStreams(nodes, 1), reproducible run to run) that difference
+    // was empirically 7 fixed-code sends against 3 with the fix reverted
+    // for this exact burst -- the threshold below sits with real margin on
+    // both sides of that gap rather than pinning an exact count that would
+    // be fragile to a stream/seed change.
+    for (uint16_t dtsn = 1; dtsn <= 150; dtsn++)
+    {
+        RplDioHeader bump;
+        bump.SetInstanceId(RPL_DEFAULT_INSTANCE);
+        bump.SetVersionNumber(0);
+        bump.SetRank(RPL_MIN_HOPRANKINC);
+        bump.SetMop(RPL_MOP_NON_STORING);
+        bump.SetDodagId(root->GetDodagId());
+        bump.SetDtsn(static_cast<uint8_t>(dtsn));
+
+        Simulator::Schedule(MilliSeconds(20 * dtsn),
+                            &SendRawRplMessage<RplDioHeader>,
+                            rootNode,
+                            1,
+                            bump,
+                            static_cast<uint8_t>(RPL_CODE_DIO),
+                            rootLinkLocal,
+                            childLinkLocal);
+    }
+    // The injection window itself (3 s) plus the up-to-1-s jitter the last
+    // coalesced send could still be waiting out when the injection ends.
+    Simulator::Stop(Seconds(4.5));
+    Simulator::Run();
+
+    uint32_t daoCountDuringBumps = m_daoCount - daoCountBeforeBumps;
+    NS_TEST_ASSERT_MSG_GT_OR_EQ(daoCountDuringBumps,
+                               5,
+                               "150 rapid DTSN increments produced only " << daoCountDuringBumps
+                                                                         << " DAO refreshes -- "
+                                                                            "consistent with the "
+                                                                            "unconditional "
+                                                                            "cancel-and-rearm bug "
+                                                                            "starving most of "
+                                                                            "them");
+
+    daoMonitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Check the neighbour freshness rule: a neighbour heard once is a
  *        candidate parent only while nothing better-established is
  *        available, and stops being one as soon as another neighbour has
@@ -20095,6 +20265,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplDaoAckSequenceTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDtsnRefreshTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDtsnOwnIncrementWrapTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplDtsnRapidBumpCoalescedTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplComputeSourceRouteFailureTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplMrhofSelectionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplMrhofHysteresisBoundaryTestCase, TestCase::Duration::QUICK);

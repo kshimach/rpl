@@ -882,6 +882,18 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
         uint8_t pathSequence{0};  //!< path sequence of the route this node advertises
         uint8_t daoRetriesLeft{0}; //!< retries left for the DAO awaiting an acknowledgement
         bool daoAckPending{false}; //!< true while a DAO-ACK is being waited for
+        /// True from the moment a DAO parent's DTSN increment (RFC 6550
+        /// section 9.6 rule 1) jitters daoEvent to fire early, until
+        /// DaoTimerExpire() actually sends that refresh and clears it.
+        /// Checked before jittering daoEvent again on a further DTSN
+        /// increment heard in the meantime, so repeated bumps coalesce
+        /// into the one already-pending early send instead of each
+        /// cancelling and re-arming it -- without this, a DAO parent
+        /// (misbehaving, or an active adversary controlling it) that
+        /// increments its DTSN faster than the jitter window could
+        /// perpetually defer this node's own DAO refresh, never letting it
+        /// actually fire.
+        bool daoRefreshPending{false};
         Timer daoEvent{Timer::CANCEL_ON_DESTROY};      //!< schedules the periodic DAO
         Timer daoRetryEvent{Timer::CANCEL_ON_DESTROY}; //!< schedules the retry of an unacknowledged DAO
 

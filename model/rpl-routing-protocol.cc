@@ -1624,8 +1624,22 @@ RplRoutingProtocol::HandleDio(const RplDioHeader& dio,
         // node in the sub-DODAG at once would be exactly the kind of burst
         // Trickle-style pacing exists to avoid.
         NS_LOG_INFO("DAO parent " << from << " incremented its DTSN, refreshing this node's DAO");
-        dodag->daoEvent.Cancel();
-        dodag->daoEvent.Schedule(Seconds(m_jitter->GetValue(0.0, 1.0)));
+        // Only arms a fresh jittered send when none is already pending
+        // (@see DodagMembership::daoRefreshPending's own doc comment): RFC
+        // 6550 places no rate limit of its own on how often a DAO parent
+        // may increment its DTSN, and section 9.6's own cascade (a bump
+        // heard here also bumps this node's own DTSN, propagating the same
+        // trigger to every node below it) means an unconditional
+        // Cancel()+Schedule() here would let a parent that bumps faster
+        // than the jitter window perpetually defer this node's DAO refresh
+        // -- and, by the same cascade, every refresh in the sub-DODAG under
+        // it -- without ever actually sending one.
+        if (!dodag->daoRefreshPending)
+        {
+            dodag->daoRefreshPending = true;
+            dodag->daoEvent.Cancel();
+            dodag->daoEvent.Schedule(Seconds(m_jitter->GetValue(0.0, 1.0)));
+        }
     }
 
     if (dio.HasP2pRdo())
@@ -2254,6 +2268,12 @@ RplRoutingProtocol::DaoTimerExpire(DodagKey key)
     DodagMembership& dodag = it->second;
 
     SendDao(dodag);
+    // Whatever caused this firing -- an ordinary periodic tick, or an
+    // early one jittered in by a DTSN increment (@see
+    // DodagMembership::daoRefreshPending's own doc comment) -- the refresh
+    // it owed has now gone out, so a further DTSN increment is free to
+    // jitter in another one of its own.
+    dodag.daoRefreshPending = false;
     dodag.daoEvent.Cancel();
     dodag.daoEvent.Schedule(m_daoInterval);
 }
