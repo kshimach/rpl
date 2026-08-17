@@ -6830,4 +6830,165 @@ load-bearing検証:
 
 `./ns3 build`(rplモジュール・プロジェクト全体とも)、
 `test-runner --suite=rpl`を複数回実行して安定PASSを確認。
+
+## 60. `/protocol-test-matrix`によるDAO複数Target集約(§59, `ae1f4a2`)の監査
+
+標準メモリ指示(contrib/rpl実装マイルストーン後は毎回
+`/protocol-test-matrix`を実行)に従い、直近の§59実装(DAO複数
+Target集約)自体を対象に、新5角並列マルチエージェント構成の
+2回目の実地運用として監査を実施。
+
+### 60.1 監査体制
+
+Phase 0(対象確定、非委譲)でSendNoPathDao()が独自にRplDaoHeader
+を組み立てておりSendDaoMessage()を経由しない(§54.2由来の既存の
+意図的設計、viaParentがpreferredParentと異なりうるため)ことを
+確認 — 集約機能の移行漏れ角(角5)が誤検出しないよう、事前に
+「対象外」と整理した上でPhase 1へ。
+
+5角(正常系・境界値・異常系・シーケンス状態遷移・移行漏れ)を
+それぞれ独立コンテキストのAgentサブエージェントとして並列起動。
+セッション上限リセット(13:20 JST)を跨いだため、角4(シーケンス
+状態遷移)・角5(移行漏れ)は一度失敗し、リセット後に再起動して
+完走した。
+
+### 60.2 発見された候補(Phase 1、重複統合後)
+
+1. **`Deserialize()`のペアリングがRFC適合のN:M構成を破壊**
+   (角1で発見): RFC 6550 section 9.4 rule 3の一般形(N個の
+   Target optionの後にM個のTransit Information option、全Mが
+   全Nに適用)は、section 6.7.8自身のworked example(non-storing
+   複数parent)にも登場する正当な構成だが、`Deserialize()`は
+   1:1逐次ペアリングしか実装していない。従来コードは「先に来た
+   Targetを黙って上書き」「対応するTargetのないTransitを黙って
+   捨てる」という挙動で、rule 6が要求する「メッセージ全体の破棄」
+   ではなく、一部だけを黙って破棄しつつ誤った組み合わせ(2番目の
+   Targetに1番目のTransitが紐付く等)を採用してしまっていた。
+2. **`HandleDao()`のprimary target `IsAny()`チェックが集約全体を
+   道連れにする**(角2・角3で重複発見): `dao.GetTarget().IsAny()`
+   の場合に関数全体から`return`しており、後続のadditionalTargets
+   ループが一度も実行されない。primary targetがたまたま`::`
+   (無効値)であっても、同じメッセージに乗った正当な追加targetは
+   本来独立に処理されるべき(`handleOneTarget`自身のdocコメントが
+   「各targetは個別メッセージで届いたのと同じに扱う」と明言して
+   いるにもかかわらず、この一点でそれが崩れていた)。
+3. **重複target(primary+追加、または追加同士)が中継DAOに二重で
+   乗る**(角3で発見): 同一集約DAO内に同じtarget addressが複数回
+   (異なるPath Sequenceで)出現した場合、`handleOneTarget`は
+   呼び出しごとに独立して`toPropagate`へpushするため、中継先へ
+   送る1通のDAOに同じtargetが古い値・新しい値の2組で乗ってしまう
+   — RFC 6550 section 9.4の「target毎に1グループ」という構造の
+   前提から外れる、集約機能導入前には存在し得なかった状態。
+4. **集約DAOのワイヤサイズに上限が無い**(角2で発見、PLAUSIBLE):
+   `downwardRoutes`自体が長時間・高頻度な入れ替わりのある展開では
+   無制限に増加しうる(`PurgeDownwardRoutes()`自身のdocコメントが
+   既に認めている)にもかかわらず、集約DAOのシリアライズサイズには
+   `RplSourceRoutingHeader::MAX_SERIALIZED_SIZE`のような上限
+   ガードが無い。約27target以上でIPv6の最小MTU(1280バイト)を
+   超える。ただしns-3のIPv6/6LoWPANフラグメンテーション層が
+   通常配送パスとして機能するため、クラッシュ・打ち切り等の
+   実害には直結しない(検証担当エージェントの実地確認による) —
+   残るのは「1フラグメント喪失が集約全体の再送を招く」という
+   信頼性上の質的懸念であり、緊急のハードキャップよりも可視化
+   (ログ)が適切と判断。
+5. **`toPropagate.size() > 1`(1件の受信DAOから複数target同時
+   集約)・`DaoRetry()`のadditionalTargets再構築内容、いずれも
+   既存テストで一度も踏まれていない**(角4・角5で重複発見):
+   全既存テストをフルスイート実測(`toPropagate.size()`への
+   一時的なNS_LOG_UNCOND計測)した結果、`toPropagate.size() >= 2`
+   は既存スイート中一度も発生せず、`DaoRetry()`のadditionalTargets
+   再構築ループ自体は(relay自身の自己広告経由で)非空で実行
+   されているものの、その内容を検証するアサーションは存在しな
+   かった — §56で見逃された`DaoRetry()`バグと同型の死角。
+6. `Print()`が追加targetを件数のみ表示し、アドレス・Path Sequence
+   等の中身を表示しない(角5、debuggability上の劣化、機能上の
+   バグではない)。
+7. `SendNoPathDao()`が集約に参加しない設計判断そのものは正しいが、
+   この節の他の設計判断と異なりコメントで明文化されていなかった
+   (角5)。
+
+### 60.3 Phase 2 検証結果
+
+候補1・2・3・5はいずれも実プローブ(一時的なテストケース追加→
+`./ns3 build test-runner`→実行→復元)でCONFIRMED。候補4は
+PLAUSIBLE(機構自体は実在するが、フラグメンテーション層により
+実害は緩和されている)。候補6・7はコード読解のみで自明
+(プローブ不要と判断)。
+
+検証プロセス中、複数の並列検証エージェントが同一作業ツリー
+(`contrib/rpl`)に一時的なプローブコードを同時に書き込み、
+互いの変更が干渉する場面があった(あるエージェントが未知の
+`NS_LOG_UNCOND("VERIFIER-PROBE ...")`行を発見する等)。いずれも
+各エージェント自身が`git diff`で自分の変更のみを慎重に復元し、
+最終的な作業ツリーはクリーンな状態に戻ったことを確認済み。今後、
+同一ファイルを触る検証エージェントを多数並列起動する場合は、
+このような一時的な衝突が起こりうる点を踏まえておく。
+
+### 60.4 修正
+
+1. `Deserialize()`: Target optionが既にpending中のTargetがある
+   状態で出現、またはTransit Information optionがpending中の
+   Targetなしに出現した場合、`malformed`フラグを立てて即座に
+   ループを打ち切り、ループ終了後に`m_target`/`m_parent`/
+   `m_additionalTargets`等を全て未設定状態へリセットする —
+   RFC 6550 section 9.4 rule 6の「メッセージ全体を破棄」を文字
+   通り実装。
+2. `HandleDao()`: primary targetの`IsAny()`チェックを、関数全体の
+   `return`から、primaryのみの`handleOneTarget()`呼び出しをスキップ
+   する分岐に変更。additionalTargetsのループは常に実行される。
+   副次的に、これによりDAO-ACKの返送(`dao.GetAckRequested()`)も
+   従来の早期returnで飛ばされていたのが正しく実行されるようになった。
+3. `HandleDao()`: `toPropagate`構築後、target addressで重複排除する
+   処理を追加 — 同一targetが複数回出現した場合は最後(最新状態を
+   反映する)の値のみを残し、出現位置(先頭)はそのまま保持する。
+4. `SendDaoMessage()`: 集約後のDAOの`GetSerializedSize()`がIPv6
+   最小MTU(1280バイト、RFC 8200 section 5)を超える場合に
+   `NS_LOG_WARN`を出力するよう追加。送信自体は妨げない(下位層の
+   フラグメンテーションに委ねる)、可視化のみの対応。
+5. `RplDaoHeader::Print()`: 追加targetの件数のみだった出力を、
+   各追加target毎のアドレス・prefix長・Path Sequence・Path
+   Lifetimeを表示するよう拡張。
+6. `SendNoPathDao()`: 集約に参加しない理由(この関数の撤回対象は
+   常に自ノード自身の1 targetのみであり、中継していた子孫の
+   downwardRoutesエントリはこの撤回に含まれない、という既存の
+   意図的設計)を明文化するdocコメントを追加。
+
+### 60.5 新規テスト
+
+- `RplDaoGroupedTargetTransitTestCase`: N-Target/M-Transitの
+  グループ構成(2 Target直後に3 Transit)、および正常ペアの直後に
+  この構成が続くケースの両方で、DAO全体が破棄される
+  (`GetTarget()`が`::`、`GetAdditionalTargets()`が空)ことを確認。
+- `RplStoringModeBogusPrimaryTargetTestCase`: primary targetが`::`
+  のDAOに、正当な追加targetを1つ乗せて送信 — root側がその追加
+  targetを正しく学習することを確認(2ノード構成)。
+- `RplDaoDuplicateTargetDedupedTestCase`: 同一targetをprimary
+  (古いPath Sequence)と追加target(新しいPath Sequence)の両方に
+  乗せたDAOをrelayへ注入 — relay自身の`downwardRoutes`は正しい
+  最新値になること、かつrelayが中継する1通のDAOにそのtargetが
+  ちょうど1回だけ、新しいPath Sequenceで乗ることを確認(3ノード
+  構成、rootの監視ソケットでデコード)。
+- `RplHandleDaoAggregatesSimultaneousChangesTestCase`: 1通の受信
+  DAOに2つの新規target(いずれもrelayにとって初見)を乗せて注入 —
+  relayが中継する出力DAOが1通のみで、両targetを含むことを確認
+  (§59時点で未踏だった`toPropagate.size() > 1`の経路)。
+- `RplStoringModeDaoRetryContentTestCase`: `RplStoringModeDaoRetryTestCase`
+  と同じ(1秒遅延+200msタイムアウトでDaoRetry()確定発火する)
+  トポロジで、root側の監視ソケットが全期間にわたり捕捉した
+  DAO群から、relay自身の自己広告(primary target = relay自身の
+  アドレス)のうち少なくとも1通がprobeへの下り経路を追加target
+  として正しく含んでいることを確認 — §59時点でDaoRetry()の
+  再構築ループの中身を検証するテストが皆無だった死角を埋める。
+
+load-bearing検証: 上記のうち修正1・2・3それぞれについて、対応する
+新ロジックを一時的に無効化(`&& false`)し、対応する新規テストが
+明確にFAILすることを確認、元に戻して再度PASSを確認。修正4(ログ
+警告のみ)・5(表示のみ)・6(docコメントのみ)は機能的な正誤に
+関わらないためload-bearing検証の対象外。
+
+### 60.6 検証
+
+`./ns3 build`(rplモジュール・プロジェクト全体とも)、
+`test-runner --suite=rpl`を複数回実行し、既存118件+新規5件=
+123件全てが安定PASSすることを確認。
 既存の全テスト(§54-58で追加したものを含む)はPASS。

@@ -1843,6 +1843,134 @@ RplDaoMultiTargetHeaderTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief RFC 6550 section 9.4 rule 3's general form -- N Target options
+ *        followed by M Transit Information options, all M applying to all N
+ *        -- is a grouping this module's Deserialize() does not implement
+ *        (@see its own doc comment). Rather than silently misparse it (an
+ *        earlier version overwrote an earlier pending Target with a later
+ *        one and paired a Transit Information option with the wrong
+ *        Target, losing data without any sign anything was wrong), the
+ *        whole message must be discarded per rule 6.
+ */
+class RplDaoGroupedTargetTransitTestCase : public TestCase
+{
+  public:
+    RplDaoGroupedTargetTransitTestCase();
+
+  private:
+    void DoRun() override;
+
+    /// @brief Append one raw Target option (RFC 6550 section 6.7.7).
+    /// @param wire the byte buffer to append to
+    /// @param target the target address
+    /// @param prefixLength the target prefix length
+    static void PushTargetOption(std::vector<uint8_t>& wire,
+                                 Ipv6Address target,
+                                 uint8_t prefixLength);
+
+    /// @brief Append one raw Transit Information option (RFC 6550 section
+    ///        6.7.8).
+    /// @param wire the byte buffer to append to
+    /// @param parent the DODAG Parent Address subfield
+    /// @param pathSequence the Path Sequence
+    /// @param pathLifetime the Path Lifetime
+    static void PushTransitOption(std::vector<uint8_t>& wire,
+                                  Ipv6Address parent,
+                                  uint8_t pathSequence,
+                                  uint8_t pathLifetime);
+};
+
+RplDaoGroupedTargetTransitTestCase::RplDaoGroupedTargetTransitTestCase()
+    : TestCase("A DAO grouping N Target options with M Transit Information options is discarded "
+              "wholesale, not misparsed")
+{
+}
+
+void
+RplDaoGroupedTargetTransitTestCase::PushTargetOption(std::vector<uint8_t>& wire,
+                                                      Ipv6Address target,
+                                                      uint8_t prefixLength)
+{
+    wire.push_back(RPL_OPTION_TARGET);
+    wire.push_back(18); // Option Length: Flags + Prefix Length + 16-byte address
+    wire.push_back(0);  // Flags
+    wire.push_back(prefixLength);
+    uint8_t buf[16];
+    target.Serialize(buf);
+    wire.insert(wire.end(), buf, buf + 16);
+}
+
+void
+RplDaoGroupedTargetTransitTestCase::PushTransitOption(std::vector<uint8_t>& wire,
+                                                       Ipv6Address parent,
+                                                       uint8_t pathSequence,
+                                                       uint8_t pathLifetime)
+{
+    wire.push_back(RPL_OPTION_TRANSIT);
+    wire.push_back(20); // Option Length: flags + Path Control + Seq + Lifetime + 16-byte parent
+    wire.push_back(0);  // E flag and flags
+    wire.push_back(0);  // Path Control
+    wire.push_back(pathSequence);
+    wire.push_back(pathLifetime);
+    uint8_t buf[16];
+    parent.Serialize(buf);
+    wire.insert(wire.end(), buf, buf + 16);
+}
+
+void
+RplDaoGroupedTargetTransitTestCase::DoRun()
+{
+    // Two Targets followed by three Transit Information options -- RFC
+    // 6550 section 6.7.8's own worked example of a non-storing node with
+    // more than one DAO parent, legal per rule 3 but not a shape this
+    // module supports.
+    {
+        std::vector<uint8_t> wire{9, 0, 0, 1}; // InstanceId, Flags, Reserved, Sequence
+        PushTargetOption(wire, Ipv6Address("2001:1::1"), 128);
+        PushTargetOption(wire, Ipv6Address("2001:1::2"), 128);
+        PushTransitOption(wire, Ipv6Address("2001:1::10"), 1, 10);
+        PushTransitOption(wire, Ipv6Address("2001:1::11"), 2, 20);
+        PushTransitOption(wire, Ipv6Address("2001:1::12"), 3, 30);
+
+        Ptr<Packet> packet = Create<Packet>(wire.data(), wire.size());
+        RplDaoHeader received;
+        packet->RemoveHeader(received);
+
+        NS_TEST_ASSERT_MSG_EQ(received.GetTarget(),
+                              Ipv6Address::GetAny(),
+                              "A grouped N-Target/M-Transit DAO was not discarded wholesale -- it "
+                              "reported a primary target");
+        NS_TEST_ASSERT_MSG_EQ(received.GetAdditionalTargets().size(),
+                              0,
+                              "A grouped N-Target/M-Transit DAO was not discarded wholesale -- it "
+                              "reported additional targets");
+    }
+
+    // A well-formed pair ahead of the grouped, unsupported tail must not
+    // survive either: rule 6 discards the whole message, not just the part
+    // that broke the pattern.
+    {
+        std::vector<uint8_t> wire{9, 0, 0, 1};
+        PushTargetOption(wire, Ipv6Address("2001:1::5"), 128);
+        PushTransitOption(wire, Ipv6Address("2001:1::4"), 1, 30); // one well-formed pair first
+        PushTargetOption(wire, Ipv6Address("2001:1::6"), 128);
+        PushTargetOption(wire, Ipv6Address("2001:1::7"), 128); // then two Targets in a row
+
+        Ptr<Packet> packet = Create<Packet>(wire.data(), wire.size());
+        RplDaoHeader received;
+        packet->RemoveHeader(received);
+
+        NS_TEST_ASSERT_MSG_EQ(received.GetTarget(),
+                              Ipv6Address::GetAny(),
+                              "A DAO with a well-formed pair ahead of an unsupported grouping "
+                              "kept that pair instead of discarding the whole message");
+    }
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief P2P-DRO serialization (RFC 6997 section 8): the base object's own
  *        bit-packed S/A/Seq octet, and the one P2P-RDO it carries.
  */
@@ -4011,6 +4139,558 @@ RplStoringModeAggregatedRefreshTestCase::DoRun()
     NS_TEST_ASSERT_MSG_EQ(root->GetDownwardRoute(RPL_DEFAULT_INSTANCE, dodagId, fictitiousB, nextHop),
                           true,
                           "root did not learn the 2nd additional target from the aggregated DAO");
+
+    monitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief HandleDao() no longer discards a whole aggregated DAO just because
+ *        its primary target happens to be the unspecified address: an
+ *        otherwise well-formed additional target riding alongside it is
+ *        still processed, the same as if it had arrived on its own.
+ */
+class RplStoringModeBogusPrimaryTargetTestCase : public TestCase
+{
+  public:
+    RplStoringModeBogusPrimaryTargetTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplStoringModeBogusPrimaryTargetTestCase::RplStoringModeBogusPrimaryTargetTestCase()
+    : TestCase("A DAO with a bogus primary target still processes a legitimate additional "
+              "target riding alongside it")
+{
+}
+
+void
+RplStoringModeBogusPrimaryTargetTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2); // 0 = root, 1 = child
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    rplHelper.Set("Mop", UintegerValue(RPL_MOP_STORING_NO_MULTICAST));
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(200));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> root = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> child = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(child->IsJoined(), true, "The child never joined the Storing mode DODAG");
+
+    Ipv6Address dodagId = root->GetGlobalAddress();
+    Ipv6Address childLinkLocal =
+        nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address rootLinkLocal =
+        nodes.Get(0)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    Ipv6Address legitimate("2001:1::ff:fe00:77");
+    RplDaoHeader dao;
+    dao.SetInstanceId(RPL_DEFAULT_INSTANCE);
+    dao.SetDodagId(dodagId);
+    dao.SetSequence(1);
+    dao.SetTarget(Ipv6Address::GetAny()); // bogus primary
+    dao.SetTransitInformation(Ipv6Address::GetAny(), 0, 0);
+    RplDaoHeader::AdditionalTarget additional;
+    additional.target = legitimate;
+    additional.targetPrefixLength = 128;
+    additional.pathSequence = 5;
+    additional.pathLifetime = RPL_DEFAULT_LIFETIME;
+    dao.AddTarget(additional);
+
+    Simulator::Schedule(Seconds(0),
+                        &SendRawRplMessage<RplDaoHeader>,
+                        nodes.Get(1),
+                        1,
+                        dao,
+                        static_cast<uint8_t>(RPL_CODE_DAO),
+                        childLinkLocal,
+                        rootLinkLocal);
+    Simulator::Stop(MilliSeconds(50));
+    Simulator::Run();
+
+    Ipv6Address nextHop;
+    NS_TEST_ASSERT_MSG_EQ(root->GetDownwardRoute(RPL_DEFAULT_INSTANCE, dodagId, legitimate, nextHop),
+                          true,
+                          "A legitimate additional target was dropped because the DAO's primary "
+                          "target was bogus");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief A target appearing twice in one incoming aggregated DAO (once as
+ *        the primary, once as an additional target, with a fresher Path
+ *        Sequence) must not be relayed onward as two separate Target +
+ *        Transit Information groups, one of them stale.
+ */
+class RplDaoDuplicateTargetDedupedTestCase : public TestCase
+{
+  public:
+    RplDaoDuplicateTargetDedupedTestCase();
+
+  private:
+    void DoRun() override;
+
+    /// @brief Decode a DAO delivered to the monitoring socket.
+    /// @param socket the receiving socket
+    void CaptureDao(Ptr<Socket> socket);
+
+    std::vector<RplDaoHeader> m_captured; //!< every DAO seen on the monitoring socket
+};
+
+RplDaoDuplicateTargetDedupedTestCase::RplDaoDuplicateTargetDedupedTestCase()
+    : TestCase("A target appearing twice in one aggregated DAO is relayed only once, with its "
+              "freshest Path Sequence")
+{
+}
+
+void
+RplDaoDuplicateTargetDedupedTestCase::CaptureDao(Ptr<Socket> socket)
+{
+    Ptr<Packet> packet = socket->Recv();
+    while (packet)
+    {
+        // A raw socket's own Recv() hands back the packet with its IPv6
+        // header still attached in front (@see
+        // RplStoringModeAggregatedRefreshTestCase::CountDao()'s own
+        // comment).
+        Ipv6Header ipv6Header;
+        if (packet->RemoveHeader(ipv6Header) != 0)
+        {
+            Icmpv6Header icmpv6Header;
+            if (packet->RemoveHeader(icmpv6Header) != 0 && icmpv6Header.GetCode() == RPL_CODE_DAO)
+            {
+                RplDaoHeader dao;
+                packet->RemoveHeader(dao);
+                m_captured.push_back(dao);
+            }
+        }
+        packet = socket->Recv();
+    }
+}
+
+void
+RplDaoDuplicateTargetDedupedTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(3); // 0 = root, 1 = relay, 2 = probe
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    Ptr<SimpleNetDevice> first = DynamicCast<SimpleNetDevice>(devices.Get(0));
+    Ptr<SimpleNetDevice> last = DynamicCast<SimpleNetDevice>(devices.Get(2));
+    channel->BlackList(first, last);
+    channel->BlackList(last, first);
+
+    RplHelper rplHelper;
+    rplHelper.Set("Mop", UintegerValue(RPL_MOP_STORING_NO_MULTICAST));
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(200));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> root = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> relay = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> probe = nodes.Get(2)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(probe->IsJoined(), true, "The probe never joined the Storing mode DODAG");
+
+    Ipv6Address dodagId = root->GetGlobalAddress();
+    Ipv6Address probeLinkLocal =
+        nodes.Get(2)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address relayLinkLocal =
+        nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    Ipv6Address duplicated("2001:1::ff:fe00:dd");
+
+    Ptr<Socket> monitor = Socket::CreateSocket(nodes.Get(0), Ipv6RawSocketFactory::GetTypeId());
+    monitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    monitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    monitor->SetRecvCallback(MakeCallback(&RplDaoDuplicateTargetDedupedTestCase::CaptureDao, this));
+
+    RplDaoHeader dao;
+    dao.SetInstanceId(RPL_DEFAULT_INSTANCE);
+    dao.SetDodagId(dodagId);
+    dao.SetSequence(1);
+    dao.SetTarget(duplicated);
+    dao.SetTransitInformation(Ipv6Address::GetAny(), 3, 10); // stale, seen first as the primary
+    RplDaoHeader::AdditionalTarget again;
+    again.target = duplicated; // the same address, again
+    again.targetPrefixLength = 128;
+    again.pathSequence = 5; // fresher
+    again.pathLifetime = 20;
+    dao.AddTarget(again);
+
+    Simulator::Schedule(Seconds(0),
+                        &SendRawRplMessage<RplDaoHeader>,
+                        nodes.Get(2),
+                        1,
+                        dao,
+                        static_cast<uint8_t>(RPL_CODE_DAO),
+                        probeLinkLocal,
+                        relayLinkLocal);
+    Simulator::Stop(MilliSeconds(50));
+    Simulator::Run();
+
+    Ipv6Address nextHop;
+    NS_TEST_ASSERT_MSG_EQ(relay->GetDownwardRoute(RPL_DEFAULT_INSTANCE, dodagId, duplicated, nextHop),
+                          true,
+                          "relay did not accept the duplicated target at all");
+
+    NS_TEST_ASSERT_MSG_EQ(m_captured.size(),
+                          1,
+                          "relay relayed the duplicated target in more than one outgoing DAO");
+
+    uint32_t occurrences = 0;
+    uint8_t seenPathSequence = 0;
+    const RplDaoHeader& relayed = m_captured.front();
+    if (relayed.GetTarget() == duplicated)
+    {
+        occurrences++;
+        seenPathSequence = relayed.GetPathSequence();
+    }
+    for (const auto& additionalTarget : relayed.GetAdditionalTargets())
+    {
+        if (additionalTarget.target == duplicated)
+        {
+            occurrences++;
+            seenPathSequence = additionalTarget.pathSequence;
+        }
+    }
+    NS_TEST_ASSERT_MSG_EQ(occurrences,
+                          1,
+                          "the relayed DAO carried the same target twice, once stale and once "
+                          "fresh, instead of being deduplicated");
+    NS_TEST_ASSERT_MSG_EQ(+seenPathSequence,
+                          5,
+                          "the relayed DAO kept the stale Path Sequence instead of the fresh one");
+
+    monitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief Two targets that both change in one incoming aggregated DAO are
+ *        relayed together, in one outgoing DAO -- not split into two --
+ *        the same aggregation SendDao()'s own periodic refresh applies.
+ */
+class RplHandleDaoAggregatesSimultaneousChangesTestCase : public TestCase
+{
+  public:
+    RplHandleDaoAggregatesSimultaneousChangesTestCase();
+
+  private:
+    void DoRun() override;
+
+    /// @brief Decode a DAO delivered to the monitoring socket.
+    /// @param socket the receiving socket
+    void CaptureDao(Ptr<Socket> socket);
+
+    std::vector<RplDaoHeader> m_captured; //!< every DAO seen on the monitoring socket
+};
+
+RplHandleDaoAggregatesSimultaneousChangesTestCase::
+    RplHandleDaoAggregatesSimultaneousChangesTestCase()
+    : TestCase("Two targets that both change in one incoming DAO are relayed together in one "
+              "outgoing DAO, not two")
+{
+}
+
+void
+RplHandleDaoAggregatesSimultaneousChangesTestCase::CaptureDao(Ptr<Socket> socket)
+{
+    Ptr<Packet> packet = socket->Recv();
+    while (packet)
+    {
+        Ipv6Header ipv6Header;
+        if (packet->RemoveHeader(ipv6Header) != 0)
+        {
+            Icmpv6Header icmpv6Header;
+            if (packet->RemoveHeader(icmpv6Header) != 0 && icmpv6Header.GetCode() == RPL_CODE_DAO)
+            {
+                RplDaoHeader dao;
+                packet->RemoveHeader(dao);
+                m_captured.push_back(dao);
+            }
+        }
+        packet = socket->Recv();
+    }
+}
+
+void
+RplHandleDaoAggregatesSimultaneousChangesTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(3); // 0 = root, 1 = relay, 2 = probe
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    Ptr<SimpleNetDevice> first = DynamicCast<SimpleNetDevice>(devices.Get(0));
+    Ptr<SimpleNetDevice> last = DynamicCast<SimpleNetDevice>(devices.Get(2));
+    channel->BlackList(first, last);
+    channel->BlackList(last, first);
+
+    RplHelper rplHelper;
+    rplHelper.Set("Mop", UintegerValue(RPL_MOP_STORING_NO_MULTICAST));
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(200));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> root = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> relay = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> probe = nodes.Get(2)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(probe->IsJoined(), true, "The probe never joined the Storing mode DODAG");
+
+    Ipv6Address dodagId = root->GetGlobalAddress();
+    Ipv6Address probeLinkLocal =
+        nodes.Get(2)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address relayLinkLocal =
+        nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    Ipv6Address targetX("2001:1::ff:fe00:11");
+    Ipv6Address targetY("2001:1::ff:fe00:22");
+
+    Ptr<Socket> monitor = Socket::CreateSocket(nodes.Get(0), Ipv6RawSocketFactory::GetTypeId());
+    monitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    monitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    monitor->SetRecvCallback(
+        MakeCallback(&RplHandleDaoAggregatesSimultaneousChangesTestCase::CaptureDao, this));
+
+    RplDaoHeader dao;
+    dao.SetInstanceId(RPL_DEFAULT_INSTANCE);
+    dao.SetDodagId(dodagId);
+    dao.SetSequence(1);
+    dao.SetTarget(targetX);
+    dao.SetTransitInformation(Ipv6Address::GetAny(), 1, 30);
+    RplDaoHeader::AdditionalTarget additionalY;
+    additionalY.target = targetY;
+    additionalY.targetPrefixLength = 128;
+    additionalY.pathSequence = 1;
+    additionalY.pathLifetime = 30;
+    dao.AddTarget(additionalY);
+
+    Simulator::Schedule(Seconds(0),
+                        &SendRawRplMessage<RplDaoHeader>,
+                        nodes.Get(2),
+                        1,
+                        dao,
+                        static_cast<uint8_t>(RPL_CODE_DAO),
+                        probeLinkLocal,
+                        relayLinkLocal);
+    Simulator::Stop(MilliSeconds(50));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(m_captured.size(),
+                          1,
+                          "relay split two simultaneously-changed targets from one incoming DAO "
+                          "into more than one outgoing DAO");
+
+    const RplDaoHeader& relayed = m_captured.front();
+    bool sawX = relayed.GetTarget() == targetX;
+    bool sawY = relayed.GetTarget() == targetY;
+    for (const auto& additionalTarget : relayed.GetAdditionalTargets())
+    {
+        sawX = sawX || additionalTarget.target == targetX;
+        sawY = sawY || additionalTarget.target == targetY;
+    }
+    NS_TEST_ASSERT_MSG_EQ(sawX, true, "relay's single outgoing DAO did not carry the 1st target");
+    NS_TEST_ASSERT_MSG_EQ(sawY, true, "relay's single outgoing DAO did not carry the 2nd target");
+
+    monitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief DaoRetry()'s own additionalTargets rebuild (from the sender's
+ *        current downwardRoutes, not whatever the original unacknowledged
+ *        DAO happened to carry) must actually reflect real content, not
+ *        silently retry an empty or wrong aggregate.
+ */
+class RplStoringModeDaoRetryContentTestCase : public TestCase
+{
+  public:
+    RplStoringModeDaoRetryContentTestCase();
+
+  private:
+    void DoRun() override;
+
+    /// @brief Decode a DAO delivered to the monitoring socket.
+    /// @param socket the receiving socket
+    void CaptureDao(Ptr<Socket> socket);
+
+    std::vector<RplDaoHeader> m_captured; //!< every DAO seen on the monitoring socket
+};
+
+RplStoringModeDaoRetryContentTestCase::RplStoringModeDaoRetryContentTestCase()
+    : TestCase("DaoRetry() rebuilds its additional targets from the sender's own current "
+              "downward routes, not empty or stale data")
+{
+}
+
+void
+RplStoringModeDaoRetryContentTestCase::CaptureDao(Ptr<Socket> socket)
+{
+    Ptr<Packet> packet = socket->Recv();
+    while (packet)
+    {
+        Ipv6Header ipv6Header;
+        if (packet->RemoveHeader(ipv6Header) != 0)
+        {
+            Icmpv6Header icmpv6Header;
+            if (packet->RemoveHeader(icmpv6Header) != 0 && icmpv6Header.GetCode() == RPL_CODE_DAO)
+            {
+                RplDaoHeader dao;
+                packet->RemoveHeader(dao);
+                m_captured.push_back(dao);
+            }
+        }
+        packet = socket->Recv();
+    }
+}
+
+void
+RplStoringModeDaoRetryContentTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(3); // 0 = root, 1 = relay, 2 = probe
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    // Same reasoning as RplStoringModeDaoRetryTestCase: a non-trivial delay
+    // makes a real DAO-ACK round trip reliably longer than DaoAckTimeout
+    // below, so relay's own self-advertisement is guaranteed to retry at
+    // least once.
+    channel->SetAttribute("Delay", TimeValue(Seconds(1)));
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    Ptr<SimpleNetDevice> first = DynamicCast<SimpleNetDevice>(devices.Get(0));
+    Ptr<SimpleNetDevice> last = DynamicCast<SimpleNetDevice>(devices.Get(2));
+    channel->BlackList(first, last);
+    channel->BlackList(last, first);
+
+    RplHelper rplHelper;
+    rplHelper.Set("Mop", UintegerValue(RPL_MOP_STORING_NO_MULTICAST));
+    rplHelper.Set("DaoAckTimeout", TimeValue(MilliSeconds(200)));
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    Ptr<Socket> monitor = Socket::CreateSocket(nodes.Get(0), Ipv6RawSocketFactory::GetTypeId());
+    monitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    monitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    monitor->SetRecvCallback(MakeCallback(&RplStoringModeDaoRetryContentTestCase::CaptureDao, this));
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(200));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> root = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> relay = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> probe = nodes.Get(2)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(probe->IsJoined(), true, "The probe never joined the Storing mode DODAG");
+
+    Ipv6Address relayGlobal = relay->GetGlobalAddress();
+    Ipv6Address probeGlobal = probe->GetGlobalAddress();
+
+    // Among every DAO root captured over the whole run (formation, every
+    // periodic refresh, and every DaoRetry() along the way), find one that
+    // is relay's own self-advertisement (primary target == relay's own
+    // address, the shape both SendDao() and DaoRetry() build the same way)
+    // and check it actually carries probe as an additional target -- not
+    // empty, and not some other node's data. This topology's own 1 s
+    // channel delay against a 200 ms DaoAckTimeout guarantees at least one
+    // of relay's own self-advertisements is a genuine DaoRetry() retry, not
+    // just SendDao()'s first attempt (@see RplStoringModeDaoRetryTestCase's
+    // own comment).
+    bool foundProbeAggregated = false;
+    for (const auto& dao : m_captured)
+    {
+        if (dao.GetTarget() != relayGlobal)
+        {
+            continue;
+        }
+        for (const auto& additional : dao.GetAdditionalTargets())
+        {
+            if (additional.target == probeGlobal && additional.pathLifetime > 0)
+            {
+                foundProbeAggregated = true;
+            }
+        }
+    }
+    NS_TEST_ASSERT_MSG_EQ(foundProbeAggregated,
+                          true,
+                          "relay never sent a self-advertisement (initial or retried) that "
+                          "correctly aggregated its own downward route to the probe");
 
     monitor->Close();
     Simulator::Destroy();
@@ -19011,6 +19691,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplDioMultiArtTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDaoHeaderTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDaoMultiTargetHeaderTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplDaoGroupedTargetTransitTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pDroHeaderTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pDroAckHeaderTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDaoBoundaryTestCase, TestCase::Duration::QUICK);
@@ -19025,9 +19706,13 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplStoringModeDownwardRouteTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplStoringModeStaleDaoAndNoPathTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplStoringModeDaoRetryTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplStoringModeDaoRetryContentTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplStoringModeInputValidationTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplStoringModeInfiniteLifetimeRelayedTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplStoringModeAggregatedRefreshTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplStoringModeBogusPrimaryTargetTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplDaoDuplicateTargetDedupedTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplHandleDaoAggregatesSimultaneousChangesTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplStoringModeOrdinarySwitchNoPathTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplStoringModeStaleAfterExpiryTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplStoringModeRootPurgeTestCase, TestCase::Duration::QUICK);

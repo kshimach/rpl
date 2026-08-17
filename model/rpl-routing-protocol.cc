@@ -2011,6 +2011,29 @@ RplRoutingProtocol::SendDaoMessage(DodagMembership& dodag,
         dao.AddTarget(wireEntry);
     }
 
+    // downwardRoutes (the source of additionalTargets, in SendDao()/
+    // DaoRetry()) has no upper bound on how many entries it holds -- @see
+    // PurgeDownwardRoutes()'s own doc comment -- so nothing here stops an
+    // aggregated DAO from growing past the point a single IPv6 packet can
+    // carry without fragmentation. Ipv6L3Protocol::Send() fragments a
+    // locally-originated packet that exceeds the outgoing interface's MTU
+    // rather than dropping or asserting, so this is not a correctness bug,
+    // but a DAO large enough to fragment turns one lost fragment into a
+    // full DaoRetry() of the whole (still-large) aggregate rather than of
+    // one target's worth of data. Logged, not capped or asserted on: this
+    // module has no policy for how to split one logical update across more
+    // than one DAO message, and refusing to send would drop the update
+    // entirely instead of relying on fragmentation to deliver it.
+    constexpr uint32_t IPV6_MIN_MTU = 1280; // RFC 8200 section 5
+    if (dao.GetSerializedSize() > IPV6_MIN_MTU)
+    {
+        NS_LOG_WARN("Aggregated DAO for " << dodag.dodagId << " is "
+                                          << dao.GetSerializedSize()
+                                          << " bytes, over the IPv6 minimum MTU of "
+                                          << IPV6_MIN_MTU
+                                          << " and will be fragmented to send");
+    }
+
     Ptr<Packet> packet = Create<Packet>();
     packet->AddHeader(dao);
 
@@ -2139,6 +2162,18 @@ RplRoutingProtocol::SendNoPathDao(DodagMembership& dodag, Ipv6Address viaParent)
     // parent this node was actually last advertised through -- the one
     // reason this cannot simply share SendDaoMessage()'s own
     // preferred-parent-only destination resolution.
+    //
+    // Never carries additionalTargets, unlike SendDao()/DaoRetry(): this
+    // withdrawal is inherently about exactly one target, this node's own
+    // global address, not (RFC 6550 section 9.8 rule 3) any of the
+    // downwardRoutes entries this node was relaying for others through
+    // viaParent. Those keep their own PathLifetime timers and are not
+    // withdrawn here; SendDao()'s next periodic refresh re-advertises the
+    // ones still valid through the (by then already switched) new
+    // preferred parent instead. A future change that wants a single
+    // message to withdraw this node's own target and everything it was
+    // relaying through the same old parent at once could use
+    // additionalTargets for that, but nothing currently needs it.
     bool storing = dodag.mop == RPL_MOP_STORING_NO_MULTICAST;
     Ipv6Address target = GetGlobalAddressIn(dodag);
     Ipv6Address parent = storing ? Ipv6Address::GetAny() : GlobalAddressOf(dodag, viaParent);
@@ -2610,15 +2645,63 @@ RplRoutingProtocol::HandleDao(const RplDaoHeader& dao, Ipv6Address from, uint32_
         }
     };
 
+    // A bogus/empty primary target does not disqualify the rest of the
+    // message: an aggregated DAO's additional targets (RFC 6550 section
+    // 9.4) are each independently valid or not, so this only skips the
+    // primary's own handleOneTarget() call (which would otherwise just
+    // repeat this same IsAny() check and warn a second time) rather than
+    // returning out of the whole function and silently dropping every
+    // additional target riding alongside it.
     if (dao.GetTarget().IsAny())
     {
-        NS_LOG_WARN("Ignoring a DAO from " << from << " with no target");
-        return;
+        NS_LOG_WARN("Ignoring the primary target of a DAO from " << from << " with no target");
     }
-    handleOneTarget(dao.GetTarget(), dao.GetPathSequence(), dao.GetPathLifetime());
+    else
+    {
+        handleOneTarget(dao.GetTarget(), dao.GetPathSequence(), dao.GetPathLifetime());
+    }
     for (const auto& additional : dao.GetAdditionalTargets())
     {
         handleOneTarget(additional.target, additional.pathSequence, additional.pathLifetime);
+    }
+
+    // A target that appears more than once in the same incoming aggregated
+    // DAO -- once as the primary and once as an additional target, or
+    // twice among the additional targets -- can independently be judged
+    // "changed" at each occurrence (e.g. primary carries Path Sequence 3,
+    // seen first with no prior entry at all so unconditionally accepted;
+    // an additional entry for the same address then carries Path Sequence
+    // 5, also accepted since 5 is newer than the 3 just stored), pushing
+    // one toPropagate entry per occurrence. Left alone, the relayed
+    // message below would then carry two separate Target + Transit
+    // Information groups for the identical address -- one stale, one
+    // fresh -- which RFC 6550 section 9.4's "one group per Target"
+    // structure never anticipates and no sender before this aggregation
+    // feature could ever produce. Keeping only the last occurrence's entry
+    // per target (its content, not its position -- @see the loop below)
+    // matches downwardRoutes[target]'s actual final state, since the last
+    // handleOneTarget() call to accept a given target is always the one
+    // that most recently wrote it there.
+    if (toPropagate.size() > 1)
+    {
+        std::vector<DaoTargetEntry> deduped;
+        for (const auto& entry : toPropagate)
+        {
+            auto it = std::find_if(deduped.begin(),
+                                   deduped.end(),
+                                   [&entry](const DaoTargetEntry& seen) {
+                                       return seen.target == entry.target;
+                                   });
+            if (it != deduped.end())
+            {
+                *it = entry;
+            }
+            else
+            {
+                deduped.push_back(entry);
+            }
+        }
+        toPropagate = std::move(deduped);
     }
 
     // Everything that changed goes out together, the same aggregation

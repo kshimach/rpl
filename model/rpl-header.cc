@@ -1602,9 +1602,11 @@ RplDaoHeader::Print(std::ostream& os) const
     {
         os << " ack requested";
     }
-    if (!m_additionalTargets.empty())
+    for (const auto& additional : m_additionalTargets)
     {
-        os << " (+" << m_additionalTargets.size() << " more target(s))";
+        os << "; +target " << additional.target << "/" << +additional.targetPrefixLength
+           << " sequence " << +additional.pathSequence << " lifetime "
+           << +additional.pathLifetime;
     }
 }
 
@@ -1727,11 +1729,26 @@ RplDaoHeader::Deserialize(Buffer::Iterator start)
     // own primary target (m_target/m_parent/m_pathSequence/m_pathLifetime,
     // preserving every existing single-target caller's own behaviour
     // unchanged); every complete pair after that is appended to
-    // m_additionalTargets instead. A Target option with no Transit
-    // Information option ever following it (or a second Target option
-    // before the first is paired) cannot come from this module's own
-    // SendDaoMessage() and is simply dropped, the same "does not follow
-    // the rules, discard" allowance RFC 6550 section 9.4 rule 6 gives.
+    // m_additionalTargets instead.
+    //
+    // Anything that does not fit that simple alternating shape -- a second
+    // Target option before the first is paired (the general "N targets
+    // share one Transit Information group" form), or a Transit Information
+    // option with no Target option immediately preceding it (the general
+    // "M Transit Information options apply to one Target" form, RFC 6550
+    // section 6.7.8's own multi-parent worked example) -- is a grouping
+    // this module does not implement. A previous version of this function
+    // silently dropped just the offending option and kept whatever had
+    // already paired, which for the first case in particular does not
+    // "drop" cleanly: it overwrites the still-pending Target with the new
+    // one, silently losing it, and lets an unrelated Transit Information
+    // option pair with (and so misattribute a parent/Path Sequence/Path
+    // Lifetime to) the wrong Target. Since this module cannot correctly
+    // interpret such a message at all, the only safe response is RFC 6550
+    // section 9.4 rule 6's own: "If a node receives a DAO message that
+    // does not follow the above rules, it MUST discard the DAO message
+    // without further processing" -- the whole message, not merely the
+    // option that broke the pattern.
     //
     // The DAO is the last thing in the packet, so the end of the buffer is
     // the end of the option list.
@@ -1739,6 +1756,7 @@ RplDaoHeader::Deserialize(Buffer::Iterator start)
     Ipv6Address pendingTarget;
     uint8_t pendingPrefixLength = 128;
     bool haveAnyPair = false;
+    bool malformed = false;
 
     while (!i.IsEnd())
     {
@@ -1773,6 +1791,13 @@ RplDaoHeader::Deserialize(Buffer::Iterator start)
 
         if (type == RPL_OPTION_TARGET && length == TARGET_OPTION_LENGTH)
         {
+            if (havePendingTarget)
+            {
+                NS_LOG_WARN("Discarding a DAO with two Target options in a row (an "
+                            "unsupported grouping, RFC 6550 section 9.4 rule 6)");
+                malformed = true;
+                break;
+            }
             i.ReadU8(); // Flags
             pendingPrefixLength = i.ReadU8();
             i.Read(buf, 16);
@@ -1781,6 +1806,14 @@ RplDaoHeader::Deserialize(Buffer::Iterator start)
         }
         else if (type == RPL_OPTION_TRANSIT && length == TRANSIT_OPTION_LENGTH)
         {
+            if (!havePendingTarget)
+            {
+                NS_LOG_WARN("Discarding a DAO with a Transit Information option not "
+                            "immediately preceded by a Target option (an unsupported "
+                            "grouping, RFC 6550 section 9.4 rule 6)");
+                malformed = true;
+                break;
+            }
             i.ReadU8(); // E flag and flags
             i.ReadU8(); // Path Control
             uint8_t pathSequence = i.ReadU8();
@@ -1788,34 +1821,41 @@ RplDaoHeader::Deserialize(Buffer::Iterator start)
             i.Read(buf, 16);
             Ipv6Address parent = Ipv6Address::Deserialize(buf);
 
-            if (havePendingTarget)
+            if (!haveAnyPair)
             {
-                if (!haveAnyPair)
-                {
-                    m_target = pendingTarget;
-                    m_targetPrefixLen = pendingPrefixLength;
-                    m_parent = parent;
-                    m_pathSequence = pathSequence;
-                    m_pathLifetime = pathLifetime;
-                    haveAnyPair = true;
-                }
-                else
-                {
-                    AdditionalTarget additional;
-                    additional.target = pendingTarget;
-                    additional.targetPrefixLength = pendingPrefixLength;
-                    additional.pathSequence = pathSequence;
-                    additional.pathLifetime = pathLifetime;
-                    m_additionalTargets.push_back(additional);
-                }
-                havePendingTarget = false;
+                m_target = pendingTarget;
+                m_targetPrefixLen = pendingPrefixLength;
+                m_parent = parent;
+                m_pathSequence = pathSequence;
+                m_pathLifetime = pathLifetime;
+                haveAnyPair = true;
             }
+            else
+            {
+                AdditionalTarget additional;
+                additional.target = pendingTarget;
+                additional.targetPrefixLength = pendingPrefixLength;
+                additional.pathSequence = pathSequence;
+                additional.pathLifetime = pathLifetime;
+                m_additionalTargets.push_back(additional);
+            }
+            havePendingTarget = false;
         }
         else
         {
             NS_LOG_LOGIC("Skipping RPL option " << +type << " of length " << +length);
             i.Next(length);
         }
+    }
+
+    if (malformed)
+    {
+        m_target = Ipv6Address::GetAny();
+        m_targetPrefixLen = 128;
+        m_parent = Ipv6Address::GetAny();
+        m_pathSequence = 0;
+        m_pathLifetime = 0;
+        m_additionalTargets.clear();
     }
 
     return i.GetDistanceFrom(start);
