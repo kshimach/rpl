@@ -1602,6 +1602,10 @@ RplDaoHeader::Print(std::ostream& os) const
     {
         os << " ack requested";
     }
+    if (!m_additionalTargets.empty())
+    {
+        os << " (+" << m_additionalTargets.size() << " more target(s))";
+    }
 }
 
 uint32_t
@@ -1612,7 +1616,10 @@ RplDaoHeader::GetSerializedSize() const
     {
         size += 16;
     }
-    return size + TARGET_OPTION_SIZE + TRANSIT_OPTION_SIZE;
+    size += TARGET_OPTION_SIZE + TRANSIT_OPTION_SIZE;
+    size += static_cast<uint32_t>(m_additionalTargets.size()) *
+           (TARGET_OPTION_SIZE + TRANSIT_OPTION_SIZE);
+    return size;
 }
 
 void
@@ -1655,6 +1662,29 @@ RplDaoHeader::Serialize(Buffer::Iterator start) const
     start.WriteU8(m_pathLifetime);
     m_parent.Serialize(buf);
     start.Write(buf, 16);
+
+    // Every additional Target + Transit Information pair, RFC 6550 section
+    // 9.4 rule 3: each is its own complete group, sharing this message's
+    // own Transit Information parent field (m_parent) the same way the
+    // primary one does -- @see AddTarget()'s own doc comment for why.
+    for (const auto& additional : m_additionalTargets)
+    {
+        start.WriteU8(RPL_OPTION_TARGET);
+        start.WriteU8(TARGET_OPTION_LENGTH);
+        start.WriteU8(0); // Flags
+        start.WriteU8(additional.targetPrefixLength);
+        additional.target.Serialize(buf);
+        start.Write(buf, 16);
+
+        start.WriteU8(RPL_OPTION_TRANSIT);
+        start.WriteU8(TRANSIT_OPTION_LENGTH);
+        start.WriteU8(0); // E flag and flags
+        start.WriteU8(0); // Path Control
+        start.WriteU8(additional.pathSequence);
+        start.WriteU8(additional.pathLifetime);
+        m_parent.Serialize(buf);
+        start.Write(buf, 16);
+    }
 }
 
 uint32_t
@@ -1684,9 +1714,32 @@ RplDaoHeader::Deserialize(Buffer::Iterator start)
 
     m_target = Ipv6Address::GetAny();
     m_parent = Ipv6Address::GetAny();
+    m_additionalTargets.clear();
 
-    // The DAO is the last thing in the packet, so the end of the buffer is the
-    // end of the option list.
+    // Pairs each Target option with the Transit Information option that
+    // follows it (RFC 6550 section 9.4 rule 3): this module's own send
+    // side only ever generates the simplest form of the general grouping
+    // rule -- exactly one Transit Information option per Target option --
+    // so that pairing is done here purely sequentially rather than
+    // implementing the fully general "one or more Target options followed
+    // by one or more Transit Information options, applying to the whole
+    // group" rule. The first complete pair found becomes this message's
+    // own primary target (m_target/m_parent/m_pathSequence/m_pathLifetime,
+    // preserving every existing single-target caller's own behaviour
+    // unchanged); every complete pair after that is appended to
+    // m_additionalTargets instead. A Target option with no Transit
+    // Information option ever following it (or a second Target option
+    // before the first is paired) cannot come from this module's own
+    // SendDaoMessage() and is simply dropped, the same "does not follow
+    // the rules, discard" allowance RFC 6550 section 9.4 rule 6 gives.
+    //
+    // The DAO is the last thing in the packet, so the end of the buffer is
+    // the end of the option list.
+    bool havePendingTarget = false;
+    Ipv6Address pendingTarget;
+    uint8_t pendingPrefixLength = 128;
+    bool haveAnyPair = false;
+
     while (!i.IsEnd())
     {
         uint8_t type = i.ReadU8();
@@ -1721,18 +1774,42 @@ RplDaoHeader::Deserialize(Buffer::Iterator start)
         if (type == RPL_OPTION_TARGET && length == TARGET_OPTION_LENGTH)
         {
             i.ReadU8(); // Flags
-            m_targetPrefixLen = i.ReadU8();
+            pendingPrefixLength = i.ReadU8();
             i.Read(buf, 16);
-            m_target = Ipv6Address::Deserialize(buf);
+            pendingTarget = Ipv6Address::Deserialize(buf);
+            havePendingTarget = true;
         }
         else if (type == RPL_OPTION_TRANSIT && length == TRANSIT_OPTION_LENGTH)
         {
             i.ReadU8(); // E flag and flags
             i.ReadU8(); // Path Control
-            m_pathSequence = i.ReadU8();
-            m_pathLifetime = i.ReadU8();
+            uint8_t pathSequence = i.ReadU8();
+            uint8_t pathLifetime = i.ReadU8();
             i.Read(buf, 16);
-            m_parent = Ipv6Address::Deserialize(buf);
+            Ipv6Address parent = Ipv6Address::Deserialize(buf);
+
+            if (havePendingTarget)
+            {
+                if (!haveAnyPair)
+                {
+                    m_target = pendingTarget;
+                    m_targetPrefixLen = pendingPrefixLength;
+                    m_parent = parent;
+                    m_pathSequence = pathSequence;
+                    m_pathLifetime = pathLifetime;
+                    haveAnyPair = true;
+                }
+                else
+                {
+                    AdditionalTarget additional;
+                    additional.target = pendingTarget;
+                    additional.targetPrefixLength = pendingPrefixLength;
+                    additional.pathSequence = pathSequence;
+                    additional.pathLifetime = pathLifetime;
+                    m_additionalTargets.push_back(additional);
+                }
+                havePendingTarget = false;
+            }
         }
         else
         {
@@ -1742,6 +1819,18 @@ RplDaoHeader::Deserialize(Buffer::Iterator start)
     }
 
     return i.GetDistanceFrom(start);
+}
+
+void
+RplDaoHeader::AddTarget(const AdditionalTarget& additionalTarget)
+{
+    m_additionalTargets.push_back(additionalTarget);
+}
+
+const std::vector<RplDaoHeader::AdditionalTarget>&
+RplDaoHeader::GetAdditionalTargets() const
+{
+    return m_additionalTargets;
 }
 
 void

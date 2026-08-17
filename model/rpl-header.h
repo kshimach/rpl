@@ -1102,6 +1102,57 @@ class RplDaoHeader : public Header
      */
     uint8_t GetPathLifetime() const;
 
+    /**
+     * @brief One additional Target + Transit Information pair beyond the
+     *        primary one (SetTarget()/SetTransitInformation()).
+     *
+     * RFC 6550 section 9.4: "a DAO message may include several groups of
+     * options, where each group consists of one or more Target options
+     * followed by one or more Transit Information options." This is that
+     * general grouping rule taken to its simplest per-target form -- one
+     * Target option immediately followed by its own Transit Information
+     * option -- which is all this module ever needs, since it never varies
+     * the Transit Information's own parent field across targets in one
+     * message (@see AddTarget()'s own doc comment).
+     */
+    struct AdditionalTarget
+    {
+        Ipv6Address target;               //!< the additional target address
+        uint8_t targetPrefixLength{128};  //!< significant bits of the target
+        uint8_t pathSequence{0};          //!< path sequence for this target
+        uint8_t pathLifetime{0};          //!< path lifetime for this target, 0 for a No-Path
+    };
+
+    /**
+     * @brief Append an additional Target + Transit Information pair, letting
+     *        one DAO message carry several targets (RFC 6550 section 9.4
+     *        rule 3) instead of one message per target.
+     *
+     * The appended pair's own Transit Information option shares this
+     * message's single Transit Information parent field
+     * (SetTransitInformation()'s own @p parent) rather than carrying one of
+     * its own: this module never has a reason to vary it across targets in
+     * one message (Storing mode leaves it empty for every target
+     * regardless, RFC 6550 section 9.8 rule 1; Non-Storing mode's own
+     * sender has exactly one preferred parent to report, the same for
+     * every target it is relaying). A general RFC 6550 sender is free to
+     * pair different Target option groups with different Transit
+     * Information options of their own; this is the simplification this
+     * module's own send side never needs more than.
+     *
+     * @param additionalTarget the target, prefix length, path sequence and
+     *        path lifetime to append
+     */
+    void AddTarget(const AdditionalTarget& additionalTarget);
+
+    /**
+     * @brief Get every additional Target + Transit Information pair beyond
+     *        the primary one.
+     * @return the additional pairs, in the order they were added (or, after
+     *         a Deserialize(), the order they were found on the wire)
+     */
+    const std::vector<AdditionalTarget>& GetAdditionalTargets() const;
+
   private:
     /// Serialized size of the Target option for a full address, type and
     /// length byte included (RFC 6550, section 6.7.7).
@@ -1125,6 +1176,11 @@ class RplDaoHeader : public Header
     Ipv6Address m_parent;      //!< the parent the target is reached through
     uint8_t m_pathSequence;    //!< path sequence of the Transit Information option
     uint8_t m_pathLifetime;    //!< path lifetime, 0 for a No-Path
+
+    /// Every Target + Transit Information pair beyond the primary one
+    /// above, in wire order; @see AddTarget()'s own doc comment for why
+    /// they all still share m_parent rather than carrying one of their own.
+    std::vector<AdditionalTarget> m_additionalTargets;
 };
 
 /**

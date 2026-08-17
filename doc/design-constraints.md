@@ -6719,3 +6719,115 @@ load-bearing検証: `RplSequenceIncrement()`の実装を素朴な`++`に
 `./ns3 build`(rplモジュール・プロジェクト全体とも)、
 `test-runner --suite=rpl`を複数回実行して安定PASSを確認。
 既存の全テスト(§54-57で追加したものを含む)はPASS。
+
+## 59. §54.10で見送った複数downwardRoutesエントリの1メッセージ集約を実装
+
+### 59.1 RFC上の根拠
+
+RFC 6550 section 9.4 "Structure of DAO Messages": "a DAO message may
+include several groups of options, where each group consists of one
+or more Target options followed by one or more Transit Information
+options. The entire group of Transit Information options applies to
+the entire group of Target options." rule 3も同旨:
+「One or more RPL Target options in a unicast DAO message MUST be
+followed by one or more Transit Information options. All the transit
+options apply to all the Target options that immediately precede
+them.」— 複数Targetの集約自体はRFCが明示的に許容する構造であり、
+今回はその一般形のうち最も単純な部分集合(各グループがTarget
+option 1個+Transit Information option 1個)だけを実装した。
+
+### 59.2 ワイヤフォーマット
+
+`RplDaoHeader`に`AdditionalTarget`(target・targetPrefixLength・
+pathSequence・pathLifetimeの4フィールド)構造体を新設、
+`AddTarget()`/`GetAdditionalTargets()`を追加。既存の
+`SetTarget()`/`SetTransitInformation()`/`GetTarget()`/
+`GetPathSequence()`/`GetPathLifetime()`は「先頭(primary)の
+Target+Transit Informationペア」に対する既存のスカラーAPIのまま
+一切変更していない — 全既存呼び出し元の挙動は無変更。
+
+**設計上の単純化**: 各追加Targetの独自Transit Informationも、
+Parent Address subfieldはメッセージ全体で共有する単一の
+`m_parent`(既存フィールド)を書き込む。RFC上は各グループが
+異なるTransit Informationを持てる(≠異なるparent)が、この
+モジュール自身の送信側は常に単一のpreferred parent(Storing
+mode)または単一の空値(Storing modeでは元々空)にしかならない
+ため、この単純化で実害は無い。`AddTarget()`自身のdocコメントに
+明記した。
+
+`Deserialize()`は、Target optionとTransit Information optionを
+「出現順に逐次ペアリング」する方式に書き換えた(既存の
+「最後に出現した値で上書き」というoption-loopの慣習をそのまま
+延長)。1つ目の完成ペアはprimaryスカラーフィールドへ、2つ目以降は
+`m_additionalTargets`へ追加。ペアにならなかったTarget option
+(Transit Informationが後続しない)は、このモジュール自身の送信側が
+生成しえない形なので、RFC 6550 section 9.4 rule 6
+「does not follow the above rules... MUST discard」と同じ扱いで
+無視する。
+
+### 59.3 送信側: `SendDao()`と`DaoRetry()`の集約
+
+`SendDao()`のStoring mode分岐は、以前は自己広告DAO 1通 +
+`downwardRoutes`エントリごとに1通、計N+1通を個別送信していた。
+これを、自己広告をprimary target、`downwardRoutes`の全生存エントリを
+`additionalTargets`として**1つのDAOメッセージに集約**するよう
+書き換えた。DAOSequence・K flagはメッセージ全体で共有(既存の
+DAOSequenceの仕様どおり、そもそもper-targetの概念を持たない)。
+
+`DaoRetry()`も同様に、再送時点の`downwardRoutes`の現在状態から
+`additionalTargets`を再構築して集約する — 「常に現在状態から
+組み立て直す」という既存の再送規約(dodag.pathSequence・
+m_pathLifetimeを都度読み直す)をそのまま踏襲。
+
+### 59.4 受信側: `HandleDao()`の per-target ヘルパー化と伝播の集約
+
+`HandleDao()`内の「1つのtargetに対する受理判定・staleness判定・
+downwardRoutes/topology書き込み」ロジックをラムダ
+(`handleOneTarget`)へ抽出し、primary targetに対して1回、
+`dao.GetAdditionalTargets()`の各要素に対してもう1回ずつ、
+計N+1回呼び出す形に書き換えた。既存の単一target DAOの挙動は
+このラムダを1回だけ呼ぶ特殊ケースとして完全に保たれる。
+
+**上流への再伝播も集約**: 受信した集約DAOのうち複数のtargetが
+`changed=true`と判定された場合、以前ならtargetごとに個別の
+`SendDaoMessage()`呼び出しになっていたところを、`toPropagate`
+ベクタに集めて**1回の集約`SendDaoMessage()`呼び出し**にまとめた。
+これにより、集約されたDAOを受け取った中継ノードが、自分の
+preferred parentへ再伝播する際も同様に集約される — ツリーの
+どの段でも、1回の変化イベントにつき1メッセージという性質が
+保たれる。
+
+### 59.5 新規テスト
+
+- `RplDaoMultiTargetHeaderTestCase`: primary + 追加2 targetを含む
+  DAOのシリアライズ/デシリアライズ往復。サイズ計算・各フィールド
+  (pathSequence/pathLifetime個別)・No-Pathが他の生存targetと
+  混在しても正しく往復すること・単一targetDAOが空の
+  `additionalTargets`を報告すること、を確認。
+- `RplStoringModeAggregatedRefreshTestCase`: root--relay--probeの
+  3ノードStoring mode構成で、relayに3つの下り経路(probeの自己
+  広告+直接注入した2つの架空target)を持たせた上で、relayの
+  周期リフレッシュ(`DaoTimerExpire()`)をrootの監視ソケットで
+  観測 — 3経路に対し**ちょうど1通**のDAOしか届かないこと
+  (集約が実際に効いていること)、その1通からroot側が3つの
+  targetすべてを正しく学習することを確認。
+
+load-bearing検証:
+- `RplDaoMultiTargetHeaderTestCase`: `Deserialize()`のペアリング
+  ロジック(`if (!haveAnyPair)`)・`AddTarget()`自体をそれぞれ
+  一時的に無効化したところ、いずれも(前者はクラッシュ、後者も
+  クラッシュ)明確に異常終了することを確認 — 意図的な破壊による
+  クラッシュであり、ns3-debug-pitfallsスキル自身の「クラッシュは
+  まずテスト失敗に格下げできないか疑う」という指針は、既知の
+  未知バグ調査ではなくこの検証自体には適用しなかった(§54.9の
+  前例と同じ扱い)。修正を元に戻し再度PASSを確認。
+- `RplStoringModeAggregatedRefreshTestCase`: `SendDao()`の集約を
+  一時的に無効化(集約する代わりに個別送信するよう戻す)した
+  ところ、このテストが`m_daoCount`実測値4(期待1)で明確にFAILする
+  ことを確認、元に戻して再度PASSを確認。
+
+### 59.6 検証
+
+`./ns3 build`(rplモジュール・プロジェクト全体とも)、
+`test-runner --suite=rpl`を複数回実行して安定PASSを確認。
+既存の全テスト(§54-58で追加したものを含む)はPASS。

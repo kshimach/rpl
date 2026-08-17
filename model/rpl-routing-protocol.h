@@ -1833,6 +1833,29 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     bool SelectPreferredParent(DodagMembership& dodag);
 
     /**
+     * @brief One Target + Transit Information pair to aggregate into a DAO
+     *        message SendDaoMessage() builds, beyond its own primary target.
+     *
+     * A plain copy of RplDaoHeader::AdditionalTarget's own four fields,
+     * kept as this class's own private type rather than reusing
+     * RplDaoHeader's directly: rpl-routing-protocol.h only ever forward-
+     * declares RplDaoHeader (every existing use of it here is by reference
+     * or pointer, which a forward declaration is enough for), and naming
+     * a nested type the way a parameter here would need actually requires
+     * its full definition, which would mean pulling rpl-header.h's own
+     * declarations into every translation unit that includes this header.
+     * SendDaoMessage()'s own .cc implementation converts one of these into
+     * a RplDaoHeader::AdditionalTarget when it actually calls AddTarget().
+     */
+    struct DaoTargetEntry
+    {
+        Ipv6Address target;              //!< the target address
+        uint8_t targetPrefixLength{128}; //!< significant bits of the target
+        uint8_t pathSequence{0};         //!< path sequence for this target
+        uint8_t pathLifetime{0};         //!< path lifetime for this target, 0 for a No-Path
+    };
+
+    /**
      * @brief Build and unicast one DAO, RFC 6550 section 6.4/9.8.
      *
      * The wire-format and destination-resolution core SendDao(), DaoRetry()
@@ -1858,13 +1881,19 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      * @param pathLifetimeField the Transit Information's own Path Lifetime
      *        field, 0 for a No-Path
      * @param ackRequested the 'K' bit
+     * @param additionalTargets further Target + Transit Information pairs to
+     *        aggregate into this same DAO message (RFC 6550 section 9.4 rule
+     *        3), appended after @p target/@p pathSequence/@p
+     *        pathLifetimeField's own pair; empty for an ordinary single-
+     *        target DAO
      */
     void SendDaoMessage(DodagMembership& dodag,
                         Ipv6Address target,
                         uint8_t sequence,
                         uint8_t pathSequence,
                         uint8_t pathLifetimeField,
-                        bool ackRequested);
+                        bool ackRequested,
+                        const std::vector<DaoTargetEntry>& additionalTargets = {});
 
     /**
      * @brief Advertise this node to the root, RFC 6550 section 6.4.
