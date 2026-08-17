@@ -6504,3 +6504,145 @@ load-bearing検証: `DaoRetry()`の修正を旧実装(Non-Storing専用の
 `./ns3 build`(rplモジュール・プロジェクト全体とも)、
 `test-runner --suite=rpl`を複数回実行して安定PASSを確認。
 既存の全テスト(§54・§55で追加したものを含む)はPASS。
+
+## 57. `protocol-test-matrix`スキルをcode-review型の5角並列マルチエージェント
+     構成へ書き換え、Storing mode(§54-56)に対する初回実地検証で実バグ
+     6件・盲点2件を発見
+
+§56の独立`/code-review`で`DaoRetry()`の移行漏れが見つかったことを受け、
+ユーザーから「実装者と監査者が同一コンテキストでは、RFC解釈の誤りを
+実装・テスト双方に一貫して持ち込んでいても自己検出できないのでは」と
+いう指摘があり、`protocol-test-matrix`スキル自体をcode-review型の
+構成(4象限それぞれを独立サブエージェントに割り当てて並列実行し、
+新設のAngle 5「移行漏れ」で共有ヘルパーへの統合漏れを専門に探す)へ
+書き換えた。本節はその新構成での初回実地検証(対象: Storing mode
+実装全体、コミット範囲94ed3da..ef81db1)の結果を記録する。
+
+### 57.1 監査体制
+
+5角(Angle 1正常系・Angle 2境界値・Angle 3異常系・Angle 4シーケンス
+状態遷移・Angle 5移行漏れ)をそれぞれ独立コンテキストの`Agent`ツール
+サブエージェントとして並列起動。各エージェントは実装セッションの記憶を
+一切引き継がず、RFC 6550原文を自分でcurl取得し、diffと現在のソース
+コードを自分で読んで候補を洗い出した。セッション使用量上限に一度
+達し、Angle 1・2・4の3つが一時失敗、リセット後に再実行して5角
+全て完了させた。
+
+### 57.2 発見した実バグ(6件、修正済み)
+
+1. **PathLifetime=0xFF(無期限)がStoring modeのリレー時に保持され
+   ない**(Angle 2): `SendDao()`の周期リレーループと`HandleDao()`の
+   上流伝播呼び出しの両方が、子から実際に advertised された
+   `dao.GetPathLifetime()`ではなく、このノード自身の`m_pathLifetime`
+   属性を代わりに使っていた。`DownwardRoute`構造体に`pathLifetime`
+   (ワイヤ値そのもの)フィールドを追加し、`HandleDao()`の書き込み側で
+   保存、両方のリレー箇所でこの値(または`dao.GetPathLifetime()`)を
+   使うよう修正。
+
+2. **No-Path DAOが一度も保持していないtargetに対してもRFC 9.2.2の
+   "new"基準を厳密には満たさずに上流へ中継される**(Angle 3):
+   `changed`の計算を`noPath ? !isNewTarget : (order ==
+   GREATER)`に変更 — No-Pathは「実際に何かを削除した場合」のみ
+   "new"とみなす(RFC 9.2.2 criterion 3の「removes the last Downward
+   route」の字義どおり)。
+
+3. **`HandleDao()`が`from`アドレスのlink-local性を一切検証しない**
+   (Angle 3): RFC 6550 section 9.1 rule 4はStoring modeのDAOの送信元
+   がlink-localであることを要求している。global送信元を偽装した
+   DAOは、後段の`RouteToNeighbourOn()`が「実在しないlink-local
+   隣人」を合成してしまい、下り方向トラフィックが黙って
+   ブラックホール化する — §56で修正した`DaoRetry()`のバグの
+   受信側版に相当する。`storing && !from.IsLinkLocal()`で拒否する
+   ガードを追加。
+
+4. **`HandleDao()`がtargetが祖先(root自身)やこのノード自身の
+   アドレスかどうかを一切検証しない**(Angle 3): 1件のDAOで
+   このノード自身の上り方向トラフィックを送信者へリダイレクト
+   できてしまう(`RouteOutput()`のStoring mode下り経路ルックアップが
+   通常のpreferred parentフォールバックより優先されるため)。RFC
+   6550自身はDAOの送信元認証を必須にしていない(Secure-DAO等の
+   任意拡張の領分)が、target == root自身のアドレスまたはこのノード
+   自身のアドレスというケースだけは、認証の有無に関わらず常に
+   拒否してよい。
+
+5. **通常のparent切替(rank/ETX改善による、staleでも
+   lost-last-parentでもない切替)で旧parentへNo-Path DAOが一度も
+   送られない**(Angle 1とAngle 4が独立に同じ箇所を発見): RFC 6550
+   section 9.8 rule 4違反。既存の`SendNoPathDao()`3箇所の呼び出し
+   元(stale neighbour掃除・infinite rank・最後の親を失った場合)は
+   いずれもこのケースを扱わない。`SelectPreferredParent()`の
+   `parentChanged`ブロックに、`dodag.pathSequence`自身のincrementより
+   前という既存3箇所と同じ順序で(撤回のPath Sequenceが後続の
+   再広告より必ず小さくなることを保証するため)、旧parentへの
+   `SendNoPathDao()`呼び出しを追加。
+
+6. **ローカルで期限切れになったdownwardRoutesエントリを
+   `HandleDao()`が即座に消去していたため、古い(reorderされた)
+   重複DAOがstaleチェックを回避してしまう**(Angle 4):
+   期限切れエントリを消去すると、それ以降に届く**どんなDAOも**
+   比較対象が無いため無条件に「新規」扱いされてしまう —
+   Non-Storing側の`topology`にも同じパターンがあるが、root限定で
+   影響が閉じているのに対し、Storing modeはこれを上流へ**能動的に
+   再伝播する**ため実害が大きい。`HandleDao()`のStoring分岐から
+   即時消去を削除し、`PurgeDownwardRoutes()`による定期的な回収に
+   一本化(ルックアップ側は既存の`expire`チェックにより無害)。
+
+### 57.3 発見した盲点(2件、修正済み)
+
+7. **Storing modeのrootが自らは経路を発信せずforwardのみ行う
+   「pure sink」構成の場合、`downwardRoutes`が永久に掃除されない**
+   (Angle 4とAngle 5が独立に収束): §56.4で追加した
+   `PurgeDownwardRoutes()`の2つの呼び出し元(`SendDao()`の周期
+   ループ、`RouteOutput()`)はいずれも、root自身が経路を発信する
+   場合にしか実行されない。rootには元々`daoEvent`が(SendDao()が
+   no-opのため)未使用のまま残っていたので、Storing mode時にこの
+   同じTimerスロットを新設の`PurgeDownwardRoutesTimerExpire()`
+   (`DaoInterval`周期で`PurgeDownwardRoutes()`を呼ぶだけ)に
+   再利用するようにした。
+
+8. **`RouteOutput()`/`RouteInput()`/`GetDownwardRoute()`が同じ
+   「targetを検索し期限切れなら無視」ロジックを重複実装**
+   (§56で既に対応済みと判明、Angle 5により再確認): `FindDownwardRoute()`
+   への統一は§56の時点で完了していたことを独立に確認。
+
+### 57.4 新規テスト
+
+`RplStoringModeInputValidationTestCase`(項目2・3・4を一括カバー、
+うち3のNo-Path非伝播はrootに監視用の生ICMPv6ソケットを立てて
+実際にパケットが届かないことを確認 — `GetDownwardRoute()`だけでは
+「伝播したが影響が無かった」と「伝播しなかった」を区別できない
+ため)、`RplStoringModeInfiniteLifetimeRelayedTestCase`(項目1)、
+`RplStoringModeOrdinarySwitchNoPathTestCase`(項目5)、
+`RplStoringModeStaleAfterExpiryTestCase`(項目6)、
+`RplStoringModeRootPurgeTestCase`(項目7、期限切れ後も残存
+エントリ数を生で数える`GetDownwardRoutesRawCount()`を新設 —
+`GetDownwardRouteCount()`は期限切れを自動的に除外するため
+「無害だが未回収」と「実際に回収済み」を区別できない)。
+
+テスト作成中に踏んだ落とし穴2件:
+- `Simulator::Stop()`は絶対時刻ではなく現在時刻からの相対遅延を
+  取る。`Simulator::Stop(Seconds(210))`のつもりで書いたコードが
+  実際には「現在時刻から210秒後」を意味し、意図と異なる長時間
+  テストになっていた。
+- 合成DIOのマルチキャスト配送に`SendRawRplMessage()`(生ソケット
+  経由の実送信)を使うと、多くの場合届かない。この操作体系の
+  他の全テストは`DeliverRawRplMessage()`(`Ipv6L3Protocol::
+  Receive()`への直接投入)を使っており、それに倣った。
+- `SelectPreferredParent()`は2パス構造で、pass 0が(既に確立済みの
+  他候補のせいで)「候補が見つかった」状態で終わると、freshness
+  要件を緩和するpass 1が実行されない。新しい候補を統計的に
+  即座に有利にするには、その候補からのDIOを`RPL_FRESHNESS_TARGET`
+  (4)回届ける必要がある。
+- 生ソケットの`Recv()`が返すパケットには、`SendRawRplMessage()`の
+  送信側と異なりIPv6ヘッダが先頭に残ったまま渡ってくる。ICMPv6
+  ヘッダを読む前に`Ipv6Header`を`RemoveHeader()`で剥がす必要が
+  ある。
+
+各修正について、対応する変更を一時的に無効化してテストが実際に
+FAILすることを確認(load-bearing検証)、元に戻して再度PASSを確認。
+
+### 57.5 検証
+
+`./ns3 build`(rplモジュール・プロジェクト全体とも)、
+`test-runner --suite=rpl`を複数回実行して安定PASSを確認。
+既存の全テスト(§54-56で追加したものを含む)はPASS。

@@ -756,6 +756,22 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      */
     uint32_t GetDownwardRouteCount(uint8_t instanceId, Ipv6Address dodagId) const;
 
+    /**
+     * @brief How many downwardRoutes entries this node holds for a DODAG,
+     *        expired ones included.
+     *
+     * Unlike GetDownwardRouteCount(), which -- like every routing decision
+     * -- filters expired entries out, this exposes the raw map size, so a
+     * test can tell "expired but not yet purged" apart from "actually
+     * reclaimed" (@see PurgeDownwardRoutes()'s own doc comment for why the
+     * distinction matters).
+     *
+     * @param instanceId the RPLInstanceID of the DODAG
+     * @param dodagId the DODAGID of the DODAG
+     * @return the number of entries, expired or not
+     */
+    uint32_t GetDownwardRoutesRawCount(uint8_t instanceId, Ipv6Address dodagId) const;
+
   protected:
     void DoInitialize() override;
     void DoDispose() override;
@@ -901,7 +917,17 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
             Ipv6Address nextHop;   //!< the child this was learned from, link-local
             uint32_t interface{0}; //!< which interface nextHop was heard on
             uint8_t pathSequence{0}; //!< path sequence of the DAO this came from
-            Time expire;            //!< when the entry goes stale
+            /// The wire Path Lifetime the DAO this entry came from carried,
+            /// kept alongside the already-computed expire below so that
+            /// relaying this entry onward (SendDao()'s own refresh loop,
+            /// HandleDao()'s own upstream propagation) can advertise the
+            /// same lifetime the child actually asked for -- including RFC
+            /// 6550 section 6.7.8's RPL_INFINITE_LIFETIME (0xFF) -- rather
+            /// than this node's own unrelated PathLifetime attribute, which
+            /// governs this node's own self-advertisement, not routes it
+            /// merely relays.
+            uint8_t pathLifetime{0};
+            Time expire; //!< when the entry goes stale
         };
 
         /// Storing mode (RFC 6550 section 9.8) only, every node including
@@ -1882,6 +1908,24 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      * @param key identifies which DODAG membership's DAO timer fired
      */
     void DaoTimerExpire(DodagKey key);
+
+    /**
+     * @brief Sweep expired downwardRoutes entries and reschedule.
+     *
+     * Bound to a Storing mode root's own daoEvent in place of
+     * DaoTimerExpire() (which is a no-op for a root, @see SendDao()):
+     * unlike every other non-leaf node, a root never sends its own DAO and
+     * so never reaches SendDao()'s own periodic PurgeDownwardRoutes() call,
+     * and RouteOutput()'s own purge only runs when the root itself locally
+     * originates a packet -- never, for a root that is a pure traffic sink
+     * (every downward packet forwarded via RouteInput(), nothing sourced
+     * locally). Without this, such a root's downwardRoutes would grow
+     * without bound for descendants that disappear without ever sending a
+     * No-Path DAO.
+     *
+     * @param key identifies which DODAG membership's timer fired
+     */
+    void PurgeDownwardRoutesTimerExpire(DodagKey key);
 
     /**
      * @brief Re-send the DAO that was not acknowledged, or give up.

@@ -612,10 +612,19 @@ RplRoutingProtocol::CreateDodagMembership(DodagKey key, uint8_t mop)
     dodag.dioIntervalDoublings = m_dioIntervalDoublings;
     dodag.dioRedundancy = m_dioRedundancy;
 
-    // No daoEvent/daoRetryEvent binding: SendDao() is a no-op for a root
-    // (dodag.isRoot), and nothing ever schedules either Timer for one in
-    // the first place -- only SelectPreferredParent() does that, on
-    // picking a first preferred parent, which a root never has.
+    // No daoRetryEvent binding: a root sends no DAO of its own to await an
+    // ACK for. daoEvent is likewise unused for its ordinary purpose here
+    // (SendDao() is a no-op for a root), but a Storing mode root reuses the
+    // same Timer slot for its own periodic downwardRoutes purge instead
+    // (@see PurgeDownwardRoutesTimerExpire()'s own doc comment for why a
+    // root needs one at all when every other node already gets one for
+    // free via SendDao()'s own loop).
+    if (mop == RPL_MOP_STORING_NO_MULTICAST)
+    {
+        dodag.daoEvent.SetFunction(&RplRoutingProtocol::PurgeDownwardRoutesTimerExpire, this);
+        dodag.daoEvent.SetArguments(key);
+        dodag.daoEvent.Schedule(m_daoInterval);
+    }
     dodag.dioTrickle.SetFunction(MakeCallback(&RplRoutingProtocol::DioTrickleFire, this, key));
     dodag.dioTrickle.SetParameters(dodag.dioIntervalMin,
                                    dodag.dioIntervalDoublings,
@@ -2067,11 +2076,15 @@ RplRoutingProtocol::SendDao(DodagMembership& dodag)
         PurgeDownwardRoutes(dodag);
         for (const auto& [downstreamTarget, route] : dodag.downwardRoutes)
         {
+            // route.pathLifetime, not m_pathLifetime: @see HandleDao()'s
+            // own propagation call for why substituting this node's own
+            // attribute here would silently finitize an advertised-
+            // infinite route.
             SendDaoMessage(dodag,
                           downstreamTarget,
                           dodag.daoSequence,
                           route.pathSequence,
-                          m_pathLifetime,
+                          route.pathLifetime,
                           false);
         }
     }
@@ -2152,6 +2165,23 @@ RplRoutingProtocol::DaoTimerExpire(DodagKey key)
     DodagMembership& dodag = it->second;
 
     SendDao(dodag);
+    dodag.daoEvent.Cancel();
+    dodag.daoEvent.Schedule(m_daoInterval);
+}
+
+void
+RplRoutingProtocol::PurgeDownwardRoutesTimerExpire(DodagKey key)
+{
+    NS_LOG_FUNCTION(this);
+
+    auto it = m_dodags.find(key);
+    if (it == m_dodags.end())
+    {
+        return;
+    }
+    DodagMembership& dodag = it->second;
+
+    PurgeDownwardRoutes(dodag);
     dodag.daoEvent.Cancel();
     dodag.daoEvent.Schedule(m_daoInterval);
 }
@@ -2291,8 +2321,37 @@ RplRoutingProtocol::HandleDao(const RplDaoHeader& dao, Ipv6Address from, uint32_
         NS_LOG_WARN("Ignoring a DAO from " << from << " with no target");
         return;
     }
+    if (target == dodag->dodagId || target == GetGlobalAddressIn(*dodag))
+    {
+        // A node cannot legitimately be downstream of the root or of
+        // itself: accepting either would let a single DAO redirect this
+        // node's own upward traffic down towards whoever sent it --
+        // RouteOutput()'s Storing-mode downward lookup runs ahead of the
+        // ordinary preferred-parent fallback (@see its own doc comment).
+        // RFC 6550 does not mandate DAO origin authentication on its own
+        // (that is what the optional Secure-DAO/counter-based mechanisms
+        // are for), but this much holds regardless of who is trusted.
+        NS_LOG_WARN("Ignoring a DAO from " << from << " claiming " << target
+                                           << " (the root or this node's own address) as a "
+                                              "downward target");
+        return;
+    }
 
     bool storing = dodag->mop == RPL_MOP_STORING_NO_MULTICAST;
+    if (storing && !from.IsLinkLocal())
+    {
+        // RFC 6550 section 9.1 rule 4: "the IPv6 source ... addresses of a
+        // DAO message MUST be link-local addresses" in Storing mode --
+        // this node's own downwardRoutes design relies on that to treat
+        // 'from' as the address of a genuine one-hop neighbour (section
+        // 9.8: a Storing-mode DAO's information "is implicit from the
+        // IPv6 source address"). A global from here means either a
+        // misconfigured peer or a packet claiming a hop count -- and so a
+        // next hop -- its own sender is not.
+        NS_LOG_WARN("Ignoring a Storing mode DAO from " << from << ": not link-local");
+        return;
+    }
+
     // RFC 6550 section 9.8's own downward route table (dodag->downwardRoutes)
     // plays the same role in Storing mode that dodag->topology plays for the
     // root in Non-Storing mode, and is kept with the exact same staleness
@@ -2304,14 +2363,22 @@ RplRoutingProtocol::HandleDao(const RplDaoHeader& dao, Ipv6Address from, uint32_
     bool noPath = dao.GetPathLifetime() == 0;
     if (storing)
     {
+        // Unlike the Non-Storing topology branch below, a locally
+        // clock-expired entry is deliberately *not* erased here before the
+        // staleness comparison: doing so would forget the last Path
+        // Sequence this node ever saw for the target, so any DAO arriving
+        // after the entry's own PathLifetime elapsed -- however old,
+        // including a reordered or duplicated copy of a DAO this node
+        // already superseded -- would be treated as unconditionally
+        // "new" (nothing left to compare against) and, if Storing mode
+        // relays it onward, resurrect a superseded route at every
+        // ancestor along the way. Leaving the (already lookup-inert,
+        // since FindDownwardRoute()/RouteOutput()/RouteInput() all check
+        // expire independently) entry standing keeps the staleness check
+        // meaningful across an expiry; PurgeDownwardRoutes() still
+        // reclaims it eventually regardless of whether a fresher DAO ever
+        // arrives to overwrite it.
         auto existingRoute = dodag->downwardRoutes.find(target);
-        if (existingRoute != dodag->downwardRoutes.end() &&
-            existingRoute->second.expire <= Simulator::Now())
-        {
-            dodag->downwardRoutes.erase(existingRoute);
-            existingRoute = dodag->downwardRoutes.end();
-        }
-
         RplSequenceOrder order =
             existingRoute == dodag->downwardRoutes.end()
                 ? RplSequenceOrder::GREATER
@@ -2326,24 +2393,31 @@ RplRoutingProtocol::HandleDao(const RplDaoHeader& dao, Ipv6Address from, uint32_
         }
         else
         {
+            bool isNewTarget = existingRoute == dodag->downwardRoutes.end();
             // RFC 6550 section 9.2.2: in Storing mode, a DAO is "new" (and
             // so, per section 9.8 rule 2, worth telling the preferred
             // parent about) exactly when it "has a newer Path Sequence
             // number" or "is a No-Path DAO message that removes the last
-            // Downward route to a prefix" -- order == GREATER is exactly
-            // "newer Path Sequence" (it is also how a brand new target is
-            // represented above, so this covers that case too). A plain
-            // refresh with an unchanged Path Sequence (order == EQUAL)
-            // changes nothing worth propagating, and re-advertising it up
-            // the tree on every one would turn every periodic self-DAO into
-            // a storm that grows with the tree's own depth. A same-Path-
-            // Sequence report from a *different* nextHop is accepted below
-            // (the most recent sender is trusted) but is deliberately not
-            // treated as "new" either: nothing upstream of this node cares
-            // which of its own children it relays through, only that it
-            // still can, which order == GREATER-or-noPath already covers
+            // Downward route to a prefix". For an ordinary advertisement
+            // that is order == GREATER (which a brand new target forces
+            // unconditionally, so that case is covered too). For a
+            // No-Path, it is specifically !isNewTarget -- a withdrawal for
+            // a target this node never held anything for "removes" nothing
+            // at all, so it is not "new" no matter how new its own Path
+            // Sequence looks; propagating it anyway would let a forged or
+            // reordered No-Path for a nonexistent target walk all the way
+            // to the root for no reason. A plain refresh with an unchanged
+            // Path Sequence (order == EQUAL) changes nothing worth
+            // propagating either, and re-advertising it up the tree on
+            // every one would turn every periodic self-DAO into a storm
+            // that grows with the tree's own depth. A same-Path-Sequence
+            // report from a *different* nextHop is accepted below (the
+            // most recent sender is trusted) but is deliberately not
+            // treated as "new": nothing upstream of this node cares which
+            // of its own children it relays through, only that it still
+            // can, which order == GREATER-or-noPath already covers
             // whenever that stops being true.
-            changed = order == RplSequenceOrder::GREATER || noPath;
+            changed = noPath ? !isNewTarget : (order == RplSequenceOrder::GREATER);
 
             if (noPath)
             {
@@ -2356,6 +2430,7 @@ RplRoutingProtocol::HandleDao(const RplDaoHeader& dao, Ipv6Address from, uint32_
                 route.nextHop = from;
                 route.interface = interface;
                 route.pathSequence = dao.GetPathSequence();
+                route.pathLifetime = dao.GetPathLifetime();
                 route.expire = dao.GetPathLifetime() == RPL_INFINITE_LIFETIME
                                   ? Time::Max()
                                   : Simulator::Now() +
@@ -2446,11 +2521,18 @@ RplRoutingProtocol::HandleDao(const RplDaoHeader& dao, Ipv6Address from, uint32_
     // incremented for this -- @see SendDaoMessage()'s own doc comment.
     if (storing && changed && !dodag->isRoot)
     {
+        // dao.GetPathLifetime() verbatim, not this node's own m_pathLifetime
+        // attribute: the wire value is the child's own commitment for the
+        // target (including RFC 6550 section 6.7.8's RPL_INFINITE_LIFETIME,
+        // 0xFF), and m_pathLifetime governs only this node's own
+        // self-advertisement, not routes it merely relays -- substituting
+        // it here would silently finitize an advertised-infinite route by
+        // the second hop.
         SendDaoMessage(*dodag,
                       target,
                       dodag->daoSequence,
                       dao.GetPathSequence(),
-                      noPath ? 0 : m_pathLifetime,
+                      dao.GetPathLifetime(),
                       false);
     }
 
@@ -3295,6 +3377,7 @@ RplRoutingProtocol::SelectPreferredParent(DodagMembership& dodag)
     NS_LOG_INFO("Preferred parent is " << best << ", rank " << bestRank << " (was "
                                        << dodag.preferredParent << ", rank " << dodag.rank << ")");
     bool parentChanged = (best != dodag.preferredParent);
+    Ipv6Address oldPreferredParent = dodag.preferredParent;
     dodag.preferredParent = best;
     dodag.rank = bestRank;
     if (dodag.ocp == RPL_OCP_MRHOF)
@@ -3327,6 +3410,28 @@ RplRoutingProtocol::SelectPreferredParent(DodagMembership& dodag)
 
     if (parentChanged && dodag.mop != RPL_MOP_P2P_ROUTE_DISCOVERY)
     {
+        // RFC 6550 section 9.8 rule 4: "When a node removes a node from
+        // its DAO parent set, it SHOULD send a No-Path DAO message ... to
+        // that removed DAO parent to invalidate the existing route." The
+        // three other call sites of SendNoPathDao() (the stale-neighbour
+        // sweep above, HandleDio()'s infinite-rank poisoning, and losing
+        // the last parent below) already cover their own cases; this is
+        // the ordinary "found a better parent while the old one is still
+        // live" switch, which previously fell through to just re-
+        // advertising to the new parent, leaving the old one's own
+        // downwardRoutes entry for this node (and everything relayed
+        // through it) stale until its own independent PathLifetime
+        // timeout. Sent before dodag.pathSequence's own increment just
+        // below, the same ordering the other three call sites already
+        // rely on to keep the withdrawal's Path Sequence strictly behind
+        // the following re-advertisement's (@see SendNoPathDao()'s own
+        // doc comment) -- oldPreferredParent is still in dodag.parents
+        // at this point (this switch reason never erases it), so
+        // resolving an interface/address for it still succeeds.
+        if (!oldPreferredParent.IsAny())
+        {
+            SendNoPathDao(dodag, oldPreferredParent);
+        }
         // RFC 6550, section 9.5: a node that changes parent has to tell the
         // root about it. The path sequence is what lets the root tell the new
         // report from the one the old parent may still be relaying. Not for
@@ -4220,6 +4325,13 @@ RplRoutingProtocol::GetDownwardRouteCount(uint8_t instanceId, Ipv6Address dodagI
         }
     }
     return count;
+}
+
+uint32_t
+RplRoutingProtocol::GetDownwardRoutesRawCount(uint8_t instanceId, Ipv6Address dodagId) const
+{
+    auto it = m_dodags.find(DodagKey{instanceId, dodagId});
+    return it == m_dodags.end() ? 0 : static_cast<uint32_t>(it->second.downwardRoutes.size());
 }
 
 uint32_t

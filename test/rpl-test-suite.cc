@@ -3390,6 +3390,746 @@ RplStoringModeDaoRetryTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief Storing mode's HandleDao() rejects three kinds of untrustworthy
+ *        input: a source address that is not link-local, a Target claiming
+ *        to be the root or this node's own address, and a No-Path DAO for
+ *        a target this node never held anything for.
+ *
+ * root(0)--relay(1)--probe(2), the same shape RplStoringModeStaleDaoAndNoPathTestCase
+ * uses. Found by an independent /protocol-test-matrix audit of the Storing
+ * mode implementation (@see design-constraints.md section 57): none of
+ * these three were checked at all before this test existed.
+ */
+class RplStoringModeInputValidationTestCase : public TestCase
+{
+  public:
+    RplStoringModeInputValidationTestCase();
+
+  private:
+    void DoRun() override;
+
+    /// @brief Count a DAO delivered to the monitoring socket.
+    /// @param socket the receiving socket
+    void CountDao(Ptr<Socket> socket);
+
+    uint32_t m_daoCount{0}; //!< DAOs observed on the monitoring socket
+};
+
+RplStoringModeInputValidationTestCase::RplStoringModeInputValidationTestCase()
+    : TestCase("Storing mode rejects a non-link-local source, a Target claiming to be an "
+              "ancestor, and a No-Path for a never-held target")
+{
+}
+
+void
+RplStoringModeInputValidationTestCase::CountDao(Ptr<Socket> socket)
+{
+    Ptr<Packet> packet = socket->Recv();
+    while (packet)
+    {
+        // Unlike SendRawRplMessage()'s own send side (which builds a
+        // packet starting from the ICMPv6 header, letting the IP layer
+        // prepend its own IPv6 header on the way out), a raw socket's own
+        // Recv() hands back the packet with the IPv6 header still
+        // attached in front -- skip its fixed 40 bytes (no extension
+        // headers on any RPL control message this module sends) to reach
+        // the ICMPv6 Type/Code this callback actually needs.
+        Ipv6Header ipv6Header;
+        if (packet->RemoveHeader(ipv6Header) != 0)
+        {
+            uint8_t icmpv6[2];
+            if (packet->CopyData(icmpv6, sizeof(icmpv6)) == sizeof(icmpv6) &&
+                icmpv6[1] == RPL_CODE_DAO)
+            {
+                m_daoCount++;
+            }
+        }
+        packet = socket->Recv();
+    }
+}
+
+void
+RplStoringModeInputValidationTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(3); // 0 = root, 1 = relay, 2 = probe
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    Ptr<SimpleNetDevice> first = DynamicCast<SimpleNetDevice>(devices.Get(0));
+    Ptr<SimpleNetDevice> last = DynamicCast<SimpleNetDevice>(devices.Get(2));
+    channel->BlackList(first, last);
+    channel->BlackList(last, first);
+
+    RplHelper rplHelper;
+    rplHelper.Set("Mop", UintegerValue(RPL_MOP_STORING_NO_MULTICAST));
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(200));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> root = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> relay = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> probe = nodes.Get(2)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(probe->IsJoined(), true, "The probe never joined the Storing mode DODAG");
+
+    Ipv6Address dodagId = root->GetGlobalAddress();
+    Ipv6Address relayAddress = relay->GetGlobalAddress();
+    Ipv6Address probeLinkLocal =
+        nodes.Get(2)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address relayLinkLocal =
+        nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    Ipv6Address nextHop;
+
+    // A spoofed non-link-local source (RFC 6550 section 9.1 rule 4):
+    // delivered directly to relay's own Receive() (DeliverRawRplMessage(),
+    // not a real send) since the point is precisely that no real device
+    // backs this source address.
+    {
+        Ipv6Address fictitious("2001:1::ff:fe00:aa");
+        Ipv6Address spoofedGlobalSource("2001:1::ff:fe00:99");
+        RplDaoHeader dao;
+        dao.SetInstanceId(RPL_DEFAULT_INSTANCE);
+        dao.SetDodagId(dodagId);
+        dao.SetSequence(1);
+        dao.SetTarget(fictitious);
+        dao.SetTransitInformation(Ipv6Address::GetAny(), 5, RPL_DEFAULT_LIFETIME);
+        Simulator::Schedule(Seconds(0),
+                            &DeliverRawRplMessage<RplDaoHeader>,
+                            nodes.Get(1),
+                            1,
+                            dao,
+                            static_cast<uint8_t>(RPL_CODE_DAO),
+                            spoofedGlobalSource,
+                            relayLinkLocal);
+        Simulator::Stop(MilliSeconds(50));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(
+            relay->GetDownwardRoute(RPL_DEFAULT_INSTANCE, dodagId, fictitious, nextHop),
+            false,
+            "A DAO with a non-link-local source address was accepted into downwardRoutes");
+
+        // Positive control: the identical DAO, genuinely from probe's own
+        // link-local address, must be accepted -- proving the rejection
+        // above was really about the source address, not some other
+        // difference between the two deliveries.
+        Simulator::Schedule(Seconds(0),
+                            &SendRawRplMessage<RplDaoHeader>,
+                            nodes.Get(2),
+                            1,
+                            dao,
+                            static_cast<uint8_t>(RPL_CODE_DAO),
+                            probeLinkLocal,
+                            relayLinkLocal);
+        Simulator::Stop(MilliSeconds(50));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(
+            relay->GetDownwardRoute(RPL_DEFAULT_INSTANCE, dodagId, fictitious, nextHop),
+            true,
+            "The identical DAO from a genuine link-local source was not accepted");
+    }
+
+    // A Target claiming to be the root, or this node's own address: both
+    // would let a single DAO redirect this node's own upward traffic down
+    // towards whoever sent it.
+    {
+        auto sendClaiming = [&](Ipv6Address claimedTarget) {
+            RplDaoHeader dao;
+            dao.SetInstanceId(RPL_DEFAULT_INSTANCE);
+            dao.SetDodagId(dodagId);
+            dao.SetSequence(1);
+            dao.SetTarget(claimedTarget);
+            dao.SetTransitInformation(Ipv6Address::GetAny(), 5, RPL_DEFAULT_LIFETIME);
+            Simulator::Schedule(Seconds(0),
+                                &SendRawRplMessage<RplDaoHeader>,
+                                nodes.Get(2),
+                                1,
+                                dao,
+                                static_cast<uint8_t>(RPL_CODE_DAO),
+                                probeLinkLocal,
+                                relayLinkLocal);
+            Simulator::Stop(MilliSeconds(50));
+            Simulator::Run();
+        };
+
+        sendClaiming(dodagId);
+        NS_TEST_ASSERT_MSG_EQ(
+            relay->GetDownwardRoute(RPL_DEFAULT_INSTANCE, dodagId, dodagId, nextHop),
+            false,
+            "A DAO claiming the root itself as a downward target was accepted");
+
+        sendClaiming(relayAddress);
+        NS_TEST_ASSERT_MSG_EQ(
+            relay->GetDownwardRoute(RPL_DEFAULT_INSTANCE, dodagId, relayAddress, nextHop),
+            false,
+            "A DAO claiming this node's own address as a downward target was accepted");
+    }
+
+    // A No-Path DAO for a target this node never held anything for must not
+    // be relayed upstream (RFC 6550 section 9.2.2: a No-Path is "new" only
+    // when it "removes the last Downward route to a prefix" -- there was
+    // none to remove here). Observed directly on a monitoring socket at
+    // root, rather than through root's own downwardRoutes state, since an
+    // incorrectly-relayed No-Path for a target root also never held would
+    // leave root's state identical either way.
+    {
+        Ptr<Socket> monitor = Socket::CreateSocket(nodes.Get(0), Ipv6RawSocketFactory::GetTypeId());
+        monitor->SetAttribute("Protocol",
+                              UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+        monitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+        monitor->SetRecvCallback(
+            MakeCallback(&RplStoringModeInputValidationTestCase::CountDao, this));
+
+        Ipv6Address neverHeld("2001:1::ff:fe00:bb");
+        RplDaoHeader dao;
+        dao.SetInstanceId(RPL_DEFAULT_INSTANCE);
+        dao.SetDodagId(dodagId);
+        dao.SetSequence(1);
+        dao.SetTarget(neverHeld);
+        dao.SetTransitInformation(Ipv6Address::GetAny(), 5, 0); // No-Path
+        Simulator::Schedule(Seconds(0),
+                            &SendRawRplMessage<RplDaoHeader>,
+                            nodes.Get(2),
+                            1,
+                            dao,
+                            static_cast<uint8_t>(RPL_CODE_DAO),
+                            probeLinkLocal,
+                            relayLinkLocal);
+        Simulator::Stop(MilliSeconds(50));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(
+            m_daoCount,
+            0,
+            "A No-Path DAO for a target relay never held anything for was relayed to root anyway");
+        monitor->Close();
+    }
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief RFC 6550 section 6.7.8's RPL_INFINITE_LIFETIME (0xFF) survives a
+ *        Storing mode relay hop, rather than being silently replaced by the
+ *        relaying node's own, unrelated PathLifetime attribute.
+ *
+ * root(0)--relay(1)--probe(2), Storing mode, with the PathLifetime
+ * attribute set low (finite) on every node -- deliberately the opposite of
+ * what probe advertises for its own fictitious target, so that a relay
+ * mistakenly substituting its own attribute instead of forwarding what it
+ * was actually told is directly observable two hops out.
+ */
+class RplStoringModeInfiniteLifetimeRelayedTestCase : public TestCase
+{
+  public:
+    RplStoringModeInfiniteLifetimeRelayedTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplStoringModeInfiniteLifetimeRelayedTestCase::RplStoringModeInfiniteLifetimeRelayedTestCase()
+    : TestCase("Storing mode preserves RPL_INFINITE_LIFETIME across a relay hop")
+{
+}
+
+void
+RplStoringModeInfiniteLifetimeRelayedTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(3); // 0 = root, 1 = relay, 2 = probe
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    Ptr<SimpleNetDevice> first = DynamicCast<SimpleNetDevice>(devices.Get(0));
+    Ptr<SimpleNetDevice> last = DynamicCast<SimpleNetDevice>(devices.Get(2));
+    channel->BlackList(first, last);
+    channel->BlackList(last, first);
+
+    RplHelper rplHelper;
+    rplHelper.Set("Mop", UintegerValue(RPL_MOP_STORING_NO_MULTICAST));
+    // Deliberately low: every node's own self-advertisement (and, before
+    // the fix, what a relay would substitute for anything it relays) is
+    // valid for only PathLifetime * the 60 s default lifetime unit -- 60 s
+    // here. probe's own fictitious target below advertises
+    // RPL_INFINITE_LIFETIME instead, the opposite end of the scale.
+    rplHelper.Set("PathLifetime", UintegerValue(1));
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(200));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> root = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> relay = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> probe = nodes.Get(2)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(probe->IsJoined(), true, "The probe never joined the Storing mode DODAG");
+
+    Ipv6Address dodagId = root->GetGlobalAddress();
+    Ipv6Address probeLinkLocal =
+        nodes.Get(2)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address relayLinkLocal =
+        nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address fictitious("2001:1::ff:fe00:aa");
+
+    RplDaoHeader dao;
+    dao.SetInstanceId(RPL_DEFAULT_INSTANCE);
+    dao.SetDodagId(dodagId);
+    dao.SetSequence(1);
+    dao.SetTarget(fictitious);
+    dao.SetTransitInformation(Ipv6Address::GetAny(), 5, RPL_INFINITE_LIFETIME);
+    Simulator::Schedule(Seconds(0),
+                        &SendRawRplMessage<RplDaoHeader>,
+                        nodes.Get(2),
+                        1,
+                        dao,
+                        static_cast<uint8_t>(RPL_CODE_DAO),
+                        probeLinkLocal,
+                        relayLinkLocal);
+    Simulator::Stop(MilliSeconds(50));
+    Simulator::Run();
+
+    Ipv6Address nextHop;
+    NS_TEST_ASSERT_MSG_EQ(relay->GetDownwardRoute(RPL_DEFAULT_INSTANCE, dodagId, fictitious, nextHop),
+                          true,
+                          "relay did not accept the infinite-lifetime advertisement");
+    NS_TEST_ASSERT_MSG_EQ(root->GetDownwardRoute(RPL_DEFAULT_INSTANCE, dodagId, fictitious, nextHop),
+                          true,
+                          "root never learned of the target two hops out");
+
+    // Well past the 60 s a *finite* (PathLifetime=1) relay would have used:
+    // if relay substituted its own PathLifetime attribute instead of
+    // forwarding probe's own RPL_INFINITE_LIFETIME, root's copy would have
+    // expired by now.
+    Simulator::Stop(Seconds(120));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(
+        root->GetDownwardRoute(RPL_DEFAULT_INSTANCE, dodagId, fictitious, nextHop),
+        true,
+        "root's copy of an advertised-infinite route expired: the relay substituted its own "
+        "finite PathLifetime instead of forwarding the one it was actually told");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief An ordinary preferred-parent switch (a strictly better parent
+ *        found, the old one still live) sends a No-Path DAO to the parent
+ *        being left, RFC 6550 section 9.8 rule 4.
+ *
+ * root(0)--A(1), T(2) initially only reaching A (root--T blocked), so T
+ * joins two hops out via A. Root--T is then unblocked and T is handed a
+ * fabricated DIO claiming to be from root's own real link-local address,
+ * advertising a rank T cannot reach through A -- root itself, one hop
+ * closer than A. This is deliberately not the stale-neighbour or
+ * lost-last-parent path (@see SelectPreferredParent()'s own three existing
+ * SendNoPathDao() call sites): A never goes quiet and is never dropped from
+ * T's own candidate set, so this exercises the ordinary "found something
+ * better" switch specifically.
+ */
+class RplStoringModeOrdinarySwitchNoPathTestCase : public TestCase
+{
+  public:
+    RplStoringModeOrdinarySwitchNoPathTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplStoringModeOrdinarySwitchNoPathTestCase::RplStoringModeOrdinarySwitchNoPathTestCase()
+    : TestCase("An ordinary preferred-parent switch sends a No-Path DAO to the parent being left")
+{
+}
+
+void
+RplStoringModeOrdinarySwitchNoPathTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(3); // 0 = root, 1 = A, 2 = T (under test)
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    Ptr<SimpleNetDevice> rootDevice = DynamicCast<SimpleNetDevice>(devices.Get(0));
+    Ptr<SimpleNetDevice> tDevice = DynamicCast<SimpleNetDevice>(devices.Get(2));
+    channel->BlackList(rootDevice, tDevice);
+    channel->BlackList(tDevice, rootDevice);
+
+    RplHelper rplHelper;
+    rplHelper.Set("Mop", UintegerValue(RPL_MOP_STORING_NO_MULTICAST));
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(200));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> root = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> a = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> t = nodes.Get(2)->GetObject<RplRoutingProtocol>();
+    Ipv6Address dodagId = root->GetGlobalAddress();
+    Ipv6Address tAddress = t->GetGlobalAddress();
+    Ipv6Address rootLinkLocal =
+        nodes.Get(0)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address aLinkLocal =
+        nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    NS_TEST_ASSERT_MSG_EQ(t->IsJoined(), true, "T never joined the Storing mode DODAG");
+    NS_TEST_ASSERT_MSG_EQ(t->GetPreferredParent(), aLinkLocal, "T did not join via A");
+    NS_TEST_ASSERT_MSG_EQ(t->GetRank(), 3 * RPL_MIN_HOPRANKINC, "T is not two hops out via A");
+
+    Ipv6Address nextHop;
+    NS_TEST_ASSERT_MSG_EQ(a->GetDownwardRoute(RPL_DEFAULT_INSTANCE, dodagId, tAddress, nextHop),
+                          true,
+                          "A never learned a downward route to T");
+
+    // Root and T can now genuinely hear each other, so whatever T decides
+    // to do about its preferred parent can actually be delivered.
+    channel->UnBlackList(rootDevice, tDevice);
+    channel->UnBlackList(tDevice, rootDevice);
+
+    // A fabricated DIO, claiming to be from root's own real link-local
+    // address (so anything T subsequently sends there really arrives),
+    // advertising root's own real rank -- one hop closer than A, which T
+    // cannot reach through A at all (RankViaParent() via root:
+    // 2*MinHopRankInc, strictly less than T's current 3*MinHopRankInc via
+    // A). Driving this directly, rather than waiting on root's own Trickle
+    // schedule, keeps the test's timing independent of wherever root's
+    // Trickle counter happens to be by t=200s.
+    RplDioHeader dio;
+    dio.SetInstanceId(RPL_DEFAULT_INSTANCE);
+    dio.SetVersionNumber(0);
+    dio.SetRank(RPL_MIN_HOPRANKINC);
+    dio.SetMop(RPL_MOP_STORING_NO_MULTICAST);
+    dio.SetDodagId(dodagId);
+    dio.SetDagConfiguration(RPL_DIO_INTERVAL_DOUBLINGS,
+                            RPL_DIO_INTERVAL_MIN,
+                            RPL_DIO_REDUNDANCY,
+                            RPL_MAX_RANKINC,
+                            RPL_MIN_HOPRANKINC,
+                            RPL_OCP_OF0,
+                            RPL_DEFAULT_LIFETIME,
+                            RPL_DEFAULT_LIFETIME_UNIT);
+    // DeliverRawRplMessage(), not SendRawRplMessage(): every other synthetic
+    // multicast DIO in this test suite uses it too (SendRawRplMessage()'s
+    // own real send via a raw socket does not reliably reach a multicast
+    // destination the way delivering straight to T's own Receive() does).
+    // Only this one injection is synthetic -- T's own subsequent real
+    // traffic (its new DAO to root, its No-Path to A) still goes out for
+    // real, over the now-unblocked channel.
+    //
+    // Delivered RPL_FRESHNESS_TARGET times, not once:
+    // SelectPreferredParent()'s own two-pass structure only relaxes the
+    // freshness requirement (pass 1) when pass 0 finds no candidate at
+    // all, and A -- already well past the freshness target from the whole
+    // formation above -- still clears pass 0 as an unchanged candidate
+    // even though root's own rank is better, so pass 1 (which would
+    // otherwise let a freshly-heard root through despite its low
+    // freshness) never runs and root is silently ignored until it, too,
+    // reaches the target.
+    for (uint8_t i = 0; i < RPL_FRESHNESS_TARGET; i++)
+    {
+        Simulator::Schedule(Seconds(0),
+                            &DeliverRawRplMessage<RplDioHeader>,
+                            nodes.Get(2),
+                            1,
+                            dio,
+                            static_cast<uint8_t>(RPL_CODE_DIO),
+                            rootLinkLocal,
+                            Ipv6Address(RPL_ALL_NODES_MULTICAST));
+        Simulator::Stop(MilliSeconds(50));
+        Simulator::Run();
+    }
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(t->GetPreferredParent(),
+                          rootLinkLocal,
+                          "T did not switch to the strictly better parent");
+    NS_TEST_ASSERT_MSG_EQ(t->GetRank(), 2 * RPL_MIN_HOPRANKINC, "T's rank did not improve");
+
+    NS_TEST_ASSERT_MSG_EQ(
+        a->GetDownwardRoute(RPL_DEFAULT_INSTANCE, dodagId, tAddress, nextHop),
+        false,
+        "A still has a downward route to T after T switched away to a still-live root: no "
+        "No-Path DAO was sent for this ordinary switch");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief A locally clock-expired downwardRoutes entry is not erased on the
+ *        spot; a stale, reordered duplicate arriving after that expiry is
+ *        still correctly rejected rather than resurrected.
+ *
+ * root(0)--probe(1), Storing mode. Erasing an expired entry the moment
+ * HandleDao() happens to notice it (the behaviour before this fix) throws
+ * away the last Path Sequence this node ever saw for the target -- so any
+ * later DAO for it, however old, would be compared against nothing and
+ * treated as unconditionally new. This drives a fictitious target directly
+ * at root: establish it, let it expire, then deliver a duplicate carrying
+ * an older Path Sequence than what was ever stored, and confirm it is still
+ * recognised as stale.
+ */
+class RplStoringModeStaleAfterExpiryTestCase : public TestCase
+{
+  public:
+    RplStoringModeStaleAfterExpiryTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplStoringModeStaleAfterExpiryTestCase::RplStoringModeStaleAfterExpiryTestCase()
+    : TestCase("A stale duplicate DAO is rejected even after the entry it would supersede has "
+              "locally expired")
+{
+}
+
+void
+RplStoringModeStaleAfterExpiryTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2); // 0 = root, 1 = probe
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    rplHelper.Set("Mop", UintegerValue(RPL_MOP_STORING_NO_MULTICAST));
+    // Large enough that no periodic purge (SendDao()'s own loop, or root's
+    // own PurgeDownwardRoutesTimerExpire()) sweeps the entry out from under
+    // this test before it gets a chance to check that leaving it standing,
+    // past its own expiry, is what keeps the staleness check meaningful.
+    rplHelper.Set("DaoInterval", TimeValue(Seconds(600)));
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(60));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> root = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ipv6Address dodagId = root->GetGlobalAddress();
+    Ipv6Address rootLinkLocal =
+        nodes.Get(0)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address probeLinkLocal =
+        nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address fictitious("2001:1::ff:fe00:aa");
+
+    auto sendDao = [&](uint8_t pathSequence, uint8_t pathLifetime) {
+        RplDaoHeader dao;
+        dao.SetInstanceId(RPL_DEFAULT_INSTANCE);
+        dao.SetDodagId(dodagId);
+        dao.SetSequence(1);
+        dao.SetTarget(fictitious);
+        dao.SetTransitInformation(Ipv6Address::GetAny(), pathSequence, pathLifetime);
+        Simulator::Schedule(Seconds(0),
+                            &SendRawRplMessage<RplDaoHeader>,
+                            nodes.Get(1),
+                            1,
+                            dao,
+                            static_cast<uint8_t>(RPL_CODE_DAO),
+                            probeLinkLocal,
+                            rootLinkLocal);
+        Simulator::Stop(MilliSeconds(50));
+        Simulator::Run();
+    };
+
+    // PathLifetime 1: 60 s (the default lifetime unit).
+    sendDao(5, 1);
+    Ipv6Address nextHop;
+    NS_TEST_ASSERT_MSG_EQ(root->GetDownwardRoute(RPL_DEFAULT_INSTANCE, dodagId, fictitious, nextHop),
+                          true,
+                          "root did not accept the initial advertisement");
+
+    // Past the 60 s expiry, with nothing else (DaoInterval is far longer)
+    // touching this entry in between.
+    Simulator::Stop(Seconds(61));
+    Simulator::Run();
+    NS_TEST_ASSERT_MSG_EQ(
+        root->GetDownwardRoute(RPL_DEFAULT_INSTANCE, dodagId, fictitious, nextHop),
+        false,
+        "the entry did not correctly read as expired");
+
+    // A stale, reordered duplicate -- an older Path Sequence than what was
+    // ever stored (3 < 5) -- arriving after the entry's own local expiry.
+    // With the entry erased on sight instead of left standing, this would
+    // be compared against nothing and accepted as unconditionally new.
+    sendDao(3, 1);
+    NS_TEST_ASSERT_MSG_EQ(
+        root->GetDownwardRoute(RPL_DEFAULT_INSTANCE, dodagId, fictitious, nextHop),
+        false,
+        "a stale, reordered duplicate was incorrectly resurrected after the entry's own local "
+        "expiry");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief A Storing mode root that never itself originates a downward
+ *        packet (a pure traffic sink) still eventually purges a downward
+ *        route to a descendant that disappears without ever sending a
+ *        No-Path DAO.
+ *
+ * root(0)--probe(1). SendDao() is a no-op for a root, and RouteOutput()'s
+ * own purge only runs when the root itself locally originates a packet --
+ * neither of which this test's root ever does (@see
+ * PurgeDownwardRoutesTimerExpire()'s own doc comment). probe is blacklisted
+ * away after root has learned of it, simulating a descendant that vanishes
+ * (crash, moved out of range) rather than politely withdrawing.
+ *
+ * GetDownwardRoutesRawCount(), not GetDownwardRouteCount(): the latter
+ * filters expired entries out regardless of whether they were ever
+ * actually reclaimed, so it cannot tell "correctly ignored but still
+ * sitting in the map" apart from "purged" -- the distinction this test
+ * exists to check.
+ */
+class RplStoringModeRootPurgeTestCase : public TestCase
+{
+  public:
+    RplStoringModeRootPurgeTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplStoringModeRootPurgeTestCase::RplStoringModeRootPurgeTestCase()
+    : TestCase("A Storing mode root that never originates traffic still purges a downward route "
+              "to a vanished descendant")
+{
+}
+
+void
+RplStoringModeRootPurgeTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2); // 0 = root, 1 = probe
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    rplHelper.Set("Mop", UintegerValue(RPL_MOP_STORING_NO_MULTICAST));
+    rplHelper.Set("PathLifetime", UintegerValue(1));    // 60 s
+    rplHelper.Set("DaoInterval", TimeValue(Seconds(10))); // root's own purge cadence
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(60));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> root = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> probe = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(probe->IsJoined(), true, "probe never joined the Storing mode DODAG");
+
+    Ipv6Address dodagId = root->GetGlobalAddress();
+    NS_TEST_ASSERT_MSG_EQ(root->GetDownwardRoutesRawCount(RPL_DEFAULT_INSTANCE, dodagId),
+                          1,
+                          "root never learned of probe at all");
+
+    // probe vanishes: no more DIOs, no No-Path DAO, nothing -- root simply
+    // stops hearing from it, the way a crash or moving out of range would
+    // look, as opposed to a graceful withdrawal.
+    Ptr<SimpleNetDevice> rootDevice = DynamicCast<SimpleNetDevice>(devices.Get(0));
+    Ptr<SimpleNetDevice> probeDevice = DynamicCast<SimpleNetDevice>(devices.Get(1));
+    channel->BlackList(rootDevice, probeDevice);
+    channel->BlackList(probeDevice, rootDevice);
+
+    // Well past the 60 s PathLifetime, with several of root's own 10 s
+    // purge cycles (PurgeDownwardRoutesTimerExpire()) along the way -- root
+    // itself never calls RouteOutput() for probe's address anywhere in
+    // this test, so PurgeDownwardRoutes()'s other call site never runs
+    // either.
+    Simulator::Stop(Seconds(120));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(
+        root->GetDownwardRoutesRawCount(RPL_DEFAULT_INSTANCE, dodagId),
+        0,
+        "root's downwardRoutes entry for the vanished probe was never actually purged");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief A node in radio range of two independent DODAG roots joins both at
  *        once, and each root's own topology genuinely learns about it.
  *
@@ -17928,6 +18668,11 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplStoringModeDownwardRouteTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplStoringModeStaleDaoAndNoPathTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplStoringModeDaoRetryTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplStoringModeInputValidationTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplStoringModeInfiniteLifetimeRelayedTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplStoringModeOrdinarySwitchNoPathTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplStoringModeStaleAfterExpiryTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplStoringModeRootPurgeTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplMultiDodagTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplCreateLocalDodagTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplCreateLocalDodagClearsDFlagTestCase, TestCase::Duration::QUICK);
