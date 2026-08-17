@@ -1608,8 +1608,12 @@ RplRoutingProtocol::HandleDio(const RplDioHeader& dio,
     if (preferredParentBumpedDtsn && dodag->mop != RPL_MOP_P2P_ROUTE_DISCOVERY)
     {
         // Rule 2: in non-storing mode, this node's own DTSN follows its
-        // parent's up.
-        dodag->dtsn++;
+        // parent's up. RplSequenceIncrement(), not a plain ++, for the same
+        // RFC 6550 section 7.2 rule 2 circular-region reason Path Sequence
+        // was fixed for (@see RplSequenceIncrement()'s own doc comment): a
+        // plain increment crossing 127 -> 128 would leave the linear region
+        // instead of wrapping back to 0.
+        dodag->dtsn = RplSequenceIncrement(dodag->dtsn);
         // Rule 1: schedule a DAO. RFC 6550 section 9.5's DelayDAO jitter is
         // the same one a parent switch already uses just below, for the
         // same reason -- an immediate, unjittered transmission from every
@@ -2343,16 +2347,20 @@ RplRoutingProtocol::GlobalRepairFire(DodagKey key)
                  "GlobalRepairFire() fired for a DODAG membership this node does not root");
 
     // RFC 6550 section 3.2.2: "A DODAG root institutes a global repair
-    // operation by incrementing the DODAGVersionNumber." A plain wraparound
-    // increment, the same simplification section 26/27 already made for
-    // dtsn/pathSequence: not a faithful lollipop increment (section 7.2's
-    // circular region wraps 127 back to 0, not into the linear region this
-    // takes it through instead), but every receiver compares versions with
-    // RplSequenceNewer() rather than '>', so the wrap this produces is still
-    // read correctly as "newer" once it lands (rule 4's NOT_COMPARABLE case
-    // does not arise here: this node's own held version is always the one
-    // just incremented, one step away by construction).
-    dodag.version++;
+    // operation by incrementing the DODAGVersionNumber." RplSequenceIncrement(),
+    // not a plain ++, for the same section 7.2 rule 2 circular-region reason
+    // Path Sequence and DTSN were fixed for (@see RplSequenceIncrement()'s
+    // own doc comment): a plain increment crossing 127 -> 128 would leave
+    // the linear region instead of wrapping back to 0, drifting the version
+    // permanently into the circular region on every root that happens to
+    // repair an odd number of times while below it -- harmless for any one
+    // repair (RplSequenceNewer() still reads 128 as newer than 127), but not
+    // what rule 2 specifies, and not free of consequence indefinitely: once
+    // in the circular region, RplSequenceCompare()'s NOT_COMPARABLE case
+    // becomes reachable the next time this same DODAG suffers a real
+    // discontinuity (rule 3), for a root whose region a plain increment
+    // could otherwise have kept in the linear one.
+    dodag.version = RplSequenceIncrement(dodag.version);
 
     NS_LOG_INFO("Global repair: DODAG " << dodag.dodagId << " moved to version "
                                         << +dodag.version);

@@ -18009,6 +18009,160 @@ RplDtsnRefreshTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief RFC 6550 section 7.2 rule 2's circular-region wrap (127 -> 0, not
+ *        128) applies to DTSN's own increment (rule 2's "this node's own
+ *        DTSN follows its parent's up"), the same as Path Sequence
+ *        (design-constraints.md section 58).
+ */
+class RplDtsnOwnIncrementWrapTestCase : public TestCase
+{
+  public:
+    RplDtsnOwnIncrementWrapTestCase();
+
+  private:
+    void DoRun() override;
+
+    /// @brief Record a DIO's DTSN, if it came from the child.
+    /// @param socket the monitoring socket
+    void RecordDio(Ptr<Socket> socket);
+
+    Ipv6Address m_childLinkLocal;      //!< the child's address, to filter DIOs by sender
+    std::vector<uint8_t> m_childDtsns; //!< DTSN of every DIO the child itself sent
+};
+
+RplDtsnOwnIncrementWrapTestCase::RplDtsnOwnIncrementWrapTestCase()
+    : TestCase("The DTSN a node advertises wraps from 127 to 0, not into the linear region at "
+              "128")
+{
+}
+
+void
+RplDtsnOwnIncrementWrapTestCase::RecordDio(Ptr<Socket> socket)
+{
+    Address sender;
+    Ptr<Packet> packet = socket->RecvFrom(sender);
+    if (!packet)
+    {
+        return;
+    }
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ipv6Header);
+    if (ipv6Header.GetSource() != m_childLinkLocal)
+    {
+        return;
+    }
+    Icmpv6Header icmpv6Header;
+    packet->RemoveHeader(icmpv6Header);
+    if (icmpv6Header.GetType() == ICMPV6_RPL && icmpv6Header.GetCode() == RPL_CODE_DIO)
+    {
+        RplDioHeader dio;
+        packet->RemoveHeader(dio);
+        m_childDtsns.push_back(dio.GetDtsn());
+    }
+}
+
+void
+RplDtsnOwnIncrementWrapTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    rplHelper.Set("DioIntervalMin", TimeValue(MilliSeconds(256)));
+    rplHelper.Set("DioIntervalDoublings", UintegerValue(2));
+
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Ptr<Node> rootNode = nodes.Get(0);
+    Ptr<Node> childNode = nodes.Get(1);
+
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> root = rootNode->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> child = childNode->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(child->IsJoined(), true, "The child never joined the DODAG");
+
+    Ipv6Address rootLinkLocal =
+        rootNode->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address childLinkLocal =
+        childNode->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    m_childLinkLocal = childLinkLocal;
+    Ptr<Socket> dioMonitor = Socket::CreateSocket(rootNode, Ipv6RawSocketFactory::GetTypeId());
+    dioMonitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    dioMonitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    dioMonitor->BindToNetDevice(rootNode->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+    dioMonitor->SetRecvCallback(MakeCallback(&RplDtsnOwnIncrementWrapTestCase::RecordDio, this));
+
+    // 128 successive hand-built DIOs from the root, DTSN 1 through 128 --
+    // each one step "newer" than the last per RplSequenceNewer(), so every
+    // one triggers rule 2's "this node's own DTSN follows its parent's up"
+    // (@see RplDtsnRefreshTestCase for the same mechanism, one bump at a
+    // time). The 127th bump takes the child's own DTSN to 127; the 128th
+    // is what section 7.2 rule 2 says must wrap it back to 0, not carry it
+    // on to 128. 1 ms apart is enough: each SendRawRplMessage()'s own
+    // HandleDio() call runs to completion (updating the cached parent DTSN
+    // rule 2 compares the next one against) before the next one fires,
+    // ns-3's event loop being single-threaded.
+    for (uint16_t dtsn = 1; dtsn <= 128; dtsn++)
+    {
+        RplDioHeader bump;
+        bump.SetInstanceId(RPL_DEFAULT_INSTANCE);
+        bump.SetVersionNumber(0);
+        bump.SetRank(RPL_MIN_HOPRANKINC);
+        bump.SetMop(RPL_MOP_NON_STORING);
+        bump.SetDodagId(root->GetDodagId());
+        bump.SetDtsn(static_cast<uint8_t>(dtsn));
+
+        Simulator::Schedule(MilliSeconds(dtsn),
+                            &SendRawRplMessage<RplDioHeader>,
+                            rootNode,
+                            1,
+                            bump,
+                            static_cast<uint8_t>(RPL_CODE_DIO),
+                            rootLinkLocal,
+                            childLinkLocal);
+    }
+    Simulator::Stop(Seconds(1));
+    Simulator::Run();
+
+    // The same 2 * Imax margin RplDtsnRefreshTestCase waits for its own
+    // single bump, for the child's own next real DIO to arrive and be
+    // read back.
+    Simulator::Stop(Seconds(3));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_GT_OR_EQ(m_childDtsns.size(), 1, "The child never sent a DIO of its own");
+    NS_TEST_ASSERT_MSG_EQ(m_childDtsns.back(),
+                          0,
+                          "The child's DTSN wrapped past 127 into the linear region instead of "
+                          "back to 0");
+
+    dioMonitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Check the neighbour freshness rule: a neighbour heard once is a
  *        candidate parent only while nothing better-established is
  *        available, and stops being one as soon as another neighbour has
@@ -19216,6 +19370,156 @@ RplVersionWrapTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief RFC 6550 section 7.2 rule 2's circular-region wrap (127 -> 0, not
+ *        128) applies to the DODAG Version Number's own increment
+ *        (GlobalRepairFire(), RFC 6550 section 3.2.2), the same as Path
+ *        Sequence (design-constraints.md section 58) and DTSN. Unlike
+ *        RplVersionWrapTestCase above (the receiving/comparison side, the
+ *        already-correct linear-region 255 -> 0 wrap), this is the sending
+ *        side: does a root that repairs its way up to 127 actually wrap the
+ *        value it advertises next back to 0, rather than carrying it on into
+ *        the linear region at 128.
+ */
+class RplGlobalRepairVersionWrapTestCase : public TestCase
+{
+  public:
+    RplGlobalRepairVersionWrapTestCase();
+
+  private:
+    void DoRun() override;
+
+    /// @brief Record a DIO's version number, if it came from the root.
+    /// @param socket the monitoring socket
+    void RecordDio(Ptr<Socket> socket);
+
+    Ipv6Address m_rootLinkLocal;         //!< the root's address, to filter DIOs by sender
+    std::vector<uint8_t> m_rootVersions; //!< version of every DIO the root itself sent
+};
+
+RplGlobalRepairVersionWrapTestCase::RplGlobalRepairVersionWrapTestCase()
+    : TestCase("The DODAG Version Number a root advertises wraps from 127 to 0, not into the "
+              "linear region at 128, across repeated global repairs")
+{
+}
+
+void
+RplGlobalRepairVersionWrapTestCase::RecordDio(Ptr<Socket> socket)
+{
+    Ptr<Packet> packet = socket->Recv();
+    while (packet)
+    {
+        Ipv6Header ipv6Header;
+        if (packet->RemoveHeader(ipv6Header) != 0 && ipv6Header.GetSource() == m_rootLinkLocal)
+        {
+            Icmpv6Header icmpv6Header;
+            if (packet->RemoveHeader(icmpv6Header) != 0 &&
+                icmpv6Header.GetCode() == RPL_CODE_DIO)
+            {
+                RplDioHeader dio;
+                packet->RemoveHeader(dio);
+                m_rootVersions.push_back(dio.GetVersionNumber());
+            }
+        }
+        packet = socket->Recv();
+    }
+}
+
+void
+RplGlobalRepairVersionWrapTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2); // 0 = root, 1 = child
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    rplHelper.Set("DioIntervalMin", TimeValue(MilliSeconds(256)));
+    rplHelper.Set("DioIntervalDoublings", UintegerValue(2));
+    // Short enough that the whole circular region (128 repairs) fits in a
+    // practical test duration; dioTrickle.Reset() on every repair
+    // (GlobalRepairFire()'s own doc comment) means no DIO actually escapes
+    // until repairs stop resetting it, so this need not be anywhere near
+    // DioIntervalMin.
+    rplHelper.Set("GlobalRepairInterval", TimeValue(MilliSeconds(10)));
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Ptr<Node> rootNode = nodes.Get(0);
+    Ptr<Node> childNode = nodes.Get(1);
+
+    m_rootLinkLocal = rootNode->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ptr<Socket> monitor = Socket::CreateSocket(childNode, Ipv6RawSocketFactory::GetTypeId());
+    monitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    monitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    monitor->SetRecvCallback(MakeCallback(&RplGlobalRepairVersionWrapTestCase::RecordDio, this));
+
+    // Left running free rather than timed to stop at exactly the 128th
+    // repair: the first repair does not fire until close to Imax after the
+    // DODAG forms (observed ~1 s with the DioIntervalMin/Doublings below,
+    // Trickle's own settling time before GlobalRepairFire() was first
+    // scheduled), so pinning an absolute time to "the 128th repair" is
+    // fragile. 6 s at a 10 ms repair interval is enough for several hundred
+    // repairs -- multiple full trips around the circular region -- so
+    // instead of checking one specific wrap, every version this DIO
+    // monitor records over the whole run is checked below: none may ever
+    // reach the linear region (128), and 127 must be followed by 0
+    // somewhere, proving an actual wrap happened and was handled instead of
+    // the boundary simply never being reached.
+    Simulator::Stop(Seconds(6));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> child = childNode->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(child->IsJoined(), true, "The child never joined the DODAG");
+
+    bool sawLinearRegionValue = false;
+    bool sawWrapTo0After127 = false;
+    bool have127 = false;
+    for (auto version : m_rootVersions)
+    {
+        if (version >= 128)
+        {
+            sawLinearRegionValue = true;
+        }
+        if (version == 127)
+        {
+            have127 = true;
+        }
+        else if (version == 0 && have127)
+        {
+            sawWrapTo0After127 = true;
+        }
+    }
+    NS_TEST_ASSERT_MSG_GT_OR_EQ(m_rootVersions.size(), 1, "The root never sent a DIO of its own");
+    NS_TEST_ASSERT_MSG_EQ(sawLinearRegionValue,
+                          false,
+                          "The DODAG version wrapped past 127 into the linear region (128) "
+                          "instead of back to 0");
+    NS_TEST_ASSERT_MSG_EQ(sawWrapTo0After127,
+                          true,
+                          "Never observed the version actually wrap from 127 back to 0 -- the "
+                          "boundary was not reached within this run");
+
+    monitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Check that the root orders DAOs for one target by their Path
  *        Sequence, so a stale one -- a No-Path in particular -- cannot undo a
  *        newer one that overtook it.
@@ -19780,6 +20084,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplDisHandlingTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDaoAckSequenceTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDtsnRefreshTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplDtsnOwnIncrementWrapTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplComputeSourceRouteFailureTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplMrhofSelectionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplMrhofHysteresisBoundaryTestCase, TestCase::Duration::QUICK);
@@ -19798,6 +20103,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplSequenceCounterTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplSequenceIncrementTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplVersionWrapTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplGlobalRepairVersionWrapTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplStaleDaoTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplInfiniteLifetimeDaoTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDtsnWrapTestCase, TestCase::Duration::QUICK);

@@ -6992,3 +6992,100 @@ load-bearing検証: 上記のうち修正1・2・3それぞれについて、対
 `test-runner --suite=rpl`を複数回実行し、既存118件+新規5件=
 123件全てが安定PASSすることを確認。
 既存の全テスト(§54-58で追加したものを含む)はPASS。
+
+## 61. DTSN・DODAG Version NumberにもRFC 6550 section 7.2境界ラップ修正を適用(§58の対象拡大)
+
+§58ではPath Sequenceのみを対象に、循環領域(127以下)のインクリメントが
+127の次を0ではなく128(線形領域)へ進めてしまう不具合を`RplSequenceIncrement()`
+で修正した。当時DTSN・DODAG Version Numberは意図的にスコープ外とし、
+それぞれのインクリメント箇所には「既知だが今回は直さない」簡略化として
+コメントで明文化していた。今回、ユーザーの指示によりこの2箇所にも
+同じ修正を適用した。
+
+### 61.1 対象箇所
+
+- `HandleDio()`内、rule 2(RFC 6550 section 9.6: "If a node hears one of
+  its DAO parents increment its DTSN, the node MUST increment its own
+  DTSN.")の実装、`dodag->dtsn++`(旧)。DTSNのインクリメント箇所は
+  この1箇所のみ(grep で確認済み)。
+- `GlobalRepairFire()`内、RFC 6550 section 3.2.2("A DODAG root
+  institutes a global repair operation by incrementing the
+  DODAGVersionNumber.")の実装、`dodag.version++`(旧)。既存コメントは
+  「単純な折り返しインクリメントで、section 7.2の循環領域ラップ
+  (127→0)ではなく線形領域を通ってしまうが、比較は常に
+  `RplSequenceNewer()`(直前の値との1ステップ差のみ)を使うので実害は
+  無い」という理由で意図的に据え置いていた。この「実害無し」の理屈は
+  1回の repair 単体では成立するが、同一DODAGが将来section 7.2 rule 3
+  相当の不連続(別の要因によるバージョン飛び)を経験した場合、線形
+  領域にドリフトしたルートの比較で`NOT_COMPARABLE`が発生しうる —
+  恒久的に無害とは言えないため、修正することにした。
+
+いずれも`dodag->dtsn = RplSequenceIncrement(dodag->dtsn);`
+/`dodag.version = RplSequenceIncrement(dodag.version);`に変更。
+`RplSequenceIncrement()`自体は§58で既に実装・境界値テスト済みの
+関数をそのまま再利用しており、ワイヤフォーマットや比較ロジック
+(`RplSequenceCompare()`/`RplSequenceNewer()`)には一切手を入れていない。
+
+### 61.2 新規テスト
+
+- `RplDtsnOwnIncrementWrapTestCase`: 子ノードに対しDAO parent
+  (root)から127回、DTSN 1〜127と一段ずつ増える合成DIOを注入し
+  (`RplSequenceNewer()`により毎回「親がDTSNを上げた」と判定される)、
+  子自身のDTSNを127まで押し上げた上で、128回目の注入(DTSN=128)を
+  行う。子自身の次の実DIOのDTSNフィールドを(rootに置いた監視
+  ソケットで)読み取り、128ではなく0であることを確認。
+  - 既存の`RplDtsnWrapTestCase`(このコミット以前から存在)とは別物:
+    既存テストは「DAO parentのDTSNが255→0へラップした際、それを
+    正しく'newer'と認識できるか」という**受信・比較側**の線形領域
+    ラップを検証するもので、今回の新規テストは「自ノード自身のDTSN
+    インクリメントが循環領域境界(127→0)を正しく処理するか」という
+    **送信・インクリメント側**を検証する、対象範囲が異なるテスト。
+    クラス名が衝突したため`RplDtsnOwnIncrementWrapTestCase`と命名。
+- `RplGlobalRepairVersionWrapTestCase`: `GlobalRepairInterval`属性を
+  10msに短縮したrootを、6秒間走らせる(数百回のrepairが起き、循環
+  領域を複数周する)。子ノードに置いた監視ソケットがroot自身の
+  DIOから読み取ったversion番号の全履歴を対象に、(a) 128以上の値が
+  一度も現れないこと、(b) 127の後に0が現れること(実際にラップが
+  発生し正しく処理されたことの確認、境界に一度も到達しないまま
+  素通りするテストになっていないことの担保)、の2点を検証。
+  既存の`RplVersionWrapTestCase`(受信・比較側、255→0の線形領域
+  ラップ)とは対象が異なる(送信・インクリメント側、127→0の循環
+  領域ラップ)。
+
+### 61.3 テスト設計で踏んだ落とし穴
+
+- **`GlobalRepairFire()`の初回発火はt=0ではない**: 当初「repairは
+  10ms間隔でt=10msから始まる」という前提で「128回目の直後に属性を
+  `Time::Max()`へ変更してこれ以上のrepairを止める」という設計だった
+  が、実際には初回発火が(このテストのDioIntervalMin/Doublings設定
+  でのImax、約1秒)ほど遅れて始まっており、想定した絶対時刻での
+  停止は無意味だった(`GlobalRepairInterval`属性を実行時に変更する
+  タイミングがずれ、127や0ではなく無関係な中間値を最終値として
+  誤検出してFAILした)。原因特定は`GlobalRepairFire()`自身に一時的な
+  `std::cerr`計測を仕込んで実測することで完了。
+  - **対処**: 絶対時刻を前提にした「ちょうどN回で止める」設計を
+    捨て、十分長い時間(6秒、数百repair分)自由に走らせたままにし、
+    観測した全履歴に対して「境界を超えた値が一度も無いこと」
+    「127の後に0が来ること」という**相対的な**条件で検証する方式へ
+    変更した。ns3-debug-pitfallsスキル自身が繰り返し強調している
+    「絶対時刻を前提にしない」という指針を、今回は「一定回数で
+    ぴったり止める」という別形の絶対時刻依存にも適用漏れしていた
+    ことが分かった教訓。
+- **`uint8_t`のNS_TEST_ASSERT失敗メッセージは文字として出力される**:
+  既存の`RplDtsnWrapTestCase`自身のコメントが既に指摘していた
+  落とし穴に、今回も一度踏んだ(`uint32_t`へ widen せずに
+  `m_rootVersions.back()`を直接比較し、失敗時のactual表示が
+  非表示文字や文字化けとして出て読み取れなかった)。デバッグ時は
+  `std::cerr`で明示的に`+value`(integer昇格)して出力する回避策で
+  実測した。
+
+load-bearing検証: 両修正それぞれについて、対応行を元の`++`へ一時的に
+戻し、対応する新規テストが明確にFAILすることを確認(DTSN側は
+`actual`表示が文字化けしたが、期待値0との不一致自体は明確に検出
+できた)、元に戻して再度PASSを確認。
+
+### 61.4 検証
+
+`./ns3 build`(rplモジュール・プロジェクト全体とも)、
+`test-runner --suite=rpl`を実行し、既存123件+新規2件=125件全てが
+安定PASSすることを確認。
