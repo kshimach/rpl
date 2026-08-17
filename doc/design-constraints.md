@@ -7089,3 +7089,97 @@ load-bearing検証: 両修正それぞれについて、対応行を元の`++`�
 `./ns3 build`(rplモジュール・プロジェクト全体とも)、
 `test-runner --suite=rpl`を実行し、既存123件+新規2件=125件全てが
 安定PASSすることを確認。
+
+## 62. `/protocol-test-matrix`による§61(DTSN・Version境界ラップ)の監査
+
+標準メモリ指示に従い、§61(コミット`e855947`)自体を対象に新5角監査を
+実施。今回は比較的小さい増分(既存関数`RplSequenceIncrement()`を
+2箇所へ追加適用しただけ)だったため、Phase 0で既存呼び出し箇所を
+grepで全数確認(4箇所: Path Sequence x2、DTSN、Version)した上で
+5角を並列起動。Angle 4(シーケンス状態遷移)は`GlobalRepairFire()`へ
+一時的な計測を仕込んで実測するプローブまで実施し、他角の一部指摘も
+実地確認込みで返ってきた。
+
+### 62.1 発見された候補
+
+1. **`daoSequence`がRFC名指しのlollipop対象なのに未対応**(角5・
+   移行漏れ、CONFIRMED): RFC 6550 section 7の冒頭
+   ("...such as the DODAGVersionNumber in the DIO message, the
+   DAOSequence in the DAO message, and the Path Sequence in the
+   Transit Information option.")がDAOSequenceを明示的に3カウンタの
+   1つとして名指ししている — DTSN(section 7.1に名前が無く、この
+   モジュール自身のコメントが独自拡大解釈と認めている)より明確な
+   対象であるにもかかわらず、インクリメント側(`SendDaoMessage()`・
+   `SendNoPathDao()`の2箇所、いずれも`++dodag.daoSequence`)は
+   §58・§61とも対象外のままだった。比較側は§33で既に「等価比較
+   のみ(DAO-ACK相関用)なのでlollipop比較を受けない」と対象外に
+   済んでいたが、これは比較側テストのスコープ決定であり、
+   インクリメント側の適合可否とは別問題。
+2. **doc comment 3箇所が「DTSN・Versionはまだ素の`++`」と書いた
+   まま**(角1・角2・角5が独立に発見、CONFIRMED): `rpl-conf.h`の
+   `RplSequenceIncrement()`自身のdocコメント、`rpl-p2p.cc:439`の
+   P2P-DRO Seq折り返しに関する比較コメント、の計2ファイル3箇所が
+   §61の変更を反映しておらず、今読むと事実と異なる記述になって
+   いた。
+3. **`GlobalRepairInterval`をDODAG形成後に変更しても無効**(角4、
+   CONFIRMED、実プローブ確認済み): `CreateDodagMembership()`内で
+   一度だけ読まれ`globalRepairEvent`をarmする設計のため、生成済み
+   rootへ`SetAttribute()`しても該当DODAGのタイマーには一切反映
+   されない(有効化・無効化どちらの方向も)。クラッシュや誤動作は
+   しないが、通常のns-3属性が「いつでも動的変更可能」という直感に
+   反する無言の無効化であり、属性自身のdocに明記が無かった。
+4. **新規`RplGlobalRepairVersionWrapTestCase::RecordDio()`が
+   ICMPv6 Type確認を欠いていた**(角4、CONFIRMED): 同じコミットで
+   追加したもう一方の新規テスト`RplDtsnOwnIncrementWrapTestCase::RecordDio()`
+   を含む、ファイル内の他11箇所の同種コールバックは全て
+   `GetType() == ICMPV6_RPL`と`GetCode() == RPL_CODE_DIO`の両方を
+   確認しているのに、この1箇所だけCodeのみだった。今回の2ノード
+   構成では他のICMPv6トラフィックが存在せず実害は出ていないが、
+   一貫性を欠く箇所として修正対象とした。
+5. **`RplDtsnOwnIncrementWrapTestCase`の合成DIO注入が実DIOと
+   キャッシュを共有**(角4、実プローブで機構は確認、実害は12種の
+   seedで未観測): 注入する128個の合成DIOと、rootノード自身が
+   実際にTrickleで送る本物のDIOが、どちらも
+   `dodag->parents[rootLinkLocal].dtsn`という同じキャッシュ枠を
+   使う。本物のDIOが注入ウィンドウ中に紛れ込むと
+   `RplSequenceCompare()`のwindow=16判定に引っかかり静かに
+   カウントが狂いうるが、このテストの`DioIntervalMin`/`Doublings`
+   設定では現状余裕を持って衝突しないことを確認済み。構造的な
+   ガードは入れず、コメントで前提を明文化するに留めた(§62.2)。
+6. 角3(異常系)は「DTSN follow-parentトリガーにレート制限が無い」
+   という既存(このコミット以前からの)懸念を報告したが、今回の
+   修正の対象外であり実害範囲も変えていないことを角3自身が明言。
+   本節では対応せず、将来の別増分の候補として記録するに留める。
+
+### 62.2 修正
+
+1. `SendDaoMessage()`(relay自己広告時)・`SendNoPathDao()`の
+   `++dodag.daoSequence`を`dodag.daoSequence = RplSequenceIncrement(dodag.daoSequence);`
+   へ変更。比較側は既存のまま等価比較のみ(挙動に影響なし、純粋な
+   RFC文言適合)。
+2. `rpl-conf.h`の`RplSequenceIncrement()`docコメント、
+   `rpl-p2p.cc:439`のコメントを、DTSN・Version(および今回の
+   daoSequence)が既に`RplSequenceIncrement()`を使っている現状に
+   合わせて書き直した。
+3. `GlobalRepairInterval`属性のdocに「DODAG形成後の変更は無効、
+   `SetRoot()`/`Install()`前に設定すること」を追記。
+4. `RplGlobalRepairVersionWrapTestCase::RecordDio()`に
+   `icmpv6Header.GetType() == ICMPV6_RPL`確認を追加。
+5. `RplDtsnOwnIncrementWrapTestCase`の注入ループに、実DIOとの
+   キャッシュ共有・現状の余裕についてのコメントを追加(構造変更は
+   せず)。
+
+### 62.3 検証
+
+`daoSequence`の修正は比較側が等価判定のみのため、既存・新規いずれの
+テストからも観測できない、挙動上完全に不可視な変更(RFC文言適合
+のみが目的)であり、load-bearing検証の対象にならない — 新規の
+専用テストも意図的に追加していない(観測不能な変更に対するテストは
+書けない)。docコメント・属性説明の修正も同様に非機能的なため対象外。
+`RecordDio()`のType確認追加は既存テストの安定性を高める修正であり、
+2ノードの本テスト環境では他ICMPv6トラフィックが無いため、これ単体も
+load-bearing化はできない(誤検出を実際には踏んでいない)。
+
+`./ns3 build`(rplモジュール・プロジェクト全体とも)、
+`test-runner --suite=rpl`を実行し、既存125件全てが安定PASSすることを
+確認(新規テストは追加していない)。

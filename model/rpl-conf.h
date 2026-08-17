@@ -222,14 +222,26 @@ RplSequenceNewer(uint8_t candidate, uint8_t held)
  * A single-step increment lands on a value RplSequenceCompare() still
  * judges "newer" than what it replaced at every boundary regardless of
  * which of the two wrap rules applies (traced in design-constraints.md
- * section 37.6/37.7), which is why the plain, unwrapped `++` this module's
- * DTSN and DODAG Version Number both still use elsewhere gets away with
- * it for as long as their own updates stay single-step. It stops holding
- * once a real gap can open between two increments of the *same* counter --
- * a relay outage, or a burst of parent flapping -- and the next comparison
- * has to relate two values on opposite sides of the boundary rather than
- * two adjacent ones; whichever counter that comparison actually happens
- * against needs the true RFC wrap to stay correctly ordered across it.
+ * section 37.6/37.7), which is why a plain, unwrapped `++` gets away with
+ * it for as long as a counter's own updates stay single-step. It stops
+ * holding once a real gap can open between two increments of the *same*
+ * counter -- a relay outage, or a burst of parent flapping -- and the next
+ * comparison has to relate two values on opposite sides of the boundary
+ * rather than two adjacent ones; whichever counter that comparison
+ * actually happens against needs the true RFC wrap to stay correctly
+ * ordered across it. This module applies this function to every locally
+ * incremented sequence counter RFC 6550 section 7 names as governed by
+ * this scheme -- the DODAG Version Number, DAOSequence, and Path Sequence
+ * -- plus DTSN, which section 7.1 does not name but which this module
+ * still treats the same way (design-constraints.md sections 58 and 61
+ * cover Path Sequence and DTSN/Version respectively). DAOSequence's own
+ * comparisons (design-constraints.md section 33) are all by exact
+ * equality (DAO-ACK correlation) rather than through
+ * RplSequenceCompare()/RplSequenceNewer(), so which side of either wrap
+ * boundary it lands on has no observable effect either way -- applied
+ * here anyway, for the same reason the DODAG Version Number's own
+ * "practically harmless" pre-fix argument (section 61) was not treated as
+ * a reason to leave it non-conformant.
  *
  * @param value the counter's current value
  * @return the counter's value after one RFC-correct increment

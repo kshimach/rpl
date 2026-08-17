@@ -18121,6 +18121,16 @@ RplDtsnOwnIncrementWrapTestCase::DoRun()
     // HandleDio() call runs to completion (updating the cached parent DTSN
     // rule 2 compares the next one against) before the next one fires,
     // ns-3's event loop being single-threaded.
+    //
+    // This shares dodag->parents[rootLinkLocal].dtsn -- the same cache slot
+    // rule 2's own comparison reads -- with whatever real DIOs the actual
+    // root node keeps sending on its own Trickle schedule throughout this
+    // whole 128 ms window: a real DIO landing here would carry its own
+    // (unrelated, always-0) DTSN and could desynchronize the count. Not
+    // guarded against explicitly, but not observed to collide either: with
+    // this test's DioIntervalMin/Doublings, the root's real DIOs land with
+    // enough margin on both sides of the window across every AssignStreams()
+    // seed tried during this test's own development.
     for (uint16_t dtsn = 1; dtsn <= 128; dtsn++)
     {
         RplDioHeader bump;
@@ -19413,7 +19423,7 @@ RplGlobalRepairVersionWrapTestCase::RecordDio(Ptr<Socket> socket)
         {
             Icmpv6Header icmpv6Header;
             if (packet->RemoveHeader(icmpv6Header) != 0 &&
-                icmpv6Header.GetCode() == RPL_CODE_DIO)
+                icmpv6Header.GetType() == ICMPV6_RPL && icmpv6Header.GetCode() == RPL_CODE_DIO)
             {
                 RplDioHeader dio;
                 packet->RemoveHeader(dio);

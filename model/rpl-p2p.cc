@@ -435,8 +435,11 @@ RplRoutingProtocol::HandleP2pRdo(const RplDioHeader& dio, Ipv6Address from, uint
             // was already in flight for the old Seq.
             //
             // Wrapped at the wire field's own 2-bit width rather than left
-            // to grow (the raw wraparound this module uses for its 8-bit
-            // lollipop counters, e.g. dodag.version++ in GlobalRepairFire()):
+            // to grow (distinct from RplSequenceIncrement(), this module's
+            // RFC 6550 section 7.2 wraparound for its 8-bit lollipop
+            // counters like dodag.version in GlobalRepairFire() -- this
+            // 'Seq' is a P2P-RPL/RFC 6997 field of its own, unrelated
+            // width and rule):
             // a Target with a temporary DAG membership that outlives its
             // own 'L' deadline by little enough, or one that keeps
             // re-matching a Target named only via an RPL Target option

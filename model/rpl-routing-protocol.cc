@@ -349,7 +349,11 @@ RplRoutingProtocol::GetTypeId()
                           "that bound never gets to reset L and stays stuck advertising "
                           "INFINITE_RANK permanently. Time::Max(), the default, disables this "
                           "attribute -- a no-op change from every prior release; @see "
-                          "design-constraints.md section 37.",
+                          "design-constraints.md section 37. Only read once, when a DODAG this "
+                          "node roots is created (CreateDodagMembership()): changing it on an "
+                          "already-live root has no effect on that DODAG's own repair timer, "
+                          "whether turning repairs on for the first time or off -- set it before "
+                          "SetRoot()/Install(), not afterward.",
                           TimeValue(Time::Max()),
                           MakeTimeAccessor(&RplRoutingProtocol::m_globalRepairInterval),
                           MakeTimeChecker())
@@ -2129,12 +2133,20 @@ RplRoutingProtocol::SendDao(DodagMembership& dodag)
     // No DAO-ACK requested and dodag.daoSequence deliberately not
     // incremented again for the aggregated entries -- @see
     // SendDaoMessage()'s own doc comment for why -- but the message as a
-    // whole still carries the self-advertisement's own ++dodag.daoSequence
-    // and 'K' bit, so the DAO-ACK this triggers still confirms the whole
-    // aggregated message arrived, not only its primary target.
+    // whole still carries the self-advertisement's own incremented
+    // dodag.daoSequence and 'K' bit, so the DAO-ACK this triggers still
+    // confirms the whole aggregated message arrived, not only its primary
+    // target. RplSequenceIncrement(), not a plain ++, for the same RFC
+    // 6550 section 7.2 rule 2 reason every other locally-incremented
+    // sequence counter this module has uses it (@see its own doc comment
+    // in rpl-conf.h) -- harmless here specifically, since DAOSequence is
+    // only ever compared by exact equality, but applied for the same
+    // reason DODAG Version Number's own "practically harmless" argument
+    // was not treated as a reason to stay non-conformant.
+    dodag.daoSequence = RplSequenceIncrement(dodag.daoSequence);
     SendDaoMessage(dodag,
                   target,
-                  ++dodag.daoSequence,
+                  dodag.daoSequence,
                   dodag.pathSequence,
                   m_pathLifetime,
                   true,
@@ -2191,7 +2203,10 @@ RplRoutingProtocol::SendNoPathDao(DodagMembership& dodag, Ipv6Address viaParent)
     RplDaoHeader dao;
     dao.SetInstanceId(dodag.instanceId);
     dao.SetDodagId(dodag.dodagId);
-    dao.SetSequence(++dodag.daoSequence);
+    // RplSequenceIncrement(), not a plain ++: @see the matching comment in
+    // SendDaoMessage()'s own self-advertisement path.
+    dodag.daoSequence = RplSequenceIncrement(dodag.daoSequence);
+    dao.SetSequence(dodag.daoSequence);
     dao.SetTarget(target);
     // Path Lifetime 0, RFC 6550 section 6.4.3: a No-Path. The path sequence
     // still has to advance, the same as any other DAO with new information
