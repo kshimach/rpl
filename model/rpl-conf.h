@@ -206,6 +206,40 @@ RplSequenceNewer(uint8_t candidate, uint8_t held)
     return RplSequenceCompare(candidate, held) == RplSequenceOrder::GREATER;
 }
 
+/**
+ * @brief Increment a lollipop sequence counter, RFC 6550 section 7.2 rule 2.
+ *
+ * "When a sequence counter increment would cause the sequence counter to
+ * increment beyond its maximum value, the sequence counter MUST wrap back
+ * to zero. When incrementing a sequence counter greater than or equal to
+ * 128, the maximum value is 255. When incrementing a sequence counter less
+ * than 128, the maximum value is 127." A plain `uint8_t` increment already
+ * gets the linear region's own wrap right (255 -> 0 is exactly what
+ * unsigned overflow does), but would instead carry 127 across into the
+ * linear region at 128 -- not the "circular sequence number space of size
+ * 128" section 7.2 itself describes the region below 128 as.
+ *
+ * A single-step increment lands on a value RplSequenceCompare() still
+ * judges "newer" than what it replaced at every boundary regardless of
+ * which of the two wrap rules applies (traced in design-constraints.md
+ * section 37.6/37.7), which is why the plain, unwrapped `++` this module's
+ * DTSN and DODAG Version Number both still use elsewhere gets away with
+ * it for as long as their own updates stay single-step. It stops holding
+ * once a real gap can open between two increments of the *same* counter --
+ * a relay outage, or a burst of parent flapping -- and the next comparison
+ * has to relate two values on opposite sides of the boundary rather than
+ * two adjacent ones; whichever counter that comparison actually happens
+ * against needs the true RFC wrap to stay correctly ordered across it.
+ *
+ * @param value the counter's current value
+ * @return the counter's value after one RFC-correct increment
+ */
+inline uint8_t
+RplSequenceIncrement(uint8_t value)
+{
+    return value == RPL_SEQUENCE_LINEAR_REGION - 1 ? 0 : static_cast<uint8_t>(value + 1);
+}
+
 /// Routing Header type 3 (RFC 6554).
 constexpr uint8_t RPL_RH_TYPE_SRH = 3;
 

@@ -2129,8 +2129,14 @@ RplRoutingProtocol::SendNoPathDao(DodagMembership& dodag, Ipv6Address viaParent)
     // still has to advance, the same as any other DAO with new information
     // (RFC 6550 section 9.3 rule 1) -- this is what lets the receiver tell
     // an in-flight withdrawal apart from a stale, reordered copy of the
-    // advertisement it is withdrawing.
-    dao.SetTransitInformation(parent, ++dodag.pathSequence, 0);
+    // advertisement it is withdrawing. RplSequenceIncrement(), not a plain
+    // ++, since this counter's own comparisons (RplSequenceCompare()) can
+    // span a real gap -- not just the adjacent single steps a plain
+    // wraparound increment stays correct across -- once two updates for
+    // the same target are separated by an outage or a burst of parent
+    // flapping (@see RplSequenceIncrement()'s own doc comment).
+    dodag.pathSequence = RplSequenceIncrement(dodag.pathSequence);
+    dao.SetTransitInformation(parent, dodag.pathSequence, 0);
 
     Ptr<Packet> packet = Create<Packet>();
     packet->AddHeader(dao);
@@ -3436,7 +3442,9 @@ RplRoutingProtocol::SelectPreferredParent(DodagMembership& dodag)
         // root about it. The path sequence is what lets the root tell the new
         // report from the one the old parent may still be relaying. Not for
         // an AODV-RPL instance, which sends no DAOs at all (@see SendDao()).
-        dodag.pathSequence++;
+        // RplSequenceIncrement(), not a plain ++: @see SendNoPathDao()'s own
+        // matching comment, and RplSequenceIncrement()'s own doc comment.
+        dodag.pathSequence = RplSequenceIncrement(dodag.pathSequence);
         dodag.daoEvent.Cancel();
         dodag.daoEvent.Schedule(Seconds(m_jitter->GetValue(0.0, 1.0)));
     }

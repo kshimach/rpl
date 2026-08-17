@@ -6646,3 +6646,76 @@ FAILすることを確認(load-bearing検証)、元に戻して再度PASSを確�
 `./ns3 build`(rplモジュール・プロジェクト全体とも)、
 `test-runner --suite=rpl`を複数回実行して安定PASSを確認。
 既存の全テスト(§54-56で追加したものを含む)はPASS。
+
+## 58. §57で意図的に別増分へ回したPath SequenceのRFC §7.2境界ラップを修正
+
+### 58.1 問題
+
+RFC 6550 section 7.2 rule 2: "When a sequence counter increment would
+cause the sequence counter to increment beyond its maximum value, the
+sequence counter MUST wrap back to zero. When incrementing a sequence
+counter greater than or equal to 128, the maximum value is 255. When
+incrementing a sequence counter less than 128, the maximum value is
+127." — circular領域(0-127)とlinear領域(128-255)で「最大値」が
+異なり、ラップ地点も異なる。既存の`dodag.pathSequence`の2箇所の
+インクリメント(`SendNoPathDao()`・`SelectPreferredParent()`)は
+いずれも素朴な`uint8_t`の`++`で、255→0のlinear側の境界は(unsigned
+overflowにより)たまたま正しく動くが、circular側の127→0という境界は
+再現されず、127→128とlinear領域へそのまま踏み込んでしまっていた。
+
+§37.6で既にこの単純増分の採用理由が記録されている:
+「`RplSequenceCompare()`のwindow(16)が単発の+1増分を全ての境界で
+正しく"newer"と判定することをコード上でトレース済み」— これは
+**隣接する1ステップだけを比較する限りは事実正しい**が、同じ
+カウンタの2回の更新の間に本物の間隔が開いた場合(リレーの一時的な
+断絶、短期間でのparent切り替えの連続等)に破綻する。§7.2 rule
+3.1はcircular領域とlinear領域を非対称に扱うため、本来circular
+領域内に留まるべき値がバグにより誤ってlinear領域へ踏み込むと、
+「このノードは最近再起動した」という誤ったシグナルを他ノードへ
+伝えてしまう。
+
+### 58.2 修正
+
+`model/rpl-conf.h`に`RplSequenceIncrement()`を新設 — 現在値が127
+(=`RPL_SEQUENCE_LINEAR_REGION - 1`)ならば0へ、それ以外は通常の
+`+1`(255の場合は`uint8_t`のunsigned overflowにより自然に0へ)を
+返す、RFC準拠の1関数。`dodag.pathSequence`の2箇所の増分箇所を
+これに置き換えた。
+
+**スコープを意図的にPath Sequenceのみへ限定**: DTSN
+(`dodag->dtsn++`)・DODAG Version Number(`dodag.version++`)も
+同じ素朴な`++`パターンを使っており、理論上は同じ境界バグを
+共有しているが、ユーザーの明示的な指示によりPath Sequenceのみを
+今回の対象とした。DTSN/Versionへの適用は別増分として意図的に
+見送っている — `RplSequenceIncrement()`自体は汎用ヘルパーとして
+実装したため、いつでも横展開できる。
+
+`dodag.pathSequence`の初期値(既定`0`)自体はRFC section 7.2
+rule 1の推奨値("128以上、推奨値240")からは外れているが、rule
+1は"SHOULD"であり、かつ初期値がcircular領域内であること自体は
+`RplSequenceIncrement()`の正しさに影響しないため、これも今回の
+スコープ外とした。
+
+### 58.3 新規テスト
+
+`RplSequenceIncrementTestCase`: 通常の1ステップ(circular・linear
+各領域)、circular境界(126→127は無風、127→0はラップ)、linear境界
+(254→255は無風、255→0はラップ、既存のunsigned overflowと一致する
+ことの確認)を直接検証。加えて、120から10回インクリメント
+(127を1度ラップして2に到達)した結果が正しく`2`になること、その
+値が元の`120`より`RplSequenceNewer()`で正しく"newer"と判定される
+ことを確認 — もし素朴な`++`のままだったら結果は`130`(linear領域)
+になり、本来ただのcircular領域の通常値であるはずが「再起動した
+ノード」という誤ったセマンティクスを持ってしまうことをコメントで
+明記した。
+
+load-bearing検証: `RplSequenceIncrement()`の実装を素朴な`++`に
+一時的に戻したところ、このテストが明確にFAILすることを確認
+(127→0が127→128になる境界のアサーションで検出)、元に戻して
+再度PASSを確認。
+
+### 58.4 検証
+
+`./ns3 build`(rplモジュール・プロジェクト全体とも)、
+`test-runner --suite=rpl`を複数回実行して安定PASSを確認。
+既存の全テスト(§54-57で追加したものを含む)はPASS。

@@ -18052,6 +18052,89 @@ RplSequenceCounterTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief RplSequenceIncrement() wraps a lollipop sequence counter at the
+ *        boundary RFC 6550 section 7.2 rule 2 actually specifies for
+ *        whichever region it is currently in -- 127 for the circular
+ *        region, 255 for the linear one -- rather than a plain `uint8_t`
+ *        increment's single wrap at 255 for both.
+ *
+ * Found by an independent /protocol-test-matrix audit (@see
+ * design-constraints.md section 57.2 item 6's own sibling finding, and
+ * section 58): every Path Sequence increment in this module used a plain
+ * `++` before this, which happens to still compare correctly for a single
+ * adjacent step at any boundary (@see design-constraints.md section 37.6),
+ * but permanently mis-files a value that should have wrapped back into the
+ * circular region as a linear-region ("just restarted") one instead --
+ * section 7.2 rule 3.1 treats the two regions asymmetrically, so this is
+ * not a cosmetic difference.
+ */
+class RplSequenceIncrementTestCase : public TestCase
+{
+  public:
+    RplSequenceIncrementTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplSequenceIncrementTestCase::RplSequenceIncrementTestCase()
+    : TestCase("Lollipop sequence counter increment wraps within its own region")
+{
+}
+
+void
+RplSequenceIncrementTestCase::DoRun()
+{
+    // An ordinary step, nowhere near either boundary, in each region.
+    NS_TEST_ASSERT_MSG_EQ(+RplSequenceIncrement(10), 11, "an ordinary circular-region step");
+    NS_TEST_ASSERT_MSG_EQ(+RplSequenceIncrement(200), 201, "an ordinary linear-region step");
+
+    // Rule 2: "When incrementing a sequence counter less than 128, the
+    // maximum value is 127" -- the circular region wraps to 0 one step
+    // early, at 127, not at 255 the way a plain uint8_t increment would.
+    NS_TEST_ASSERT_MSG_EQ(+RplSequenceIncrement(126),
+                          127,
+                          "the last ordinary step before the circular region's own boundary");
+    NS_TEST_ASSERT_MSG_EQ(+RplSequenceIncrement(127),
+                          0,
+                          "the circular region did not wrap back to 0 at its own boundary (127), "
+                          "instead carrying through into the linear region at 128");
+
+    // Rule 2: "When incrementing a sequence counter greater than or equal
+    // to 128, the maximum value is 255" -- unaffected by the fix, since a
+    // plain increment already wraps 255 back to 0 correctly on its own.
+    NS_TEST_ASSERT_MSG_EQ(+RplSequenceIncrement(254), 255, "the last step in the linear region");
+    NS_TEST_ASSERT_MSG_EQ(+RplSequenceIncrement(255), 0, "the linear region's own boundary wrap");
+
+    // The consequence the wrong wrap point produces: a node whose Path
+    // Sequence has been incrementing normally for a while (starting below
+    // 127, long enough to approach it) must still compare as *more
+    // circular-region* Path Sequences arrive, not suddenly read as if it
+    // had just restarted. Simulates 10 ordinary increments starting at
+    // 120 -- correctly wrapping once through 127 -- and confirms the
+    // result still lands in the circular region, comparing correctly
+    // against a stale value from before the run.
+    uint8_t value = 120;
+    for (int i = 0; i < 10; i++)
+    {
+        value = RplSequenceIncrement(value);
+    }
+    NS_TEST_ASSERT_MSG_EQ(+value,
+                          2,
+                          "10 increments from 120, wrapping once at 127, should land on 2");
+    NS_TEST_ASSERT_MSG_EQ(RplSequenceNewer(value, 120),
+                          true,
+                          "10 real increments away was not recognised as newer than the "
+                          "original value -- had these used a plain ++ instead, the result "
+                          "(130) would have permanently misrepresented this node as having "
+                          "just restarted (RFC 6550 section 7.2 rule 3.1's own linear-region "
+                          "semantics), rather than remaining an ordinary circular-region value");
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Check that a DODAG Version Number wrapping past its maximum is read
  *        as the increment it is, and that a genuinely older one is still
  *        rejected.
@@ -18753,6 +18836,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplPacketInfoMalformedTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplPacketInfoProcessTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplSequenceCounterTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplSequenceIncrementTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplVersionWrapTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplStaleDaoTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplInfiniteLifetimeDaoTestCase, TestCase::Duration::QUICK);
