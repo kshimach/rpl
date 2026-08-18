@@ -7576,8 +7576,9 @@ load-bearing検証: クランプを一時的に除去したところ、この
   §65.1で言及したもう1つの経路(section 8.2.2.4のバージョン変更
   rejoin)は未テスト。修正自体はJoinDodag()の1箇所で両経路が
   共有するため構造的には妥当と見られるが、将来rejoin経路だけを
-  特別扱いする変更が入った場合に検出できない — 低優先度の
-  カバレッジ欠如として次回に持ち越し。
+  特別扱いする変更が入った場合に検出できない —
+  `RplRejoinWithoutDagConfigurationTestCase`として後続セッションで
+  追加、load-bearing検証済み(@see §68)。
 - **角5(移行漏れ)**: `SelectPreferredParent()`の「最後のparentを
   失った」分岐内、`m_disTimer.Cancel()+Schedule()`が同じ無条件
   cancel-and-rearm形状を持つが、再トリガーには
@@ -7690,3 +7691,30 @@ load-bearing検証: ガード(`dodag.parents.find(...) != end()`)を
 `./ns3 build`(rplモジュール・プロジェクト全体とも)、
 `test-runner --suite=rpl`、`./test.py -s rpl`を実行し、
 既存129件+新規1件=130件全てが安定PASS(3.6秒前後)することを確認。
+
+## 68. §66.4角4のrejoin経路カバレッジ欠如を解消
+
+§65の`dioIntervalMin`デフォルト値修正は、`JoinDodag()`を呼ぶ2つの
+経路(初回join、section 8.2.2.4のバージョン変更rejoin)の両方を
+1箇所の修正でカバーする設計だが、`RplJoinWithoutDagConfigurationTestCase`
+(§65)は初回join経路しか検証していなかった。
+
+`RplRejoinWithoutDagConfigurationTestCase`を新設: 通常formation
+(DAG Configuration付きの本物のDIOで初回join、健全な
+`dioIntervalMin`を既に保持した状態を作る)の後、DAG Configuration
+オプションを持たない、バージョン番号だけ1つ進めたDIOを注入し、
+`HandleDio()`の`LeaveDodag()`+`JoinDodag()`rejoin分岐を狙って
+発火させる。rejoin成立と、その後5秒間のDIO送信件数が僅少に収まる
+ことを確認する。
+
+load-bearing検証: `dioIntervalMin`のデフォルト初期化子を一時的に
+除去したところ、このテストを含むスイート全体が実測でハング
+(watchdog強制終了)することを確認 — §65が塞いだのと同一のTrickle
+無限ループが、rejoin経路からも確かに到達可能で、かつ確かに修正で
+塞がれていることを直接確証した。元に戻して全件PASSを再確認。
+
+### 68.1 検証
+
+`./ns3 build`(rplモジュール・プロジェクト全体とも)、
+`test-runner --suite=rpl`、`./test.py -s rpl`を実行し、
+既存130件+新規1件=131件全てが安定PASS(3.6秒前後)することを確認。

@@ -19142,6 +19142,169 @@ RplStaleAndSwitchCoincideTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief `RplJoinWithoutDagConfigurationTestCase`'s own fix -- a default
+ *        member initializer on DodagMembership::dioIntervalMin -- also
+ *        covers the OTHER path that reaches JoinDodag() without a DAG
+ *        Configuration option: a version-change rejoin, not only a
+ *        node's very first join.
+ *
+ * `HandleDio()` calls `JoinDodag()` from two places: the `!existing`
+ * branch (a brand new join) and, separately, `LeaveDodag()` followed by
+ * `JoinDodag()` again when a DIO's DODAGVersionNumber is a lollipop-newer
+ * one than what this node already has (RFC 6550 section 8.2.2.4). Both
+ * share the exact same `JoinDodag()` body, so the fix (a single default
+ * member initializer) almost certainly covers both -- but nothing in the
+ * suite exercised the rejoin path specifically with a config-less DIO
+ * until this test, so a future change that special-cased the rejoin
+ * branch (e.g. skipping re-deriving dioIntervalMin on the theory that
+ * "it was already set from before") could silently reintroduce a variant
+ * of the lockup for version-change rejoins only, undetected.
+ */
+class RplRejoinWithoutDagConfigurationTestCase : public TestCase
+{
+  public:
+    RplRejoinWithoutDagConfigurationTestCase();
+
+  private:
+    void DoRun() override;
+
+    /**
+     * @brief Count a DIO sent by the child.
+     * @param socket the monitoring socket
+     */
+    void RecordDio(Ptr<Socket> socket);
+
+    uint32_t m_dioCount{0}; //!< DIOs observed from the child
+};
+
+RplRejoinWithoutDagConfigurationTestCase::RplRejoinWithoutDagConfigurationTestCase()
+    : TestCase("A version-change rejoin via a DIO without a DAG Configuration option also "
+              "leaves the Trickle interval at a sane default")
+{
+}
+
+void
+RplRejoinWithoutDagConfigurationTestCase::RecordDio(Ptr<Socket> socket)
+{
+    Ptr<Packet> packet = socket->Recv();
+    while (packet)
+    {
+        Ipv6Header ipv6Header;
+        if (packet->RemoveHeader(ipv6Header) != 0)
+        {
+            Icmpv6Header icmpv6Header;
+            if (packet->RemoveHeader(icmpv6Header) != 0 &&
+                icmpv6Header.GetType() == ICMPV6_RPL && icmpv6Header.GetCode() == RPL_CODE_DIO)
+            {
+                m_dioCount++;
+            }
+        }
+        packet = socket->Recv();
+    }
+}
+
+void
+RplRejoinWithoutDagConfigurationTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2); // 0 = root, 1 = child
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    rplHelper.Set("DioIntervalMin", TimeValue(MilliSeconds(256)));
+    rplHelper.Set("DioIntervalDoublings", UintegerValue(2));
+
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Ptr<Node> rootNode = nodes.Get(0);
+    Ptr<Node> childNode = nodes.Get(1);
+
+    Ptr<Socket> dioMonitor = Socket::CreateSocket(rootNode, Ipv6RawSocketFactory::GetTypeId());
+    dioMonitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    dioMonitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    dioMonitor->BindToNetDevice(rootNode->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+    dioMonitor->SetRecvCallback(
+        MakeCallback(&RplRejoinWithoutDagConfigurationTestCase::RecordDio, this));
+
+    // Ordinary formation first: the child joins via the root's own real
+    // DIO, which (like every DIO this module itself sends) carries a DAG
+    // Configuration option -- so by the time the rejoin below happens, the
+    // child already has a legitimate, non-default dioIntervalMin, making
+    // this genuinely a rejoin-path check, not indistinguishable from
+    // RplJoinWithoutDagConfigurationTestCase's own first-join one.
+    Simulator::Stop(Seconds(2));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> child = childNode->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(child->IsJoined(), true, "The child never joined the DODAG");
+
+    Ipv6Address rootLinkLocal =
+        rootNode->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address childLinkLocal =
+        childNode->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address dodagId = child->GetDodagId();
+
+    // A strictly newer DODAGVersionNumber than the real root's own
+    // starting one (every RplHelper-formed root in this suite begins at
+    // version 0, RFC 6550 section 7.2's lollipop rule, well clear of the
+    // wrap), spoofed as if from the real root but with no DAG
+    // Configuration option at all -- forces HandleDio()'s
+    // LeaveDodag()+JoinDodag() rejoin path specifically, not the
+    // first-join one.
+    RplDioHeader rejoin;
+    rejoin.SetInstanceId(RPL_DEFAULT_INSTANCE);
+    rejoin.SetVersionNumber(1);
+    rejoin.SetRank(RPL_MIN_HOPRANKINC);
+    rejoin.SetMop(RPL_MOP_NON_STORING);
+    rejoin.SetDodagId(dodagId);
+    DeliverRawRplMessage(childNode, 1, rejoin, static_cast<uint8_t>(RPL_CODE_DIO), rootLinkLocal,
+                        childLinkLocal);
+
+    NS_TEST_ASSERT_MSG_EQ(child->IsJoined(),
+                          true,
+                          "The child did not rejoin via the version-bumped, "
+                          "DAG-Configuration-less DIO");
+
+    // The same style of bound RplJoinWithoutDagConfigurationTestCase uses:
+    // reaching this Stop()/Run() at all, and seeing only a small handful
+    // of DIOs, is what rules out the rejoin path leaving dioIntervalMin at
+    // Time(0) the way the first-join path used to.
+    uint32_t dioCountBefore = m_dioCount;
+    Simulator::Stop(Seconds(5));
+    Simulator::Run();
+    uint32_t dioCountAfter = m_dioCount - dioCountBefore;
+
+    NS_TEST_ASSERT_MSG_LT_OR_EQ(dioCountAfter,
+                                5,
+                                "The child sent " << dioCountAfter << " DIOs in 5 s after "
+                                                   << "rejoining via a config-less version "
+                                                      "bump -- consistent with a Trickle "
+                                                      "interval far below its own configured "
+                                                      "Imin");
+
+    dioMonitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Check the neighbour freshness rule: a neighbour heard once is a
  *        candidate parent only while nothing better-established is
  *        available, and stops being one as soon as another neighbour has
@@ -21069,6 +21232,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplJoinWithoutDagConfigurationTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDagConfigurationExponentOverflowTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplStaleAndSwitchCoincideTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplRejoinWithoutDagConfigurationTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplComputeSourceRouteFailureTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplMrhofSelectionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplMrhofHysteresisBoundaryTestCase, TestCase::Duration::QUICK);
