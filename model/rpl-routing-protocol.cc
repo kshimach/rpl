@@ -1791,8 +1791,30 @@ RplRoutingProtocol::JoinDodag(const RplDioHeader& dio, uint32_t interface)
         dodag.ocp = dio.GetOcp();
         dodag.minHopRankIncrease = dio.GetMinHopRankIncrease();
         dodag.maxRankIncrease = dio.GetMaxRankIncrease();
-        dodag.dioIntervalMin = MilliSeconds(int64_t(1) << dio.GetIntervalMin());
-        dodag.dioIntervalDoublings = dio.GetIntervalDoublings();
+        // DIOIntervalMin/DIOIntervalDoublings are each a raw wire byte
+        // (0-255, RFC 6550 section 6.7.6 imposes no range of its own) fed
+        // directly as a shift exponent below and, for Doublings, again in
+        // SelectPreferredParent()'s own Imax computation and in
+        // RplTrickleTimer::SetParameters() -- an unclamped value >= 64 is
+        // undefined behaviour, and even a value as small as 63 (shifting a
+        // 1 into a signed 64-bit type's own sign bit) deterministically
+        // produces a negative Time on real (two's complement) hardware.
+        // Confirmed by this fix's own load-bearing check: reverting the
+        // clamp and delivering a single DIO with DIOIntervalMin =
+        // DIOIntervalDoublings = 63 hung the whole simulator (100% CPU,
+        // never returning) rather than cleanly asserting -- one malformed
+        // or adversarial DIO's DAG Configuration option is enough to lock
+        // up the process, no timing race required (@see
+        // RplDagConfigurationExponentOverflowTestCase). Clamped once,
+        // here, at the one place these wire bytes enter dodag's own
+        // trusted state, so every downstream consumer inherits the safety
+        // @see RPL_DIO_INTERVAL_EXPONENT_MAX's own doc comment for the
+        // bound's derivation.
+        uint8_t intervalMinExponent =
+            std::min(dio.GetIntervalMin(), RPL_DIO_INTERVAL_EXPONENT_MAX);
+        dodag.dioIntervalMin = MilliSeconds(int64_t(1) << intervalMinExponent);
+        dodag.dioIntervalDoublings =
+            std::min(dio.GetIntervalDoublings(), RPL_DIO_INTERVAL_EXPONENT_MAX);
         dodag.dioRedundancy = dio.GetRedundancy();
 
         if (dodag.ocp != RPL_OCP_OF0 && dodag.ocp != RPL_OCP_MRHOF)

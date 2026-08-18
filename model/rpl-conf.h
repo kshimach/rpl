@@ -265,6 +265,19 @@ constexpr uint8_t RPL_HDR_OPT_FWD_ERR = 0x20;  //!< 'F' flag
 constexpr uint8_t RPL_DIO_INTERVAL_MIN = 12;      //!< Imin = 2^12 ms = 4.096 s
 constexpr uint8_t RPL_DIO_INTERVAL_DOUBLINGS = 8; //!< Imax = Imin << 8 ~= 17.5 min
 constexpr uint8_t RPL_DIO_REDUNDANCY = 0;         //!< k = 0 disables suppression
+
+/// DIOIntervalMin and DIOIntervalDoublings (RFC 6550 section 6.7.6) are each
+/// an unconstrained wire byte (0-255), consumed as the shift-exponent
+/// operand of `int64_t(1) << exponent` when converting to a Time -- a
+/// shift by >= 64 is undefined behaviour, and even a shift comfortably
+/// under 64 can overflow once the result is also multiplied by
+/// MilliSeconds()'s own ~1e6 (2^20) nanosecond scale and, for
+/// DIOIntervalDoublings specifically, multiplied again by the DODAG's
+/// already-computed Imin. Clamping each exponent to this bound keeps their
+/// *sum* (the worst case, Imax) safely under 63 bits even after that
+/// double scaling, while still permitting an Imin or Imax far longer than
+/// any real deployment would use (2^20 ms is already about 12.4 days).
+constexpr uint8_t RPL_DIO_INTERVAL_EXPONENT_MAX = 20;
 constexpr uint16_t RPL_MIN_HOPRANKINC = 128;
 constexpr uint16_t RPL_MAX_RANKINC = 8 * RPL_MIN_HOPRANKINC;
 constexpr uint16_t RPL_SIGNIFICANT_CHANGE_THRESHOLD = 4 * RPL_MIN_HOPRANKINC;

@@ -18781,6 +18781,162 @@ RplJoinWithoutDagConfigurationTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief A DAG Configuration option's DIOIntervalMin/DIOIntervalDoublings
+ *        (RFC 6550 section 6.7.6, each an unconstrained wire byte) do not
+ *        crash or hang the simulator when a joining/rejoining DIO carries
+ *        an out-of-range value.
+ *
+ * `JoinDodag()` fed both fields, unclamped, straight into
+ * `int64_t(1) << exponent` -- undefined behaviour for an exponent >= 64,
+ * and even an in-range-looking exponent of exactly 63 (shifting a 1 into
+ * a signed 64-bit type's own sign bit) deterministically produces a
+ * negative `Time` on real (two's complement) hardware. Confirmed by this
+ * fix's own load-bearing check: reverting the clamp and delivering a DIO
+ * with DIOIntervalMin = DIOIntervalDoublings = 63 hung the whole
+ * simulator (100% CPU, never returning) rather than cleanly asserting --
+ * a single malformed or adversarial DIO's DAG Configuration option is
+ * therefore enough to lock up the process, no timing race required,
+ * needing a hard kill to recover. (An exponent >= 64, e.g. 100, is
+ * genuinely unpredictable rather than reliably bad: on this toolchain
+ * the shift amount is masked modulo 64, so 100 behaves as 36 and stays
+ * harmless -- 63 is the value that actually exercises the failure.)
+ */
+class RplDagConfigurationExponentOverflowTestCase : public TestCase
+{
+  public:
+    RplDagConfigurationExponentOverflowTestCase();
+
+  private:
+    void DoRun() override;
+
+    /**
+     * @brief Count a DIO sent by the child.
+     * @param socket the monitoring socket
+     */
+    void RecordDio(Ptr<Socket> socket);
+
+    uint32_t m_dioCount{0}; //!< DIOs observed from the child
+};
+
+RplDagConfigurationExponentOverflowTestCase::RplDagConfigurationExponentOverflowTestCase()
+    : TestCase("A DAG Configuration option's out-of-range DIOIntervalMin or DIOIntervalDoublings "
+              "does not crash or hang the simulator")
+{
+}
+
+void
+RplDagConfigurationExponentOverflowTestCase::RecordDio(Ptr<Socket> socket)
+{
+    Ptr<Packet> packet = socket->Recv();
+    while (packet)
+    {
+        Ipv6Header ipv6Header;
+        if (packet->RemoveHeader(ipv6Header) != 0)
+        {
+            Icmpv6Header icmpv6Header;
+            if (packet->RemoveHeader(icmpv6Header) != 0 &&
+                icmpv6Header.GetType() == ICMPV6_RPL && icmpv6Header.GetCode() == RPL_CODE_DIO)
+            {
+                m_dioCount++;
+            }
+        }
+        packet = socket->Recv();
+    }
+}
+
+void
+RplDagConfigurationExponentOverflowTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2); // 0 = root (unused past supplying a DODAGID), 1 = child
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    Ipv6Address dodagId("2001:1::1");
+    Ptr<Node> rootNode = nodes.Get(0);
+    Ptr<Node> childNode = nodes.Get(1);
+    Ipv6Address rootLinkLocal =
+        rootNode->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address childLinkLocal =
+        childNode->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    Ptr<Socket> dioMonitor = Socket::CreateSocket(rootNode, Ipv6RawSocketFactory::GetTypeId());
+    dioMonitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    dioMonitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    dioMonitor->BindToNetDevice(rootNode->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+    dioMonitor->SetRecvCallback(
+        MakeCallback(&RplDagConfigurationExponentOverflowTestCase::RecordDio, this));
+
+    Simulator::Stop(Seconds(1));
+    Simulator::Run();
+
+    // 63, not some larger out-of-range value: shifting a 1 into a signed
+    // 64-bit type's own sign bit (exponent 63) deterministically produces
+    // INT64_MIN on real (two's complement) hardware, i.e. a negative Time
+    // -- an exponent >= 64 is instead genuinely unpredictable (some
+    // toolchains mask the shift amount modulo 64, e.g. 100 -> effectively
+    // 36, which stays positive and would not exercise the failure this
+    // test means to catch at all).
+    RplDioHeader dio;
+    dio.SetInstanceId(RPL_DEFAULT_INSTANCE);
+    dio.SetVersionNumber(0);
+    dio.SetRank(RPL_MIN_HOPRANKINC);
+    dio.SetMop(RPL_MOP_NON_STORING);
+    dio.SetDodagId(dodagId);
+    dio.SetDagConfiguration(63,
+                            63,
+                            RPL_DIO_REDUNDANCY,
+                            RPL_MAX_RANKINC,
+                            RPL_MIN_HOPRANKINC,
+                            RPL_OCP_OF0,
+                            RPL_DEFAULT_LIFETIME,
+                            RPL_DEFAULT_LIFETIME_UNIT);
+    DeliverRawRplMessage(childNode, 1, dio, static_cast<uint8_t>(RPL_CODE_DIO), rootLinkLocal,
+                        childLinkLocal);
+
+    Ptr<RplRoutingProtocol> child = childNode->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(child->IsJoined(),
+                          true,
+                          "The child never joined via the out-of-range DAG Configuration DIO");
+
+    // Reaching this Stop()/Run() at all -- rather than hanging the way the
+    // unclamped code genuinely does for this exact input, confirmed above
+    // -- is most of what this test checks. The clamp
+    // (RPL_DIO_INTERVAL_EXPONENT_MAX = 20) still leaves a very long Imin,
+    // so no more than a couple of DIOs are expected in 5 s -- the same
+    // style of bound RplJoinWithoutDagConfigurationTestCase uses.
+    Simulator::Stop(Seconds(5));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_LT_OR_EQ(m_dioCount,
+                                5,
+                                "The child sent " << m_dioCount << " DIOs in 5 s after joining "
+                                                   << "via an out-of-range DAG Configuration -- "
+                                                      "consistent with the clamp not actually "
+                                                      "engaging");
+
+    dioMonitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Check the neighbour freshness rule: a neighbour heard once is a
  *        candidate parent only while nothing better-established is
  *        available, and stops being one as soon as another neighbour has
@@ -20706,6 +20862,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplDtsnRapidBumpCoalescedTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplParentSwitchRapidBumpCoalescedTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplJoinWithoutDagConfigurationTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplDagConfigurationExponentOverflowTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplComputeSourceRouteFailureTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplMrhofSelectionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplMrhofHysteresisBoundaryTestCase, TestCase::Duration::QUICK);

@@ -7480,3 +7480,128 @@ watchdogで強制終了)。元に戻して再度全件PASSを確認。
 `./ns3 build`(rplモジュール・プロジェクト全体とも)、
 `test-runner --suite=rpl`、`./test.py -s rpl`を実行し、
 既存127件+新規1件=128件全てが安定PASS(3.5秒前後)することを確認。
+
+## 66. `/protocol-test-matrix`による`9bdff64`(§64・§65)の監査
+
+コミット`9bdff64`(§64のparent switch側`daoRefreshPending`拡張、
+§65の`dioIntervalMin`デフォルト値修正)を対象に5角監査を実施。
+角2(境界値)・角3(異常系)が独立に同一の重大な既存バグを発見し、
+角3が実際にクラッシュ相当の実害まで確証した。角1(正常系)は
+別の実在する非攻撃的バグ(通常運用でも起きる二重withdrawal)を
+発見。角4(シーケンス状態遷移)・角5(移行漏れ)は軽微な指摘に
+留まった。
+
+### 66.1 発見: `DIOIntervalMin`/`DIOIntervalDoublings`が未検証のまま
+シフト演算の指数として使われていた(角2・角3、CONFIRMED)
+
+`RplDioHeader::GetIntervalMin()`/`GetIntervalDoublings()`
+(RFC 6550 section 6.7.6のDAG Configurationオプションが運ぶ、
+生の1バイトフィールド、0-255)が、`JoinDodag()`
+(`rpl-routing-protocol.cc`旧1794行目)で一切の範囲検証なしに
+`int64_t(1) << exponent`のシフト指数として直接使われていた。
+C++規格上、シフト量が左オペランドの型幅(`int64_t`なら64)以上は
+未定義動作。さらに指数63(符号ビットへの1のシフト)は、64未満
+であっても実機(二の補数)上では決定論的に`INT64_MIN`(負の
+`Time`)を生成する。
+
+この`dodag.dioIntervalDoublings`は`JoinDodag()`でも同様に未検証の
+まま格納され、`SelectPreferredParent()`(旧3381行目、
+`maxInterval`計算)で*毎回のDIO処理のたびに*再度シフト演算に
+使われる — つまり一度汚染されたDODAGメンバーシップは、以後
+処理する全てのDIOで繰り返しこの未定義動作を踏み続ける。
+
+**実害の確証**: 修正を一時的に無効化し、`DIOIntervalMin` =
+`DIOIntervalDoublings` = 63を持つDAG Configurationオプション付き
+DIOを1つ注入したところ、シミュレータ全体がCPU使用率100%のまま
+一切応答を返さなくなることを実測で確認した(バックグラウンド
+watchdogで強制終了)。悪意ある、あるいは単に壊れた1個のDIOだけで
+プロセス全体をロックできる — タイミング競合を一切必要とせず、
+§65が塞いだ`Time(0)`ロックアップより発見・悪用ともに容易。
+(指数100のような64以上の値は、このツールチェーンではシフト量が
+64で剰余される実装依存の挙動により`1<<36`相当になり無害化される
+— 実際に未定義動作の実害を再現するには63のような64未満の値が
+必要だった。)
+
+### 66.2 修正
+
+`rpl-conf.h`に`RPL_DIO_INTERVAL_EXPONENT_MAX = 20`を新設(2^20ms
+= 約12.4日、現実的などんな運用より遥かに長く、かつ
+`MilliSeconds()`自身のスケール変換や`SelectPreferredParent()`側の
+二重乗算と合算しても63ビットに収まる安全域)。`JoinDodag()`が
+DAG Configurationオプションから`dodag`自身の信頼済み状態へ値を
+取り込む、まさにその1箇所で`std::min(生値, 上限)`によりクランプ
+し、以後の全ての消費箇所(`SelectPreferredParent()`、
+`RplTrickleTimer::SetParameters()`)が自動的に安全になるよう
+した。
+
+### 66.3 新規テストと load-bearing 検証
+
+`RplDagConfigurationExponentOverflowTestCase`: `DIOIntervalMin`=
+`DIOIntervalDoublings`=63を持つDAG ConfigurationオプションDIOを
+`DeliverRawRplMessage()`でchildへ直接注入し、join成立と、その後
+5秒間のDIO送信件数が僅少に収まることを確認する。
+
+load-bearing検証: クランプを一時的に除去したところ、この
+テストを含むスイート全体が実測でハング(watchdog強制終了)する
+ことを確認、元に戻して全件PASSを再確認。
+
+### 66.4 他の角の指摘 — 検証未完了、または対応不要と判定
+
+- **角1(正常系)**: `SelectPreferredParent()`内、staleness sweep
+  (stale化した現preferred parentを`SendNoPathDao()`送信の上で
+  `dodag.parents`から削除するが、`dodag.preferredParent`自体は
+  リセットしない)と、その直後の通常の parent switch 分岐
+  (`oldPreferredParent = dodag.preferredParent`を再度捕捉し、
+  勝者が変われば再度`SendNoPathDao()`)が、同一の
+  `SelectPreferredParent()`呼び出し内で連続発火した場合、同じ
+  相手へのNo-Path DAOが二重送信され、`pathSequence`も想定より
+  多くインクリメントされる — 攻撃者不要、現preferred parentが
+  単に無応答になり同時に別候補が現れるという通常運用シナリオで
+  再現しうる。§64自身が新設したコメント(「oldPreferredParentは
+  この時点でまだdodag.parentsに残っている」)がこのケースでは
+  実際には誤り。CONFIRMED相当の裏付けだが、検証エージェントの
+  実プローブ実行はセッション利用上限(セッション使用量上限の
+  到達、リセット14:20 JST)により未完了。実害は「無駄なパケット
+  送信+シーケンス番号の余分な進み」でRFC違反ではないため優先度は
+  中 — 次回セッションでの修正候補として持ち越し。
+- **角1・角3**: `dioIntervalMin`のフォールバックデフォルトが
+  ノード自身の`m_dioIntervalMin`属性ではなくハードコードされた
+  `RPL_DIO_INTERVAL_MIN`定数である点 — 検証エージェントが実プローブで
+  メカニズム自体は確認したが、同じ構造体の兄弟フィールド
+  (`ocp`/`minHopRankIncrease`/`maxRankIncrease`)も同様にハード
+  コード定数を使う既存の設計方針と一致しており、かつこの属性
+  自体が「rootのみが使う、非rootは常にDAG Configurationオプション
+  から学習する」という明示的な既存ドキュメントと整合するため、
+  新規の欠陥ではなく既存方針の踏襲と判断 — 対応不要。
+- **角4(シーケンス状態遷移)**: `RplJoinWithoutDagConfigurationTestCase`
+  は初回join経路のみを検証しており、design-constraints.md自身が
+  §65.1で言及したもう1つの経路(section 8.2.2.4のバージョン変更
+  rejoin)は未テスト。修正自体はJoinDodag()の1箇所で両経路が
+  共有するため構造的には妥当と見られるが、将来rejoin経路だけを
+  特別扱いする変更が入った場合に検出できない — 低優先度の
+  カバレッジ欠如として次回に持ち越し。
+- **角5(移行漏れ)**: `SelectPreferredParent()`の「最後のparentを
+  失った」分岐内、`m_disTimer.Cancel()+Schedule()`が同じ無条件
+  cancel-and-rearm形状を持つが、再トリガーには
+  `LeaveDodag()`(メンバーシップ全体の消去)を伴う完全なrejoin
+  サイクルが毎回必要という点、および影響が「DIS送信の遅延」に
+  留まり(他ノードの通常DIOで受動的に再joinできるため完全な
+  rejoin不能ではない)という点から、§64の`daoEvent`livelockほど
+  深刻ではないと角5自身が判定 — 検証エージェントの実プローブは
+  セッション利用上限により未完了のため、低優先度の要調査項目として
+  記録するに留める。
+- **角3(`SendNoPathDao()`の増幅)**: parent switch毎に無条件送信
+  される`SendNoPathDao()`(non-storing modeではrootまで複数ホップ
+  中継される)が、攻撃者の強制switch回数に比例した実トラフィックを
+  生む点 — 検証の結果、これはコミット`9bdff64`自身が新規に
+  導入したものではなく(修正前から無条件だった)、かつ
+  design-constraints.md第64.1節が既に「なぜ意図的に無条件のまま
+  残すか」を明記済みであるため、PLAUSIBLEではあるが対応不要
+  (RFCが要求する正当なwithdrawalであり、レート制限を課すことは
+  古い経路の陳腐化という別の正しさの問題を再導入する)と判定。
+
+### 66.5 検証
+
+`./ns3 build`(rplモジュール・プロジェクト全体とも)、
+`test-runner --suite=rpl`、`./test.py -s rpl`を実行し、
+既存128件+新規1件=129件全てが安定PASS(3.3秒前後)することを確認。
