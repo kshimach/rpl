@@ -1769,7 +1769,9 @@ No-Path DAO が root に届いていることを確認する。poisoning を
 対象としており、Trickle アルゴリズム本体 (RFC 6206)、目的関数の数値規定
 (RFC 6552 OF0 / RFC 6719 MRHOF)、および RFC 6550 のうち rank 制約と
 DTSN まわりは対象外だった。今回そこを原文と突き合わせた結果を記録する。
-**いずれも今回は修正しておらず、既知の乖離として残している。**
+**いずれも今回は修正しておらず、既知の乖離として残している**
+(25.2・25.3・25.5・25.6 は後日 26/28 節で解消済み、25.7 の優先度付けと
+併せて参照。25.4 のみ方針判断待ちで現在も未解消 — @see 25.7)。
 
 ### 25.1 準拠を確認できたもの
 
@@ -1788,7 +1790,7 @@ DTSN まわりは対象外だった。今回そこを原文と突き合わせた
 - **RFC 6719 の `ALLOW_FLOATING_ROOT` 0 相当**: floating root になる
   経路を持たないので、推奨値 0 と等価。
 
-### 25.2 乖離: RFC 6550 8.2.2.4 rule 3 の DAGMaxRankIncrease が未適用 (MUST)
+### 25.2 乖離: RFC 6550 8.2.2.4 rule 3 の DAGMaxRankIncrease が未適用 (MUST、**26.1節の通り対応済み**)
 
 > Let L be the lowest Rank within a DODAG Version that a given node has
 > advertised. Within the same DODAG Version, that node MUST NOT advertise
@@ -1807,7 +1809,15 @@ RPL でこの制約は、ノードが際限なく rank を上げ続ける
 塞いだループはいずれも「親選択の時点で」防ぐ仕組みであり、この rule 3
 は「広告する rank の側で」歯止めをかけるもので、役割が重なっていない。
 
-### 25.3 乖離: RFC 6550 9.6 節の DTSN 処理が未実装 (MUST 2 件)
+**追記(後日)**: `lowestRankThisVersion`(L)の追跡と
+`DAGMaxRankIncrease`によるクランプは26.1節で実装した。ただし
+この検出側だけでは不十分で、Lをリセットする回復側(グローバル修復)が
+別途必要であることが37節で判明し、37.6節で`GlobalRepairInterval`を
+実装したが、37.7-37.9節の実測で密なトポロジでは効果が測定できない
+ことも分かっている — 検出側は対応済みだが、回復側は37.10節の通り
+現在も未解決の残課題。
+
+### 25.3 乖離: RFC 6550 9.6 節の DTSN 処理が未実装 (MUST 2 件、**26.2節の通り対応済み**)
 
 > 1. If a node hears one of its DAO parents increment its DTSN, the node
 >    MUST schedule a DAO message transmission ...
@@ -1824,6 +1834,13 @@ DTSN を上げて sub-DODAG 全体の DAO 更新をトリガーしても、本�
 ノードは反応しない。非 storing mode では DTSN の increment が
 sub-DODAG 全体へ伝播する設計なので、本実装のノードがいる枝から先は
 更新が止まる。
+
+**追記(後日)**: rule 1・2 とも26.2節で実装した(検出・自身のDTSN
+インクリメント・DAO再送のスケジューリング)。その後61節でRFC 6550
+section 7.2のlollipop境界ラップに対応、63節でこのDAO再送トリガーに
+レート制限の欠如によるlivelockが見つかり`daoRefreshPending`機構で
+修正、64節で同機構をparent switch側にも拡張、と複数回の増分監査を
+経て現在に至る。
 
 ### 25.4 乖離: RFC 6552 の step_of_rank が既定値と異なる (範囲内、MUST 違反ではない)
 
@@ -1861,7 +1878,7 @@ root に近く見え、親として選ばれやすくなる。DAGMaxRankIncrease
 
 いずれも境界 1 単位の差で、SHOULD/MAY 条項のため違反ではない。
 
-### 25.6 乖離: MRHOF 3.2.2 rule 4 の cur_min_path_cost (MUST、実害なし)
+### 25.6 乖離: MRHOF 3.2.2 rule 4 の cur_min_path_cost (MUST、実害なし、**26.4節の通り対応済み**)
 
 > If ALLOW_FLOATING_ROOT is 0 and no neighbors are discovered, the node
 > does not have a preferred parent and MUST set cur_min_path_cost to
@@ -4779,11 +4796,16 @@ Phase 1の4象限監査を実施した。
   §38で追加済みで、RFC原文どおりに書かれていることは確認済みだが、
   「S=1を見た後、改善するはずのDIOが実際に拒否される」ことを直接
   観測するテストは書いていない。時間都合により次回の監査対象として
-  持ち越す。
+  持ち越す。**(後日対応済み)**: `RplP2pSoleTargetViaOptionStopsTestCase`
+  (test/rpl-test-suite.cc) が、S=1後の repeat DIO が
+  already-answered として黙って無視されることを直接検証している。
 - **異常系: 未知のDodagKey宛てP2P-DRO-ACKの静かな破棄**、
   **異常系: `isTarget=false`または既にACK済みの状態でのACK重複到達**
   — いずれもコードレビューでは正しく `return` されることを確認済み
-  だが、専用のプローブ/テストは無い。
+  だが、専用のプローブ/テストは依然として無い(2026年時点で確認、
+  `RplP2pDroAckWrongSequenceTestCase`は別のシナリオ[誤ったSequence
+  Number]を検証するテストで、この2件はカバーしていない) —
+  引き続き未対応の残課題。
 
 ### 40.4 検証
 
