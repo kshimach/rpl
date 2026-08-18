@@ -7559,11 +7559,9 @@ load-bearing検証: クランプを一時的に除去したところ、この
   単に無応答になり同時に別候補が現れるという通常運用シナリオで
   再現しうる。§64自身が新設したコメント(「oldPreferredParentは
   この時点でまだdodag.parentsに残っている」)がこのケースでは
-  実際には誤り。CONFIRMED相当の裏付けだが、検証エージェントの
-  実プローブ実行はセッション利用上限(セッション使用量上限の
-  到達、リセット14:20 JST)により未完了。実害は「無駄なパケット
-  送信+シーケンス番号の余分な進み」でRFC違反ではないため優先度は
-  中 — 次回セッションでの修正候補として持ち越し。
+  実際には誤り。検証エージェントの実プローブ実行はセッション利用
+  上限により未完了だったが、後続セッションで自分で検証・修正した
+  (@see §67)。
 - **角1・角3**: `dioIntervalMin`のフォールバックデフォルトが
   ノード自身の`m_dioIntervalMin`属性ではなくハードコードされた
   `RPL_DIO_INTERVAL_MIN`定数である点 — 検証エージェントが実プローブで
@@ -7605,3 +7603,90 @@ load-bearing検証: クランプを一時的に除去したところ、この
 `./ns3 build`(rplモジュール・プロジェクト全体とも)、
 `test-runner --suite=rpl`、`./test.py -s rpl`を実行し、
 既存128件+新規1件=129件全てが安定PASS(3.3秒前後)することを確認。
+
+## 67. §66.4で持ち越したstaleness sweepとparent switchの二重withdrawal送信を修正
+
+§66角1の指摘 — セッション利用上限で検証未完了だったもの — を
+後続セッションで自分で検証・修正した。
+
+### 67.1 問題の実体
+
+`SelectPreferredParent()`冒頭のstaleness sweep(RFC 6550の「2回連続で
+announcementを聞き逃したら相手が消えたとみなす」規則)が、stale化した
+現preferred parentを`dodag.parents`から削除する際、その相手宛てに
+`SendNoPathDao()`を送信する — が、`dodag.preferredParent`自体は
+リセットしない。その直後、通常のparent switch分岐が
+`oldPreferredParent = dodag.preferredParent`を再度捕捉し(まだ
+sweep前の値、つまり今しがた削除された同じアドレス)、別候補が
+勝者になった場合(`parentChanged`)、同じ相手へ**2回目の**
+`SendNoPathDao()`を送信していた。攻撃者は不要 — 現preferred parent
+が単に無応答になったタイミングで、たまたま別の候補が同じ
+`SelectPreferredParent()`呼び出し内で勝つという、通常運用でも
+起こりうる巡り合わせで再現する。
+
+このコードが自ら新設していたコメント(「oldPreferredParentは
+この時点でまだdodag.parentsに残っている(このswitch理由は
+それを削除しない)」)は、まさにこの巡り合わせのケースでは誤り
+だった — staleness sweepという「別のswitch理由」が同一呼び出し内で
+先に削除している。
+
+### 67.2 修正方針
+
+同じ関数内、数行上にある`best.IsAny()`分岐(「最後のparentを
+失った」ケース)は既に同種のガード
+(`dodag.parents.find(dodag.preferredParent) != dodag.parents.end()`)
+を持っており、そのコメント自身も「staleness sweepが既にこの
+アドレスを消して独自にwithdrawal済みかもしれない」ことを正しく
+認識していた。通常のparent switch分岐にも同一パターンのガードを
+追加:
+
+```cpp
+if (!oldPreferredParent.IsAny() &&
+    dodag.parents.find(oldPreferredParent) != dodag.parents.end())
+{
+    SendNoPathDao(dodag, oldPreferredParent);
+}
+```
+
+`pathSequence`のインクリメント自体は無条件のまま変更していない —
+これは「今回のこのswitch」自身の新しいpreferred parentへの
+再広告を表すものであり、withdrawalが二重送信されたかどうかとは
+無関係に、switchの度に進むべきもの。
+
+### 67.3 新規テストとload-bearing検証
+
+`RplStaleAndSwitchCoincideTestCase`: 3ノード構成(root, oldParent,
+child)。まず通常formationで全員参加させ、その後
+`DeliverRawRplMessage()`でoldParentを騙った低rankのDIOを注入して
+childのpreferred parentをoldParentへ強制切替、続けて
+`SimpleChannel::BlackList()`でoldParent→child方向を恒常的に遮断
+(oldParent自身の通常のTrickle送信がchildに届かなくなり、実際に
+stale化できるようにする — 一時的なon/off切替ではなく恒常的な
+遮断のみを使う、`.claude/skills/ns3-debug-pitfalls`が警告する
+「トグル型注入」の落とし穴を踏まない設計)。staleness閾値
+(`2*maxInterval`=400ms、`DioIntervalMin`=100ms/`Doublings`=1で
+構成)を超えて待ち、root自身の次のDIO到達が
+staleness-sweep-and-switchの巡り合わせを引き起こすのを待って、
+rootへ届くNo-Path DAO件数が正確に1件であることを確認する。
+
+開発中、当初は`noPathDaoCountAfter`が2(修正済みのはず)になり
+一見load-bearing検証が失敗して見えたが、原因は修正の不備ではなく
+テスト自身の設計ミスだった: `DeliverRawRplMessage()`による強制
+switch注入(child自身がroot→oldParentへ切替、rootへの正当な
+withdrawal)は`Simulator::Schedule()`を介さない同期呼び出しである
+一方、`SimpleChannel`経由のパケット配送自体はスケジュールされる
+(即座には完了しない)ため、注入直後に取ったbeforeカウントの
+時点ではまだこの正当なwithdrawalが配送(観測)されておらず、
+後続のafterカウント側に紛れ込んでいた。注入後に短い
+`Simulator::Stop(MilliSeconds(1)); Simulator::Run();`を挟んで
+配送を確定させてからbeforeカウントを取るよう修正し解決。
+
+load-bearing検証: ガード(`dodag.parents.find(...) != end()`)を
+一時的に除去したところ、このテストが実測2件(期待1件)で
+明確にFAILすることを確認、元に戻して再度PASSを確認。
+
+### 67.4 検証
+
+`./ns3 build`(rplモジュール・プロジェクト全体とも)、
+`test-runner --suite=rpl`、`./test.py -s rpl`を実行し、
+既存129件+新規1件=130件全てが安定PASS(3.6秒前後)することを確認。

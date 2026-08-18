@@ -18937,6 +18937,211 @@ RplDagConfigurationExponentOverflowTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief A preferred parent that goes stale at the exact moment a
+ *        different candidate wins is withdrawn with exactly one No-Path
+ *        DAO, not two.
+ *
+ * `SelectPreferredParent()`'s own staleness sweep (RFC 6550's "two missed
+ * announcements" rule) and its ordinary parent-switch block can both run
+ * within one call: if the current preferred parent has gone stale, the
+ * sweep erases it and sends its own withdrawal -- but does not reset
+ * `dodag.preferredParent` itself. If a different candidate then wins in
+ * the very same call, the switch block's own `SendNoPathDao()` call,
+ * guarded only by `!oldPreferredParent.IsAny()`, fired a second,
+ * duplicate withdrawal for the exact same already-withdrawn address (its
+ * own comment's claim that "this switch reason never erases
+ * oldPreferredParent" does not hold in this specific coincidence). No
+ * attacker is needed: an ordinary parent simply going silent (RFC 6550
+ * imposes no minimum DIO rate a node must sustain) at the moment a better
+ * neighbour is heard is enough. The fix mirrors the existing
+ * best.IsAny() branch's own guard a few lines up: check the address is
+ * still actually in dodag.parents before withdrawing it a second time.
+ */
+class RplStaleAndSwitchCoincideTestCase : public TestCase
+{
+  public:
+    RplStaleAndSwitchCoincideTestCase();
+
+  private:
+    void DoRun() override;
+
+    /**
+     * @brief Count a No-Path DAO (Path Lifetime 0) landing at root.
+     * @param socket the monitoring socket
+     */
+    void RecordNoPathDao(Ptr<Socket> socket);
+
+    uint32_t m_noPathDaoCount{0}; //!< No-Path DAOs observed at the root
+};
+
+RplStaleAndSwitchCoincideTestCase::RplStaleAndSwitchCoincideTestCase()
+    : TestCase("A preferred parent that goes stale exactly as a better one is heard is "
+              "withdrawn once, not twice")
+{
+}
+
+void
+RplStaleAndSwitchCoincideTestCase::RecordNoPathDao(Ptr<Socket> socket)
+{
+    Ptr<Packet> packet = socket->Recv();
+    while (packet)
+    {
+        Ipv6Header ipv6Header;
+        if (packet->RemoveHeader(ipv6Header) != 0)
+        {
+            Icmpv6Header icmpv6Header;
+            if (packet->RemoveHeader(icmpv6Header) != 0 &&
+                icmpv6Header.GetType() == ICMPV6_RPL && icmpv6Header.GetCode() == RPL_CODE_DAO)
+            {
+                RplDaoHeader dao;
+                if (packet->RemoveHeader(dao) != 0 && dao.GetPathLifetime() == 0)
+                {
+                    m_noPathDaoCount++;
+                }
+            }
+        }
+        packet = socket->Recv();
+    }
+}
+
+void
+RplStaleAndSwitchCoincideTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(3); // 0 = root, 1 = oldParent (forced stale), 2 = child
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    // Small and few doublings: maxInterval = 100 ms * 2^1 = 200 ms, so the
+    // "two missed announcements" staleness threshold (2 * maxInterval) is
+    // 400 ms -- short enough to reach deterministically within a short
+    // Simulator::Run() window, while still comfortably longer than any
+    // single Trickle interval so root's own real, unblocked DIOs never
+    // themselves go stale in the meantime.
+    rplHelper.Set("DioIntervalMin", TimeValue(MilliSeconds(100)));
+    rplHelper.Set("DioIntervalDoublings", UintegerValue(1));
+
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Ptr<Node> rootNode = nodes.Get(0);
+    Ptr<Node> oldParentNode = nodes.Get(1);
+    Ptr<Node> childNode = nodes.Get(2);
+
+    Ptr<Socket> daoMonitor = Socket::CreateSocket(rootNode, Ipv6RawSocketFactory::GetTypeId());
+    daoMonitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    daoMonitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    daoMonitor->BindToNetDevice(rootNode->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+    daoMonitor->SetRecvCallback(
+        MakeCallback(&RplStaleAndSwitchCoincideTestCase::RecordNoPathDao, this));
+
+    Simulator::Stop(Seconds(3));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> child = childNode->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(child->IsJoined(), true, "The child never joined the DODAG");
+
+    Ipv6Address rootLinkLocal =
+        rootNode->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address childLinkLocal =
+        childNode->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address oldParentLinkLocal =
+        oldParentNode->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address dodagId = child->GetDodagId();
+
+    // Forces the child onto oldParent as preferred parent: oldParent is a
+    // real, already-joined node (@see the class's own doc comment for why
+    // a fabricated address that resolves to nobody cannot stand in here --
+    // its own natural DAO/withdrawal traffic has to actually reach root),
+    // but its own genuine advertised rank (one hop below root) would never
+    // win on its own, so this spoofs a claimed Rank that does, via the
+    // same DeliverRawRplMessage() pattern (and for the same reason)
+    // RplParentSwitchRapidBumpCoalescedTestCase's own burst uses.
+    RplDioHeader forceSwitch;
+    forceSwitch.SetInstanceId(RPL_DEFAULT_INSTANCE);
+    forceSwitch.SetVersionNumber(0);
+    forceSwitch.SetRank(1);
+    forceSwitch.SetMop(RPL_MOP_NON_STORING);
+    forceSwitch.SetDodagId(dodagId);
+    DeliverRawRplMessage(childNode, 1, forceSwitch, static_cast<uint8_t>(RPL_CODE_DIO),
+                        oldParentLinkLocal, childLinkLocal);
+
+    NS_TEST_ASSERT_MSG_EQ(child->GetPreferredParent(),
+                          oldParentLinkLocal,
+                          "The spoofed low-rank DIO did not make oldParent the preferred parent");
+
+    // This switch's own withdrawal (child's self-advertisement moving off
+    // root) was only sent synchronously above, inside
+    // DeliverRawRplMessage()'s own call to Receive() -- delivery over
+    // SimpleChannel is scheduled, not immediate, so it does not actually
+    // reach root's monitor socket until an event loop tick processes it.
+    // Settling here, before the noPathDaoCount baseline just below,
+    // is what keeps that expected, unrelated withdrawal out of the delta
+    // this test actually measures.
+    Simulator::Stop(MilliSeconds(1));
+    Simulator::Run();
+
+    // A standing (not toggled) one-directional block: oldParent's own,
+    // otherwise-unaffected Trickle-driven DIOs can no longer reach the
+    // child from this point on, letting it actually go stale rather than
+    // being kept fresh by oldParent's own ordinary periodic traffic.
+    // Nothing else is blacklisted -- root's own DIOs keep arriving
+    // normally, which is what eventually drives the coinciding
+    // SelectPreferredParent() call this test means to force.
+    Ptr<SimpleNetDevice> oldParentDevice = DynamicCast<SimpleNetDevice>(devices.Get(1));
+    Ptr<SimpleNetDevice> childDevice = DynamicCast<SimpleNetDevice>(devices.Get(2));
+    channel->BlackList(oldParentDevice, childDevice);
+
+    uint32_t noPathDaoCountBefore = m_noPathDaoCount;
+
+    // Comfortably past the 400 ms staleness threshold computed above, but
+    // short enough that this stays a fast, deterministic test: once
+    // root's own next unblocked DIO arrives after oldParent has been
+    // silent (to the child) for over 400 ms, that single
+    // HandleDio()->SelectPreferredParent() call has to run the staleness
+    // sweep (erasing oldParent, sending withdrawal #1) and the ordinary
+    // switch to root (parentChanged, since root is now the only
+    // candidate) together.
+    Simulator::Stop(Seconds(1));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(child->GetPreferredParent(),
+                          rootLinkLocal,
+                          "The child did not fall back to root after oldParent went stale -- "
+                          "the coinciding staleness-and-switch scenario this test means to "
+                          "force never actually happened");
+
+    uint32_t noPathDaoCountAfter = m_noPathDaoCount - noPathDaoCountBefore;
+    NS_TEST_ASSERT_MSG_EQ(noPathDaoCountAfter,
+                          1,
+                          "oldParent going stale at the same moment root won produced "
+                              << noPathDaoCountAfter
+                              << " No-Path DAOs for it, not the expected 1 -- consistent with "
+                                 "the staleness sweep's own withdrawal and the ordinary "
+                                 "switch block's withdrawal both firing for the same address");
+
+    daoMonitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Check the neighbour freshness rule: a neighbour heard once is a
  *        candidate parent only while nothing better-established is
  *        available, and stops being one as soon as another neighbour has
@@ -20863,6 +21068,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplParentSwitchRapidBumpCoalescedTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplJoinWithoutDagConfigurationTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDagConfigurationExponentOverflowTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplStaleAndSwitchCoincideTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplComputeSourceRouteFailureTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplMrhofSelectionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplMrhofHysteresisBoundaryTestCase, TestCase::Duration::QUICK);

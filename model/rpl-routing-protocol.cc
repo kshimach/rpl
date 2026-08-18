@@ -3680,10 +3680,22 @@ RplRoutingProtocol::SelectPreferredParent(DodagMembership& dodag)
         // below, the same ordering the other three call sites already
         // rely on to keep the withdrawal's Path Sequence strictly behind
         // the following re-advertisement's (@see SendNoPathDao()'s own
-        // doc comment) -- oldPreferredParent is still in dodag.parents
-        // at this point (this switch reason never erases it), so
-        // resolving an interface/address for it still succeeds.
-        if (!oldPreferredParent.IsAny())
+        // doc comment).
+        //
+        // The existence check mirrors the best.IsAny() branch's own one a
+        // few lines up (@see its own comment): despite this comment's
+        // earlier claim that "this switch reason never erases
+        // oldPreferredParent", it can -- the staleness sweep at the very
+        // top of this same function may have already erased this exact
+        // address (and already sent its own withdrawal for it) earlier in
+        // this very call, if it happened to be both stale and the
+        // preferred parent, coincident with a different candidate winning
+        // below. Without this check, that ordinary (no attacker required)
+        // coincidence sent a second, duplicate No-Path DAO for an address
+        // already withdrawn (@see design-constraints.md's own account of
+        // this fix).
+        if (!oldPreferredParent.IsAny() &&
+            dodag.parents.find(oldPreferredParent) != dodag.parents.end())
         {
             SendNoPathDao(dodag, oldPreferredParent);
         }
