@@ -14096,6 +14096,498 @@ RplP2pDroAckWrongSequenceTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief A P2P-DRO-ACK naming a temporary DAG this node has no membership
+ *        for is silently dropped, not mistaken for one this node actually
+ *        has a pending P2P-DRO-ACK for.
+ *
+ * HandleP2pDroAck()'s very first check, `m_dodags.find(DodagKey{...})`,
+ * was confirmed correct by code review when design-constraints.md section
+ * 40.3 was first written, but nothing had actually delivered an ack for
+ * an unrecognised DodagKey to confirm it. Same two-node construction and
+ * verification style as RplP2pDroAckWrongSequenceTestCase (@see its own
+ * doc comment): an ack for a completely different (InstanceId, DODAGID)
+ * pair, one this node was never part of, must not disturb the real
+ * pending cycle.
+ *
+ * Not load-bearing verified by reverting the production guard itself:
+ * `m_dodags.find()` returning `end()` and the code falling through
+ * anyway would dereference that iterator, undefined behaviour rather
+ * than a clean, observable test failure -- disproportionate risk for
+ * what amounts to a standard existence check. Verified instead by
+ * temporarily pointing this test's own "unknown" ack at the real
+ * (InstanceId, origin) pair and confirming the assertion below then
+ * correctly fails (m_droCount stuck at 1, the retry wrongly cancelled)
+ * -- proof this test's own observable actually discriminates accepted
+ * from rejected, restored before committing.
+ */
+class RplP2pDroAckUnknownDodagTestCase : public TestCase
+{
+  public:
+    RplP2pDroAckUnknownDodagTestCase();
+
+  private:
+    void DoRun() override;
+
+    /// @brief Count each P2P-DRO seen at the monitor.
+    /// @param socket the monitoring socket
+    void CaptureDro(Ptr<Socket> socket);
+
+    uint32_t m_droCount{0}; //!< how many times node 1 has sent a P2P-DRO
+};
+
+RplP2pDroAckUnknownDodagTestCase::RplP2pDroAckUnknownDodagTestCase()
+    : TestCase("A P2P-DRO-ACK naming an unrecognised temporary DAG is dropped, not mistaken "
+              "for the one actually pending")
+{
+}
+
+void
+RplP2pDroAckUnknownDodagTestCase::CaptureDro(Ptr<Socket> socket)
+{
+    Address sender;
+    Ptr<Packet> packet = socket->RecvFrom(sender);
+    if (!packet)
+    {
+        return;
+    }
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ipv6Header);
+    Icmpv6Header icmpv6Header;
+    packet->RemoveHeader(icmpv6Header);
+    if (icmpv6Header.GetType() != ICMPV6_RPL || icmpv6Header.GetCode() != RPL_CODE_P2P_DRO)
+    {
+        return;
+    }
+    m_droCount++;
+}
+
+void
+RplP2pDroAckUnknownDodagTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    rplHelper.Set("P2pDroAckWaitTime", TimeValue(MilliSeconds(100)));
+    rplHelper.Set("P2pDroMaxRetransmissions", UintegerValue(2));
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.AssignWithoutAddress(devices);
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    Ptr<Node> node = nodes.Get(1);
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoined(), true, "The base DODAG did not reach node 1");
+
+    Ptr<SimpleNetDevice> dev0 = DynamicCast<SimpleNetDevice>(devices.Get(0));
+    Ptr<SimpleNetDevice> dev1 = DynamicCast<SimpleNetDevice>(devices.Get(1));
+    channel->BlackList(dev0, dev1);
+
+    Ptr<Socket> monitor = Socket::CreateSocket(nodes.Get(0), Ipv6RawSocketFactory::GetTypeId());
+    monitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    monitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    monitor->BindToNetDevice(nodes.Get(0)->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+    monitor->SetRecvCallback(MakeCallback(&RplP2pDroAckUnknownDodagTestCase::CaptureDro, this));
+
+    Ipv6Address origin("2001:9::1"); // no real node owns this address
+    Ipv6Address neighbour("fe80::a");
+    static constexpr uint8_t INSTANCE = 0x81;
+
+    RplDioHeader dio;
+    dio.SetInstanceId(INSTANCE);
+    dio.SetVersionNumber(0);
+    dio.SetRank(RPL_MIN_HOPRANKINC);
+    dio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+    dio.SetGrounded(true);
+    dio.SetDodagId(origin);
+    dio.SetDtsn(0);
+    dio.SetDagConfiguration(4, 6, 0, 0, RPL_MIN_HOPRANKINC, RPL_OCP_OF0, RPL_DEFAULT_LIFETIME,
+                            RPL_DEFAULT_LIFETIME_UNIT);
+    P2pRdoOption rdo;
+    rdo.reply = true;
+    rdo.hopByHop = false;
+    rdo.numRoutes = 0;
+    rdo.lifetime = 2;
+    rdo.maxRankOrNh = 3;
+    rdo.target = rpl->GetGlobalAddress(); // node 1 is the Target
+    rdo.addressVector = {};
+    dio.SetP2pRdo(rdo);
+
+    DeliverRawRplMessage<RplDioHeader>(node,
+                                       1,
+                                       dio,
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       neighbour,
+                                       Ipv6Address(RPL_ALL_NODES_MULTICAST));
+
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsP2pTarget(INSTANCE, origin),
+                          true,
+                          "The node did not recognise itself as the Target");
+
+    Simulator::Stop(MilliSeconds(10));
+    Simulator::Run();
+    NS_TEST_ASSERT_MSG_EQ(m_droCount, 1, "The first P2P-DRO was not sent");
+
+    // An ack for a temporary DAG this node was never part of: a different
+    // InstanceId *and* a different DODAGID, so it cannot collide with the
+    // real (INSTANCE, origin) key by accident.
+    RplP2pDroAckHeader unknownAck;
+    unknownAck.SetInstanceId(static_cast<uint8_t>(INSTANCE + 1));
+    unknownAck.SetSequence(1);
+    unknownAck.SetDodagId(Ipv6Address("2001:9::2"));
+    DeliverRawRplMessage<RplP2pDroAckHeader>(node,
+                                             1,
+                                             unknownAck,
+                                             static_cast<uint8_t>(RPL_CODE_P2P_DRO_ACK),
+                                             neighbour,
+                                             rpl->GetGlobalAddress());
+
+    // Same margin and same reasoning as RplP2pDroAckWrongSequenceTestCase's
+    // own: if the unknown-DodagKey ack had (incorrectly) been applied to
+    // the real, pending cycle instead of being dropped for its own
+    // unrecognised key, the retries below would not happen.
+    Simulator::Stop(Seconds(0.5));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(m_droCount,
+                          3,
+                          "The unknown-DodagKey P2P-DRO-ACK disturbed the real pending cycle: "
+                          "the Target should have retried both times by now, exactly as if no "
+                          "ack for its own cycle had arrived at all");
+
+    monitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief A second, duplicate P2P-DRO-ACK for a cycle already acknowledged
+ *        does not restart it or trigger a fresh P2P-DRO.
+ *
+ * HandleP2pDroAck()'s `!dodag.p2p.droAckPending` check (the other half of
+ * the same `if` design-constraints.md section 40.3 flagged as
+ * code-reviewed but untested, alongside `!dodag.p2p.isTarget` -- @see
+ * RplP2pDroAckNotTargetTestCase for that half) exists for exactly this:
+ * a retransmitted or duplicated ack arriving after the real one already
+ * cancelled the retry timer. Same construction as
+ * RplP2pDroAckWrongSequenceTestCase, but this time the *correct* sequence
+ * is delivered twice.
+ *
+ * Not load-bearing verified: reverting this specific check (dropping the
+ * `!dodag.p2p.droAckPending` half of the guard) does not change this
+ * test's own observable at all. What that half's absence would let
+ * through -- `droRetryEvent.Cancel()` on a Timer that was never
+ * (re)armed, `droAckPending = false` on a flag already false -- are both
+ * themselves safe no-ops (Timer::Cancel() is unconditionally safe on an
+ * unscheduled EventId, confirmed by reading its own implementation), and
+ * neither one sends a packet or flips any state this test can see from
+ * outside. The assertion below still stands as regression coverage for a
+ * *different* future bug (anything that made receiving a second ack
+ * actually trigger a fresh send), just not as proof this exact guard
+ * matters -- the same kind of observationally-inert change
+ * design-constraints.md section 62.3 documents for daoSequence.
+ */
+class RplP2pDroAckDuplicateTestCase : public TestCase
+{
+  public:
+    RplP2pDroAckDuplicateTestCase();
+
+  private:
+    void DoRun() override;
+
+    /// @brief Count each P2P-DRO seen at the monitor.
+    /// @param socket the monitoring socket
+    void CaptureDro(Ptr<Socket> socket);
+
+    uint32_t m_droCount{0}; //!< how many times node 1 has sent a P2P-DRO
+};
+
+RplP2pDroAckDuplicateTestCase::RplP2pDroAckDuplicateTestCase()
+    : TestCase("A duplicate P2P-DRO-ACK for an already-acknowledged cycle does not restart it")
+{
+}
+
+void
+RplP2pDroAckDuplicateTestCase::CaptureDro(Ptr<Socket> socket)
+{
+    Address sender;
+    Ptr<Packet> packet = socket->RecvFrom(sender);
+    if (!packet)
+    {
+        return;
+    }
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ipv6Header);
+    Icmpv6Header icmpv6Header;
+    packet->RemoveHeader(icmpv6Header);
+    if (icmpv6Header.GetType() != ICMPV6_RPL || icmpv6Header.GetCode() != RPL_CODE_P2P_DRO)
+    {
+        return;
+    }
+    m_droCount++;
+}
+
+void
+RplP2pDroAckDuplicateTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    rplHelper.Set("P2pDroAckWaitTime", TimeValue(MilliSeconds(100)));
+    rplHelper.Set("P2pDroMaxRetransmissions", UintegerValue(2));
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.AssignWithoutAddress(devices);
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    Ptr<Node> node = nodes.Get(1);
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoined(), true, "The base DODAG did not reach node 1");
+
+    Ptr<SimpleNetDevice> dev0 = DynamicCast<SimpleNetDevice>(devices.Get(0));
+    Ptr<SimpleNetDevice> dev1 = DynamicCast<SimpleNetDevice>(devices.Get(1));
+    channel->BlackList(dev0, dev1);
+
+    Ptr<Socket> monitor = Socket::CreateSocket(nodes.Get(0), Ipv6RawSocketFactory::GetTypeId());
+    monitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    monitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    monitor->BindToNetDevice(nodes.Get(0)->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+    monitor->SetRecvCallback(MakeCallback(&RplP2pDroAckDuplicateTestCase::CaptureDro, this));
+
+    Ipv6Address origin("2001:9::1"); // no real node owns this address
+    Ipv6Address neighbour("fe80::a");
+    static constexpr uint8_t INSTANCE = 0x81;
+
+    RplDioHeader dio;
+    dio.SetInstanceId(INSTANCE);
+    dio.SetVersionNumber(0);
+    dio.SetRank(RPL_MIN_HOPRANKINC);
+    dio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+    dio.SetGrounded(true);
+    dio.SetDodagId(origin);
+    dio.SetDtsn(0);
+    dio.SetDagConfiguration(4, 6, 0, 0, RPL_MIN_HOPRANKINC, RPL_OCP_OF0, RPL_DEFAULT_LIFETIME,
+                            RPL_DEFAULT_LIFETIME_UNIT);
+    P2pRdoOption rdo;
+    rdo.reply = true;
+    rdo.hopByHop = false;
+    rdo.numRoutes = 0;
+    rdo.lifetime = 2;
+    rdo.maxRankOrNh = 3;
+    rdo.target = rpl->GetGlobalAddress(); // node 1 is the Target
+    rdo.addressVector = {};
+    dio.SetP2pRdo(rdo);
+
+    DeliverRawRplMessage<RplDioHeader>(node,
+                                       1,
+                                       dio,
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       neighbour,
+                                       Ipv6Address(RPL_ALL_NODES_MULTICAST));
+
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsP2pTarget(INSTANCE, origin),
+                          true,
+                          "The node did not recognise itself as the Target");
+
+    Simulator::Stop(MilliSeconds(10));
+    Simulator::Run();
+    NS_TEST_ASSERT_MSG_EQ(m_droCount, 1, "The first P2P-DRO was not sent");
+
+    RplP2pDroAckHeader correctAck;
+    correctAck.SetInstanceId(INSTANCE);
+    correctAck.SetSequence(1);
+    correctAck.SetDodagId(origin);
+
+    // The real ack: legitimately cancels the retry.
+    DeliverRawRplMessage<RplP2pDroAckHeader>(node,
+                                             1,
+                                             correctAck,
+                                             static_cast<uint8_t>(RPL_CODE_P2P_DRO_ACK),
+                                             neighbour,
+                                             rpl->GetGlobalAddress());
+
+    // A duplicate of the exact same ack, as a retransmission or a stray
+    // copy might arrive: droAckPending is already false by this point, so
+    // this must be dropped too, not misread as still-outstanding.
+    DeliverRawRplMessage<RplP2pDroAckHeader>(node,
+                                             1,
+                                             correctAck,
+                                             static_cast<uint8_t>(RPL_CODE_P2P_DRO_ACK),
+                                             neighbour,
+                                             rpl->GetGlobalAddress());
+
+    // Long enough for both retries to have fired if either ack (or their
+    // combination) had failed to actually cancel the cycle.
+    Simulator::Stop(Seconds(0.5));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(m_droCount,
+                          1,
+                          "The duplicate P2P-DRO-ACK triggered "
+                              << (m_droCount - 1)
+                              << " unexpected retransmission(s) -- consistent with the second, "
+                                 "already-acknowledged ack being mistaken for a fresh cycle");
+
+    monitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief A P2P-DRO-ACK delivered to a router that relayed a P2P mode DIO
+ *        without itself being the Target is silently dropped, not
+ *        mistaken for an ack this router is actually waiting on.
+ *
+ * The other half of HandleP2pDroAck()'s `!dodag.p2p.isTarget ||
+ * !dodag.p2p.droAckPending` check design-constraints.md section 40.3
+ * flagged as code-reviewed but untested (@see
+ * RplP2pDroAckDuplicateTestCase for the droAckPending half). An ordinary
+ * intermediate router -- one that processed and re-flooded a P2P mode DIO
+ * without matching the Target itself, RFC 6997 section 9.4 -- has a real
+ * DodagMembership for the temporary DAG (so the unknown-DodagKey guard
+ * RplP2pDroAckUnknownDodagTestCase covers would not fire), but
+ * dodag.p2p.isTarget stays false and it never calls SendP2pDro() (only
+ * an actual Target does), so droAckPending is naturally also false --
+ * this test's job is confirming the isTarget check specifically does not
+ * crash or misbehave should an ack still be misdirected there, not
+ * isolating it from droAckPending's own equally-false state (the two
+ * cannot be pulled apart under this module's own invariants, since
+ * nothing sets droAckPending true without isTarget already being true).
+ *
+ * Not load-bearing verified, for the same reason as
+ * RplP2pDroAckDuplicateTestCase (@see its own doc comment): dropping the
+ * `!dodag.p2p.isTarget` half of the guard falls through to the same two
+ * safe no-ops, and IsP2pTarget()'s own answer is computed and stored
+ * entirely by HandleP2pRdo() -- HandleP2pDroAck() never touches it -- so
+ * this test's assertion cannot move either way regardless of whether
+ * this specific check is present.
+ */
+class RplP2pDroAckNotTargetTestCase : public TestCase
+{
+  public:
+    RplP2pDroAckNotTargetTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplP2pDroAckNotTargetTestCase::RplP2pDroAckNotTargetTestCase()
+    : TestCase("A P2P-DRO-ACK misdirected to a non-Target relay is silently dropped")
+{
+}
+
+void
+RplP2pDroAckNotTargetTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.AssignWithoutAddress(devices);
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    Ptr<Node> node = nodes.Get(1);
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoined(), true, "The base DODAG did not reach node 1");
+
+    Ipv6Address origin("2001:9::1"); // no real node owns this address
+    Ipv6Address neighbour("fe80::a");
+    Ipv6Address someoneElse("2001:9::99"); // the actual Target -- not node 1
+    static constexpr uint8_t INSTANCE = 0x81;
+
+    RplDioHeader dio;
+    dio.SetInstanceId(INSTANCE);
+    dio.SetVersionNumber(0);
+    dio.SetRank(RPL_MIN_HOPRANKINC);
+    dio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+    dio.SetGrounded(true);
+    dio.SetDodagId(origin);
+    dio.SetDtsn(0);
+    dio.SetDagConfiguration(4, 6, 0, 0, RPL_MIN_HOPRANKINC, RPL_OCP_OF0, RPL_DEFAULT_LIFETIME,
+                            RPL_DEFAULT_LIFETIME_UNIT);
+    P2pRdoOption rdo;
+    rdo.reply = true;
+    rdo.hopByHop = false;
+    rdo.numRoutes = 0;
+    rdo.lifetime = 2;
+    rdo.maxRankOrNh = 3;
+    rdo.target = someoneElse; // node 1 does not match -- it is a relay
+    rdo.addressVector = {};
+    dio.SetP2pRdo(rdo);
+
+    DeliverRawRplMessage<RplDioHeader>(node,
+                                       1,
+                                       dio,
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       neighbour,
+                                       Ipv6Address(RPL_ALL_NODES_MULTICAST));
+
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsP2pTarget(INSTANCE, origin),
+                          false,
+                          "Node 1 incorrectly recognised itself as the Target");
+
+    // A P2P-DRO-ACK arriving anyway (misdirected, or an attacker probing):
+    // must be silently dropped, not crash and not disturb this node's own
+    // (correct) belief that it is not the Target.
+    RplP2pDroAckHeader ack;
+    ack.SetInstanceId(INSTANCE);
+    ack.SetSequence(1);
+    ack.SetDodagId(origin);
+    DeliverRawRplMessage<RplP2pDroAckHeader>(node,
+                                             1,
+                                             ack,
+                                             static_cast<uint8_t>(RPL_CODE_P2P_DRO_ACK),
+                                             neighbour,
+                                             rpl->GetGlobalAddress());
+
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsP2pTarget(INSTANCE, origin),
+                          false,
+                          "The misdirected P2P-DRO-ACK made node 1 believe it is the Target");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief A P2P-RPL discovery completes end to end: the P2P-DRO relays back
  *        along the trimmed Address Vector, the Origin stores an
  *        Origin-outward route from it, and the route carries data.
@@ -21415,6 +21907,9 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplP2pMultiTargetRelayTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pSoleTargetViaOptionStopsTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pDroAckWrongSequenceTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pDroAckUnknownDodagTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pDroAckDuplicateTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pDroAckNotTargetTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pRouteCompletesTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pHopByHopRouteCompletesTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pHopByHopRouteOutlivesTemporaryDagTestCase, TestCase::Duration::QUICK);

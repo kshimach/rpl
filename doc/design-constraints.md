@@ -4804,8 +4804,24 @@ Phase 1の4象限監査を実施した。
   — いずれもコードレビューでは正しく `return` されることを確認済み
   だが、専用のプローブ/テストは依然として無い(2026年時点で確認、
   `RplP2pDroAckWrongSequenceTestCase`は別のシナリオ[誤ったSequence
-  Number]を検証するテストで、この2件はカバーしていない) —
-  引き続き未対応の残課題。
+  Number]を検証するテストで、この2件はカバーしていない)。
+  **(後日対応済み)**: 3つの新規テストで対応。
+  `RplP2pDroAckUnknownDodagTestCase`(未知のDodagKey)、
+  `RplP2pDroAckDuplicateTestCase`(既にACK済みの状態への重複到達)、
+  `RplP2pDroAckNotTargetTestCase`(isTarget=falseのrelayへの誤配送)。
+  ただし後2者はload-bearing検証の対象外と判明した:
+  `!dodag.p2p.isTarget || !dodag.p2p.droAckPending`の各半分を個別に
+  外しても、`droRetryEvent.Cancel()`(未armのTimerに対して安全な
+  no-op)と`droAckPending = false`(既にfalseへの再代入)という、
+  どちらもブラックボックスからは観測不可能な副作用にしかならない
+  ため、production側のガードを実際に外しても各テスト自身の
+  アサーションは変化しない(§62.3の`daoSequence`と同種の、観測不能な
+  変更)。前者(未知のDodagKey)は`m_dodags.end()`の逆参照という
+  未定義動作を招くため、本物のガード除去では検証せず、代わりに
+  テスト自身の"unknown" ack宛先を実在のkeyへ一時的に差し替えて
+  アサーションが正しく落ちることを確認する形でテスト自体の
+  識別力を確認した(§66.4以降に確立した「本物のリバートがリスクに
+  見合わない場合の代替手段」の踏襲)。
 
 ### 40.4 検証
 
