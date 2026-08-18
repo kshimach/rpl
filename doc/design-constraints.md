@@ -7581,14 +7581,15 @@ load-bearing検証: クランプを一時的に除去したところ、この
   追加、load-bearing検証済み(@see §68)。
 - **角5(移行漏れ)**: `SelectPreferredParent()`の「最後のparentを
   失った」分岐内、`m_disTimer.Cancel()+Schedule()`が同じ無条件
-  cancel-and-rearm形状を持つが、再トリガーには
-  `LeaveDodag()`(メンバーシップ全体の消去)を伴う完全なrejoin
-  サイクルが毎回必要という点、および影響が「DIS送信の遅延」に
-  留まり(他ノードの通常DIOで受動的に再joinできるため完全な
-  rejoin不能ではない)という点から、§64の`daoEvent`livelockほど
-  深刻ではないと角5自身が判定 — 検証エージェントの実プローブは
-  セッション利用上限により未完了のため、低優先度の要調査項目として
-  記録するに留める。
+  cancel-and-rearm形状を持つ点。§64の`daoEvent`livelockほど
+  深刻ではないと角5自身が判定した通り、単一DODAGメンバーシップでは
+  同一機構(`best.IsAny()`)を連続して踏むにはその都度
+  `JoinDodag()`によるrejoinを挟む必要があり、rejoin自体が
+  ガードフラグを正しくリセットするため、当初想定した「連打による
+  starvation」という筋書きは(単一メンバーシップの範囲では)
+  実際には構造的に再現しない。だが修正・検証の過程で、それとは
+  別の、より地味だが実害のある本物のバグを発見・修正した
+  (@see §69)。
 - **角3(`SendNoPathDao()`の増幅)**: parent switch毎に無条件送信
   される`SendNoPathDao()`(non-storing modeではrootまで複数ホップ
   中継される)が、攻撃者の強制switch回数に比例した実トラフィックを
@@ -7718,3 +7719,88 @@ load-bearing検証: `dioIntervalMin`のデフォルト初期化子を一時的�
 `./ns3 build`(rplモジュール・プロジェクト全体とも)、
 `test-runner --suite=rpl`、`./test.py -s rpl`を実行し、
 既存130件+新規1件=131件全てが安定PASS(3.6秒前後)することを確認。
+
+## 69. `m_disTimer`にも`daoRefreshPending`と同じ形のガードを適用、
+     その過程で見つけた別バグも修正
+
+§66.4角5の指摘(低優先度)を、ユーザーの指示により小さく修正する
+形で拾った。
+
+### 69.1 修正1: `m_disRefreshPending`ガードの追加
+
+`SelectPreferredParent()`の`best.IsAny()`分岐(最後のparentを
+失った際、`m_disTimer`をjitter付きで再ソリシテーションする箇所)は、
+`dodag.daoRefreshPending`と全く同じ形の無条件cancel-and-rearmを
+持っていた。`RplRoutingProtocol`に(`DodagMembership`ではなく
+ノード全体で1つの)`bool m_disRefreshPending{false}`を新設し、
+同じ形のガードを適用: `DisTimerExpire()`が実際にfireした時に
+クリアする。
+
+### 69.2 修正1だけでは不十分だった理由、および修正2
+
+新規テストの開発中、修正1だけでは`m_disRefreshPending`が`true`の
+まま永久に固着し、以後の全てのtriggerを無条件で抑制してしまう
+という、修正1自身が生んだ新しいバグに気づいた。
+
+原因: `m_disTimer`は`DisTimerExpire()`(実際にfireした時)以外にも、
+`JoinDodag()`内で無条件に`Cancel()`される — 「今joinできたのだから、
+もう能動的にソリシテーションする必要はない」という、それ自体は
+正しい既存のクリーンアップ。しかし修正1はこの経路を見落として
+おり、`JoinDodag()`によるcancelは`m_disRefreshPending`を
+クリアしない。結果: あるparent喪失がDISをjitter付きで腕(arm)した
+直後、(DisTimerExpire()自身がfireするより先に)別のneighborから
+の通常DIOで正常にrejoinすると、その`JoinDodag()`が保留中のDISを
+黙って`Cancel()`する — が、フラグは`true`のまま残る。以後、
+全く別の、正当な「最後のparentを失った」イベントが起きても、
+ガードは「まだ保留中」と誤認して再armを拒否し続け、DISが二度と
+送信されなくなる。§63/§64の`daoEvent`livelockより静かだが、
+タイマーとの競合が一切不要(単に「armしてから、実際にfireする
+前に無関係な理由でjoinし直す」だけで踏める)という点でむしろ
+見つけにくい。
+
+`JoinDodag()`自身の`m_disTimer.Cancel()`の直後にも
+`m_disRefreshPending = false;`を追加して解決。
+
+### 69.3 新規テストの設計変更 — 「連打burst」から「介在rejoin」へ
+
+当初、既存の`daoEvent`系テスト(150ステップ・3秒の連打burst)と
+同じ設計で`RplDisRapidLossRejoinCoalescedTestCase`を書いたが、
+これは根本的に的外れな設計だったと判明した: `best.IsAny()`への
+到達は必ず`LeaveDodag()`(メンバーシップ全体の消去)を伴うため、
+**同じメンバーシップで2回目のbest.IsAny()に到達するには、その前に
+必ず1回のrejoin(`JoinDodag()`)を挟む必要がある** — そしてこの
+rejoin自体が(修正2により)フラグを正しくリセットするため、
+「pending中に次のtriggerが来て無視される」という連打シナリオ
+そのものが単一メンバーシップの範囲では構造的に起こり得ない。
+(この意味で、§66.4角5自身の「daoEventほど深刻ではない」という
+判定は、当初の想定以上に正しかったことになる — ただし全く
+無害だったわけではなく、修正2が塞いだ「介在rejoinによる
+フラグ固着」という別の実害があった。)
+
+このため、テストを`RplDisRefreshAfterInterveningRejoinTestCase`
+として全面的に書き直した: (1) poisonでparentを失わせDISを腕、
+(2) 別のDIOで正常にrejoinさせ(修正2が守るべき瞬間)、(3) 再度
+poisonして2回目の、独立したparent喪失を発生させ、この2回目が
+確実に自分自身のDISを送信できることを確認する。
+
+開発中、この新テストも最初は原因不明のまま`disCountAfter=0`で
+FAILし続けた。原因は修正2の不備ではなく、テスト自身の設計漏れ
+だった: 2回目のpoison後、observation windowの間もrootは無関係な
+通常のTrickle周期DIOを送り続けており、これがちょうどこの
+observation window内に届いてchildを受動的に(正当に)rejoinさせて
+しまい、それ自体が(正しく)保留中のDISを`Cancel()`していた —
+バグではなく、テスト自身がroot→child方向の無関係なトラフィックを
+遮断していなかったことによる干渉。`SimpleChannel::BlackList()`で
+root→child方向を恒常的に遮断してから2回目のpoisonを注入するよう
+修正し解決(childが送るDIS自体はchild→root方向で、この遮断の
+影響を受けない)。
+
+load-bearing検証: 修正2(`JoinDodag()`側の`m_disRefreshPending`
+クリア)を一時的に除去したところ、このテストが明確にFAILする
+ことを確認、元に戻して再度PASSを確認。
+
+### 69.4 検証
+
+`./ns3 build`(rplモジュール・プロジェクト全体とも)、
+`test-runner --suite=rpl`、`./test.py -s rpl`を実行し、
+既存131件+新規1件=132件全てが安定PASS(3.6秒前後)することを確認。

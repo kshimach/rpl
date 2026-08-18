@@ -1069,6 +1069,13 @@ RplRoutingProtocol::DisTimerExpire()
 {
     NS_LOG_FUNCTION(this);
 
+    // Cleared here, unconditionally, even on the early return just below:
+    // whatever caused this firing has now been acted on (either a DIS
+    // went out, or this node turned out to already be joined and none was
+    // needed), so a further "lost the last parent" trigger is free to
+    // jitter another one in (@see m_disRefreshPending's own doc comment).
+    m_disRefreshPending = false;
+
     if (IsJoined())
     {
         return;
@@ -1854,6 +1861,15 @@ RplRoutingProtocol::JoinDodag(const RplDioHeader& dio, uint32_t interface)
     }
 
     m_disTimer.Cancel();
+    // Cleared here too, not only in DisTimerExpire() (@see
+    // m_disRefreshPending's own doc comment): a successful join cancels
+    // m_disTimer through this completely different path, bypassing
+    // DisTimerExpire() entirely, so without this a pending flag armed by
+    // an earlier best.IsAny() and then cancelled by this same join (e.g.
+    // rejoining via one neighbour right after losing another) would stay
+    // stuck true forever, silently blocking every future trigger from
+    // ever arming another one.
+    m_disRefreshPending = false;
 
     // A freshly constructed DodagMembership's Timer-bearing members start
     // out with no function bound at all (unlike the old scalar members,
@@ -3624,8 +3640,16 @@ RplRoutingProtocol::SelectPreferredParent(DodagMembership& dodag)
         // again after this call.
         DodagKey key{dodag.instanceId, dodag.dodagId};
         LeaveDodag(key, true);
-        m_disTimer.Cancel();
-        m_disTimer.Schedule(Seconds(m_jitter->GetValue(0.0, 1.0)));
+        // Only arms a fresh jittered DIS when none is already pending --
+        // @see m_disRefreshPending's own doc comment for why this trigger
+        // site needs the same coalescing guard dodag.daoRefreshPending's
+        // own two trigger sites do.
+        if (!m_disRefreshPending)
+        {
+            m_disRefreshPending = true;
+            m_disTimer.Cancel();
+            m_disTimer.Schedule(Seconds(m_jitter->GetValue(0.0, 1.0)));
+        }
         return true;
     }
 

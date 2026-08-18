@@ -2339,6 +2339,26 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     bool m_isRoot;                       //!< true if this node is the DODAG root
     Time m_disInterval;                  //!< period of unsolicited multicast DIS
     Timer m_disTimer;                    //!< schedules the periodic DIS
+    /// True from the moment some non-root membership losing its last
+    /// parent jitters m_disTimer to fire early (SelectPreferredParent()'s
+    /// own best.IsAny() branch), until DisTimerExpire() actually runs and
+    /// clears it -- the same daoRefreshPending-style coalescing guard as
+    /// dodag.daoRefreshPending, applied here since the trigger site had
+    /// the identical unconditional-cancel-and-rearm shape: a node whose
+    /// every membership repeatedly loses its last parent (each loss its
+    /// own full LeaveDodag(), so this is more expensive to force
+    /// repeatedly than the daoEvent triggers, but not impossible, e.g. a
+    /// neighbour that keeps poisoning itself to RPL_INFINITE_RANK and then
+    /// un-poisoning) would otherwise keep deferring the DIS solicitation
+    /// this node needs to actually rejoin. Node-wide, not per-membership,
+    /// since m_disTimer itself is: unlike DodagMembership's own
+    /// daoRefreshPending, this has to survive a LeaveDodag() erasing the
+    /// very membership that armed it. Cleared unconditionally at the top
+    /// of DisTimerExpire(), even on its own early return for an
+    /// already-rejoined node -- otherwise that early return would leave a
+    /// stale true behind, silently suppressing a genuinely new future
+    /// trigger's own arm.
+    bool m_disRefreshPending{false};
     Ptr<UniformRandomVariable> m_jitter; //!< jitter applied to control messages
 
     /**

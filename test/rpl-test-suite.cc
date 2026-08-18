@@ -19305,6 +19305,209 @@ RplRejoinWithoutDagConfigurationTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief A second, independent "lost the last parent" event still gets its
+ *        own DIS solicitation after an intervening rejoin, not silently
+ *        suppressed by state left over from the first.
+ *
+ * SelectPreferredParent()'s best.IsAny() branch ("lost the last parent")
+ * had the same unconditional cancel-and-rearm shape the daoEvent livelock
+ * did, so it gained the identical style of guard: m_disRefreshPending,
+ * set once a DIS is jittered in, checked before jittering another one in.
+ * But reaching best.IsAny() a second time structurally requires a fresh
+ * JoinDodag() first (LeaveDodag() erases the whole membership on the way
+ * out, so nothing is left to lose a second time without rejoining
+ * something first) -- and JoinDodag() itself unconditionally cancels
+ * m_disTimer on every successful join (a completely different code path
+ * from DisTimerExpire(), which is the only place that otherwise clears
+ * the flag). Without also clearing m_disRefreshPending there, a DIS
+ * jittered in by one loss, then cancelled by the very next rejoin (not
+ * by DisTimerExpire() actually firing), left the flag stuck true forever
+ * -- silently blocking every later, genuinely new loss from ever
+ * arming its own DIS again, an even quieter failure than the daoEvent
+ * bug this mechanism was modelled on, since nothing here ever needs to
+ * race a timer to reproduce it. Found by this fix's own load-bearing
+ * check unexpectedly failing with the guard in place, tracing to
+ * JoinDodag()'s own m_disTimer.Cancel() at rpl-routing-protocol.cc.
+ */
+class RplDisRefreshAfterInterveningRejoinTestCase : public TestCase
+{
+  public:
+    RplDisRefreshAfterInterveningRejoinTestCase();
+
+  private:
+    void DoRun() override;
+
+    /**
+     * @brief Count a DIS delivered to the monitoring socket.
+     * @param socket the monitoring socket
+     */
+    void RecordDis(Ptr<Socket> socket);
+
+    uint32_t m_disCount{0}; //!< DIS messages observed at the root
+};
+
+RplDisRefreshAfterInterveningRejoinTestCase::RplDisRefreshAfterInterveningRejoinTestCase()
+    : TestCase("A second parent loss after an intervening rejoin still gets its own DIS, "
+              "not silently suppressed by the first loss's own leftover state")
+{
+}
+
+void
+RplDisRefreshAfterInterveningRejoinTestCase::RecordDis(Ptr<Socket> socket)
+{
+    Ptr<Packet> packet = socket->Recv();
+    while (packet)
+    {
+        Ipv6Header ipv6Header;
+        if (packet->RemoveHeader(ipv6Header) != 0)
+        {
+            Icmpv6Header icmpv6Header;
+            if (packet->RemoveHeader(icmpv6Header) != 0 &&
+                icmpv6Header.GetType() == ICMPV6_RPL && icmpv6Header.GetCode() == RPL_CODE_DIS)
+            {
+                m_disCount++;
+            }
+        }
+        packet = socket->Recv();
+    }
+}
+
+void
+RplDisRefreshAfterInterveningRejoinTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2); // 0 = root (child's only possible parent), 1 = child
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    rplHelper.Set("DioIntervalMin", TimeValue(MilliSeconds(256)));
+    rplHelper.Set("DioIntervalDoublings", UintegerValue(2));
+
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Ptr<Node> rootNode = nodes.Get(0);
+    Ptr<Node> childNode = nodes.Get(1);
+
+    // DIS is multicast (RPL_ALL_NODES_MULTICAST), which root also receives
+    // off the same channel, the same monitoring pattern
+    // RplJoinWithoutDagConfigurationTestCase's own DIO monitor uses.
+    Ptr<Socket> disMonitor = Socket::CreateSocket(rootNode, Ipv6RawSocketFactory::GetTypeId());
+    disMonitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    disMonitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    disMonitor->BindToNetDevice(rootNode->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+    disMonitor->SetRecvCallback(
+        MakeCallback(&RplDisRefreshAfterInterveningRejoinTestCase::RecordDis, this));
+
+    Simulator::Stop(Seconds(2));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> child = childNode->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(child->IsJoined(), true, "The child never joined the DODAG");
+
+    Ipv6Address rootLinkLocal =
+        rootNode->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address childLinkLocal =
+        childNode->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address dodagId = child->GetDodagId();
+
+    auto buildDio = [&dodagId](uint16_t rank) {
+        RplDioHeader dio;
+        dio.SetInstanceId(RPL_DEFAULT_INSTANCE);
+        dio.SetVersionNumber(0);
+        dio.SetRank(rank);
+        dio.SetMop(RPL_MOP_NON_STORING);
+        dio.SetDodagId(dodagId);
+        return dio;
+    };
+
+    // First loss: poisons the child's only parent (spoofed as if from the
+    // real root), reaching best.IsAny() and jittering a DIS in.
+    DeliverRawRplMessage(childNode, 1, buildDio(RPL_INFINITE_RANK),
+                        static_cast<uint8_t>(RPL_CODE_DIO), rootLinkLocal, childLinkLocal);
+    NS_TEST_ASSERT_MSG_EQ(child->IsJoined(),
+                          false,
+                          "The poisoned DIO did not make the child lose its only parent");
+
+    // The intervening rejoin, well before the first loss's own jittered
+    // DIS (up to 1 s out) could possibly have fired: JoinDodag()'s own
+    // unconditional m_disTimer.Cancel() cancels that pending DIS here,
+    // pre-fix without clearing m_disRefreshPending.
+    DeliverRawRplMessage(childNode, 1, buildDio(RPL_MIN_HOPRANKINC),
+                        static_cast<uint8_t>(RPL_CODE_DIO), rootLinkLocal, childLinkLocal);
+    NS_TEST_ASSERT_MSG_EQ(child->IsJoined(),
+                          true,
+                          "The child did not rejoin via the ordinary-rank DIO");
+
+    // A standing (not toggled) one-directional block from here on: root's
+    // own ordinary, unrelated Trickle-driven DIOs -- which keep arriving
+    // regardless of anything this test does -- can no longer reach the
+    // child. Without this, root's own next periodic DIO landing before
+    // the second loss's own jittered DIS fires causes an entirely
+    // legitimate passive rejoin, which (correctly, via this same fix)
+    // cancels that pending DIS -- observed once during this test's own
+    // development, and not the scenario this test means to isolate.
+    // Root's own reply to a DIS this child actually sends is blocked the
+    // same way, but that only matters for whether the child ends up
+    // rejoined again, not for what this test actually asserts: that the
+    // DIS itself reaches root's monitor socket, which travels the
+    // opposite (unblocked) direction.
+    Ptr<SimpleNetDevice> rootDevice = DynamicCast<SimpleNetDevice>(devices.Get(0));
+    Ptr<SimpleNetDevice> childDevice = DynamicCast<SimpleNetDevice>(devices.Get(1));
+    channel->BlackList(rootDevice, childDevice);
+
+    // A second, independent loss, well clear of the first (real time has
+    // passed via the two Simulator::Run() calls above, so this is not the
+    // same instant as the first -- @see the ns3-debug-pitfalls skill's own
+    // note on same-instant scheduling not being able to distinguish a
+    // guard's presence from its absence).
+    uint32_t disCountBefore = m_disCount;
+    DeliverRawRplMessage(childNode, 1, buildDio(RPL_INFINITE_RANK),
+                        static_cast<uint8_t>(RPL_CODE_DIO), rootLinkLocal, childLinkLocal);
+    NS_TEST_ASSERT_MSG_EQ(child->IsJoined(),
+                          false,
+                          "The second poisoned DIO did not make the child lose its only "
+                          "parent again");
+
+    // Comfortably past the up-to-1-s jitter window: root's own traffic is
+    // blocked now, so the second loss's own DIS -- if it was actually
+    // armed, not silently left unarmed by stale state from the first --
+    // has to have fired by now, undisturbed.
+    Simulator::Stop(Seconds(1.5));
+    Simulator::Run();
+
+    uint32_t disCountAfter = m_disCount - disCountBefore;
+    NS_TEST_ASSERT_MSG_EQ(disCountAfter,
+                          1,
+                          "The second, independent parent loss produced "
+                              << disCountAfter
+                              << " DIS solicitations in 1.5 s, not the expected 1 -- consistent "
+                                 "with m_disRefreshPending being left stuck true by the first "
+                                 "loss's own DIS getting cancelled (not fired) by the "
+                                 "intervening rejoin, silently blocking this one");
+
+    disMonitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Check the neighbour freshness rule: a neighbour heard once is a
  *        candidate parent only while nothing better-established is
  *        available, and stops being one as soon as another neighbour has
@@ -21233,6 +21436,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplDagConfigurationExponentOverflowTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplStaleAndSwitchCoincideTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplRejoinWithoutDagConfigurationTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplDisRefreshAfterInterveningRejoinTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplComputeSourceRouteFailureTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplMrhofSelectionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplMrhofHysteresisBoundaryTestCase, TestCase::Duration::QUICK);
