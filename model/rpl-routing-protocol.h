@@ -856,7 +856,17 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
          * advertises instead -- "is an exception to this rule".
          */
         uint16_t lowestRankThisVersion{RPL_INFINITE_RANK};
-        Time dioIntervalMin;              //!< Trickle Imin for DIOs
+        // The DAG Configuration option (RFC 6550 section 6.7.6) that carries
+        // this is not required on every single DIO, only recommended
+        // periodically -- unlike its sibling fields just below, this one had
+        // no default member initializer, so a (re)join via a DIO that
+        // happens to omit it left this at Time(0) instead of falling back to
+        // a sane value. RplTrickleTimer::IntervalEvent()'s own doubling
+        // (interval + interval) has 0 as a fixed point, so an Imin of 0
+        // never grows past it: every firing reschedules itself at zero
+        // delay, forever, freezing the simulator (@see
+        // RplJoinWithoutDagConfigurationTestCase).
+        Time dioIntervalMin{MilliSeconds(int64_t(1) << RPL_DIO_INTERVAL_MIN)}; //!< Trickle Imin
         uint8_t dioIntervalDoublings{RPL_DIO_INTERVAL_DOUBLINGS}; //!< Trickle doublings for DIOs
         uint8_t dioRedundancy{RPL_DIO_REDUNDANCY}; //!< Trickle redundancy constant for DIOs
 
@@ -882,17 +892,25 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
         uint8_t pathSequence{0};  //!< path sequence of the route this node advertises
         uint8_t daoRetriesLeft{0}; //!< retries left for the DAO awaiting an acknowledgement
         bool daoAckPending{false}; //!< true while a DAO-ACK is being waited for
-        /// True from the moment a DAO parent's DTSN increment (RFC 6550
-        /// section 9.6 rule 1) jitters daoEvent to fire early, until
-        /// DaoTimerExpire() actually sends that refresh and clears it.
-        /// Checked before jittering daoEvent again on a further DTSN
-        /// increment heard in the meantime, so repeated bumps coalesce
-        /// into the one already-pending early send instead of each
-        /// cancelling and re-arming it -- without this, a DAO parent
-        /// (misbehaving, or an active adversary controlling it) that
-        /// increments its DTSN faster than the jitter window could
-        /// perpetually defer this node's own DAO refresh, never letting it
-        /// actually fire.
+        /// True from the moment either of daoEvent's two early-trigger
+        /// sources -- a DAO parent's DTSN increment (RFC 6550 section 9.6
+        /// rule 1, in HandleDio()) or this node's own preferred parent
+        /// changing (section 9.5, in SelectPreferredParent()) -- jitters
+        /// it to fire early, until DaoTimerExpire() actually sends that
+        /// refresh and clears it. Checked before jittering daoEvent again
+        /// on a further trigger of either kind heard in the meantime, so
+        /// repeated triggers coalesce into the one already-pending early
+        /// send instead of each cancelling and re-arming it -- without
+        /// this, a DAO parent that increments its DTSN faster than the
+        /// jitter window, or a single already-adjacent neighbour that
+        /// forces repeated parent switches by repeatedly claiming a
+        /// strictly better rank (trivial under this module's default OF0
+        /// objective function, which applies no rank hysteresis at all),
+        /// could perpetually defer this node's own DAO refresh, never
+        /// letting it actually fire. Does not gate SendNoPathDao() or the
+        /// pathSequence increment in the parent-switch case -- @see that
+        /// call site's own comment for why those two stay unconditional
+        /// per transition while only the resulting send coalesces.
         bool daoRefreshPending{false};
         Timer daoEvent{Timer::CANCEL_ON_DESTROY};      //!< schedules the periodic DAO
         Timer daoRetryEvent{Timer::CANCEL_ON_DESTROY}; //!< schedules the retry of an unacknowledged DAO

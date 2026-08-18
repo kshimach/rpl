@@ -3672,8 +3672,38 @@ RplRoutingProtocol::SelectPreferredParent(DodagMembership& dodag)
         // RplSequenceIncrement(), not a plain ++: @see SendNoPathDao()'s own
         // matching comment, and RplSequenceIncrement()'s own doc comment.
         dodag.pathSequence = RplSequenceIncrement(dodag.pathSequence);
-        dodag.daoEvent.Cancel();
-        dodag.daoEvent.Schedule(Seconds(m_jitter->GetValue(0.0, 1.0)));
+        // Only arms a fresh jittered send when none is already pending, the
+        // same daoRefreshPending guard HandleDio()'s own DTSN-triggered
+        // refresh uses (@see its own doc comment) and for the identical
+        // reason: RFC 6550 imposes no rate limit on how often a node's
+        // preferred parent may change, and this module's default OF0
+        // objective function applies no rank hysteresis at all (unlike
+        // MRHOF's own PARENT_SWITCH_THRESHOLD), so a single already-
+        // adjacent neighbour repeatedly claiming a strictly better rank on
+        // each of its own DIOs can force parentChanged on nearly every one
+        // -- an unconditional cancel-and-rearm here reproduces the exact
+        // same daoEvent livelock the DTSN fix closed, just triggered by
+        // parent churn instead of DTSN churn (design-constraints.md
+        // section 64). SendNoPathDao() and the pathSequence increment
+        // above are deliberately NOT gated by this flag, unlike the
+        // reschedule below: each is owed to this specific transition's own
+        // oldPreferredParent, not to "some transition or other", so
+        // skipping either of them on a rapid subsequent switch would
+        // silently drop a real parent's own withdrawal -- precisely the
+        // staleness this block's own SendNoPathDao() call exists to
+        // prevent (@see its own comment above). Only the act of actually
+        // sending the resulting self-advertisement is safe to coalesce:
+        // SendDao() (via DaoTimerExpire()) always reads dodag's own live,
+        // current state when it finally fires, so whichever switch is
+        // "current" by the time the pending send goes out is correctly
+        // reflected regardless of how many earlier ones were coalesced
+        // into it.
+        if (!dodag.daoRefreshPending)
+        {
+            dodag.daoRefreshPending = true;
+            dodag.daoEvent.Cancel();
+            dodag.daoEvent.Schedule(Seconds(m_jitter->GetValue(0.0, 1.0)));
+        }
     }
     return true;
 }

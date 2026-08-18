@@ -18297,9 +18297,18 @@ RplDtsnRapidBumpCoalescedTestCase::DoRun()
     // often cancellation gets a chance to interrupt one. For this stream
     // (AssignStreams(nodes, 1), reproducible run to run) that difference
     // was empirically 7 fixed-code sends against 3 with the fix reverted
-    // for this exact burst -- the threshold below sits with real margin on
-    // both sides of that gap rather than pinning an exact count that would
-    // be fragile to a stream/seed change.
+    // for this exact burst. The threshold below is not the midpoint of
+    // that gap, though: the burst's own ~4.48 s effective window (first
+    // bump at +20 ms to the +4.5 s stop) divided by the maximum possible
+    // single jitter draw (Seconds(0,1), i.e. < 1 s) gives a provable floor
+    // of floor(4.48 / 1.0) = 4 completed cycles for genuinely-fixed code
+    // even under an adversarial draw sequence that always lands at the
+    // jitter ceiling -- so 4, not something picked to merely clear this
+    // one run's observed 7, is the threshold that cannot spuriously fail a
+    // correctly-fixed run regardless of which draws this shared m_jitter
+    // stream happens to produce (shared with dioTrickle/DIS/other
+    // jittered sends elsewhere in the same run, so not fully isolated to
+    // this test's own Schedule() calls).
     for (uint16_t dtsn = 1; dtsn <= 150; dtsn++)
     {
         RplDioHeader bump;
@@ -18326,7 +18335,7 @@ RplDtsnRapidBumpCoalescedTestCase::DoRun()
 
     uint32_t daoCountDuringBumps = m_daoCount - daoCountBeforeBumps;
     NS_TEST_ASSERT_MSG_GT_OR_EQ(daoCountDuringBumps,
-                               5,
+                               4,
                                "150 rapid DTSN increments produced only " << daoCountDuringBumps
                                                                          << " DAO refreshes -- "
                                                                             "consistent with the "
@@ -18336,6 +18345,435 @@ RplDtsnRapidBumpCoalescedTestCase::DoRun()
                                                                             "them");
 
     daoMonitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief A single already-adjacent neighbour forcing repeated preferred
+ *        parent switches (RFC 6550 imposes no rate limit on how often a
+ *        node's preferred parent may change, and this module's default
+ *        OF0 objective function applies no rank hysteresis at all) must
+ *        not be able to perpetually defer this node's own DAO refresh by
+ *        repeatedly cancelling and re-arming it -- the same
+ *        daoRefreshPending coalescing HandleDio()'s own DTSN trigger uses
+ *        (@see RplDtsnRapidBumpCoalescedTestCase) has to also cover
+ *        SelectPreferredParent()'s own separate trigger on the identical
+ *        Timer.
+ */
+class RplParentSwitchRapidBumpCoalescedTestCase : public TestCase
+{
+  public:
+    RplParentSwitchRapidBumpCoalescedTestCase();
+
+  private:
+    void DoRun() override;
+
+    /**
+     * @brief Count a DAO delivered to the monitoring socket.
+     * @param socket the monitoring socket
+     */
+    void RecordDao(Ptr<Socket> socket);
+
+    uint32_t m_daoCount{0}; //!< DAOs observed at the root
+};
+
+RplParentSwitchRapidBumpCoalescedTestCase::RplParentSwitchRapidBumpCoalescedTestCase()
+    : TestCase("Rapid forced preferred parent switches coalesce into a bounded number of DAO "
+              "refreshes, not one per switch and not none at all")
+{
+}
+
+void
+RplParentSwitchRapidBumpCoalescedTestCase::RecordDao(Ptr<Socket> socket)
+{
+    Ptr<Packet> packet = socket->Recv();
+    while (packet)
+    {
+        Ipv6Header ipv6Header;
+        if (packet->RemoveHeader(ipv6Header) != 0)
+        {
+            Icmpv6Header icmpv6Header;
+            if (packet->RemoveHeader(icmpv6Header) != 0 &&
+                icmpv6Header.GetType() == ICMPV6_RPL && icmpv6Header.GetCode() == RPL_CODE_DAO)
+            {
+                // SelectPreferredParent()'s own SendNoPathDao() call (Path
+                // Lifetime 0) is deliberately left unguarded by
+                // daoRefreshPending -- it is owed to each specific
+                // transition's own old preferred parent, not something
+                // later switches may coalesce away -- so it fires on every
+                // one of the burst's forced switches below regardless of
+                // whether the coalescing fix under test is even present.
+                // Counting it here would pass this test on that volume
+                // alone, independent of the guard. Only the coalesced
+                // self-advertisement (SendDao() via daoEvent, a nonzero
+                // Path Lifetime) is what daoRefreshPending actually gates,
+                // so that is the only one this test counts.
+                RplDaoHeader dao;
+                if (packet->RemoveHeader(dao) != 0 && dao.GetPathLifetime() != 0)
+                {
+                    m_daoCount++;
+                }
+            }
+        }
+        packet = socket->Recv();
+    }
+}
+
+void
+RplParentSwitchRapidBumpCoalescedTestCase::DoRun()
+{
+    NodeContainer nodes;
+    // 0 = root (the DAO destination), 1 and 2 = altA/altB (real, properly
+    // joined second-hop relays the child is forced to alternate between),
+    // 3 = child (the victim). altA/altB have to be real nodes, not
+    // fabricated addresses with nobody behind them: RouteOutput() (@see its
+    // own comment, "everyone else sends everything to its preferred
+    // parent") makes dodag.preferredParent the gateway of every route this
+    // node's own self-advertisement DAO takes, so a preferred parent with
+    // no real device on the channel leaves that DAO permanently
+    // undeliverable at the link layer -- SendDao() itself still runs and
+    // reports success, but nothing ever reaches the root to prove it. An
+    // earlier version of this test used two addresses nobody owned
+    // ("fe80::...:aa"/"...:bb") for exactly that reason (a single attacker
+    // can trivially operate two identities) and every coalesced
+    // self-advertisement silently vanished, which read as the exact same
+    // symptom the unfixed livelock produces (daoCountDuringSwitches == 0)
+    // for a completely different, uninteresting reason -- @see
+    // design-constraints.md's own account of this fix.
+    nodes.Create(4);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    rplHelper.Set("DioIntervalMin", TimeValue(MilliSeconds(256)));
+    rplHelper.Set("DioIntervalDoublings", UintegerValue(2));
+
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Ptr<Node> rootNode = nodes.Get(0);
+    Ptr<Node> altANode = nodes.Get(1);
+    Ptr<Node> altBNode = nodes.Get(2);
+    Ptr<Node> childNode = nodes.Get(3);
+
+    Ptr<Socket> daoMonitor = Socket::CreateSocket(rootNode, Ipv6RawSocketFactory::GetTypeId());
+    daoMonitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    daoMonitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    daoMonitor->BindToNetDevice(rootNode->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+    daoMonitor->SetRecvCallback(
+        MakeCallback(&RplParentSwitchRapidBumpCoalescedTestCase::RecordDao, this));
+
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> root = rootNode->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> child = childNode->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(child->IsJoined(), true, "The child never joined the DODAG");
+    NS_TEST_ASSERT_MSG_EQ(altANode->GetObject<RplRoutingProtocol>()->IsJoined(),
+                          true,
+                          "altA never joined the DODAG");
+    NS_TEST_ASSERT_MSG_EQ(altBNode->GetObject<RplRoutingProtocol>()->IsJoined(),
+                          true,
+                          "altB never joined the DODAG");
+
+    Ipv6Address rootLinkLocal =
+        rootNode->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address childLinkLocal =
+        childNode->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    // altA/altB's own real link-local addresses: DeliverRawRplMessage()
+    // spoofs the DIOs' claimed Rank below, not their identity, so the
+    // resulting preferred-parent switches land on genuine, L2-reachable
+    // neighbours that can actually relay the child's own DAO onward.
+    Ipv6Address altALinkLocal =
+        altANode->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address altBLinkLocal =
+        altBNode->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address dodagId = root->GetDodagId();
+
+    auto buildDio = [&dodagId](uint16_t rank) {
+        RplDioHeader dio;
+        dio.SetInstanceId(RPL_DEFAULT_INSTANCE);
+        dio.SetVersionNumber(0);
+        dio.SetRank(rank);
+        dio.SetMop(RPL_MOP_NON_STORING);
+        dio.SetDodagId(dodagId);
+        return dio;
+    };
+
+    // Warm both alternates up to RPL_FRESHNESS_TARGET first, at a rank far
+    // worse than the real root's, so the freshness gate does not exclude
+    // either of them from the burst below -- otherwise a "new" candidate
+    // heard only once or twice would lose to the real, already-established
+    // root regardless of claimed rank (@see RplParentFreshnessTestCase),
+    // masking the very switching this test means to force. Delivered
+    // straight to childNode's own Receive() (DeliverRawRplMessage(), not
+    // SendRawRplMessage()): the child already heard altA/altB's own
+    // genuine, unmanipulated DIOs during formation above (both real
+    // second-hop relays, @see the node-count comment), so this only
+    // overwrites the claimed Rank of an already-known neighbour, not its
+    // identity.
+    for (uint8_t heard = 0; heard < RPL_FRESHNESS_TARGET; heard++)
+    {
+        Simulator::Schedule(Seconds(0),
+                            &DeliverRawRplMessage<RplDioHeader>,
+                            childNode,
+                            1,
+                            buildDio(5000),
+                            static_cast<uint8_t>(RPL_CODE_DIO),
+                            altALinkLocal,
+                            childLinkLocal);
+        Simulator::Schedule(Seconds(0),
+                            &DeliverRawRplMessage<RplDioHeader>,
+                            childNode,
+                            1,
+                            buildDio(5000),
+                            static_cast<uint8_t>(RPL_CODE_DIO),
+                            altBLinkLocal,
+                            childLinkLocal);
+        Simulator::Stop(MilliSeconds(10));
+        Simulator::Run();
+    }
+    NS_TEST_ASSERT_MSG_EQ(child->GetPreferredParent(),
+                          rootLinkLocal,
+                          "The warmup's own rank 5000 for both alternates was not actually worse "
+                          "than the real root's -- it took over prematurely, invalidating the "
+                          "burst's own baseline");
+
+    uint32_t daoCountBeforeSwitches = m_daoCount;
+
+    // 100 forced switches, alternating altA/altB, 20 ms apart (2 s of
+    // continuous churn). RankViaParent() computes the resulting rank as the
+    // candidate's own claimed rank plus dodag.minHopRankIncrease (RFC 6550
+    // section 6.7.6's own default, RPL_MIN_HOPRANKINC = 128 here, unchanged
+    // since none of these DIOs carry a DAG Configuration option of their
+    // own): with the real root's own rank fixed at RPL_MIN_HOPRANKINC too,
+    // root's own offer (128 + 128 = 256) is a competing candidate on every
+    // single one of SelectPreferredParent()'s calls during this burst,
+    // since root keeps re-advertising on its own Trickle schedule
+    // throughout, and so is each alternate's own genuine, unmanipulated
+    // rank (also 256, a real single hop via root) whenever its own Trickle
+    // timer happens to fire during the burst. A claimed rank has to stay
+    // below 128 for its own resulting rank to ever beat both, which leaves
+    // only 127 distinct positive integers to spend across the whole burst
+    // if each step is to keep strictly outdoing not just those but the
+    // previous step's own winning claim too -- 100, comfortably inside that
+    // ceiling, is what an earlier version of this test got wrong: claimed
+    // ranks of 1000 or more, strictly decreasing only relative to each
+    // other, never once beat root's fixed 256, so SelectPreferredParent()
+    // never actually switched away from it and this test passed for the
+    // wrong reason (@see design-constraints.md's own account of this fix).
+    // Pre-fix, each of these switches unconditionally cancelled and
+    // re-armed dodag.daoEvent the same way an unfixed DTSN bump did.
+    // step's own winning claim too -- 100, comfortably inside that ceiling,
+    // is what an earlier version of this test got wrong: claimed ranks of
+    // 1000 or more, strictly decreasing only relative to each other, never
+    for (uint16_t step = 1; step <= 100; step++)
+    {
+        Ipv6Address from = (step % 2 == 0) ? altALinkLocal : altBLinkLocal;
+        uint16_t rank = static_cast<uint16_t>(101 - step);
+        Simulator::Schedule(MilliSeconds(20 * step),
+                            &DeliverRawRplMessage<RplDioHeader>,
+                            childNode,
+                            1,
+                            buildDio(rank),
+                            static_cast<uint8_t>(RPL_CODE_DIO),
+                            from,
+                            childLinkLocal);
+    }
+    // The injection window itself (2 s) plus the up-to-1-s jitter the last
+    // coalesced send could still be waiting out when the injection ends,
+    // plus the same margin RplDtsnRapidBumpCoalescedTestCase's own burst
+    // leaves: unchanged at 4.5 s despite the shorter injection window above,
+    // so the "first bump to stop" effective window -- and the provable
+    // floor derived from it just below -- stays identical to that test's.
+    Simulator::Stop(Seconds(4.5));
+    Simulator::Run();
+
+    uint32_t daoCountDuringSwitches = m_daoCount - daoCountBeforeSwitches;
+    // Same reasoning and the same provable floor as
+    // RplDtsnRapidBumpCoalescedTestCase's own threshold: this burst's
+    // effective window and jitter ceiling are identical, so the same
+    // floor(4.48 / 1.0) = 4 completed cycles applies to genuinely-fixed
+    // code regardless of this run's own actual jitter draws.
+    NS_TEST_ASSERT_MSG_GT_OR_EQ(daoCountDuringSwitches,
+                               4,
+                               "100 rapid forced parent switches produced only "
+                                   << daoCountDuringSwitches
+                                   << " DAO refreshes -- consistent with the unconditional "
+                                      "cancel-and-rearm bug starving most of them");
+
+    daoMonitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief A join via a DIO that omits the (RFC 6550 section 6.7.6, optional
+ *        on every individual DIO) DAG Configuration option still leaves
+ *        this node's own Trickle interval at a sane, positive value, not
+ *        stuck at zero.
+ *
+ * DodagMembership::dioIntervalMin had no default member initializer, unlike
+ * its sibling fields (ocp, minHopRankIncrease, dioIntervalDoublings,
+ * dioRedundancy), so it silently stayed at Time(0) whenever JoinDodag() ran
+ * on a DIO without a Configuration option -- a real possibility, since the
+ * option is only recommended periodically, not required on every DIO
+ * (RFC 6550 section 8.2 lets a node fall back to its own locally configured
+ * defaults when nothing has been learned yet, which is exactly what this
+ * fix does; the bug was that nothing filled that role at all).
+ * RplTrickleTimer::IntervalEvent()'s own doubling (interval + interval) has
+ * 0 as a fixed point, so an Imin of 0 never grows past it: every firing
+ * reschedules the same zero-delay event forever, an infinite loop that
+ * freezes the whole simulator rather than a merely-wrong DIO cadence. This
+ * was first found by RplParentSwitchRapidBumpCoalescedTestCase's own
+ * warmup, before that test was redesigned to no longer take the code path
+ * that reached it; this test exercises the same underlying gap directly and
+ * deterministically instead of as a side effect of another scenario's own
+ * timing.
+ */
+class RplJoinWithoutDagConfigurationTestCase : public TestCase
+{
+  public:
+    RplJoinWithoutDagConfigurationTestCase();
+
+  private:
+    void DoRun() override;
+
+    /**
+     * @brief Count a DIO sent by the child.
+     * @param socket the monitoring socket
+     */
+    void RecordDio(Ptr<Socket> socket);
+
+    uint32_t m_dioCount{0}; //!< DIOs observed from the child
+};
+
+RplJoinWithoutDagConfigurationTestCase::RplJoinWithoutDagConfigurationTestCase()
+    : TestCase("Joining via a DIO without a DAG Configuration option leaves the Trickle "
+              "interval at a sane default, not stuck at zero")
+{
+}
+
+void
+RplJoinWithoutDagConfigurationTestCase::RecordDio(Ptr<Socket> socket)
+{
+    Ptr<Packet> packet = socket->Recv();
+    while (packet)
+    {
+        Ipv6Header ipv6Header;
+        if (packet->RemoveHeader(ipv6Header) != 0)
+        {
+            Icmpv6Header icmpv6Header;
+            if (packet->RemoveHeader(icmpv6Header) != 0 &&
+                icmpv6Header.GetType() == ICMPV6_RPL && icmpv6Header.GetCode() == RPL_CODE_DIO)
+            {
+                m_dioCount++;
+            }
+        }
+        packet = socket->Recv();
+    }
+}
+
+void
+RplJoinWithoutDagConfigurationTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2); // 0 = root (unused past supplying a DODAGID), 1 = child
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    Ipv6Address dodagId("2001:1::1");
+    Ptr<Node> rootNode = nodes.Get(0);
+    Ptr<Node> childNode = nodes.Get(1);
+    Ipv6Address rootLinkLocal =
+        rootNode->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address childLinkLocal =
+        childNode->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    Ptr<Socket> dioMonitor = Socket::CreateSocket(rootNode, Ipv6RawSocketFactory::GetTypeId());
+    dioMonitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    dioMonitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    dioMonitor->BindToNetDevice(rootNode->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+    dioMonitor->SetRecvCallback(
+        MakeCallback(&RplJoinWithoutDagConfigurationTestCase::RecordDio, this));
+
+    // Lets DAD/interface-up settle before the injection below, the same as
+    // every other test that delivers a fabricated DIO straight to a node
+    // that never went through ordinary root-driven formation first (@see
+    // RplRankInconsistencyPerInstanceTestCase's own such delivery).
+    Simulator::Stop(Seconds(1));
+    Simulator::Run();
+
+    // No DagConfiguration option at all: JoinDodag() has to fall back to
+    // this node's own locally configured Imin, not the option's absent
+    // one, the same way it already does for ocp/minHopRankIncrease/
+    // dioIntervalDoublings/dioRedundancy (@see the class's own doc
+    // comment).
+    RplDioHeader dio;
+    dio.SetInstanceId(RPL_DEFAULT_INSTANCE);
+    dio.SetVersionNumber(0);
+    dio.SetRank(RPL_MIN_HOPRANKINC);
+    dio.SetMop(RPL_MOP_NON_STORING);
+    dio.SetDodagId(dodagId);
+    DeliverRawRplMessage(childNode, 1, dio, static_cast<uint8_t>(RPL_CODE_DIO), rootLinkLocal,
+                        childLinkLocal);
+
+    Ptr<RplRoutingProtocol> child = childNode->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(child->IsJoined(),
+                          true,
+                          "The child never joined the DODAG-Configuration-less DIO");
+
+    // A genuinely-fixed Trickle interval (RPL_DIO_INTERVAL_MIN's own
+    // default, 2^12 ms = 4.096 s, times up to 2^RPL_DIO_INTERVAL_DOUBLINGS
+    // for Imax) sends at most a small handful of DIOs in 5 simulated
+    // seconds. An Imin stuck at 0 does not merely send more of them: its
+    // IntervalEvent() reschedules the same zero-delay event forever, an
+    // infinite loop that never reaches this Stop() boundary at all -- so
+    // this test does not fail with a large observed count if the bug is
+    // reintroduced, it hangs, the same unmistakable signal the full-suite
+    // load-bearing run for this fix relied on.
+    Simulator::Stop(Seconds(5));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_LT_OR_EQ(m_dioCount,
+                                5,
+                                "The child sent " << m_dioCount << " DIOs in 5 s -- consistent "
+                                                   << "with a Trickle interval far below its own "
+                                                      "configured Imin");
+
+    dioMonitor->Close();
     Simulator::Destroy();
 }
 
@@ -20266,6 +20704,8 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplDtsnRefreshTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDtsnOwnIncrementWrapTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDtsnRapidBumpCoalescedTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplParentSwitchRapidBumpCoalescedTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplJoinWithoutDagConfigurationTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplComputeSourceRouteFailureTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplMrhofSelectionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplMrhofHysteresisBoundaryTestCase, TestCase::Duration::QUICK);

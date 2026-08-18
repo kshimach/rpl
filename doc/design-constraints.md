@@ -7275,3 +7275,208 @@ load-bearing検証: `daoRefreshPending`のガードを一時的に無効化
 `./ns3 build`(rplモジュール・プロジェクト全体とも)、
 `test-runner --suite=rpl`を実行し、既存125件+新規1件=126件全てが
 安定PASSすることを確認。
+
+## 64. §63の`daoRefreshPending`機構をparent switch側にも拡張
+
+`/protocol-test-matrix`で`610a266`(§63)自身を監査したところ、
+`SelectPreferredParent()`内の別のCancel+Schedule箇所 — RFC 6550
+section 9.5、preferred parentが実際に切り替わった時に発火する —
+が、§63がDTSN follow-parent経路で修正したのと全く同じ形の無条件
+cancel-and-rearmを残していることが3角(角2・3・5)独立に指摘された。
+OF0(既定のOCP)にはMRHOFの`PARENT_SWITCH_THRESHOLD`のようなrank
+hysteresisが無いため、ランクをわずかに下回るだけの偽装DIOを連打
+するだけでこのlivelockは容易に誘発できる。ユーザーが「同じ
+daoRefreshPending機構をparent switch側にも拡張して修正」を選択。
+
+### 64.1 修正方針 — `SendNoPathDao()`/`pathSequence`は対象外
+
+実装時の分析で、§63と同じ形で「ブロック全体」をガードすることは
+安全でないと判明した。この箇所は`daoEvent`の再スケジュールだけで
+なく、`SendNoPathDao(dodag, oldPreferredParent)`(旧parentへの
+withdrawal)と`dodag.pathSequence`のインクリメントも行っている。
+これらは「今回のこの遷移固有のoldPreferredParent」に対して個別に
+負っているものであり、「どれか1回の遷移」に対してではない —
+A→B→Cと連続切替した場合、`SendNoPathDao(B)`をpendingを理由に
+スキップすると、Bへの正当なwithdrawalが失われ、この関数自身の
+`SendNoPathDao()`呼び出しが本来防ぐはずだった「旧parentの
+downwardRoutesエントリが陳腐化する」問題をそのまま再導入して
+しまう。
+
+このため、`daoEvent.Cancel()+Schedule()`の部分*だけ*を
+`daoRefreshPending`でガードし、`SendNoPathDao()`/`pathSequence`は
+無条件のまま残した:
+
+```cpp
+if (!oldPreferredParent.IsAny())
+{
+    SendNoPathDao(dodag, oldPreferredParent);
+}
+dodag.pathSequence = RplSequenceIncrement(dodag.pathSequence);
+if (!dodag.daoRefreshPending)
+{
+    dodag.daoRefreshPending = true;
+    dodag.daoEvent.Cancel();
+    dodag.daoEvent.Schedule(Seconds(m_jitter->GetValue(0.0, 1.0)));
+}
+```
+
+`SendDao()`(`DaoTimerExpire()`経由)は発火時点のdodagの最新状態を
+常に読むため、何回分の切替が1回のpending期間に畳み込まれても、
+最終的に送信される自己広告は「その時点で現在のもの」として正しい
+— 再スケジュール自体を畳み込むことだけが安全にできる部分。
+
+`daoRefreshPending`フィールド自身のdocコメントも、DTSN起因の
+トリガー(`HandleDio()`)とparent switch起因のトリガー
+(`SelectPreferredParent()`)の両方が同じフラグを共有する旨に
+更新した。
+
+### 64.2 新規テストの設計 — 3回作り直した
+
+`RplParentSwitchRapidBumpCoalescedTestCase`として実装したが、
+最終形に至るまで3段階の設計ミスを踏んだ。いずれも
+「テストが常にPASSしてしまい、修正の有無を区別できない」という
+同じ症状で現れたため、原因の切り分けに時間を要した。
+
+**誤り1: rankの絶対値がroot自身の実rankを一度も下回っていなかった**
+
+`SelectPreferredParent()`の候補比較は「候補自身が広告するrank +
+`dodag.minHopRankIncrease`(既定`RPL_MIN_HOPRANKINC`=128)」を
+実際に比較対象にする。rootのrankは`m_minHopRankIncrease`
+(既定128)固定なので、root経由でのchildの実効rankは256。
+初版はbump毎のrank値を4000から20ずつ減らす設計だったが
+(「前回より確実に良くなる」ことだけを狙い、rootとの絶対比較を
+していなかった)、150ステップ経ても最良値は1000超で、256を
+一度も下回らない — 偽装DIOはpreferred parentの選定に一度も
+勝てず、`SelectPreferredParent()`の`parentChanged`分岐自体が
+発火していなかった。rank値を101から1へ減らす設計(全ステップが
+128を確実に下回る)に修正。
+
+**誤り2: `SendRawRplMessage()`は送信元アドレスを偽装できない**
+
+これが最大の落とし穴だった。`SendRawRplMessage()`の`src`引数は
+ICMPv6チェックサム計算にのみ使われ、実際にワイヤに乗るIPv6ヘッダの
+送信元は、パケットを実際に送信するノード自身の実アドレスに
+`Ipv6L3Protocol::Send()`が上書きする(ソケット経由の現実的な送信
+である以上当然の挙動)。初版は`SendRawRplMessage(rootNode, ...,
+phantomA, ...)`という呼び出しだったため、「phantomAから」と
+意図したDIOは実際には全てrootNode自身から届いたことになり、
+`dodag.parents[rootLinkLocal]`のrankフィールドを繰り返し
+上書きするだけで、二つの別アドレスが競合する状況を一度も作れて
+いなかった。`DeliverRawRplMessage()`(`Ipv6L3Protocol::Receive()`
+への直接注入、IPv6ヘッダの送信元を`src`から直接構築する)に
+差し替えて解決 — @see `.claude/skills/ns3-debug-pitfalls`の
+「合成パケットをチャネル経由で注入しない」節、ここでの教訓は
+その節が明示していなかった「Send側の送信元は偽装できない」
+という追加の落とし穴。
+
+**誤り3: 実在しないアドレスをpreferred parentにすると、
+その後の自己広告DAOが物理的に配送不能になる**
+
+誤り1・2を修正した後もなお`daoCountDuringSwitches == 0`(修正の
+有無を問わず)が残った。`RouteOutput()`自身のコメント
+(「everyone else sends everything to its preferred parent」)の
+通り、非rootノードの上り(root向け)ルートのgatewayは常に
+`dodag.preferredParent`になる。この宛先がチャネル上に実在しない
+アドレス(`fe80::...:aa`/`...:bb`)だと、`SendDao()`自身は自分の
+内部ガードを問題なく通過して「送信した」と扱うが、リンク層で
+配送先が解決できず、ルート自体はパケットを物理的に一度も配送
+できない — `daoRefreshPending`の設計が正しいかどうかとは無関係に、
+観測手段そのものが機能しない状態だった。実在しないアドレスの
+代わりに、実際にDODAGへ正規参加させた2つの実ノード(`altA`/`altB`、
+トポロジを2ノードから4ノードへ拡張)を用意し、`DeliverRawRplMessage()`
+でこれらの実アドレスを騙って(rankだけを操作した)DIOを注入する
+設計に変更 — 宛先が実在するため、`altA`/`altB`が(自分自身も
+正規にrootへ参加しているRPLノードとして)childのDAOを正しく
+root向けに中継できる。
+
+**その他の設計判断**: `RecordDao()`は`SendNoPathDao()`
+(Path Lifetime 0、64.1の通りこの修正で意図的にガードしない)と
+`SendDao()`の自己広告(nonzero Path Lifetime)を区別する必要が
+あった — 前者は畳み込み対象ではなく毎回送信されるため、区別せず
+数えると畳み込みの有無に関係なく閾値を満たしてしまう
+(誤り1・2の修正だけでは気づけなかった、buggy版・fixed版の両方が
+偶然同じ実測件数7になった原因)。`dao.GetPathLifetime() != 0`で
+フィルタして解決。
+
+最終的な閾値は§63と同じ理屈(バーストの実効窓4.48秒 ÷ ジッター
+上限1.0秒 = floor 4)で`>= 4`とした。
+
+load-bearing検証: `daoRefreshPending`のガードを一時的に無効化した
+ところ、このテストが実測3件(閾値4未満)で明確にFAILすることを
+確認、元に戻して再度PASSを確認。
+
+### 64.3 検証
+
+`./ns3 build`(rplモジュール・プロジェクト全体とも)、
+`test-runner --suite=rpl`を実行し、既存126件+新規1件=127件全てが
+安定PASSすることを確認。
+
+## 65. `DodagMembership::dioIntervalMin`のデフォルト値欠如によるTrickle無限ループ
+
+§64の`RplParentSwitchRapidBumpCoalescedTestCase`を開発する過程
+(誤り2を修正する前、`SendRawRplMessage()`の送信元偽装バグに
+気づく前の段階)で、テストスイート全体が完了しない
+(通常1秒未満で終わる全テストが、2時間以上CPU使用率100%のまま
+戻らない)という、この監査で発見した中で最も深刻な副産物を
+踏んだ。
+
+### 65.1 原因
+
+`DodagMembership::dioIntervalMin`(`rpl-routing-protocol.h`)には、
+同じ構造体の兄弟フィールド(`ocp`, `minHopRankIncrease`,
+`dioIntervalDoublings`, `dioRedundancy`)が全て持つデフォルト
+メンバ初期化子が無かった。RFC 6550 section 6.7.6のDAG
+Configurationオプションは全てのDIOに載せることを要求しておらず、
+定期的な同梱を推奨するのみ — つまり、このオプションを載せていない
+正当なDIOを起点に`JoinDodag()`が実行される(初回joinでも、
+section 8.2.2.4のバージョン変更に伴うrejoinでも)ことはRFC上
+普通に起こりうる。`dio.HasDagConfiguration()`が偽の場合、
+兄弟フィールドは全て自分自身のデフォルト初期化子にフォール
+バックするが、`dioIntervalMin`だけは初期化子が無いため`Time(0)`の
+ままになる。
+
+この`0`が`RplTrickleTimer::SetParameters()`経由で`m_intervalMin`に
+渡ると、`IntervalEvent()`自身の指数バックオフ実装
+(`m_interval = std::min(m_interval + m_interval, m_intervalMax)`)
+の不動点になる — `0 + 0 = 0`は`m_intervalMax`との`min`を取っても
+永久に0のままで一切成長せず、`NewInterval()`は毎回遅延0秒で
+自分自身を再スケジュールし続ける。これは「単に短すぎるDIO周期」
+ではなく、シミュレータの当該インスタントから時刻が一切進まなくなる
+真の無限ループ(Zenoパラドックス型の事象ストーム)であり、
+`Simulator::Run()`は`Stop()`で指定した境界に決して到達できない。
+
+### 65.2 修正
+
+`dioIntervalMin`に、兄弟フィールドと同じ流儀のデフォルト初期化子を
+付与:
+
+```cpp
+Time dioIntervalMin{MilliSeconds(int64_t(1) << RPL_DIO_INTERVAL_MIN)};
+```
+
+`RPL_DIO_INTERVAL_MIN`(rpl-conf.h、既存の定数、Imin指数の既定値
+=12、すなわち4.096秒)を、SendDio()/JoinDodag()自身のワイヤ上の
+エンコード/デコード(`MilliSeconds(int64_t(1) << exp)`)と同じ式で
+デフォルト値化しただけであり、新しい定数や新しい概念は導入して
+いない。
+
+### 65.3 新規テスト
+
+`RplJoinWithoutDagConfigurationTestCase`: DAG Configurationオプション
+を一切持たない自作DIOを`DeliverRawRplMessage()`でchildへ直接注入し、
+joinが成立することと、その後5秒間のTrickle送信DIO件数が僅少
+(5件以下、既定Imin=4.096秒なら1〜2件が期待値)に収まることを確認
+する。原因が真の無限ループである以上、修正が無い状態でこのテストを
+実行すると「大きい件数でFAIL」ではなく「そもそも完了しない」ため、
+その旨をテスト自身のコメントに明記した。
+
+load-bearing検証: デフォルト初期化子を除去したところ、
+`test-runner --suite=rpl`(このテストを含む完全なスイート)が
+40秒以上CPU使用率100%のまま戻らないことを確認(バックグラウンド
+watchdogで強制終了)。元に戻して再度全件PASSを確認。
+
+### 65.4 検証
+
+`./ns3 build`(rplモジュール・プロジェクト全体とも)、
+`test-runner --suite=rpl`、`./test.py -s rpl`を実行し、
+既存127件+新規1件=128件全てが安定PASS(3.5秒前後)することを確認。
