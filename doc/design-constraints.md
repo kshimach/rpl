@@ -7961,3 +7961,121 @@ scratchプローブも役目を終えたため削除した。
 からやや外れる重い解決策でもある。現時点でこれ以上の着手予定は
 無い。
 
+## 71. RFC 6550 section 11.2.2.3 DAO Inconsistency Detection and Recovery を実装
+
+`/protocol-test-matrix`の完成度サーベイ(未実装項目の洗い出しと現行
+コードとの突き合わせ)で見つかった、現実に未実装なまま残っていた
+MUST寄りの項目に着手した。対象は`RplPacketInfoHeader`(RPI、
+RFC 6553)の'F'(Forwarding-Error)フラグ — ワイヤフォーマット上の
+`SetForwardingError()`/`GetForwardingError()`は既に存在していたが、
+どの経路からも一度も呼ばれていなかった("Never set by this
+implementation" とクラス自身のdocコメントに明記されていた)。
+
+### 71.1 RFC本文の要件
+
+RFC 6550 section 11.2.2.3、Storing modeにのみ適用される機構:
+
+> If DAO inconsistency loop recovery is applied, then the router
+> SHOULD send the packet back to the parent that passed it with the
+> Forwarding-Error 'F' bit set and the 'O' bit left untouched.
+> Otherwise, the router MUST silently discard the packet.
+>
+> Upon receiving a packet with a Forwarding-Error bit set, the node
+> MUST remove the routing states that caused forwarding to that
+> neighbor, clear the Forwarding-Error bit, and attempt to send the
+> packet again.
+
+2つの役割に分かれる: (A) 下り経路を持たないルータが、送信元へ
+`F=1`のまま送り返す側、(B) `F=1`を受け取ったノードが、自分の
+stale な`downwardRoutes`エントリを消し、`F`をクリアして再送を
+試みる側。
+
+### 71.2 実装
+
+**(A) 送信側**: `RouteInput()`のStoring mode分岐 (§9.8の下り経路
+探索が失敗する箇所) に、`FindDownwardRoute()`が何も見つけられず、
+かつパケットが実際に下り方向(RPIの'O'ビット)である場合の新しい
+分岐を追加した。この判定は重要で、上り方向のトラフィックが
+`downwardRoutes`に無いのは正常(そのテーブルは下り専用)であり、
+そちらは既存の「preferred parentへ転送」フォールバックにそのまま
+流す。新設した`ReadRpiDown()`(`ReadRpiInstanceId()`と同じ
+non-mutatingな覗き見、2オクテット固定オフセット読み)でこれを
+判定し、新設した`MarkForwardingError()`(パケットのコピー上で
+RPIの'F'ビットだけを立てて再合成、`RplIpv6OptionRpl::Process()`
+自身が使うのと同じsplice技法)でパケットを書き換え、
+`RouteViaPreferredParent()`(既存、上り方向フォールバックが使うのと
+同じ関数)でこの下り経路を渡してきた"parent"(Storing modeの
+木構造では、このノードにdownward packetを渡せるのは自分の
+preferred parent以外にありえない)へ送り返す。
+
+**(B) 受信側**: `RplIpv6OptionRpl::Process()`に、既存のrank
+不整合チェック(R bit)より前に'F' bitのチェックを追加した。順序が
+重要な理由: 'O'ビットがbounce後も変更されないため("left
+untouched")、既存のrank一貫性チェックはこのbounceパケットを
+「下りなのにsenderのrankが高い(=子から)」という**別の**不整合と
+誤認識してしまう。'F'が立っていたら、新設`NotifyForwardingError()`
+(`FindDodagByInstance()`で該当DODAGを引き、`downwardRoutes.erase
+(destination)`するだけ — どのneighborが原因かを知る必要はない、
+このノード自身の`downwardRoutes[destination]`エントリが、
+定義上、その転送を引き起こした唯一の原因だから)を呼び、'F'を
+クリアして、rank一貫性チェックをスキップしてそのまま返す。
+「再送を試みる」側はコード追加不要: `RplIpv6OptionRpl::Process()`
+の直後に`RouteInput()`自身が同じ宛先で新規に`FindDownwardRoute()`
+を引き直す既存の流れがそのまま働き、エントリが消えていれば
+自動的に(A)と同じ分岐に落ちて、さらに上のparentへ再bounceする
+(多段階のstaleさにも自然に対応する、専用のretryロジック不要)。
+
+新設属性は無し。`GlobalRepairBurstCount`(§70)と違って、この機構
+自体はRFCの"SHOULD"部分を無条件で有効化する形にした — 既存の
+全シナリオ・全テストは(A)の分岐に到達する状況(下り方向で
+downwardRoutesが空)を作らないため、影響はゼロ。
+
+### 71.3 テストとその実装で踏んだ大きな落とし穴
+
+`RplForwardingErrorBounceTestCase`((A)の検証)、
+`RplForwardingErrorPurgesStaleRouteTestCase`((B)の検証)の2件を
+追加。単体では両方ともすぐPASSしたが、**既存135件と合わせて
+`--suite=rpl`を通すと`packet-metadata.cc:403`の`NS_ASSERT`で
+毎回確実にクラッシュする**という問題に長時間はまった。
+
+調査の経過:
+- 単独では通る、2件合わせても通る、既存135件だけでも安定して
+  通る — にもかかわらず137件全部だと確実に落ちる、という
+  組み合わせ依存の再現性から着手。
+- テストケース内の登録位置を動かしても変化なし(実行順序の問題
+  ではない)。
+- 段階的にテストの中身を削って(`Config::Connect`によるパケット
+  捕捉を丸ごと外す、`RouteInput()`を`Ipv6L3Protocol::Receive()`
+  経由ではなく直接呼ぶ形に作り直す等)原因を切り分けたが、
+  production code側(`MarkForwardingError()`等)は既存135件が
+  無傷で通り続けたことと合わせて早い段階で潔白と判断した。
+- 最終的に、テスト側の合成パケット構築で使っていた
+  `Ipv6ExtensionHopByHopHeader::AddOption()`を、生バイト列を
+  手で組み立てる方式(2オクテットの固定prefixを`Create<Packet>
+  (buf, 2)`で作り`AddAtEnd()`で本体と連結)に置き換えたところ、
+  137件全件が複数回連続で安定してPASSするようになった。
+
+**原因はここで切り上げ、断定はしない**: `Ipv6ExtensionHopByHopHeader`
+/`OptionField`まわりのns-3 core側に、多数のテストケースが直列に
+走る長寿命プロセス下でのみ顕在化する何らかの状態(グローバルな
+metadata登録か、割り当て済みバッファの再利用パターンか)がある
+らしいという以上のことは、この節の作業では突き止めていない。
+`RplPacketInfoHeaderTestCase`など既存のRPIテストも元から
+`Ipv6ExtensionHopByHopHeader`を経由せず素のヘッダだけを組み立てて
+いた(§(agent調査時点)) — 今回の新規テストが独自にこのクラスを
+使い始めたことで初めて踏んだ、ということ自体が「無闇に新しい
+ヘルパーを使わず、既存テストが実際に踏んでいる経路を踏襲する」
+ことの実利を示している。
+
+load-bearing検証: (A)を`else if (false && storing)`で無効化した
+ところ`RplForwardingErrorBounceTestCase`が確実にFAIL、(B)の
+`NotifyForwardingError()`呼び出しをコメントアウトしたところ
+`RplForwardingErrorPurgesStaleRouteTestCase`が確実にFAILすることを
+確認、両方とも元に戻して再度PASSを確認した。
+
+### 71.4 検証
+
+`./ns3 build`(rplモジュール・プロジェクト全体とも)、
+`test-runner --suite=rpl`(5回連続実行して安定性を確認)、
+`./test.py -s rpl`を実行し、既存135件+新規2件=137件全てが
+安定PASS(0.9秒前後)することを確認。

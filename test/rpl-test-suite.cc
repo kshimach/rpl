@@ -5,6 +5,7 @@
  */
 
 #include "ns3/boolean.h"
+#include "ns3/config.h"
 #include "ns3/icmpv6-header.h"
 #include "ns3/icmpv6-l4-protocol.h"
 #include "ns3/inet6-socket-address.h"
@@ -165,6 +166,77 @@ DeliverRawRplMessage(Ptr<Node> node,
     // which the device's own address standing in for both simply misses
     // (an empty lookup, not an error): harmless, since nothing this
     // function delivers needs that cache warm.
+    ipv6->Receive(device,
+                 packet,
+                 0x86dd,
+                 device->GetAddress(),
+                 device->GetAddress(),
+                 NetDevice::PACKET_HOST);
+}
+
+/**
+ * @brief Hand a downward Storing mode DATA packet, carrying the RPL Option
+ *        (RFC 6553), directly to a node's Ipv6L3Protocol::Receive() -- the
+ *        same bypass-the-channel injection DeliverRawRplMessage() uses, but
+ *        for an ordinary data packet rather than an RPL control message, so
+ *        the RPI's own 'O' (down)/'F' (Forwarding-Error) bits and sender
+ *        rank can be set to whatever a section 11.2.2.3 test needs
+ *        independent of what real traffic on a real topology would produce.
+ *
+ * @param node the node to deliver to
+ * @param interface the interface the packet is delivered on
+ * @param src the source address, only ever meaningful for a test's own
+ *        bookkeeping -- nothing this delivers checks it
+ * @param dst the destination address, both the IPv6 header's own and (for a
+ *        node not addressed by it) what RouteInput() has to find a route for
+ * @param instanceId the RPI's own RPLInstanceID
+ * @param down the RPI's own 'O' bit
+ * @param forwardingError the RPI's own 'F' bit
+ * @param senderRank the RPI's own SenderRank
+ */
+static void
+DeliverDataPacketWithRpi(Ptr<Node> node,
+                         uint32_t interface,
+                         Ipv6Address src,
+                         Ipv6Address dst,
+                         uint8_t instanceId,
+                         bool down,
+                         bool forwardingError,
+                         uint16_t senderRank)
+{
+    Ptr<Ipv6L3Protocol> ipv6 = node->GetObject<Ipv6L3Protocol>();
+    Ptr<NetDevice> device = ipv6->GetNetDevice(interface);
+
+    Ptr<Packet> packet = Create<Packet>(32); // arbitrary payload, never inspected
+
+    RplPacketInfoHeader rpi;
+    rpi.SetDown(down);
+    rpi.SetForwardingError(forwardingError);
+    rpi.SetInstanceId(instanceId);
+    rpi.SetSenderRank(senderRank);
+    packet->AddHeader(rpi);
+
+    // The Hop-by-Hop extension header's own fixed 2-octet prefix (RFC 8200
+    // section 4.3): Next Header (UDP, 17; never actually demuxed by
+    // anything this delivers to) and Hdr Ext Len (0, since the RPI's own 6
+    // octets plus this 2-octet prefix is already exactly the 8-octet unit
+    // Hdr Ext Len counts past). Prepended as raw bytes rather than through
+    // Ipv6ExtensionHopByHopHeader::AddOption(): this is the same 2-octet
+    // skip ReadRpiInstanceId()/MarkForwardingError() already assume, spelled
+    // out explicitly instead of built through the option-field machinery.
+    uint8_t hbhPrefix[2] = {17, 0};
+    Ptr<Packet> withPrefix = Create<Packet>(hbhPrefix, 2);
+    withPrefix->AddAtEnd(packet);
+    packet = withPrefix;
+
+    Ipv6Header ipv6Header;
+    ipv6Header.SetSource(src);
+    ipv6Header.SetDestination(dst);
+    ipv6Header.SetNextHeader(Ipv6Header::IPV6_EXT_HOP_BY_HOP);
+    ipv6Header.SetPayloadLength(packet->GetSize());
+    ipv6Header.SetHopLimit(64);
+    packet->AddHeader(ipv6Header);
+
     ipv6->Receive(device,
                  packet,
                  0x86dd,
@@ -3490,6 +3562,289 @@ RplStoringModeStaleDaoAndNoPathTestCase::DoRun()
         root->GetDownwardRoute(RPL_DEFAULT_INSTANCE, dodagId, fictitious, nextHop),
         false,
         "The No-Path withdrawal was not propagated two hops up to root");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief RFC 6550 section 11.2.2.3 (DAO Inconsistency Detection and
+ *        Recovery): a Storing mode router with a downward packet but no
+ *        downwardRoutes entry for its own destination "SHOULD send the
+ *        packet back to the parent that passed it with the
+ *        Forwarding-Error 'F' bit set", instead of silently misrouting it
+ *        upward as ordinary traffic (RouteInput()'s own preferred-parent
+ *        fallback, which everything else falling through the Storing mode
+ *        block reaches) or dropping it.
+ *
+ * design-constraints.md section 71.
+ */
+class RplForwardingErrorBounceTestCase : public TestCase
+{
+  public:
+    RplForwardingErrorBounceTestCase();
+
+  private:
+    void DoRun() override;
+
+    /**
+     * @brief Capture what RouteInput() itself decided to do with the packet.
+     * @param device the outgoing device (unused)
+     * @param route the route RouteInput() chose
+     * @param packet the packet as RouteInput() is handing it onward
+     * @param header the packet's own IPv6 header (unused)
+     */
+    void OnUnicastForward(Ptr<const NetDevice> device,
+                          Ptr<Ipv6Route> route,
+                          Ptr<const Packet> packet,
+                          const Ipv6Header& header);
+
+    bool m_forwarded{false};      //!< whether OnUnicastForward() ran at all
+    Ptr<Packet> m_forwardedPacket; //!< the packet it was called with, if so
+};
+
+RplForwardingErrorBounceTestCase::RplForwardingErrorBounceTestCase()
+    : TestCase("A Storing mode router with no downward route bounces a downward packet back with "
+              "the Forwarding-Error bit set")
+{
+}
+
+void
+RplForwardingErrorBounceTestCase::OnUnicastForward(Ptr<const NetDevice> device,
+                                                    Ptr<Ipv6Route> route,
+                                                    Ptr<const Packet> packet,
+                                                    const Ipv6Header& header)
+{
+    m_forwarded = true;
+    m_forwardedPacket = packet->Copy();
+}
+
+void
+RplForwardingErrorBounceTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2); // 0 = root, 1 = child
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    rplHelper.Set("Mop", UintegerValue(RPL_MOP_STORING_NO_MULTICAST));
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(200));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> root = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> child = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(child->IsJoined(), true, "The child never joined the Storing mode DODAG");
+
+    Ipv6Address rootLinkLocal =
+        nodes.Get(0)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    // Never advertised to anyone by anything -- the same style
+    // RplStoringModeStaleDaoAndNoPathTestCase's own "fictitious" uses --
+    // guaranteeing the child holds no downwardRoutes entry for it.
+    Ipv6Address target("2001:1::ff:fe00:aa");
+
+    // The same wire format PrepareOutgoingPacket() itself builds for a
+    // downward Storing mode packet -- but handed straight to RouteInput(),
+    // the same interface Ipv6L3Protocol itself calls it through, rather
+    // than routed in through a real Receive(): this only needs to check
+    // what RouteInput() itself decides to do with the packet, not exercise
+    // the rest of the receive pipeline (NDP, extension-header demuxing,
+    // Trickle/Tx tracing, ...) too. p carries no IPv6 header of its own,
+    // matching RouteInput()'s own convention (@see ReadRpiInstanceId()'s
+    // doc comment): the header is passed alongside, separately.
+    RplPacketInfoHeader rpi;
+    rpi.SetDown(true);
+    rpi.SetForwardingError(false);
+    rpi.SetInstanceId(RPL_DEFAULT_INSTANCE);
+    rpi.SetSenderRank(root->GetRank());
+    Ptr<Packet> packet = Create<Packet>(32);
+    packet->AddHeader(rpi);
+
+    // The Hop-by-Hop extension header's own fixed 2-octet prefix, spelled
+    // out as raw bytes -- @see DeliverDataPacketWithRpi()'s own matching
+    // comment for why, and for HdrExtLen's own value being 0.
+    uint8_t hbhPrefix[2] = {17, 0};
+    Ptr<Packet> withPrefix = Create<Packet>(hbhPrefix, 2);
+    withPrefix->AddAtEnd(packet);
+    packet = withPrefix;
+
+    Ipv6Header header;
+    header.SetSource(rootLinkLocal);
+    header.SetDestination(target);
+    header.SetNextHeader(Ipv6Header::IPV6_EXT_HOP_BY_HOP);
+    header.SetPayloadLength(packet->GetSize());
+    header.SetHopLimit(64);
+
+    Ptr<NetDevice> device = nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetNetDevice(1);
+
+    Ipv6RoutingProtocol::UnicastForwardCallback ucb =
+        MakeCallback(&RplForwardingErrorBounceTestCase::OnUnicastForward, this);
+    Ipv6RoutingProtocol::MulticastForwardCallback mcb; // null: no multicast route expected
+    Ipv6RoutingProtocol::LocalDeliverCallback lcb;     // null: RouteInput() never delivers locally
+    Ipv6RoutingProtocol::ErrorCallback ecb;             // null: only called if this bounce fails
+
+    bool handled = child->RouteInput(packet, header, device, ucb, mcb, lcb, ecb);
+
+    NS_TEST_ASSERT_MSG_EQ(handled, true, "RouteInput() reported it could not handle the packet");
+    NS_TEST_ASSERT_MSG_EQ(m_forwarded,
+                          true,
+                          "The child did not bounce the undeliverable downward packet back to "
+                          "root at all");
+
+    RplPacketInfoHeader bouncedRpi;
+    NS_TEST_ASSERT_MSG_EQ(m_forwardedPacket->GetSize() >= 2, true, "The bounced packet is too short");
+    Ptr<Packet> bouncedTail =
+        m_forwardedPacket->CreateFragment(2, m_forwardedPacket->GetSize() - 2);
+    NS_TEST_ASSERT_MSG_NE(bouncedTail->RemoveHeader(bouncedRpi),
+                          0,
+                          "The bounced packet's own RPL Option could not be parsed");
+    NS_TEST_ASSERT_MSG_EQ(bouncedRpi.GetForwardingError(),
+                          true,
+                          "The bounced packet's own Forwarding-Error bit was not set");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief RFC 6550 section 11.2.2.3, the other half of
+ *        RplForwardingErrorBounceTestCase: a router receiving a packet with
+ *        the Forwarding-Error bit set "MUST remove the routing states that
+ *        caused forwarding to that neighbour" -- its own downwardRoutes
+ *        entry for the packet's destination, the one entry that, by
+ *        construction, could have caused the original forward.
+ *
+ * design-constraints.md section 71.
+ */
+class RplForwardingErrorPurgesStaleRouteTestCase : public TestCase
+{
+  public:
+    RplForwardingErrorPurgesStaleRouteTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplForwardingErrorPurgesStaleRouteTestCase::RplForwardingErrorPurgesStaleRouteTestCase()
+    : TestCase("A node receiving a Forwarding-Error bounce purges its own stale downward route "
+              "for that destination")
+{
+}
+
+void
+RplForwardingErrorPurgesStaleRouteTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2); // 0 = root, 1 = child
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    rplHelper.Set("Mop", UintegerValue(RPL_MOP_STORING_NO_MULTICAST));
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(200));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> root = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> child = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(child->IsJoined(), true, "The child never joined the Storing mode DODAG");
+
+    Ipv6Address dodagId = root->GetGlobalAddress();
+    Ipv6Address rootLinkLocal =
+        nodes.Get(0)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address childLinkLocal =
+        nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address target("2001:1::ff:fe00:aa");
+
+    // Seed root's own downwardRoutes[target] via a synthetic DAO from the
+    // child -- a real send (SendRawRplMessage), not a spoof: this is the
+    // child's own real address, which has already exchanged real DIO/DAO
+    // traffic with root during the join above.
+    RplDaoHeader dao;
+    dao.SetInstanceId(RPL_DEFAULT_INSTANCE);
+    dao.SetDodagId(dodagId);
+    dao.SetSequence(1);
+    dao.SetTarget(target);
+    dao.SetTransitInformation(Ipv6Address::GetAny(), 1, RPL_DEFAULT_LIFETIME);
+    Simulator::Schedule(Seconds(0),
+                        &SendRawRplMessage<RplDaoHeader>,
+                        nodes.Get(1),
+                        1,
+                        dao,
+                        static_cast<uint8_t>(RPL_CODE_DAO),
+                        childLinkLocal,
+                        rootLinkLocal);
+    Simulator::Stop(MilliSeconds(50));
+    Simulator::Run();
+
+    Ipv6Address nextHop;
+    NS_TEST_ASSERT_MSG_EQ(root->GetDownwardRoute(RPL_DEFAULT_INSTANCE, dodagId, target, nextHop),
+                          true,
+                          "root did not accept the seeded DAO");
+    NS_TEST_ASSERT_MSG_EQ(nextHop, childLinkLocal, "root's next hop for it is wrong");
+
+    // The bounce itself: as if root had just forwarded a downward packet
+    // for target through child, and child bounced it straight back because
+    // (unknown to root) it holds no such route any more. senderRank is
+    // child's own real rank, the same "do not also trip the unrelated
+    // rank-consistency check" reasoning RplForwardingErrorBounceTestCase's
+    // own comment gives -- though the Forwarding-Error branch in
+    // RplIpv6OptionRpl::Process() returns before that check would run
+    // regardless, this keeps the packet realistic in case that ordering
+    // ever changes.
+    Simulator::Schedule(Seconds(0),
+                        &DeliverDataPacketWithRpi,
+                        nodes.Get(0),
+                        1,
+                        childLinkLocal,
+                        target,
+                        RPL_DEFAULT_INSTANCE,
+                        true, // down ('O' left untouched by a real bounce, RFC 6550 section 11.2.2.3)
+                        true, // forwardingError
+                        child->GetRank());
+    Simulator::Stop(MilliSeconds(50));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(
+        root->GetDownwardRoute(RPL_DEFAULT_INSTANCE, dodagId, target, nextHop),
+        false,
+        "root kept its stale downwardRoutes entry after being told forwarding to it failed");
 
     Simulator::Destroy();
 }
@@ -21846,6 +22201,8 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplDodagFormationTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplStoringModeDownwardRouteTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplStoringModeStaleDaoAndNoPathTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplForwardingErrorBounceTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplForwardingErrorPurgesStaleRouteTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplStoringModeDaoRetryTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplStoringModeDaoRetryContentTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplStoringModeInputValidationTestCase, TestCase::Duration::QUICK);

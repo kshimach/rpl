@@ -385,6 +385,34 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     void NotifyRankInconsistency(uint8_t instanceId);
 
     /**
+     * @brief Act on a Forwarding-Error reported by the RPL Option (RFC 6553,
+     *        RFC 6550 section 11.2.2.3): a Storing mode descendant this node
+     *        forwarded a downward packet through no longer actually holds a
+     *        route to its destination, and bounced the packet back.
+     *
+     * "the node MUST remove the routing states that caused forwarding to
+     * that neighbour ... and attempt to send the packet again" -- resolved
+     * without needing to know which neighbour bounced it: this node's own
+     * downwardRoutes[destination] is, by construction, the one entry that
+     * could have caused the original forward, so erasing it (if present) is
+     * exactly that removal. The "attempt again" half needs no code of its
+     * own here: RouteInput() runs its own fresh FindDownwardRoute() lookup
+     * immediately after this returns (RplIpv6OptionRpl::Process() calls this
+     * ahead of the routing decision, the same ordering NotifyRankInconsistency()
+     * is called from), and a miss there falls through to the same
+     * MarkForwardingError() bounce this packet itself already went through
+     * once -- naturally cascading further up the tree if the next hop is
+     * stale too, with no separate retry mechanism to maintain.
+     *
+     * Called by RplIpv6OptionRpl, not by anything in this class. Resolved by
+     * RPLInstanceID alone, the same limit NotifyRankInconsistency() has.
+     *
+     * @param instanceId the RPLInstanceID the bounced packet belongs to
+     * @param destination the downward packet's own final destination
+     */
+    void NotifyForwardingError(uint8_t instanceId, Ipv6Address destination);
+
+    /**
      * @brief Get how many nodes the root has heard a DAO from.
      *
      * Only meaningful on the root, which is the only node that keeps the
@@ -2075,6 +2103,50 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      */
     const DodagMembership::DownwardRoute* FindDownwardRoute(const DodagMembership& dodag,
                                                              Ipv6Address target) const;
+
+    /**
+     * @brief Set the 'F' (Forwarding-Error) bit on a packet's own RPL Option.
+     *
+     * RFC 6550 section 11.2.2.3: a Storing mode router with a downward
+     * packet but no downward route for it (a DAO inconsistency: whichever
+     * child once claimed one has since withdrawn it) "SHOULD send the
+     * packet back to the parent that passed it with the Forwarding-Error
+     * 'F' bit set and the 'O' bit left untouched" -- RouteInput()'s own
+     * Storing mode block calls this, on a copy of the packet it was handed,
+     * before routing that copy back to dodag.preferredParent instead of
+     * forwarding the original any further down. Same byte-splice technique
+     * ReadRpiInstanceId() uses to peek the option, but write-capable: the
+     * RPI is always the first (and only) Hop-by-Hop option this module ever
+     * puts on a packet (@see ReadRpiInstanceId()'s own comment for why that
+     * assumption is safe), so no Ipv6ExtensionDemux-driven option walk is
+     * needed to find it again.
+     *
+     * @param [in,out] p the packet to rewrite; untouched if this returns false
+     * @param header the packet's own IPv6 header (read only, not rewritten)
+     * @return true if the packet carried a well-formed RPL Option and now
+     *         has its 'F' bit set; false (p left untouched) if it did not
+     */
+    bool MarkForwardingError(Ptr<Packet>& p, const Ipv6Header& header) const;
+
+    /**
+     * @brief Read the 'O' (down) bit out of a packet's own RPL Option.
+     *
+     * Same read-only peek ReadRpiInstanceId() does, kept separate rather
+     * than folded into it: that method is public API
+     * (RplIpv6ExtensionSourceRouting::Process() uses it too) with an
+     * established two-argument-out signature callers already depend on,
+     * and this is only ever needed from RouteInput()'s own Storing mode
+     * block, to tell a genuine DAO inconsistency (a downward packet with no
+     * downwardRoutes entry, RFC 6550 section 11.2.2.3) apart from the
+     * ordinary case of upward traffic simply not being in that table at
+     * all, which is not an error.
+     *
+     * @param p the packet being routed
+     * @param header the packet's own IPv6 header
+     * @param [out] down the RPI's own 'O' bit, true for down
+     * @return true if a well-formed RPL Option was found and @p down was set
+     */
+    bool ReadRpiDown(Ptr<const Packet> p, const Ipv6Header& header, bool& down) const;
 
     /**
      * @brief Find a membership by its RPLInstanceID alone.

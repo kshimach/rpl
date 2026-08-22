@@ -2982,6 +2982,78 @@ RplRoutingProtocol::ReadRpiInstanceId(Ptr<const Packet> p,
 }
 
 bool
+RplRoutingProtocol::MarkForwardingError(Ptr<Packet>& p, const Ipv6Header& header) const
+{
+    if (header.GetNextHeader() != Ipv6Header::IPV6_EXT_HOP_BY_HOP)
+    {
+        return false;
+    }
+    if (p->GetSize() < 2)
+    {
+        return false;
+    }
+
+    // Same splice technique RplIpv6OptionRpl::Process() itself uses to
+    // rewrite the RPI in place, and the same fixed 2-octet skip
+    // ReadRpiInstanceId() reads through: the RPI is always the first (and
+    // only) option this module ever puts in the Hop-by-Hop header, @see
+    // that method's own comment for why that assumption is safe.
+    Ptr<Packet> rewritten = p->Copy();
+    Ptr<Packet> tail = rewritten->CreateFragment(2, rewritten->GetSize() - 2);
+
+    RplPacketInfoHeader rpi;
+    if (tail->GetSize() < rpi.GetSerializedSize() || tail->RemoveHeader(rpi) == 0)
+    {
+        return false;
+    }
+    if (rpi.IsMalformed() || rpi.GetType() != RPL_HBH_OPTION_TYPE)
+    {
+        return false;
+    }
+
+    // RFC 6550 section 11.2.2.3: "the router SHOULD send the packet back to
+    // the parent that passed it with the Forwarding-Error 'F' bit set and
+    // the 'O' bit left untouched" -- only 'F' changes here, the caller
+    // routes the result back to dodag.preferredParent itself.
+    rpi.SetForwardingError(true);
+    tail->AddHeader(rpi);
+
+    rewritten->RemoveAtEnd(rewritten->GetSize() - 2);
+    rewritten->AddAtEnd(tail);
+    p = rewritten;
+    return true;
+}
+
+bool
+RplRoutingProtocol::ReadRpiDown(Ptr<const Packet> p, const Ipv6Header& header, bool& down) const
+{
+    if (header.GetNextHeader() != Ipv6Header::IPV6_EXT_HOP_BY_HOP)
+    {
+        return false;
+    }
+
+    Ptr<Packet> fragment = p->Copy();
+    if (fragment->GetSize() < 2)
+    {
+        return false;
+    }
+    fragment = fragment->CreateFragment(2, fragment->GetSize() - 2);
+
+    RplPacketInfoHeader rpi;
+    if (fragment->GetSize() < rpi.GetSerializedSize() || fragment->RemoveHeader(rpi) == 0)
+    {
+        return false;
+    }
+    if (rpi.IsMalformed() || rpi.GetType() != RPL_HBH_OPTION_TYPE)
+    {
+        return false;
+    }
+
+    down = rpi.GetDown();
+    return true;
+}
+
+bool
 RplRoutingProtocol::FindHopByHopRoute(Ipv6Address destination,
                                       Ipv6Address& nextHop,
                                       uint8_t& instanceId) const
@@ -4385,9 +4457,9 @@ RplRoutingProtocol::RouteInput(Ptr<const Packet> p,
     // CreateLocalDodag()-formed one.
     {
         const DodagMembership* base = GetBaseDodag();
+        bool storing = base && base->mop == RPL_MOP_STORING_NO_MULTICAST;
         const DodagMembership::DownwardRoute* route =
-            (base && base->mop == RPL_MOP_STORING_NO_MULTICAST) ? FindDownwardRoute(*base, dst)
-                                                                : nullptr;
+            storing ? FindDownwardRoute(*base, dst) : nullptr;
         if (route)
         {
             Ptr<Ipv6Route> ipv6Route = RouteToNeighbourOn(route->interface, route->nextHop, dst);
@@ -4397,6 +4469,40 @@ RplRoutingProtocol::RouteInput(Ptr<const Packet> p,
                                            << route->nextHop);
                 ucb(ipv6Route->GetOutputDevice(), ipv6Route, p, header);
                 return true;
+            }
+        }
+        else if (storing)
+        {
+            // RFC 6550 section 11.2.2.3 (DAO Inconsistency Detection and
+            // Recovery): this is only a real inconsistency for a packet
+            // actually moving down -- upward traffic missing from
+            // downwardRoutes is the ordinary case (that table has nothing
+            // to do with it) and falls through to the preferred-parent
+            // block below unchanged. A downward packet with no
+            // downwardRoutes entry means whichever child this node last
+            // learned that route from has since withdrawn it: "the router
+            // SHOULD send the packet back to the parent that passed it with
+            // the Forwarding-Error 'F' bit set" -- dodag.preferredParent is
+            // that parent, since in a tree-structured Storing mode DODAG it
+            // is the only node that could have handed this node a downward
+            // packet in the first place.
+            bool down = false;
+            if (ReadRpiDown(p, header, down) && down)
+            {
+                Ptr<Packet> bounced = p->Copy();
+                if (MarkForwardingError(bounced, header))
+                {
+                    Ptr<Ipv6Route> ipv6Route = RouteViaPreferredParent(*base, dst);
+                    if (ipv6Route)
+                    {
+                        NS_LOG_LOGIC("Bouncing "
+                                     << dst
+                                     << " back up with the Forwarding-Error bit set: no Storing "
+                                        "mode downward route (any more)");
+                        ucb(ipv6Route->GetOutputDevice(), ipv6Route, bounced, header);
+                        return true;
+                    }
+                }
             }
         }
     }
@@ -4671,6 +4777,17 @@ RplRoutingProtocol::NotifyRankInconsistency(uint8_t instanceId)
     if (dodag)
     {
         dodag->dioTrickle.Reset();
+    }
+}
+
+void
+RplRoutingProtocol::NotifyForwardingError(uint8_t instanceId, Ipv6Address destination)
+{
+    NS_LOG_FUNCTION(this << +instanceId << destination);
+    DodagMembership* dodag = FindDodagByInstance(instanceId);
+    if (dodag)
+    {
+        dodag->downwardRoutes.erase(destination);
     }
 }
 

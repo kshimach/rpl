@@ -177,6 +177,30 @@ RplIpv6OptionRpl::Process(Ptr<Packet> packet,
         return optionSize;
     }
 
+    // RFC 6550 section 11.2.2.3: a Forwarding-Error bounce leaves the 'O'
+    // (down) bit untouched even though the packet is, for this one hop,
+    // physically moving back up towards the root -- so the ordinary rank-
+    // consistency check just below, which assumes 'O' truthfully describes
+    // the packet's direction, would misread this hop's own sender (a child,
+    // necessarily of higher rank) as a down-direction inconsistency and
+    // flag or drop a packet that is behaving exactly as designed. Handled
+    // and returned before that check runs, the same way the Hop-by-hop
+    // Route case above it is: "the node MUST remove the routing states that
+    // caused forwarding to that neighbour, clear the Forwarding-Error bit,
+    // and attempt to send the packet again" -- RouteInput()'s own Storing
+    // mode block does the "attempt again" half, immediately after this
+    // option processing step returns, off the same downwardRoutes state
+    // NotifyForwardingError() just updated.
+    if (rpi.GetForwardingError())
+    {
+        rpl->NotifyForwardingError(rpi.GetInstanceId(), ipv6Header.GetDestination());
+        rpi.SetForwardingError(false);
+        tail->AddHeader(rpi);
+        packet->RemoveAtEnd(packet->GetSize() - offset);
+        packet->AddAtEnd(tail);
+        return optionSize;
+    }
+
     bool down = rpi.GetDown();
     uint16_t senderRank = rpi.GetSenderRank();
     // Scoped to the DODAG this packet's own RPLInstanceID names, not
