@@ -11,3 +11,16 @@ build_lib_example(
     ${librpl}
     ${libsixlowpan}
 )
+
+build_lib_example(
+  NAME rpl-paper-evaluation
+  SOURCE_FILES rpl-paper-evaluation.cc
+  LIBRARIES_TO_LINK
+    ${libapplications}
+    ${libcore}
+    ${libflow-monitor}
+    ${libinternet}
+    ${libmobility}
+    ${libnetwork}
+    ${librpl}
+)
