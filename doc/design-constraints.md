@@ -7842,3 +7842,122 @@ load-bearing検証: 修正2(`JoinDodag()`側の`m_disRefreshPending`
 `./ns3 build`(rplモジュール・プロジェクト全体とも)、
 `test-runner --suite=rpl`、`./test.py -s rpl`を実行し、
 既存131件+新規1件=132件全てが安定PASS(3.6秒前後)することを確認。
+
+## 70. §37の残課題への2つの候補を検証、両方とも却下(production codeへの変更なし)
+
+論文再現評価(base RPL/P2P-RPL/AODV-RPLの比較、`examples/
+rpl-paper-evaluation.cc`)の実施中に、SimpleNetDevice上でも
+`GetRank() == RPL_INFINITE_RANK`のまま固着するノードが一定割合
+observedされ、これをきっかけに§37の残課題(root自身のTrickleが
+Imaxに張り付いたまま戻らず、`GlobalRepairInterval`が実効性を
+持たない問題)への対応を検討した。
+
+結論から言うと、**production codeへの変更は無い**。§37.10が挙げた
+案1(root自身のdioTrickleにも通常のconsistency/inconsistency処理を
+適用する)はコード調査だけで有望とは言えないと判明し、新たに
+考案した案(GlobalRepairBurstCount、後述)は実機検証の末に効果
+ゼロと確認された。§37.10の案2(`GlobalRepairFire()`へのack/retry
+新設)だけが、依然として否定されていない唯一の残り選択肢である。
+
+### 70.1 §37.10案1の再検討: コード調査だけで有望性が低いと判明
+
+案1は「`HandleDio()`冒頭の"rootは自分DODAG宛てDIOを無視"ガードが
+rootのTrickleを非対称に扱っている」という診断に基づく。しかし
+`HandleDio()`と対になる`HandleDis()`を確認したところ、こちらには
+同種のroot除外ガードが**存在しない**: multicast DIS受信時は
+`m_dodags`の全メンバーシップ(root自身が根を張るものも含む)に
+無条件で`dodag.dioTrickle.Reset()`を呼んでいる(RFC 6550 section
+8.3)。これは机上の読みに留まらず、既存の`RplDisHandlingTestCase`
+(「A multicast DIS did not reset the root's Trickle timer」という
+アサーションメッセージを持つ)によって実際にPASSする形で
+実証済みの現行動作である。
+
+さらに、`GlobalRepairFire()`自身は`HandleDio()`/`HandleDis()`の
+どちらも経由せず、`dodag.dioTrickle.Reset()`を**直接**呼んでいる。
+つまり「rootのTrickleが実際にリセットされる」状況は
+`GlobalRepairInterval`を有効にした時点で既に発生しており、
+§37.7-37.9はまさにその状態を測定して効果ゼロという結果を得ている。
+案1(DIO経由のリセット経路を追加する)は、既に動いている別の
+リセット経路(GlobalRepairFire()の直接呼び出し)が効果ゼロだった
+以上、同じ理由で効果が薄いと判断し、実装には着手しなかった。
+
+(付随して分かったこと: `DisInterval`属性のドキュメントコメントは
+「未joinのノードが送る周期DIS」限定であり、既にjoin済みのノードは
+周期DISを送らない。rank ceilingで固着したノードは`LeaveDodag()`を
+経由しない(`dodag.rank`をINFINITE_RANKにセットするだけでmembership
+自体は残る)ため、固着後もDISを送信しない。長時間安定したネット
+ワークではDIS自体がほぼ発生しないため、HandleDis()経由のリセット
+経路は理論上は非対称ではないが実際にはほとんど使われない。)
+
+### 70.2 新規候補: `GlobalRepairBurstCount`(実装・検証・revert済み)
+
+70.1を踏まえ、「rootのTrickleは既にリセットされているのに、なぜ
+`GlobalRepairInterval`を有効にしても効果が無いのか」という別の
+角度から、`GlobalRepairFire()`が1回の`Reset()`しか行わないことに
+着目した。Reset()は次の送信機会を[Imin/2, Imin)の中のランダムな
+1点にしか作らない。CSMA-CA輻輳下ではこの1回の送信機会が単純に
+失われる可能性があり、失われれば次の`GlobalRepairInterval`
+(実験では300秒)まで何のフォローアップも無い。
+
+**実装**: `GlobalRepairFire()`の1回のResetに続けて、
+`dioIntervalMin`間隔で`GlobalRepairBurstCount - 1`回の追加Reset()を
+発行する仕組みを追加した。新規`uint8_t`属性
+`GlobalRepairBurstCount`(既定値1 = 従来どおり無効、既存の全
+シナリオ・全テストに対して完全なno-op)、`DodagMembership`に新規
+`Timer globalRepairSustainEvent`と`uint8_t
+globalRepairPulsesRemaining`を追加、新規メソッド
+`GlobalRepairSustainFire()`。`CreateDodagMembership()`/
+`LeaveDodag()`への配線は`globalRepairEvent`自身と同じパターンを
+踏襲。
+
+**検証環境**: 本節の測定にはSimpleNetDeviceは使えない(CSMA-CA輻輳
+そのものが存在しないため)。§37.2と同じ条件(100ノード、200m四方、
+`RandomRectanglePositionAllocator`、lr-wpan+6LoWPAN、無トラフィック、
+OF0)を再現する使い捨てのscratchプローブ(`scratch/
+rpl-global-repair-burst-probe.cc`、§37.10の`scratch/
+rpl-rank-stability-probe.cc`と同じ位置づけで作成・検証後に削除済み)
+を新設し、`GlobalRepairInterval=300s`固定で`GlobalRepairBurstCount`
+1(現状)と5(修正)を比較した。
+
+**結果: 3 seed全てで完全に同一**。seed1(12000秒、フル尺):
+joined数が99→74/99まで単調減少する§37.2と同じパターンを再現した
+上で、burstCount=1とburstCount=5の間で全サンプル点(600秒おき、
+20点)が1つも違わず一致。seed2・seed3(6000秒)も同様に、それぞれ
+99→86/99、99→81/99という減少パターンの全サンプル点で完全一致。
+
+**機構が動いていないわけではないことを確認**: 完全一致という結果
+自体が「実は`GlobalRepairSustainFire()`が呼ばれていない」という
+実装バグを疑わせたため、一時的にtrace計装して確認した。設計通り
+1回のGlobal Repairにつき4回追加でfireしており、fire時点の
+`dioTrickle`の`m_interval`は常にIminの2倍(直前のResetからImin
+経過後、`IntervalEvent()`が1回だけ倍加した直後)になっていた —
+RFC 6206 section 4.2の「既にIminならReset()はno-op」には一度も
+該当しておらず、Reset()は毎回実際にIminへ戻す効果を持っていた。
+
+**それでも効果が無かった理由**: このバースト機構が増幅するのは
+root自身の送信頻度のみである。中継ノードが自分自身のTrickleを
+Reset()するのは、自分がまだ聞いていない新しいinconsistencyを
+検知した時だけであり、rootが(version番号を変えずに)同じ内容を
+連投しても、既に一度中継済みの中継ノードにとってはただの
+consistentな重複でしかなく、`ConsistencyHit()`にしかならない。
+つまりこの増幅はrootの1ホップ隣接ノードにしか届かず、多ホップ先で
+詰まっているノードの再送を一切加速しない。3 seedとも「たまたま
+1ホップ隣接に固着ノードが無かった」のではなく、この機構が
+多ホップの固着に対して構造的に無力であることを示している。
+
+**結論**: `GlobalRepairBurstCount`はコード上は正しく動作するが、
+§37の実害(遠方ノードの永久固着)には無関係と判明したため、
+production codeから完全にrevertした(`model/rpl-routing-protocol.h`
+/`.cc`の差分ゼロ、既存135テスト全件PASS変わらず)。検証用
+scratchプローブも役目を終えたため削除した。
+
+### 70.3 残された選択肢
+
+§37.10の案2(`GlobalRepairFire()`にDAO-ACK相当のack/retryを持たせる)
+だけが、本節で否定されていない唯一の方向として残る。ただし
+§37.10自身が指摘する通りコストは小さくなく、RFC 6550のDIOが
+本来fire-and-forget(冗長性による到達性担保)を前提に設計されて
+いることを踏まえると、確認応答プロトコルの新設はRPLの設計思想
+からやや外れる重い解決策でもある。現時点でこれ以上の着手予定は
+無い。
+
