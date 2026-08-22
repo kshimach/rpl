@@ -46,7 +46,7 @@
     `friend class rpl::RplIpv6ExtensionSourceRouting;` を `ipv6-l3-protocol.h`
     に追加した点を除く)。
   - パケットは各ホップで実際に 8 + 16n バイト分の RH3 バイトを載せて運ばれる。
-    アドレス圧縮 (CmprI/CmprE) は未実装のまま (常に非圧縮)。
+    アドレス圧縮 (CmprI/CmprE) は未実装のまま (常に非圧縮、**16節の通り対応済み**)。
 - **参考にした先行事例**: TU Wien 2024 の Baranyai の RPL 実装 (thesis) は同種の
   制約 (ただし RPL hop-by-hop header 向け、RH3 向けではない) を Tag で回避して
   いた。本実装は最終的に Tag 方式を廃し、コアにフックを追加する方式へ移行した
@@ -1861,8 +1861,8 @@ Contiki-NG rpl-lite の OF0 も同じく Sp=1 相当で、本実装の
 影響は rank の絶対値のスケールで、標準的な既定値を使う実装の 1/3 に
 なる。同一 DODAG に両者が混在すると、本実装のノードのほうが常に
 root に近く見え、親として選ばれやすくなる。DAGMaxRankIncrease との
-相対関係も変わる (25.2 が未実装なので現状は影響しないが、実装した
-場合はここが効いてくる)。
+相対関係も変わる (25.2 は**26.1節の通り対応済み**のため、現在は
+実際にここが効いている)。
 
 ### 25.5 乖離: MRHOF の境界比較が 1 単位ずれている (SHOULD/MAY、**28 節の通り対応済み**)
 
@@ -2554,7 +2554,8 @@ bind・`DodagKey` に `operator==`/`operator!=` が要ること (ns-3 の
 RPLInstanceID を実際に join/生成する API、AODV-RPL、P2P-RPL は
 未着手。それぞれの実装時に、実際の要求に合わせて `DodagMembership`
 を新規作成する経路 (今回作った `m_dodags[key]` への in-place 構築の
-パターンを流用できるはず) を設計する。
+パターンを流用できるはず) を設計する。(**AODV-RPL は 35 節、
+P2P-RPL は 36 節の通り対応済み**)
 
 ## 32. 複数 DODAG への実際の同時参加 (31 節の続き)
 
@@ -3255,7 +3256,8 @@ RPLInstanceID is always set to 0 in RPL control messages" は無条件
 から、実質的に「上り/下り」と等価であり、これは既に `RplPacketInfo
 Header` 自身の 'O' (Down) フラグが正しく担っている。よって今回は
 **制御メッセージの D=0 強制のみ** を直し、data パケットごとの動的な
-D ビット管理は見送った — 実装するには `PrepareOutgoingPacket()` の
+D ビット管理は見送った (**AODV-RPL のH=1対応に伴い48.2節の通り
+対応済み**) — 実装するには `PrepareOutgoingPacket()` の
 RPI 付与部分と `FindDodagByInstance()`/`ReadRpiInstanceId()` の
 照合ロジックの両方を、動的に変わりうる D ビットを無視してマッチする
 よう同時に直す必要があり (でないと、送信側だけ D を動的に変えて
@@ -3721,7 +3723,7 @@ G-RREP 送信自体には不要と判明 (`SendDio()` は元々 unicast 対応�
 送信のみを実装し、RFC がさらに規定する「RREQ 自体の unicast 中継」
 は干渉リスクを理由に今回も見送った (§52.5)。
 
-### 35.14 複数 ART (§6.2.2 のターゲット集合積集合) も実装を見送った
+### 35.14 複数 ART (§6.2.2 のターゲット集合積集合) も実装を見送った (**42節の通り対応済み**)
 
 §35.11 の 4 番目の項目として調べたが、これも着手時の「小さい項目」
 という見立てが外れていたため、ユーザーに確認の上で見送った。
@@ -4063,7 +4065,7 @@ RREP-Instance ... rooted at itself」— RREP-Instance は RREQ-Instance
 (§35.11〜§35.17) が完了したのを受けて着手した。P2P-RPL は新規
 ICMPv6 メッセージ型を 2 個要求する (P2P-DRO・P2P-DRO-ACK) が、今回
 実装したのは P2P-DRO まで — P2P-DRO-ACK と、それが要る A/S フラグは
-見送った。コミットは 4 つ: 増分1 (P2P-RDO ワイヤフォーマットと
+見送った (**38節の通り対応済み**)。コミットは 4 つ: 増分1 (P2P-RDO ワイヤフォーマットと
 P2P-DRO メッセージ)、増分2 (`DiscoverP2pRoute()` — Origin の一時
 DAG 形成と flood 開始)、増分3 (`HandleDio()` の P2P 分岐と
 `ShouldRefuseP2pRdo()` — flood と Target 認識)、増分4+5+6
@@ -4095,14 +4097,16 @@ R は受信した値をそのまま尊重 (Origin 役としては常に R=1 を�
 
 - **H=1 (Hop-by-hop Route)**: §9.6 が要求する「経路ごとの転送状態を
   中継ルータに保存する」という、この モジュールに全く無い
-  storing-mode 相当の新規サブシステムを要求する。
-- **複数 Target (RPL Target Option)・複数 Source Route (N>0)**:
-  AODV-RPL の複数 ART 見送り (§35.14) と同型の判断。
+  storing-mode 相当の新規サブシステムを要求する。(**46節の通り
+  対応済み**)
+- **複数 Target (RPL Target Option)**: AODV-RPL の複数 ART 見送り
+  (§35.14) と同型の判断。(**41節の通り対応済み**) **複数 Source
+  Route (N>0)** の方は依然として未実装のまま。
 - **P2P-DRO-ACK (code 0x05) と Target 側の再送**
   (`P2P_DRO_ACK_WAIT_TIME`/`MAX_P2P_DRO_RETRANSMISSIONS`)、**Stop (S)
   フラグによる早期終了**: DAO-ACK の再送機構
   (`daoRetryEvent`/`daoRetriesLeft`)を転用できる見込みは計画段階で
-  立てたが、今回は未着手。
+  立てたが、今回は未着手。(**38節の通り対応済み**)
 - **Metric Container による制約**: OF0 の rank (MaxRank) 制約のみ
   対応。RFC 自身が「OF0 なら Metric Container 不要」と明記している。
 - **Secure P2P-RPL 一式**、**双方向到達性の実測判定 (§9.3 の
@@ -4674,7 +4678,7 @@ membership同様'L'期限で退出する。design-constraints.mdの
 `./ns3 build`clean、`./test.py -s rpl`PASS、
 `test-runner --suite=rpl`を3回連続PASS確認。
 
-## 39. §9.2 の P2P mode DIO 独自 Trickle 一貫性判定を実装(既定値変更は保留)
+## 39. §9.2 の P2P mode DIO 独自 Trickle 一貫性判定を実装(既定値変更は保留、**44節の通り対応済み**)
 
 §36.2 で見送った最後の1項目。RFC 6997 §9.2 の4パターン分類を
 `HandleDio()` の Trickle-hit 部分に実装した:
@@ -4711,7 +4715,7 @@ Reset() する (変化はした) が、rule 1 は Reset() **しない** (改善�
 していない (この節の分岐は P2P-RPL の temporary DAG にのみ適用され、
 `dio.HasP2pRdo()` で汎用パスと排他的に分かれる)。
 
-### 39.2 `P2pDioRedundancy` の既定値変更は今回見送り
+### 39.2 `P2pDioRedundancy` の既定値変更は今回見送り (**44節の通り対応済み**)
 
 計画では §36.6 で 0 にした既定値を RFC 推奨の 1 に戻す予定だったが、
 **見送った**。理由:
@@ -6316,11 +6320,13 @@ PASS。
   Recovery)**: RPIの'F' (Forwarding-Error) フラグを使った
   Storing mode専用の修復機構。既存の'R' (rank inconsistency)
   フラグが「trace はするが強制はしない」という既知の未実装
-  (§12.2)と同種の、意図的に対象外とした項目。
+  (§12.2)と同種の、意図的に対象外とした項目。(**71節の通り
+  対応済み**)
 - **複数ターゲットの1メッセージ集約**: §54.4で述べた通り、
   マルチホップ伝播そのものは今回の対象に含めたが、複数の
   `downwardRoutes`エントリを1つのDAOメッセージへ集約する
-  帯域最適化(RFC上は任意)は次回増分へ持ち越す。
+  帯域最適化(RFC上は任意)は次回増分へ持ち越す。(**59節の通り
+  対応済み**)
 - **`/protocol-test-matrix`による深掘り監査**: このセッションの
   標準運用(§40/§41/§43/§47/§49/§51/§53)に従い、本実装の
   コミット後に別途実施する。
@@ -6725,8 +6731,8 @@ overflowにより)たまたま正しく動くが、circular側の127→0とい�
 同じ素朴な`++`パターンを使っており、理論上は同じ境界バグを
 共有しているが、ユーザーの明示的な指示によりPath Sequenceのみを
 今回の対象とした。DTSN/Versionへの適用は別増分として意図的に
-見送っている — `RplSequenceIncrement()`自体は汎用ヘルパーとして
-実装したため、いつでも横展開できる。
+見送っている(**61節の通り対応済み**) — `RplSequenceIncrement()`
+自体は汎用ヘルパーとして実装したため、いつでも横展開できる。
 
 `dodag.pathSequence`の初期値(既定`0`)自体はRFC section 7.2
 rule 1の推奨値("128以上、推奨値240")からは外れているが、rule
