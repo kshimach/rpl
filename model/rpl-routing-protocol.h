@@ -1598,18 +1598,16 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      * @brief Send this Target's batch of P2P-DROs once the collection
      *        window closes (RFC 6997 section 7's 'N' > 0 only).
      *
-     * Sends one plus P2pState::numRoutes P2P-DROs: the first from
+     * Sends up to one plus P2pState::numRoutes P2P-DROs: the first from
      * addressVector, tracked for a P2P-DRO-ACK exactly as the single-route
      * path does, then one per collected entry in
      * P2pState::alternateRoutes, untracked. If fewer alternates arrived
-     * than were asked for, the remainder repeat addressVector rather than
-     * going unsent -- section 9.5 has the Target "select the discovered
-     * route inside the received DIO as one or more of the routes that would
-     * be carried inside a P2P-DRO message", so sending the one route it
-     * does have more than once is within the letter of it. The diversity
-     * section 9.5 recommends ("SHOULD try to select routes that do not
-     * share a large common segment") is then simply not achieved on that
-     * run, which is a weaker outcome, not a violation.
+     * than were asked for, the batch is simply shorter -- it is never
+     * padded out with copies of a route already sent. Section 9.5's "one
+     * plus the value of the N field" describes how many routes the Target
+     * selects, while its "the Target SHOULD avoid selecting routes that
+     * have large segments in common" constrains which ones qualify, and
+     * copies of one route are that constraint's limiting case.
      *
      * @param key the temporary DAG's key
      */

@@ -16501,9 +16501,15 @@ RplP2pNumRoutesDistinctTestCase::DoRun()
     NS_TEST_ASSERT_MSG_EQ(m_ackRequested[1], false, "An extra route must not ask for an ack");
     NS_TEST_ASSERT_MSG_EQ(m_ackRequested[2], false, "An extra route must not ask for an ack");
 
-    NS_TEST_ASSERT_MSG_EQ(m_stop[0], false, "'S' must not be set before the last route");
-    NS_TEST_ASSERT_MSG_EQ(m_stop[1], false, "'S' must not be set before the last route");
-    NS_TEST_ASSERT_MSG_EQ(m_stop[2], true, "'S' belongs on the last route of the batch");
+    // 'S' on every route of the batch: by the time P2pDroCollectExpire()
+    // sends any of it, the whole batch has been selected, which is RFC 6997
+    // section 9.5's condition. Each route travels a different path, and
+    // section 5 has "all the routers receiving such a P2P-DRO" stop
+    // processing DIOs -- so 'S' on the last one only would leave every
+    // other path running to its own 'L' deadline.
+    NS_TEST_ASSERT_MSG_EQ(m_stop[0], true, "'S' belongs on every route of the batch");
+    NS_TEST_ASSERT_MSG_EQ(m_stop[1], true, "'S' belongs on every route of the batch");
+    NS_TEST_ASSERT_MSG_EQ(m_stop[2], true, "'S' belongs on every route of the batch");
 
     m_monitor->Close();
     Simulator::Destroy();
@@ -16513,16 +16519,18 @@ RplP2pNumRoutesDistinctTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
- * @brief With 'N' = 3 but only one path to the Target, the batch is padded
- *        out to four P2P-DROs rather than cut short.
+ * @brief With 'N' = 3 but only one path to the Target, exactly one P2P-DRO
+ *        goes out -- the batch is not padded up to four with copies.
  *
  * The boundary case in both directions at once: 'N' is a 2-bit field, so 3
  * is the largest value it can carry, and a one-wide diamond is the fewest
- * routes there can be. RFC 6997 section 9.5 lets the Target "select the
- * discovered route inside the received DIO as one or more of the routes
- * that would be carried inside a P2P-DRO message", so repeating the single
- * route it has is within the letter of the request -- the diversity the
- * same section recommends is simply not achievable with one path.
+ * routes there can be. RFC 6997 section 9.5's "one plus the value of the N
+ * field" describes how many routes the Target selects; the SHOULD two
+ * sentences later -- "the Target SHOULD avoid selecting routes that have
+ * large segments in common" -- constrains which ones qualify, and copies of
+ * one route are that prohibition's limiting case. Padding would spend three
+ * extra network-wide multicast floods to satisfy a count at the SHOULD's
+ * expense.
  */
 class RplP2pNumRoutesPaddedTestCase : public RplP2pNumRoutesTestCaseBase
 {
@@ -16534,8 +16542,8 @@ class RplP2pNumRoutesPaddedTestCase : public RplP2pNumRoutesTestCaseBase
 };
 
 RplP2pNumRoutesPaddedTestCase::RplP2pNumRoutesPaddedTestCase()
-    : RplP2pNumRoutesTestCaseBase("A P2P-RPL Target asked for 'N' = 3 with one route pads the "
-                                  "batch out to four",
+    : RplP2pNumRoutesTestCaseBase("A P2P-RPL Target asked for 'N' = 3 with one route sends "
+                                  "one P2P-DRO, not four copies",
                                   1)
 {
 }
@@ -16552,21 +16560,141 @@ RplP2pNumRoutesPaddedTestCase::DoRun()
 
     NS_TEST_ASSERT_MSG_NE(m_key.dodagId, Ipv6Address::GetAny(), "The discovery did not start");
     NS_TEST_ASSERT_MSG_EQ(m_routes.size(),
-                          4,
-                          "'N' = 3 should have produced exactly four P2P-DROs even with only "
-                          "one route to send");
-
-    for (uint32_t i = 1; i < m_routes.size(); i++)
-    {
-        NS_TEST_ASSERT_MSG_EQ((m_routes[i] == m_routes[0]),
-                              true,
-                              "With one path there is nothing to pad with but that path");
-    }
+                          1,
+                          "With one path to the Target, 'N' = 3 should still produce exactly "
+                          "one P2P-DRO: the batch carries distinct routes, not copies");
 
     NS_TEST_ASSERT_MSG_EQ(m_ackRequested[0], true, "The tracked P2P-DRO should ask for an ack");
-    NS_TEST_ASSERT_MSG_EQ(m_ackRequested[3], false, "An extra route must not ask for an ack");
-    NS_TEST_ASSERT_MSG_EQ(m_stop[0], false, "'S' must not be set before the last route");
-    NS_TEST_ASSERT_MSG_EQ(m_stop[3], true, "'S' belongs on the last route of the batch");
+    NS_TEST_ASSERT_MSG_EQ(m_stop[0], true, "'S' belongs on every route of the batch");
+
+    m_monitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief A Hop-by-hop discovery ('H' = 1) puts zero in 'N' on the wire and
+ *        ignores it on receipt, however P2pNumRoutes is configured.
+ *
+ * RFC 6997 section 7, on the 'N' field: "This field is valid only if the R
+ * flag is set to one and the H flag is set to zero... When Hop-by-hop
+ * Routes are being discovered, the N field MUST be set to zero on
+ * transmission and ignored on reception." Section 9.5 states the Target
+ * side of the same rule: "If the H flag inside the P2P-RDO is set to one,
+ * the Target needs to select one route and send a P2P-DRO message along
+ * this route back to the Origin."
+ *
+ * Both halves are checked on one run: the P2P mode DIOs the Origin floods
+ * are captured off the wire and their 'N' bits verified to be zero even
+ * though P2pNumRoutes is 2, and the Target is verified to answer with a
+ * single P2P-DRO with no collection window at all -- the window is set to
+ * a value long enough (5 s) that a Target which had wrongly honoured 'N'
+ * could not have replied inside the run.
+ */
+class RplP2pNumRoutesHopByHopTestCase : public RplP2pNumRoutesTestCaseBase
+{
+  public:
+    RplP2pNumRoutesHopByHopTestCase();
+
+  private:
+    void DoRun() override;
+
+    /// @brief Capture the 'N' field of every P2P mode DIO seen at the monitor.
+    /// @param socket the monitoring socket
+    void CaptureDioN(Ptr<Socket> socket);
+
+    std::vector<uint8_t> m_dioNumRoutes; //!< the 'N' of each P2P mode DIO seen
+};
+
+RplP2pNumRoutesHopByHopTestCase::RplP2pNumRoutesHopByHopTestCase()
+    : RplP2pNumRoutesTestCaseBase("A Hop-by-hop P2P-RPL discovery sends 'N' = 0 and ignores it",
+                                  1)
+{
+}
+
+void
+RplP2pNumRoutesHopByHopTestCase::CaptureDioN(Ptr<Socket> socket)
+{
+    Address sender;
+    Ptr<Packet> packet = socket->RecvFrom(sender);
+    if (!packet)
+    {
+        return;
+    }
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ipv6Header);
+    Icmpv6Header icmpv6Header;
+    packet->RemoveHeader(icmpv6Header);
+    if (icmpv6Header.GetType() != ICMPV6_RPL)
+    {
+        return;
+    }
+    if (icmpv6Header.GetCode() == RPL_CODE_P2P_DRO)
+    {
+        RplP2pDroHeader dro;
+        packet->RemoveHeader(dro);
+        if (!dro.HasP2pRdo())
+        {
+            return;
+        }
+        const P2pRdoOption& rdo = dro.GetP2pRdo();
+        if (rdo.maxRankOrNh != rdo.addressVector.size())
+        {
+            return; // relayed onward, not straight from the Target
+        }
+        m_routes.push_back(rdo.addressVector);
+        m_ackRequested.push_back(dro.GetAckRequested());
+        m_stop.push_back(dro.GetStop());
+        return;
+    }
+    if (icmpv6Header.GetCode() != RPL_CODE_DIO)
+    {
+        return;
+    }
+    RplDioHeader dio;
+    packet->RemoveHeader(dio);
+    if (!dio.HasP2pRdo())
+    {
+        return; // an ordinary base-DODAG DIO
+    }
+    m_dioNumRoutes.push_back(dio.GetP2pRdo().numRoutes);
+}
+
+void
+RplP2pNumRoutesHopByHopTestCase::DoRun()
+{
+    // A window far longer than the run that follows: if the Target wrongly
+    // honoured 'N' here, it would still be collecting when the run ends and
+    // no P2P-DRO would be seen at all.
+    Build(2, Seconds(5));
+    m_monitor->SetRecvCallback(MakeCallback(&RplP2pNumRoutesHopByHopTestCase::CaptureDioN, this));
+
+    Ptr<RplRoutingProtocol> origin = m_nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> target = m_nodes.Get(2)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(target->IsJoined(), true, "The base DODAG did not reach the Target");
+
+    m_key = origin->DiscoverP2pRoute(target->GetGlobalAddress(), true);
+    NS_TEST_ASSERT_MSG_NE(m_key.dodagId, Ipv6Address::GetAny(), "The discovery did not start");
+
+    Simulator::Stop(Seconds(3));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_GT_OR_EQ(m_dioNumRoutes.size(),
+                                1,
+                                "No P2P mode DIO was ever seen, so nothing was checked");
+    for (uint32_t i = 0; i < m_dioNumRoutes.size(); i++)
+    {
+        NS_TEST_ASSERT_MSG_EQ(+m_dioNumRoutes[i],
+                              0,
+                              "'N' MUST be zero on a Hop-by-hop discovery (RFC 6997 section 7)");
+    }
+
+    NS_TEST_ASSERT_MSG_EQ(m_routes.size(),
+                          1,
+                          "A Hop-by-hop Target must answer with exactly one P2P-DRO, sent "
+                          "immediately rather than after a collection window");
 
     m_monitor->Close();
     Simulator::Destroy();
@@ -16615,8 +16743,12 @@ RplP2pNumRoutesLateArrivalTestCase::DoRun()
     // out, short of the temporary DAG's own 'L' deadline (16 s by default).
     Discover(Seconds(1));
 
+    // Not pinned to an exact count: with the window cut this short the
+    // Target may or may not have banked an alternate before it closed, and
+    // the batch now carries only distinct routes. What is pinned is that
+    // it answered at all, and -- below -- that it never answers again.
     const uint32_t afterWindow = m_routes.size();
-    NS_TEST_ASSERT_MSG_EQ(afterWindow, 3, "'N' = 2 should have produced exactly three P2P-DROs");
+    NS_TEST_ASSERT_MSG_GT_OR_EQ(afterWindow, 1, "The Target never answered at all");
 
     // Several more P2P mode DIO floods' worth: Imax is ~1.024 s, so the
     // other two relays have re-flooded repeatedly by now, and every one of
@@ -22648,6 +22780,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplP2pNumRoutesDistinctTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pNumRoutesPaddedTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pNumRoutesLateArrivalTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pNumRoutesHopByHopTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDioRejectionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplParentLossRejoinTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplInterfaceRestartTestCase, TestCase::Duration::QUICK);

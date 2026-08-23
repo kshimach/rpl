@@ -8100,8 +8100,19 @@ Target 側をこう規定する:
 
 > If the Reply flag inside the P2P-RDO in the received DIO is set to
 > one, the Target MUST select one or more discovered routes and send
-> one or more P2P-DRO messages... The Target SHOULD try to select
-> routes that do not share a large common segment.
+> one or more P2P-DRO messages...
+>
+> This document does not prescribe a particular method for the Target
+> to select the routes.  Example methods include selecting each route
+> that meets the specified routing constraints until the desired
+> number of routes has been selected, or selecting the best routes
+> discovered over a certain time period.  If multiple routes are to be
+> selected, the Target SHOULD avoid selecting routes that have large
+> segments in common.
+
+(この引用は §73 の監査で原文と照合し直したもの。当初この節は
+"SHOULD try to select routes that do not share a large common
+segment" という**存在しない文**を逐語引用として書いていた。@see §73.2)
 
 このうち「複数の経路をどうやって手に入れるか」は RFC が一切規定して
 いない。実装前に確認した本質的な制約は、この モジュール全体が
@@ -8157,19 +8168,22 @@ received DIO as **one or more** of the routes") 上も合法ではある
 早期 return (「既に Target なので repeat は無視」と「preferred parent
 以外から来たコピーは無視」) より **手前**に置いた。捨てられるはずの
 コピーこそが別経路を運んでくるので、位置はここしかない。既に Target
-と認識済みのノードでのみ動く。重複排除は**完全一致のみ**: RFC の
-「大きな共通区間を避ける」は RFC 自身が "This document does not
-prescribe a particular method" と明言する preference であり、部分重複の
-閾値もタイブレークもこの モジュールには決める根拠が無い。一方、
-完全一致は隣人が Trickle 間隔ごとに同じ DIO を再フラッドする以上
-日常的に発生し、かつ明らかに価値ゼロなので、そこだけ落とす。
+と認識済みのノードでのみ動く。重複排除は**完全一致のみ**で、
+"the Target SHOULD avoid selecting routes that have large segments in
+common" を完全には満たしていない — 部分重複の閾値もタイブレークも
+この モジュールには決める根拠が無いため。近くにある "This document
+does not prescribe a particular method" はこの SHOULD の免罪符には
+ならない (そちらは**候補の発見方法**についての文で、SHOULD は選んだ
+方法に対する別個の制約)。捕まえられるのは限界ケースである完全一致
+だけで、これは隣人が Trickle 間隔ごとに同じ DIO を再フラッドする以上
+日常的に発生する。完全一致未満の重複は既知のギャップ (@see §73.2)。
 
-**送信** (`P2pDroCollectExpire()`): 1 + `numRoutes` 通を送る。
+**送信** (`P2pDroCollectExpire()`): 最大 1 + `numRoutes` 通を送る。
 
 1. slot 0 = `addressVector`。'A' も retry 予算も既存どおり。
-2. 残り N 通 = `alternateRoutes` から順に消費し、尽きたら
-   `addressVector` で埋める (72.2 の考え方をフォールバックとして統合)。
-   **ACK 追跡なし** (72.4)。
+2. `alternateRoutes` にある**別経路の分だけ**。経路が足りなくても
+   同一経路の複製で N+1 通に**水増ししない** (§73.2 で当初のパディング
+   方針を撤回した)。**ACK 追跡なし** (72.4)。
 
 ### 72.4 ACK/retry が scalar である問題と、その回避
 
@@ -8261,4 +8275,231 @@ load-bearing 検証:
 `./ns3 build`(rpl モジュール・プロジェクト全体とも)、
 `test-runner --suite=rpl`(5 回連続実行して安定性を確認)、
 `./test.py -s rpl`を実行し、既存 137 件 + 新規 3 件 = 140 件全てが
+安定 PASS (1.0 秒前後) することを確認。
+
+## 73. §72 への `/protocol-test-matrix` 監査 — MUST 違反1件を含む8件を修正
+
+§72 実装直後に走らせた監査。**5角のうち Angle 2 (境界値) と Angle 4
+(シーケンス状態遷移) はセッション上限で起動に失敗し、実行できていない** —
+Angle 1 (正常系)・Angle 3 (異常系)・Angle 5 (共有ヘルパー移行漏れ) の
+3角ぶんの結果に基づく。未実行の2角は次サイクルで回す。
+
+RFC 原文は各エージェントに再取得させたうえ、重要な争点
+(§7 の 'N' 定義、§9.5 の 'S' 条件、§5 の 'S' 意味論) は監査側でも
+`curl` で原文を直接読んで確認した。実際 Angle 1 と Angle 5 は 'S' の
+扱いで**逆の結論**を出しており、原文で決着させている (§73.3)。
+
+### 73.1 MUST 違反: H=1 のとき 'N' は 0 でなければならない
+
+Angle 1・Angle 3 が独立に指摘。RFC 6997 §7 の 'N' 定義、逐語:
+
+> Number of Routes (N): This field is valid only if the R flag is set
+> to one and the H flag is set to zero... When Hop-by-hop Routes are
+> being discovered, the N field MUST be set to zero on transmission
+> and ignored on reception.
+
+§9.5 も Target 側から同じことを言う: "If the H flag inside the P2P-RDO
+is set to one, the Target needs to select one route and send a P2P-DRO
+message along this route back to the Origin."
+
+§72 の実装は 'N' を端から端まで通す際に 'H' を**一度も参照していな
+かった**。`DiscoverP2pRoute()` は `hopByHop` 引数の1行手前で
+`numRoutes = m_p2pNumRoutes` を無条件に代入し、`HandleP2pRdo()` も
+`rdo.numRoutes` をそのまま採り、収集ウィンドウの分岐も `hopByHop` を
+見ていない。送信・受信の両方で MUST 違反。
+
+修正: 送信側 `numRoutes = hopByHop ? 0 : m_p2pNumRoutes`、受信側
+`numRoutes = rdo.hopByHop ? 0 : rdo.numRoutes`。受信側で「分岐時に
+無視する」ではなく**ゼロを格納する**ことにしたのは、この ノードが
+DIO を中継する際に再送出する値もゼロにするため — 両ビットを立てた
+ピアの 'N' がこのルータを経由して洗浄されない。
+
+実害 (Angle 1 の失敗シナリオ): H=1 で N=2 のまま Target が 3 通の
+Hop-by-hop 確立 P2P-DRO を別経路で送ると、経路が合流する最初の
+ルータが §9.6 の next hop 衝突チェックで 2 通目以降を捨て、分岐側の
+ルータにだけ `PathLifetime` 切れまで残る孤立した転送状態が生じる。
+
+### 73.2 パディング方針の撤回と、RFC の誤引用
+
+§72.3 は「経路が足りなければ同一経路の複製で N+1 通に埋める」と
+決めていた。その根拠として引用符付きで書いた
+
+> SHOULD try to select routes that do not share a large common segment
+
+は **RFC 6997 に存在しない文**だった (Angle 1 が指摘、原文照合で確認)。
+実際の §9.5 は "If multiple routes are to be selected, the Target
+SHOULD avoid selecting routes that have large segments in common"。
+さらに、その直前の "This document does not prescribe a particular
+method" を免罪符として使っていたのも誤りで、この文は**候補の発見
+方法**について述べたものであり、SHOULD は選んだ方法に対する別個の
+制約として後から加えられている。
+
+正しい文面で読み直すと、パディングは擁護できない。§9.5 の
+"one plus the value of the N field" は Target が**選ぶ**経路の本数を
+述べた記述文であって MUST ではなく、一方で「大きな共通区間を持つ
+経路を選ぶな」は SHOULD であり、完全同一の経路はその限界ケース。
+非規範的なカウントを満たすために、重複1本につきネットワーク全体の
+マルチキャストフラッドを1回余計に払い、SHOULD を犠牲にするのは
+トレードとして逆。
+
+修正: パディングを廃止し、実際に集まった**別経路の分だけ**送る
+(最大 1 + N 通、下回りうる)。同一箇所の誤引用はコード コメント
+2 箇所と本文書 2 箇所を原文に差し替えた。
+
+残るギャップ: 完全一致未満の部分重複は依然として弾いていない
+(閾値・タイブレークを決める根拠が無い)。SHOULD 未達として記録する。
+
+### 73.3 'S' フラグ — Angle 1 と Angle 5 の結論が割れた点
+
+§72.4 は 'S' を**バッチ末尾1通のみ**に立てていた。Angle 1 はこれを
+"the conservative, conforming reading" として妥当と判定し、Angle 5 は
+バグとして報告した。原文で決着させた。
+
+§9.5 の条件は 2 つ: 「唯一の Target であること」と
+
+> the Target has already selected the desired number of routes
+
+`P2pDroCollectExpire()` が1通目を送る時点で、ウィンドウは既に閉じ
+バッチ全体の選択は完了している。よって**全通に立てるのが条件を
+満たす**。そのうえで §5 の 'S' の意味論が決め手になった、逐語:
+
+> All the routers receiving such a P2P-DRO, **including those not
+> listed in the route carried inside a P2P-RDO**, SHOULD NOT process
+> any more DIOs received for this temporary DAG
+
+`HandleP2pDro()` は NH 位置で名指されたルータでしか `stopped` を
+立てない。バッチの各経路は別のパスを通るので、「末尾1通のみ」だと
+**停止信号が最後の代替経路のパスにしか届かず**、他のパスは自分の
+'L' 期限まで走り続ける。全通に立てれば全パスに届く。
+
+副次的に、Angle 5 が指摘した再送不整合も同時に消える:
+`P2pDroRetry()` → `SendP2pDro()` は 'S' を `!HasOtherP2pTargets()` から
+再計算するので、S=0 で送った slot 0 の再送が S=1 になり、
+「同一内容を再送する」という `SendP2pDroRoute()` 自身のコメントと
+§72.4 の「`P2pDroRetry()` は完全に無変更で済んでいる」という記述の
+両方が偽になっていた。
+
+**別件として記録**: `HandleP2pDro()` が NH 位置以外のルータで
+`stopped` を触らないこと自体が、上記 §5 の "including those not
+listed in the route" に対する乖離。これは §72 以前からある挙動で、
+'N' とは独立。未修正。
+
+### 73.4 ライフサイクルの穴 3 件 (Angle 3・Angle 5)
+
+いずれも収集ウィンドウという**新しい遅延**が作った穴。
+
+1. **'N' が 0 に変わったとき、開いているウィンドウを閉じていなかった。**
+   multi-Target 経路で DIO #1 が N=3、ウィンドウ中の DIO #2 が N=0 だと、
+   即返信したうえでウィンドウも後から発火し、同じ P2P-DRO を 2 度送って
+   `droRetryEvent` を Origin が ack 済みの Seq で再 arm する。修正:
+   'N' = 0 の分岐で `droCollectEvent.Cancel()` + `droCollecting = false`。
+2. **ウィンドウが 'L' を超えると無言で一切返信しない。** §9.5 の
+   "all P2P-DRO transmissions and retransmissions MUST take place while
+   the Target is still a part of the temporary DAG" 自体は
+   `LeaveDodag()` が `droCollectEvent` を cancel するので違反しないが、
+   Target が何も答えず Origin がタイムアウトするだけになる。既定
+   256 ms でも 'L' = 0 (1 s) なら到達しうるし、§72 が追加したテスト
+   自身が 3 s のウィンドウを設定している。修正: `expiry` の残り時間の
+   半分にクランプし、`NS_LOG_WARN` を出す。
+3. **ウィンドウ満了時に、インラインだった頃は無料で効いていたガードが
+   効かなくなっていた。** 満了コールバックは `m_dodags` 引きと
+   `addressVector.empty()` しか見ておらず、`isTarget`・`reply` ('R')・
+   `stopped` を再確認していない。ウィンドウ中に 'S' 付き P2P-DRO を
+   中継して `stopped` が立っても、'R' = 0 の DIO が来ても、バッチは
+   そのまま飛ぶ。修正: 3 つとも満了時に再確認する。
+
+### 73.5 収集品質と Origin 側の堅牢化 (Angle 1・Angle 3)
+
+- **上限到達後は先着優先で、後から来た良い経路を捨てていた。**
+  `alternateRoutes.size() >= numRoutes` で即 return していたため、
+  N=1・ウィンドウ 256 ms で t=10ms の 5 hop を採り t=120ms の 2 hop を
+  捨てる。§9.5 が例示する "selecting the best routes discovered over a
+  certain time period" — §72.3 が収集ウィンドウの根拠として引いた
+  まさにその文 — を満たしていない。修正: 満杯時は保持中の**最長**
+  経路と比較し、短ければ置換する。比較軸が hop 数なのは、ここで
+  使っている目的関数が OF0 であり Address Vector 自体が metric を
+  運ばないため。
+- **ウィンドウ中の preferred parent 切替で、重複判定が陳腐化する。**
+  `RecordP2pAlternateRoute()` は記録時点の `addressVector` と比較する
+  が、その後 `HandleP2pRdo()` が `addressVector` を書き換えうる。
+  結果 slot 0 と代替が同一内容になり、テストの本数アサーションは通る
+  のに多様性だけが黙って失われる。修正: 送信時に再比較する。
+- **Origin が P2P-DRO の TargetAddr を検証していなかった。**
+  `HandleP2pDro()` の Origin 分岐は `rdo.target` を
+  `dodag.p2p.target` と突き合わせず `m_p2pRoutes[rdo.target]` に書いて
+  いた。P2P-DRO には認証が無い (§14: "a rogue router could...generate
+  bogus P2P-DRO messages carrying bad routes") ので、Origin の隣人が
+  傍受した discovery の instanceId/DODAGID を使えば**任意の宛先**の
+  エントリを植え付けられる。修正: 一致しない P2P-DRO を捨てる。
+- **§72.5 の最短勝ちを `<=` から `<` に変えた。** 同着の場合に後着が
+  勝つようにする。偽造 P2P-DRO が短い経路を先に固定した場合、`<=`
+  だと同じ長さの正規経路が永久に負ける。`<` なら上書きできる。
+  なお `P2pDroRetry()` の再送は同一経路なので、この変更で挙動は
+  変わらない。
+
+**未解決として記録**: 収集ウィンドウは、攻撃者にとって「正規 Target
+より先に P2P-DRO を送る」ことを確率的な競争から**確定**に変える
+(正規 Target は必ず `P2pDroCollectWindow` だけ待つため)。最短勝ちと
+組み合わせると、偽造された短経路は同 discovery 中ずっと居座る。
+上記 TargetAddr 検証で「任意の宛先」は塞いだが、正しい Target 宛の
+偽造は塞げていない。P2P-RPL のセキュア版一式が未実装 (§36.2) である
+以上、根本的にはそこでしか解けない。
+
+### 73.6 修正しなかった指摘
+
+- **RFC 6997 §9.4 の中継側多様性 SHOULD が未実装** (Angle 1)。逐語:
+  "To improve the diversity of the routes being discovered, an
+  Intermediate Router SHOULD keep track of multiple routes...one of
+  which SHOULD be selected in a uniform random manner for inclusion in
+  the P2P-RDO inside the router's next DIO." これは 'N' を機能させる
+  ために RFC が**中継ルータ**側に置いた仕組みで、§72.1 が「単一
+  preferred parent モデル」として避けた前提そのもの。未実装のままだと、
+  多様性が中継の親選択から生まれるトポロジ (O→{A,B}→R→T のような、
+  R が等価な親を 2 つ持つ形) では Target のウィンドウは何も集められず、
+  'N' > 0 が実質無効になる。§72 が追加したテストは、代替経路が全て
+  Target への最終ホップになるダイヤモンド型 — §9.4 を必要としない
+  唯一の形状 — を使っているため、この穴を踏まない。**'N' の価値を
+  実際に効かせるには次に着手すべき項目**として記録する。
+- **Address Vector に載せる自アドレスが受信インタフェースのもので
+  ない** (Angle 1)。§7 逐語: "The IPv6 address that a router adds to
+  the vector MUST belong to the interface on which the router received
+  the DIO containing this P2P-RDO." `GetGlobalAddressIn()` は全
+  インタフェースを走査して最初に prefix が一致したものを返し、
+  `HandleP2pRdo()` が受け取っている `interface` 引数を使っていない。
+  §72 以前からある挙動で primary 経路も同じ形。マルチインタフェース
+  ノードでのみ顕在化する。'N' とは独立の別件として未修正。
+- **'N' を経由ルータが書き換えられる** (Angle 3)。中継は受信値を
+  素通しするので、フラッド上の任意のルータが 'N' を 0b11 にすると
+  Target は 4 通ぶんのバッチを組む。ただしパディング廃止 (§73.2) に
+  より、実際に別経路が無ければ増幅は起きなくなった。'N' に認証が
+  無いこと自体は §14 の範囲。
+
+### 73.7 テスト
+
+新規 1 件、既存 3 件を新仕様に合わせて改訂。
+
+- 新規 `RplP2pNumRoutesHopByHopTestCase`: `DiscoverP2pRoute(target,
+  true)` かつ `P2pNumRoutes=2` で、(a) 流れる P2P mode DIO の 'N' が
+  全て 0 であること、(b) Target がウィンドウを挟まず 1 通だけ返す
+  ことを同一 run で確認。ウィンドウを 5 s、run を 3 s にしてあるので、
+  誤って 'N' を尊重した実装では P2P-DRO が 1 通も観測されない。
+  load-bearing 検証済み ('H' ガードを外すと `actual="2"` で確実に FAIL)。
+- `RplP2pNumRoutesDistinctTestCase`: 'S' の期待値を「末尾のみ」から
+  「全通」に変更 (§73.3)。
+- `RplP2pNumRoutesPaddedTestCase`: 名称と期待値を反転 — 幅 1・N=3 で
+  4 通ではなく **1 通**であることを確認する (§73.2)。
+- `RplP2pNumRoutesLateArrivalTestCase`: パディング廃止で本数が
+  ウィンドウ内の到着運に依存するようになったため、絶対本数の
+  アサーションを「1 通以上答えた」+「その後増えない」に緩めた。
+
+**専用テストを持たない修正**: §73.4 の 3 件と §73.5 の 4 件。いずれも
+再現に multi-Target 経路・ウィンドウ中の親切替・偽造 P2P-DRO といった
+仕込みが要り、今回はコードレビューと RFC 照合のみで採用した。次
+サイクルで Angle 2・Angle 4 を実行する際に、ここを起点にする。
+
+### 73.8 検証
+
+`./ns3 build`(rpl モジュール・プロジェクト全体とも)、
+`test-runner --suite=rpl`(5 回連続実行して安定性を確認)、
+`./test.py -s rpl`を実行し、既存 140 件 + 新規 1 件 = 141 件全てが
 安定 PASS (1.0 秒前後) することを確認。
