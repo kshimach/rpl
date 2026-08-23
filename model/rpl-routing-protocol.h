@@ -38,6 +38,7 @@ class RplDaoHeader;
 class RplDaoAckHeader;
 class RplP2pDroHeader;
 class RplP2pDroAckHeader;
+struct P2pRdoOption;
 
 /**
  * @ingroup rpl
@@ -1134,6 +1135,13 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
             std::vector<Ipv6Address> additionalTargets;
             uint8_t maxRank{0};   //!< MaxRank, 0 meaning no limit
             uint8_t lifetimeField{0}; //!< the 'L' field this temporary DAG was opened with
+            /// 'N' (RFC 6997 section 7): one plus this many routes are asked
+            /// for per Target. Propagated verbatim by every intermediate
+            /// router, the same way maxRank and lifetimeField above are, so
+            /// that the Target reads the Origin's own request rather than
+            /// anything a relay decided. @see alternateRoutes for what a
+            /// Target does with a nonzero value.
+            uint8_t numRoutes{0};
             bool reply{true};         //!< 'R': whether the Target should send a P2P-DRO back
             bool hopByHop{false};     //!< 'H': false for a Source Route, true for a Hop-by-hop Route
             /// RFC 6997 sections 8/9.6/9.7: set once a P2P-DRO with 'S' = 1
@@ -1160,6 +1168,43 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
             /// (Origin-side first), as this node would propagate it: its own
             /// address is already appended (RFC 6997 section 9.4).
             std::vector<Ipv6Address> addressVector;
+            /// Target only, and only while numRoutes > 0: routes to this node
+            /// that arrived on copies of the P2P mode DIO which addressVector
+            /// itself refused, because they came from something other than
+            /// this node's preferred parent. Deliberately kept apart from
+            /// addressVector rather than generalising it: the single
+            /// preferred-parent model is what this implementation propagates
+            /// and re-advertises with (@see design-constraints.md, and
+            /// HandleAodvRreq()'s own intersection tracking, which makes the
+            /// same simplification), so these are reply-only -- they never
+            /// feed a DIO this node sends onward.
+            ///
+            /// Filled by HandleP2pRdo() during the collection window and
+            /// drained by P2pDroCollectExpire(), which clears it so that a
+            /// genuinely new reply cycle collects afresh rather than
+            /// re-sending stale alternates.
+            std::vector<std::vector<Ipv6Address>> alternateRoutes;
+            /// Target only, numRoutes > 0 only: how long the Target holds off
+            /// replying so that copies of the P2P mode DIO travelling other
+            /// paths have a chance to arrive and be recorded in
+            /// alternateRoutes. Not armed at all when numRoutes is 0, which
+            /// keeps the single-route path this module has always had exactly
+            /// as it was -- reply sent from HandleP2pRdo() itself.
+            Timer droCollectEvent{Timer::CANCEL_ON_DESTROY};
+            /// True between arming droCollectEvent and its firing, so that
+            /// further DIOs arriving mid-window record alternates without
+            /// re-arming (and so restarting) the window.
+            bool droCollecting{false};
+            /// Origin only: whether a Source Route has already been stored
+            /// for this discovery. What lets HandleP2pDro() tell the first
+            /// P2P-DRO of a discovery (store it, whatever it says) from a
+            /// later one (store it only if it beats what is already held),
+            /// without having to date-stamp m_p2pRoutes entries: the
+            /// membership itself is per-discovery and goes away with the
+            /// temporary DAG, whereas the (instanceId, dodagId) pair a
+            /// stored route carries is freely reused by the next discovery
+            /// from this same Origin.
+            bool routeStored{false};
             /// When the 'L' field's deadline takes this node out of the
             /// temporary DAG (RFC 6997 section 7).
             Timer expiry{Timer::CANCEL_ON_DESTROY};
@@ -1499,6 +1544,76 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      * @param key its key
      */
     void SendP2pDro(DodagMembership& dodag, DodagKey key);
+
+    /**
+     * @brief Build and multicast one P2P-DRO carrying a specific route.
+     *
+     * The body SendP2pDro() delegates to, split out so that RFC 6997
+     * section 7's 'N' (more than one route asked for per Target) can send
+     * the extra ones without disturbing the single route this module has
+     * always sent. Everything route-independent -- the 'H' flag, the
+     * DODAGID, the "MUST be set to zero on transmission" P2P-RDO fields --
+     * is filled in here identically for every route.
+     *
+     * @param dodag the temporary DAG membership, at this Target
+     * @param key its key
+     * @param route the route to send, this node's own trailing address
+     *        included exactly as addressVector holds it (dropped again on
+     *        the way onto the wire, @see SendP2pDro())
+     * @param sequence the 'Seq' to put on this P2P-DRO
+     * @param stop the 'S' flag: whether this is the last route this Target
+     *        intends to send, so no router need process further DIOs for
+     *        this discovery (RFC 6997 sections 8/9.5)
+     * @param trackAck whether to set 'A' and arm droRetryEvent for this
+     *        one. Only ever true for the route droSequence belongs to:
+     *        droSequence/droAckPending/droRetriesLeft are one set of scalars
+     *        per membership, so only one P2P-DRO per Target can be tracked
+     *        at a time. The extra routes 'N' asks for go unacknowledged,
+     *        which section 9.5 permits outright ("The Target MAY set the A
+     *        flag").
+     */
+    void SendP2pDroRoute(DodagMembership& dodag,
+                         DodagKey key,
+                         const std::vector<Ipv6Address>& route,
+                         uint8_t sequence,
+                         bool stop,
+                         bool trackAck);
+
+    /**
+     * @brief Record a route that arrived on a copy of the P2P mode DIO this
+     *        Target is not otherwise going to act on.
+     *
+     * Only called while RFC 6997 section 7's 'N' is nonzero, and only at a
+     * node that has already recognised itself as a Target. Completes the
+     * DIO's own Address Vector with this node's address exactly as
+     * HandleP2pRdo() completes addressVector, rejects exact duplicates of
+     * anything already held, and stops at numRoutes entries.
+     *
+     * @param dodag the temporary DAG membership, at this Target
+     * @param rdo the arriving DIO's P2P-RDO
+     */
+    void RecordP2pAlternateRoute(DodagMembership& dodag, const P2pRdoOption& rdo);
+
+    /**
+     * @brief Send this Target's batch of P2P-DROs once the collection
+     *        window closes (RFC 6997 section 7's 'N' > 0 only).
+     *
+     * Sends one plus P2pState::numRoutes P2P-DROs: the first from
+     * addressVector, tracked for a P2P-DRO-ACK exactly as the single-route
+     * path does, then one per collected entry in
+     * P2pState::alternateRoutes, untracked. If fewer alternates arrived
+     * than were asked for, the remainder repeat addressVector rather than
+     * going unsent -- section 9.5 has the Target "select the discovered
+     * route inside the received DIO as one or more of the routes that would
+     * be carried inside a P2P-DRO message", so sending the one route it
+     * does have more than once is within the letter of it. The diversity
+     * section 9.5 recommends ("SHOULD try to select routes that do not
+     * share a large common segment") is then simply not achieved on that
+     * run, which is a weaker outcome, not a violation.
+     *
+     * @param key the temporary DAG's key
+     */
+    void P2pDroCollectExpire(DodagKey key);
 
     /**
      * @brief Act on a received P2P-DRO: relay it onward, or store the route
@@ -2544,6 +2659,7 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     uint8_t m_p2pDioRedundancy;
     uint8_t m_p2pMaxRank; //!< MaxRank put on P2P mode DIOs, 0 meaning no limit
     uint8_t m_p2pLifetime; //!< the 'L' field put on P2P mode DIOs, 0..3
+    uint8_t m_p2pNumRoutes; //!< the 'N' field put on P2P mode DIOs this node originates, 0..3
 
     /// A route P2P-RPL found, held at the Origin.
     struct P2pRoute
@@ -2628,6 +2744,7 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     bool m_p2pDroAckRequested;         //!< whether a Target sets the P2P-DRO's 'A' flag
     Time m_p2pDroAckWaitTime;          //!< P2P_DRO_ACK_WAIT_TIME (RFC 6997 section 9.5)
     uint8_t m_p2pDroMaxRetransmissions; //!< MAX_P2P_DRO_RETRANSMISSIONS (RFC 6997 section 9.5)
+    Time m_p2pDroCollectWindow;        //!< how long a Target collects alternates when 'N' > 0
 
     Ipv6Address m_rootPrefix;    //!< the root's own GUA/ULA prefix (RootPrefix attribute)
     uint8_t m_rootPrefixLength; //!< prefix length of m_rootPrefix, in bits

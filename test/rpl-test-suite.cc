@@ -36,6 +36,7 @@
 #include "ns3/uinteger.h"
 
 #include <algorithm>
+#include <set>
 #include <sstream>
 #include <vector>
 
@@ -16264,6 +16265,377 @@ RplP2pAddressVectorFullTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief A shared base for the three RFC 6997 section 7 'N' > 0 tests: the
+ *        diamond topology they run on, and the P2P-DRO counting they all do.
+ *
+ * The topology is a diamond of configurable width: node 0 the Origin (and
+ * the base DODAG's root), nodes 1..width the parallel relays, node
+ * width + 1 the Target. Every relay hears the Origin and the Target and
+ * nothing else -- the relays are blacklisted from each other, and the
+ * Origin from the Target -- so each one is a genuinely distinct two-hop
+ * path, and the Target hears one copy of the P2P mode DIO per relay.
+ *
+ * Counting only the Target's own P2P-DROs is what makes this measurable.
+ * A monitor on relay 1 also hears every P2P-DRO that relay re-multicasts
+ * on its way to the Origin, so the two are told apart by NH: a P2P-DRO
+ * straight from the Target still carries NH equal to its Address Vector's
+ * own length (one, on a two-hop route), and RFC 6997 section 9.6 has each
+ * relay decrement it (to zero here) before passing it on.
+ */
+class RplP2pNumRoutesTestCaseBase : public TestCase
+{
+  public:
+    /**
+     * @param name the test case name
+     * @param width how many parallel relays sit between Origin and Target
+     */
+    RplP2pNumRoutesTestCaseBase(std::string name, uint32_t width);
+
+  protected:
+    /**
+     * @brief Build the diamond, form the base DODAG, and attach the monitor.
+     *
+     * @param numRoutes the Origin's own P2pNumRoutes ('N')
+     * @param collectWindow the Origin-wide P2pDroCollectWindow
+     */
+    void Build(uint8_t numRoutes, Time collectWindow);
+
+    /// @brief Start the discovery and let the collection window close.
+    /// @param settle how long to run after starting the discovery
+    void Discover(Time settle);
+
+    /// @brief Capture a P2P-DRO seen at the monitor.
+    /// @param socket the monitoring socket
+    void CaptureDro(Ptr<Socket> socket);
+
+    uint32_t m_width;                //!< parallel relays between Origin and Target
+    NodeContainer m_nodes;           //!< the whole diamond
+    Ptr<SimpleChannel> m_channel;    //!< the shared channel
+    Ptr<Socket> m_monitor;           //!< the raw socket on relay 1
+    RplRoutingProtocol::DodagKey m_key{0, Ipv6Address::GetAny()}; //!< the temporary DAG
+    /// Address Vectors of the P2P-DROs the Target itself sent, in order.
+    std::vector<std::vector<Ipv6Address>> m_routes;
+    std::vector<bool> m_ackRequested; //!< the 'A' flag of each, in the same order
+    std::vector<bool> m_stop;         //!< the 'S' flag of each, in the same order
+};
+
+RplP2pNumRoutesTestCaseBase::RplP2pNumRoutesTestCaseBase(std::string name, uint32_t width)
+    : TestCase(name),
+      m_width(width)
+{
+}
+
+void
+RplP2pNumRoutesTestCaseBase::CaptureDro(Ptr<Socket> socket)
+{
+    Address sender;
+    Ptr<Packet> packet = socket->RecvFrom(sender);
+    if (!packet)
+    {
+        return;
+    }
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ipv6Header);
+    Icmpv6Header icmpv6Header;
+    packet->RemoveHeader(icmpv6Header);
+    if (icmpv6Header.GetType() != ICMPV6_RPL || icmpv6Header.GetCode() != RPL_CODE_P2P_DRO)
+    {
+        return;
+    }
+    RplP2pDroHeader dro;
+    packet->RemoveHeader(dro);
+    if (!dro.HasP2pRdo())
+    {
+        return;
+    }
+    const P2pRdoOption& rdo = dro.GetP2pRdo();
+    // Straight from the Target, not relayed onward: @see the class comment.
+    if (rdo.maxRankOrNh != rdo.addressVector.size())
+    {
+        return;
+    }
+    m_routes.push_back(rdo.addressVector);
+    m_ackRequested.push_back(dro.GetAckRequested());
+    m_stop.push_back(dro.GetStop());
+}
+
+void
+RplP2pNumRoutesTestCaseBase::Build(uint8_t numRoutes, Time collectWindow)
+{
+    m_nodes.Create(m_width + 2);
+
+    m_channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(m_nodes, m_channel);
+
+    auto blacklist = [&](uint32_t a, uint32_t b) {
+        Ptr<SimpleNetDevice> devA = DynamicCast<SimpleNetDevice>(devices.Get(a));
+        Ptr<SimpleNetDevice> devB = DynamicCast<SimpleNetDevice>(devices.Get(b));
+        m_channel->BlackList(devA, devB);
+        m_channel->BlackList(devB, devA);
+    };
+    const uint32_t target = m_width + 1;
+    blacklist(0, target);
+    for (uint32_t a = 1; a <= m_width; a++)
+    {
+        for (uint32_t b = a + 1; b <= m_width; b++)
+        {
+            blacklist(a, b);
+        }
+    }
+
+    RplHelper rplHelper;
+    rplHelper.Set("P2pNumRoutes", UintegerValue(numRoutes));
+    rplHelper.Set("P2pDroCollectWindow", TimeValue(collectWindow));
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(m_nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < m_nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(m_nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(m_nodes, 1);
+
+    Simulator::Stop(Seconds(250));
+    Simulator::Run();
+
+    // Watching from relay 1, one of the Target's neighbours, so every
+    // P2P-DRO the Target multicasts has somewhere real to arrive.
+    m_monitor = Socket::CreateSocket(m_nodes.Get(1), Ipv6RawSocketFactory::GetTypeId());
+    m_monitor->SetAttribute("Protocol",
+                            UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    m_monitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    m_monitor->BindToNetDevice(m_nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+    m_monitor->SetRecvCallback(
+        MakeCallback(&RplP2pNumRoutesTestCaseBase::CaptureDro, this));
+}
+
+void
+RplP2pNumRoutesTestCaseBase::Discover(Time settle)
+{
+    Ptr<RplRoutingProtocol> origin = m_nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> target =
+        m_nodes.Get(m_width + 1)->GetObject<RplRoutingProtocol>();
+
+    m_key = origin->DiscoverP2pRoute(target->GetGlobalAddress());
+
+    Simulator::Stop(settle);
+    Simulator::Run();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief With 'N' = 2 and three genuinely distinct paths to it, a Target
+ *        answers with three P2P-DROs carrying three distinct routes.
+ *
+ * RFC 6997 section 7: 'N' asks for one plus that many routes per Target.
+ * The three-wide diamond gives the Target exactly three to find; the
+ * collection window is set well past the P2P mode DIO's own Imax
+ * (P2pDioIntervalMin 64 ms doubled four times, ~1.024 s) so that all three
+ * copies have arrived before the window closes, rather than depending on
+ * where in its Trickle interval each relay happened to be.
+ *
+ * Also pins the flags across the batch: only the first P2P-DRO carries 'A'
+ * (droSequence/droAckPending/droRetriesLeft are one set of scalars, so only
+ * one can be tracked), and only the last carries 'S', which section 9.5
+ * conditions on the Target having "already selected the desired number of
+ * routes".
+ */
+class RplP2pNumRoutesDistinctTestCase : public RplP2pNumRoutesTestCaseBase
+{
+  public:
+    RplP2pNumRoutesDistinctTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplP2pNumRoutesDistinctTestCase::RplP2pNumRoutesDistinctTestCase()
+    : RplP2pNumRoutesTestCaseBase("A P2P-RPL Target asked for 'N' = 2 answers over three "
+                                  "distinct routes",
+                                  3)
+{
+}
+
+void
+RplP2pNumRoutesDistinctTestCase::DoRun()
+{
+    Build(2, Seconds(3));
+
+    Ptr<RplRoutingProtocol> target = m_nodes.Get(4)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(target->IsJoined(), true, "The base DODAG did not reach the Target");
+
+    Discover(Seconds(10));
+
+    NS_TEST_ASSERT_MSG_NE(m_key.dodagId, Ipv6Address::GetAny(), "The discovery did not start");
+    NS_TEST_ASSERT_MSG_EQ(target->IsP2pTarget(m_key.instanceId, m_key.dodagId),
+                          true,
+                          "The Target never recognised itself");
+
+    NS_TEST_ASSERT_MSG_EQ(m_routes.size(), 3, "'N' = 2 should have produced exactly three "
+                                              "P2P-DROs from the Target");
+
+    // Every route is one relay long here (Origin - relay - Target, the
+    // Target's own trailing entry trimmed by SendP2pDroRoute()), so
+    // "distinct route" reduces to "distinct relay".
+    std::set<Ipv6Address> relays;
+    for (const auto& route : m_routes)
+    {
+        NS_TEST_ASSERT_MSG_EQ(route.size(), 1, "Every route through this diamond is one relay "
+                                               "long");
+        relays.insert(route[0]);
+    }
+    NS_TEST_ASSERT_MSG_EQ(relays.size(),
+                          3,
+                          "The three P2P-DROs should have named three different relays: the "
+                          "alternates were collected but not actually used");
+
+    NS_TEST_ASSERT_MSG_EQ(m_ackRequested[0], true, "The tracked P2P-DRO should ask for an ack");
+    NS_TEST_ASSERT_MSG_EQ(m_ackRequested[1], false, "An extra route must not ask for an ack");
+    NS_TEST_ASSERT_MSG_EQ(m_ackRequested[2], false, "An extra route must not ask for an ack");
+
+    NS_TEST_ASSERT_MSG_EQ(m_stop[0], false, "'S' must not be set before the last route");
+    NS_TEST_ASSERT_MSG_EQ(m_stop[1], false, "'S' must not be set before the last route");
+    NS_TEST_ASSERT_MSG_EQ(m_stop[2], true, "'S' belongs on the last route of the batch");
+
+    m_monitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief With 'N' = 3 but only one path to the Target, the batch is padded
+ *        out to four P2P-DROs rather than cut short.
+ *
+ * The boundary case in both directions at once: 'N' is a 2-bit field, so 3
+ * is the largest value it can carry, and a one-wide diamond is the fewest
+ * routes there can be. RFC 6997 section 9.5 lets the Target "select the
+ * discovered route inside the received DIO as one or more of the routes
+ * that would be carried inside a P2P-DRO message", so repeating the single
+ * route it has is within the letter of the request -- the diversity the
+ * same section recommends is simply not achievable with one path.
+ */
+class RplP2pNumRoutesPaddedTestCase : public RplP2pNumRoutesTestCaseBase
+{
+  public:
+    RplP2pNumRoutesPaddedTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplP2pNumRoutesPaddedTestCase::RplP2pNumRoutesPaddedTestCase()
+    : RplP2pNumRoutesTestCaseBase("A P2P-RPL Target asked for 'N' = 3 with one route pads the "
+                                  "batch out to four",
+                                  1)
+{
+}
+
+void
+RplP2pNumRoutesPaddedTestCase::DoRun()
+{
+    Build(3, Seconds(3));
+
+    Ptr<RplRoutingProtocol> target = m_nodes.Get(2)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(target->IsJoined(), true, "The base DODAG did not reach the Target");
+
+    Discover(Seconds(10));
+
+    NS_TEST_ASSERT_MSG_NE(m_key.dodagId, Ipv6Address::GetAny(), "The discovery did not start");
+    NS_TEST_ASSERT_MSG_EQ(m_routes.size(),
+                          4,
+                          "'N' = 3 should have produced exactly four P2P-DROs even with only "
+                          "one route to send");
+
+    for (uint32_t i = 1; i < m_routes.size(); i++)
+    {
+        NS_TEST_ASSERT_MSG_EQ((m_routes[i] == m_routes[0]),
+                              true,
+                              "With one path there is nothing to pad with but that path");
+    }
+
+    NS_TEST_ASSERT_MSG_EQ(m_ackRequested[0], true, "The tracked P2P-DRO should ask for an ack");
+    NS_TEST_ASSERT_MSG_EQ(m_ackRequested[3], false, "An extra route must not ask for an ack");
+    NS_TEST_ASSERT_MSG_EQ(m_stop[0], false, "'S' must not be set before the last route");
+    NS_TEST_ASSERT_MSG_EQ(m_stop[3], true, "'S' belongs on the last route of the batch");
+
+    m_monitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief A route that arrives after the collection window has closed does
+ *        not trigger a second batch.
+ *
+ * The state-transition case: the same three-wide diamond, but with the
+ * collection window cut to a single millisecond so that the Target replies
+ * from the one route that made it a Target, before the other two relays'
+ * copies have had a chance to arrive. Those copies keep arriving for the
+ * rest of the temporary DAG's life, and each one is still recorded as an
+ * alternate -- what this pins down is that recording one never re-opens a
+ * window or sends anything further. A Target answers a discovery once.
+ */
+class RplP2pNumRoutesLateArrivalTestCase : public RplP2pNumRoutesTestCaseBase
+{
+  public:
+    RplP2pNumRoutesLateArrivalTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplP2pNumRoutesLateArrivalTestCase::RplP2pNumRoutesLateArrivalTestCase()
+    : RplP2pNumRoutesTestCaseBase("A route arriving after the collection window does not "
+                                  "trigger a second batch of P2P-DROs",
+                                  3)
+{
+}
+
+void
+RplP2pNumRoutesLateArrivalTestCase::DoRun()
+{
+    Build(2, MilliSeconds(1));
+
+    Ptr<RplRoutingProtocol> target = m_nodes.Get(4)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(target->IsJoined(), true, "The base DODAG did not reach the Target");
+
+    // Long enough for the window to have closed and the batch to have gone
+    // out, short of the temporary DAG's own 'L' deadline (16 s by default).
+    Discover(Seconds(1));
+
+    const uint32_t afterWindow = m_routes.size();
+    NS_TEST_ASSERT_MSG_EQ(afterWindow, 3, "'N' = 2 should have produced exactly three P2P-DROs");
+
+    // Several more P2P mode DIO floods' worth: Imax is ~1.024 s, so the
+    // other two relays have re-flooded repeatedly by now, and every one of
+    // those copies reaches RecordP2pAlternateRoute().
+    Simulator::Stop(Seconds(5));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(m_routes.size(),
+                          afterWindow,
+                          "A late alternate route triggered another P2P-DRO");
+
+    m_monitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Check which DIOs RplRoutingProtocol::HandleDio() acts on and which
  *        it turns away: a mode of operation it does not implement, another
  *        RPL instance or DODAG, a stale DODAG version, and the infinite
@@ -22273,6 +22645,9 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplP2pDroRelayTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pHopByHopRouteConflictTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pAddressVectorFullTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pNumRoutesDistinctTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pNumRoutesPaddedTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pNumRoutesLateArrivalTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDioRejectionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplParentLossRejoinTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplInterfaceRestartTestCase, TestCase::Duration::QUICK);

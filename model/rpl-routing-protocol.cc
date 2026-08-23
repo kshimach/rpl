@@ -335,6 +335,34 @@ RplRoutingProtocol::GetTypeId()
                           UintegerValue(2),
                           MakeUintegerAccessor(&RplRoutingProtocol::m_p2pLifetime),
                           MakeUintegerChecker<uint8_t>(0, 3))
+            .AddAttribute("P2pNumRoutes",
+                          "The 'N' field of P2P mode DIOs this node originates (RFC 6997 "
+                          "section 7): one plus this many routes are asked for per Target. 0, "
+                          "the default, asks for the single route P2P-RPL has always sent here "
+                          "and leaves the Target replying the instant it recognises itself. Any "
+                          "nonzero value instead has the Target hold its reply for "
+                          "P2pDroCollectWindow first, so that copies of the DIO arriving by "
+                          "other paths can be collected as alternate routes -- a Target only "
+                          "ever learns of a second route by hearing a second copy, and the copy "
+                          "that made it a Target is by definition the first one it heard. Only "
+                          "the Origin's own value matters: intermediate routers propagate "
+                          "whatever they received.",
+                          UintegerValue(0),
+                          MakeUintegerAccessor(&RplRoutingProtocol::m_p2pNumRoutes),
+                          MakeUintegerChecker<uint8_t>(0, RPL_P2P_N_MASK >> RPL_P2P_N_SHIFT))
+            .AddAttribute("P2pDroCollectWindow",
+                          "How long a Target holds its P2P-DRO reply so that copies of the P2P "
+                          "mode DIO travelling other paths can be collected as alternate routes. "
+                          "Only ever armed when the P2P-RDO's 'N' is nonzero, so the default "
+                          "single-route discovery is unaffected by it. RFC 6997 sets no such "
+                          "timer of its own -- it says only that the Target selects 'one or more "
+                          "discovered routes', leaving how it comes to have more than one "
+                          "entirely open. The default is four times P2pDioIntervalMin's own 64ms "
+                          "default, long enough for a neighbour or two to re-flood on an early "
+                          "Trickle interval, and short against even the shortest 'L' (1 s).",
+                          TimeValue(MilliSeconds(256)),
+                          MakeTimeAccessor(&RplRoutingProtocol::m_p2pDroCollectWindow),
+                          MakeTimeChecker())
             .AddAttribute("GlobalRepairInterval",
                           "How often a root institutes a Global Repair (RFC 6550 section 3.2.2) "
                           "on a DODAG it roots, by incrementing its DODAGVersionNumber -- never "
@@ -1245,7 +1273,12 @@ RplRoutingProtocol::SendDio(DodagMembership& dodag, Ipv6Address dst, uint32_t in
         P2pRdoOption rdo;
         rdo.reply = dodag.p2p.reply;
         rdo.hopByHop = dodag.p2p.hopByHop; // 'H': DiscoverP2pRoute()'s own choice
-        rdo.numRoutes = 0; // exactly one Source/Hop-by-hop Route; N > 0 is out of scope
+        // 'N': the Origin's own P2pNumRoutes on the DIO it originates,
+        // whatever it received on the DIO it is relaying otherwise -- the
+        // same propagate-verbatim treatment maxRankOrNh and lifetime get
+        // just below, so that a Target reads the Origin's request rather
+        // than a relay's own configuration.
+        rdo.numRoutes = dodag.p2p.numRoutes;
         // compr left at its default: P2pRdoSerialize() computes its own
         // from target/addressVector and this DIO's own DODAGID.
         rdo.lifetime = dodag.p2p.lifetimeField;
@@ -1958,6 +1991,7 @@ RplRoutingProtocol::LeaveDodag(DodagKey key, bool poison)
     dodag.daoRetryEvent.Cancel();
     dodag.globalRepairEvent.Cancel();
     dodag.p2p.droRetryEvent.Cancel();
+    dodag.p2p.droCollectEvent.Cancel();
     m_dodags.erase(it);
 
     if (poison && m_hasBaseDodag && m_baseDodagKey == key)

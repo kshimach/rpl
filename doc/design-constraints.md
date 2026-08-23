@@ -4101,7 +4101,7 @@ R は受信した値をそのまま尊重 (Origin 役としては常に R=1 を�
   対応済み**)
 - **複数 Target (RPL Target Option)**: AODV-RPL の複数 ART 見送り
   (§35.14) と同型の判断。(**41節の通り対応済み**) **複数 Source
-  Route (N>0)** の方は依然として未実装のまま。
+  Route (N>0)** の方も (**72節の通り対応済み**)。
 - **P2P-DRO-ACK (code 0x05) と Target 側の再送**
   (`P2P_DRO_ACK_WAIT_TIME`/`MAX_P2P_DRO_RETRANSMISSIONS`)、**Stop (S)
   フラグによる早期終了**: DAO-ACK の再送機構
@@ -8085,3 +8085,180 @@ load-bearing検証: (A)を`else if (false && storing)`で無効化した
 `test-runner --suite=rpl`(5回連続実行して安定性を確認)、
 `./test.py -s rpl`を実行し、既存135件+新規2件=137件全てが
 安定PASS(0.9秒前後)することを確認。
+
+## 72. RFC 6997 section 7 の 'N' (複数 Source Route) を実装
+
+§36.2 で見送り、その後も唯一「真に未実装」として残っていた項目。
+ワイヤフォーマット上の `P2pRdoOption::numRoutes` は最初から存在して
+いたが、送信時は常に 0 固定、受信時は読み捨てだった。
+
+### 72.1 RFC 本文の要件と、実装前に確認した制約
+
+RFC 6997 section 7 の 'N' は 2 bit 幅で、「Target ごとに 1 + N 本の
+Source Route を要求する」という意味 (最大 4 本)。section 9.5 は
+Target 側をこう規定する:
+
+> If the Reply flag inside the P2P-RDO in the received DIO is set to
+> one, the Target MUST select one or more discovered routes and send
+> one or more P2P-DRO messages... The Target SHOULD try to select
+> routes that do not share a large common segment.
+
+このうち「複数の経路をどうやって手に入れるか」は RFC が一切規定して
+いない。実装前に確認した本質的な制約は、この モジュール全体が
+**単一 preferred parent モデル**で一貫していること
+(`DodagMembership::P2pState::addressVector` は preferred parent 経由の
+1 本しか追跡しない。AODV-RPL 側の Target 集合交差計算も同じ方針、
+§42.2 参照)。Target が 2 本目の経路を知る唯一の機会は「同じ P2P mode
+DIO の別コピーが別の隣人から届く」ことだが、Target 自身をそう認識
+させた最初のコピーが定義上いちばん早く届くコピーであり、その時点で
+即座に返信すると、手元には常に 1 本しか無い。
+
+### 72.2 却下した案 (degenerate 版)
+
+「同じ経路を N+1 通の P2P-DRO に複製して送り返す」だけなら実装は
+極小で、上の RFC 文面 ("select the discovered route inside the
+received DIO as **one or more** of the routes") 上も合法ではある
+(SHOULD の多様性は満たさないが MUST 違反ではない)。しかし実質的な
+複数経路発見にはならないため、これ単体は採らなかった — ただし後述の
+とおり、経路が足りないときの**パディング**としては採用している。
+
+### 72.3 採用した設計: 収集ウィンドウ
+
+新規属性 `P2pDroCollectWindow` (既定 256 ms) を導入し、'N' > 0 の
+とき **Target は即返信せず、この時間だけ返信を保留して別コピーの
+到着を待つ**。
+
+- 既定は 256 ms = `P2pDioIntervalMin` の 4 倍。P2P mode DIO の Imin が
+  64 ms なので、隣人が早い Trickle 間隔で 1〜2 回再フラッドするだけの
+  猶予があり、いちばん短い 'L' (1 s) に対しても十分内側に収まる。
+- **'N' = 0 のときは一切 arm しない**。既定値が 0 である以上、既存の
+  単一経路パスは 1 命令も通らずそのまま (`HandleP2pRdo()` から即
+  `SendP2pDro()`)。この モジュールで一度も破っていない前提に踏み込む
+  変更なので、既定の挙動をビット単位で不変に保つことを設計の前提に
+  置いた。
+- 収集ウィンドウを足すかどうかは、前セッションの申し送りで未決定と
+  して残っていた 2 択 (ウィンドウ無しの運任せ版 vs 本格版)。ウィンドウ
+  無しでは「Target と認識されるまでに何本の別コピーを既に受け取れて
+  いたか」という運任せになり、実際 72.6 の load-bearing 検証で
+  ウィンドウを 1 ms に縮めると多様性が完全に消えることを確認した。
+
+新規状態 (`P2pState`):
+
+- `numRoutes`: 受信した 'N'。`maxRank`/`lifetimeField` と同じく中継
+  ルータが素通しで伝播するので、Target は Origin の要求をそのまま
+  読む。Origin 自身の値は新規属性 `P2pNumRoutes` (既定 0)。
+- `alternateRoutes`: 収集した別経路。**addressVector とは別に持つ** —
+  addressVector は DIO の再送出にも使われる「この モジュールが
+  伝播に使う 1 本」であり、こちらは返信専用で、DIO には一切載らない。
+- `droCollectEvent` / `droCollecting`: ウィンドウ本体と、その二重 arm
+  を防ぐフラグ。
+
+**収集** (`RecordP2pAlternateRoute()`): `HandleP2pRdo()` の 2 つの
+早期 return (「既に Target なので repeat は無視」と「preferred parent
+以外から来たコピーは無視」) より **手前**に置いた。捨てられるはずの
+コピーこそが別経路を運んでくるので、位置はここしかない。既に Target
+と認識済みのノードでのみ動く。重複排除は**完全一致のみ**: RFC の
+「大きな共通区間を避ける」は RFC 自身が "This document does not
+prescribe a particular method" と明言する preference であり、部分重複の
+閾値もタイブレークもこの モジュールには決める根拠が無い。一方、
+完全一致は隣人が Trickle 間隔ごとに同じ DIO を再フラッドする以上
+日常的に発生し、かつ明らかに価値ゼロなので、そこだけ落とす。
+
+**送信** (`P2pDroCollectExpire()`): 1 + `numRoutes` 通を送る。
+
+1. slot 0 = `addressVector`。'A' も retry 予算も既存どおり。
+2. 残り N 通 = `alternateRoutes` から順に消費し、尽きたら
+   `addressVector` で埋める (72.2 の考え方をフォールバックとして統合)。
+   **ACK 追跡なし** (72.4)。
+
+### 72.4 ACK/retry が scalar である問題と、その回避
+
+`droSequence`/`droAckPending`/`droRetriesLeft`/`droRetryEvent` は
+どれも membership につき 1 個の scalar で、「1 Target につき同時に
+1 本の ACK 待ち P2P-DRO」しか追跡できない。N+1 本を並行送信するなら
+本来はスロットごとの状態が要る。
+
+簡略化として、**ACK 追跡は slot 0 だけに残し、追加の N 本は 'A' = 0 の
+fire-and-forget にした**。RFC 6997 section 9.5 が P2P-DRO-ACK 自体を
+"The Target MAY set the A flag" と MAY 機能として置いているので、
+追加経路分だけ簡略化しても MUST 違反にならない。結果として
+`HandleP2pDroAck()`/`P2pDroRetry()` は完全に無変更で済んでいる。
+
+'Seq' は**バッチ全体で同一値**にした。Seq は P2P-DRO-ACK を元の
+P2P-DRO に対応づけるためだけに存在し (section 10)、追加分は 'A' = 0 で
+そもそも ack されない。個別の Seq を振ると 2 bit しかない領域を
+食い潰し、**次のサイクル**の (追跡対象である) Seq と衝突し始める。
+
+'S' フラグは**バッチの最後の 1 通にだけ**立てる。section 9.5 の
+条件は "the Target has already selected the desired number of routes"
+であり、これが真になるのは最後の 1 通を送り終えた時点。'N' = 0 では
+最初の 1 通がそのまま最後なので、既存の挙動と一致する。
+
+### 72.5 Origin 側: 最後勝ちから最短勝ちへ
+
+Target が複数経路を送るようにしても、Origin 側が
+`m_p2pRoutes[rdo.target] = route;` で**最後に届いた 1 本**を無条件に
+上書きしていては、集めた別経路が丸ごと無駄になる。同一 discovery 内
+では**短い方を残す**ように変更した。
+
+「同一 discovery 内」の判定に (instanceId, dodagId) は使えない —
+`DiscoverP2pRoute()` は空いている Local RPLInstanceID を若い順に取る
+ので、次の discovery が同じ組を再利用しうる。代わりに Origin 側の
+membership に `routeStored` フラグを置いた。membership 自体が
+discovery ごとに生成・破棄されるので、これが自然な世代境界になる。
+
+`m_p2pRoutes` は依然として **Target ごとに 1 本**。RFC 6997 は複数本を
+保持する規則を与えておらず、保持したところで選択ポリシー
+(フェイルオーバー? 負荷分散?) をこの モジュールが発明する根拠が無い。
+'N' > 0 の利得は「見つかった中で最短のものが残る」ところまで。
+
+### 72.6 テストと load-bearing 検証
+
+3 件追加。共通の土台 `RplP2pNumRoutesTestCaseBase` が、幅可変の
+ダイヤモンド型トポロジ (Origin - 並列中継 n 台 - Target、中継同士は
+相互ブラックリスト) を組み、Target 自身が送った P2P-DRO だけを数える。
+中継が転送したコピーとの区別は NH で行う: Target 直送は NH が Address
+Vector の長さと等しく、中継は section 9.6 に従って decrement 済み。
+
+- **正常系** `RplP2pNumRoutesDistinctTestCase`: 幅 3、'N' = 2。
+  ちょうど 3 通、かつ 3 通とも別の中継を名指すこと、'A' は先頭のみ、
+  'S' は末尾のみを確認。
+- **境界値** `RplP2pNumRoutesPaddedTestCase`: 幅 1、'N' = 3 (2 bit の
+  最大値)。経路が 1 本しか無くてもちょうど 4 通送り、2 通目以降が
+  1 通目と同一経路であることを確認。
+- **状態遷移系** `RplP2pNumRoutesLateArrivalTestCase`: 幅 3、'N' = 2、
+  ウィンドウ 1 ms。返信後も別コピーは届き続けるが、追加送信が
+  発生しないことを確認。
+
+load-bearing 検証:
+
+- `RecordP2pAlternateRoute()` の呼び出しを `if (false)` で無効化 →
+  正常系が確実に FAIL (3 通とも同じ中継になる)。
+- パディングを `continue` に置き換え → 境界値が確実に FAIL (4 通が
+  1 通になる)。
+- 正常系のウィンドウを 3 s から 1 ms に縮める → 正常系が確実に FAIL。
+  収集ウィンドウそのものが多様性を買っていることの直接の確認であり、
+  72.3 で本格版を選んだ判断の裏付けでもある。
+
+**状態遷移系だけは load-bearing ではない**、と明記しておく。
+「別コピーが来ても再送信しない」を実際に支えているのは今回追加した
+`droCollecting` ガードではなく、その手前にある既存の repeat ガード
+(`isTarget && !HasOtherP2pTargets`) の方で、`droCollecting` を外しても
+このテストは通ってしまう。仕様を固定化する回帰テストとしての価値は
+あるが、新規コードを検証してはいない — §40.3/§66.4 で同種の区別を
+した時と同じ立場で記録する。
+
+### 72.7 異常系について
+
+`numRoutes` フィールドの改竄・不正値に対する専用の検証は設けていない。
+2 bit 幅なので値域外は原理的に取り得ず、他の P2P-RDO フィールドと
+同様「伝播された値をそのまま信用する」という既存の立場を踏襲する。
+`alternateRoutes` の上限は `numRoutes` そのものなので、悪意ある大きな
+値でもメモリ上は最大 3 本で頭打ちになる。
+
+### 72.8 検証
+
+`./ns3 build`(rpl モジュール・プロジェクト全体とも)、
+`test-runner --suite=rpl`(5 回連続実行して安定性を確認)、
+`./test.py -s rpl`を実行し、既存 137 件 + 新規 3 件 = 140 件全てが
+安定 PASS (1.0 秒前後) することを確認。

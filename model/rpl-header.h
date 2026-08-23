@@ -50,8 +50,11 @@ struct P2pRdoOption
     bool reply{true};      //!< 'R': the Target(s) may send P2P-DRO messages back
     bool hopByHop{false};  //!< 'H': 1 for a Hop-by-hop Route, 0 for a Source Route
     /// 'N', 2 bits: one plus this many Source Routes are requested per
-    /// Target. Always sent as 0 (exactly one route) and ignored on receipt;
-    /// @see design-constraints.md for why more are out of scope.
+    /// Target. Set from the Origin's own P2pNumRoutes attribute (0, exactly
+    /// one route, by default) and propagated verbatim by every relay; a
+    /// Target reading a nonzero value holds its reply for
+    /// P2pDroCollectWindow and answers with a batch. @see
+    /// design-constraints.md.
     uint8_t numRoutes{0};
     /// 'Compr', 4 bits: elided prefix octets, shared by TargetAddr and every
     /// Address Vector entry alike (RFC 6997 section 7). Read from the wire on

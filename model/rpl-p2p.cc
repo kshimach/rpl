@@ -105,6 +105,7 @@ RplRoutingProtocol::DiscoverP2pRoute(Ipv6Address target, bool hopByHop)
     dodag.p2p.isTarget = false;
     dodag.p2p.maxRank = m_p2pMaxRank;
     dodag.p2p.lifetimeField = m_p2pLifetime;
+    dodag.p2p.numRoutes = m_p2pNumRoutes;
     dodag.p2p.reply = true;
     dodag.p2p.hopByHop = hopByHop;
     // Empty at the Origin: "The Origin and Target addresses MUST NOT be
@@ -328,6 +329,18 @@ RplRoutingProtocol::HandleP2pRdo(const RplDioHeader& dio, Ipv6Address from, uint
     // HandleAodvRreq()'s own isTarget repeat check mirrors, or every other
     // Target this node once knew about is gone from the DIOs it has heard
     // since -- either way, nothing left to relay onward for.
+    // RFC 6997 section 7's 'N': the Origin asked for more than one route, so
+    // a copy of the DIO this node would otherwise drop below -- as a repeat,
+    // or as having come from something other than the preferred parent -- is
+    // exactly what carries the alternate. Recorded before both of those
+    // guards for that reason, and only at a Target that has already
+    // recognised itself: the copy that made this node a Target is the one
+    // addressVector holds, and everything after it is a candidate alternate.
+    if (dodag.p2p.isTarget && dodag.p2p.numRoutes > 0)
+    {
+        RecordP2pAlternateRoute(dodag, rdo);
+    }
+
     if (dodag.p2p.isTarget && !HasOtherP2pTargets(dodag))
     {
         NS_LOG_LOGIC("Already the Target of temporary DAG " << +key.instanceId
@@ -349,6 +362,7 @@ RplRoutingProtocol::HandleP2pRdo(const RplDioHeader& dio, Ipv6Address from, uint
     dodag.p2p.target = rdo.target;
     dodag.p2p.maxRank = rdo.maxRankOrNh;
     dodag.p2p.lifetimeField = rdo.lifetime;
+    dodag.p2p.numRoutes = rdo.numRoutes;
     dodag.p2p.reply = rdo.reply;
     dodag.p2p.hopByHop = rdo.hopByHop;
     // Once true, stays true even if a later DIO's P2P-RDO TargetAddr
@@ -454,7 +468,36 @@ RplRoutingProtocol::HandleP2pRdo(const RplDioHeader& dio, Ipv6Address from, uint
                 (dodag.p2p.droSequence + 1) & (RPL_P2P_DRO_SEQ_MASK >> RPL_P2P_DRO_SEQ_SHIFT);
             dodag.p2p.droAckPending = m_p2pDroAckRequested;
             dodag.p2p.droRetriesLeft = m_p2pDroMaxRetransmissions;
-            SendP2pDro(dodag, key);
+            if (dodag.p2p.numRoutes == 0)
+            {
+                // The single-route case, untouched: reply now, from the one
+                // route this DIO just delivered.
+                SendP2pDro(dodag, key);
+            }
+            else if (!dodag.p2p.droCollecting)
+            {
+                // 'N' > 0. Replying from here would send the only route this
+                // node has heard so far, N+1 times over -- the copy that made
+                // it a Target is by construction the first copy to arrive.
+                // Hold off instead and let RecordP2pAlternateRoute() collect
+                // whatever else the flood brings, @see P2pDroCollectExpire().
+                //
+                // Never re-armed while a window is already open: a
+                // multi-Target discovery can reach this branch again (the
+                // repeat guard above lets DIOs through while other Targets
+                // are still outstanding), and restarting the window on each
+                // one would let a steady DIO stream defer the reply past the
+                // temporary DAG's own 'L' deadline entirely.
+                dodag.p2p.droCollecting = true;
+                dodag.p2p.droCollectEvent.SetFunction(&RplRoutingProtocol::P2pDroCollectExpire,
+                                                      this);
+                dodag.p2p.droCollectEvent.SetArguments(key);
+                dodag.p2p.droCollectEvent.Cancel();
+                dodag.p2p.droCollectEvent.Schedule(m_p2pDroCollectWindow);
+                NS_LOG_INFO("Holding the P2P-DRO reply for "
+                            << m_p2pDroCollectWindow.As(Time::MS) << " to collect up to "
+                            << +dodag.p2p.numRoutes << " alternate route(s)");
+            }
         }
         return;
     }
@@ -469,8 +512,29 @@ RplRoutingProtocol::SendP2pDro(DodagMembership& dodag, DodagKey key)
 {
     NS_LOG_FUNCTION(this << +key.instanceId << key.dodagId);
 
-    NS_ASSERT_MSG(!dodag.p2p.addressVector.empty(), "The Target is not in its own Address Vector");
-    Ipv6Address ownAddress = dodag.p2p.addressVector.back();
+    // The single tracked route: 'S' as it has always been computed, and the
+    // one P2P-DRO droSequence/droAckPending/droRetriesLeft belong to.
+    SendP2pDroRoute(dodag,
+                    key,
+                    dodag.p2p.addressVector,
+                    dodag.p2p.droSequence,
+                    !HasOtherP2pTargets(dodag),
+                    m_p2pDroAckRequested);
+}
+
+void
+RplRoutingProtocol::SendP2pDroRoute(DodagMembership& dodag,
+                                    DodagKey key,
+                                    const std::vector<Ipv6Address>& route,
+                                    uint8_t sequence,
+                                    bool stop,
+                                    bool trackAck)
+{
+    NS_LOG_FUNCTION(this << +key.instanceId << key.dodagId << route.size() << +sequence << stop
+                         << trackAck);
+
+    NS_ASSERT_MSG(!route.empty(), "The Target is not in its own Address Vector");
+    Ipv6Address ownAddress = route.back();
 
     RplP2pDroHeader dro;
     dro.SetInstanceId(dodag.instanceId);
@@ -484,9 +548,9 @@ RplRoutingProtocol::SendP2pDro(DodagMembership& dodag, DodagKey key)
     // design-constraints.md for why a plain additionalTargets.empty()
     // check is not enough: this node's own matched entry, when matched
     // only via an RPL Target option, is never filtered out of that list).
-    dro.SetStop(!HasOtherP2pTargets(dodag));
-    dro.SetAckRequested(m_p2pDroAckRequested);
-    dro.SetSequence(dodag.p2p.droSequence);
+    dro.SetStop(stop);
+    dro.SetAckRequested(trackAck);
+    dro.SetSequence(sequence);
     // "the router recognizes itself as the Origin" by matching the P2P-DRO's
     // own DODAGID field (RFC 6997 section 9.7) -- the temporary DAG's own
     // DODAGID already is the Origin's address.
@@ -502,7 +566,7 @@ RplRoutingProtocol::SendP2pDro(DodagMembership& dodag, DodagKey key)
     // to the Target" -- this node's own trailing entry (the Target itself)
     // is excluded here, unlike the DIO's own accumulated Address Vector,
     // which keeps it (@see HandleP2pRdo() and design-constraints.md).
-    rdo.addressVector.assign(dodag.p2p.addressVector.begin(), dodag.p2p.addressVector.end() - 1);
+    rdo.addressVector.assign(route.begin(), route.end() - 1);
     // "the NH field is set to n = (Option Length - 2 - (16 - Compr)) /
     // (16 - Compr)", which is exactly this vector's own entry count.
     rdo.maxRankOrNh = static_cast<uint8_t>(rdo.addressVector.size());
@@ -519,15 +583,16 @@ RplRoutingProtocol::SendP2pDro(DodagMembership& dodag, DodagKey key)
 
     NS_LOG_INFO("Answering the P2P mode DIO for " << dodag.p2p.target << " with a P2P-DRO over "
                                                    << rdo.addressVector.size() << " hop(s)"
-                                                   << (m_p2pDroAckRequested ? ", ack requested" : ""));
+                                                   << (trackAck ? ", ack requested" : ""));
 
     // Only arms the wait timer, never resets droAckPending/droRetriesLeft:
     // this function is also what P2pDroRetry() calls to resend the exact
     // same P2P-DRO on timeout, and doing either here would make every retry
     // renew its own retry budget, so MAX_P2P_DRO_RETRANSMISSIONS would never
-    // actually bind. The two callers -- HandleP2pRdo() for a fresh cycle,
-    // P2pDroRetry() for a resend -- own that state themselves instead.
-    if (m_p2pDroAckRequested)
+    // actually bind. The callers that start a cycle -- HandleP2pRdo() for
+    // 'N' = 0, P2pDroCollectExpire() for 'N' > 0 -- own that state
+    // themselves instead, and P2pDroRetry() deliberately leaves it alone.
+    if (trackAck)
     {
         // Bound here rather than in CreateDodagMembership() (@see
         // DodagMembership::P2pState::droRetryEvent's own comment): harmless
@@ -575,6 +640,143 @@ RplRoutingProtocol::P2pDroRetry(DodagKey key)
     // Rebuilds and resends the same content: droSequence is untouched here,
     // only HandleP2pRdo() bumps it for a genuinely new cycle.
     SendP2pDro(dodag, key);
+}
+
+void
+RplRoutingProtocol::RecordP2pAlternateRoute(DodagMembership& dodag, const P2pRdoOption& rdo)
+{
+    NS_LOG_FUNCTION(this << rdo.addressVector.size());
+
+    // Capped at exactly what was asked for: 'N' is 2 bits, so at most three
+    // alternates on top of the one addressVector already holds, and any
+    // beyond that would only be collected to be discarded again in
+    // P2pDroCollectExpire().
+    if (dodag.p2p.alternateRoutes.size() >= dodag.p2p.numRoutes)
+    {
+        return;
+    }
+
+    Ipv6Address ownAddress = GetGlobalAddressIn(dodag);
+    if (ownAddress.IsAny())
+    {
+        return;
+    }
+
+    // Completed the same way HandleP2pRdo() completes addressVector: this
+    // node's own address appended, the full-vector check applied first
+    // (RFC 6997 section 9.4). Unlike there, an over-full vector is only a
+    // reason to drop this candidate, not to leave the temporary DAG --
+    // this node is a Target, and the route it is actually replying with is
+    // addressVector's, which is nowhere near the limit or it would have
+    // left already.
+    if (rdo.addressVector.size() >= RPL_P2P_ADDRESS_VECTOR_MAX_ENTRIES)
+    {
+        return;
+    }
+    std::vector<Ipv6Address> route = rdo.addressVector;
+    route.push_back(ownAddress);
+
+    // Exact-duplicate rejection only. RFC 6997 section 9.5's "SHOULD try to
+    // select routes that do not share a large common segment" is a
+    // preference the RFC deliberately leaves open ("This document does not
+    // prescribe a particular method"), and a partial-overlap metric would
+    // have to invent both a threshold and a tie-break this module has no
+    // basis to pick; identical routes, on the other hand, are unambiguously
+    // worth nothing and arrive routinely, since a neighbour re-floods the
+    // same DIO on every Trickle interval.
+    if (route == dodag.p2p.addressVector)
+    {
+        return;
+    }
+    for (const auto& known : dodag.p2p.alternateRoutes)
+    {
+        if (route == known)
+        {
+            return;
+        }
+    }
+
+    NS_LOG_INFO("Recorded an alternate route to this Target over " << route.size() - 1
+                                                                    << " hop(s)");
+    dodag.p2p.alternateRoutes.push_back(std::move(route));
+}
+
+void
+RplRoutingProtocol::P2pDroCollectExpire(DodagKey key)
+{
+    auto it = m_dodags.find(key);
+    if (it == m_dodags.end())
+    {
+        return;
+    }
+    DodagMembership& dodag = it->second;
+
+    NS_LOG_FUNCTION(this << +key.instanceId << key.dodagId
+                         << dodag.p2p.alternateRoutes.size());
+
+    dodag.p2p.droCollecting = false;
+
+    if (dodag.p2p.addressVector.empty())
+    {
+        // Nothing to reply with. Only reachable if the membership lost its
+        // Address Vector between arming the window and now; the
+        // single-route path asserts instead, because it runs inline with
+        // the DIO that just filled it in.
+        NS_LOG_WARN("The collection window closed with no route to reply with");
+        return;
+    }
+
+    // 'S' means "no more DIOs need be processed for this discovery", so it
+    // belongs on the last P2P-DRO of the batch and no earlier -- RFC 6997
+    // section 9.5 conditions it on the Target having "already selected the
+    // desired number of routes", which is only true once every route below
+    // has gone out. The other half of the condition, this being the only
+    // Target, is what the single-route path checks on its own.
+    const bool lastTarget = !HasOtherP2pTargets(dodag);
+    const uint8_t extra = dodag.p2p.numRoutes;
+
+    // Slot 0, the tracked one: identical in every respect to what the
+    // single-route path sends, including its 'A' flag and retry budget,
+    // which HandleP2pRdo() has already set up.
+    SendP2pDroRoute(dodag,
+                    key,
+                    dodag.p2p.addressVector,
+                    dodag.p2p.droSequence,
+                    lastTarget && extra == 0,
+                    m_p2pDroAckRequested);
+
+    for (uint8_t i = 0; i < extra; i++)
+    {
+        // Padding with addressVector once the alternates run out, rather
+        // than sending fewer: RFC 6997 section 9.5 lets the Target "select
+        // the discovered route inside the received DIO as one or more of
+        // the routes", so repeating the one route it has is within the
+        // letter of the request. @see design-constraints.md.
+        const std::vector<Ipv6Address>& route = (i < dodag.p2p.alternateRoutes.size())
+                                                    ? dodag.p2p.alternateRoutes[i]
+                                                    : dodag.p2p.addressVector;
+        // Every route in the batch carries the same 'Seq'. Seq exists only
+        // to match a P2P-DRO-ACK back to the P2P-DRO it acknowledges (RFC
+        // 6997 section 10), these carry 'A' = 0 and so are never
+        // acknowledged, and giving them Seqs of their own would burn
+        // through the field's 2 bits and start colliding with the Seq of
+        // the *next* cycle, which is tracked.
+        SendP2pDroRoute(dodag,
+                        key,
+                        route,
+                        dodag.p2p.droSequence,
+                        lastTarget && (i + 1 == extra),
+                        false);
+    }
+
+    NS_LOG_INFO("Replied with " << +extra + 1 << " P2P-DRO(s), "
+                                << dodag.p2p.alternateRoutes.size()
+                                << " of them over a distinct route");
+
+    // Cleared so that a genuinely new reply cycle (a multi-Target discovery
+    // reaching HandleP2pRdo()'s reply branch again) collects afresh rather
+    // than re-sending what it already sent.
+    dodag.p2p.alternateRoutes.clear();
 }
 
 void
@@ -648,10 +850,34 @@ RplRoutingProtocol::HandleP2pDro(const RplP2pDroHeader& dro, Ipv6Address from, u
             // temporary DAG's own 'L' bounds discovery, not the route it
             // finds).
             route.expire = Simulator::Now() + Seconds(m_pathLifetime * m_lifetimeUnit);
-            m_p2pRoutes[rdo.target] = route;
 
-            NS_LOG_INFO("P2P-RPL route discovery to " << rdo.target << " completed over "
-                                                       << route.hops.size() << " hop(s)");
+            // Shortest wins within one discovery, rather than last wins.
+            // With 'N' = 0 this is a distinction without a difference (the
+            // only repeats are P2pDroRetry()'s own resends of an identical
+            // route, which are not strictly shorter), but 'N' > 0 has the
+            // Target answer with several genuinely different routes, and
+            // taking whichever happened to arrive last would make the
+            // alternates it went to the trouble of collecting worth nothing.
+            // m_p2pRoutes still holds exactly one route per Target: RFC 6997
+            // gives no rule for keeping several, and choosing between them
+            // afterwards (failover? load sharing?) is a policy this module
+            // has no basis to invent.
+            auto existing = m_p2pRoutes.find(rdo.target);
+            if (dodag.p2p.routeStored && existing != m_p2pRoutes.end() &&
+                existing->second.hops.size() <= route.hops.size())
+            {
+                NS_LOG_INFO("Keeping the " << existing->second.hops.size()
+                                            << "-hop route to " << rdo.target
+                                            << " over this discovery's " << route.hops.size()
+                                            << "-hop one");
+            }
+            else
+            {
+                m_p2pRoutes[rdo.target] = route;
+                NS_LOG_INFO("P2P-RPL route discovery to " << rdo.target << " completed over "
+                                                           << route.hops.size() << " hop(s)");
+            }
+            dodag.p2p.routeStored = true;
         }
 
         // RFC 6997 section 9.7: "If the A flag is set to one...the Origin
