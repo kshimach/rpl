@@ -338,6 +338,11 @@ RplRoutingProtocol::HandleP2pRdo(const RplDioHeader& dio, Ipv6Address from, uint
     // HandleAodvRreq()'s own isTarget repeat check mirrors, or every other
     // Target this node once knew about is gone from the DIOs it has heard
     // since -- either way, nothing left to relay onward for.
+    // RFC 6997 section 9.4's route diversity, kept ahead of every guard
+    // below for the same reason the alternate collection is: the copies
+    // those guards discard are exactly the ones carrying a different route.
+    RecordP2pCandidateRoute(dodag, rdo, from);
+
     // RFC 6997 section 7's 'N': the Origin asked for more than one route, so
     // a copy of the DIO this node would otherwise drop below -- as a repeat,
     // or as having come from something other than the preferred parent -- is
@@ -686,6 +691,90 @@ RplRoutingProtocol::P2pDroRetry(DodagKey key)
     // Rebuilds and resends the same content: droSequence is untouched here,
     // only HandleP2pRdo() bumps it for a genuinely new cycle.
     SendP2pDro(dodag, key);
+}
+
+void
+RplRoutingProtocol::RecordP2pCandidateRoute(DodagMembership& dodag,
+                                            const P2pRdoOption& rdo,
+                                            Ipv6Address from)
+{
+    NS_LOG_FUNCTION(this << from << rdo.addressVector.size());
+
+    // The rank this node would advertise if it took this neighbour as its
+    // parent -- RFC 6997 section 9.4: "the route comparison in a P2P-RPL
+    // route discovery is performed using the parent selection rules of the
+    // OF in use as specified in Section 14 of RPL". HandleDio() has already
+    // folded this DIO into dodag.parents by the time it calls into here
+    // (@see its own comment at the call site), so the entry is current.
+    auto parent = dodag.parents.find(from);
+    if (parent == dodag.parents.end())
+    {
+        return;
+    }
+    uint16_t rank = RankViaParent(dodag, parent->second);
+    if (rank == RPL_INFINITE_RANK)
+    {
+        return;
+    }
+
+    // Worse than what is already held: nothing to keep. "As long as all
+    // these routes are the best seen so far" is the whole constraint on the
+    // set, and it is what keeps this from degenerating into "remember every
+    // route anyone ever advertised".
+    if (rank > dodag.p2p.candidateRank)
+    {
+        return;
+    }
+
+    Ipv6Address ownAddress = GetGlobalAddressIn(dodag);
+    if (ownAddress.IsAny())
+    {
+        return;
+    }
+    // The same full-vector rule HandleP2pRdo() applies to addressVector
+    // (section 9.4), applied before this node appends itself. Over-full is
+    // a reason to drop the candidate, not to leave the DAG: the membership
+    // decision belongs to HandleP2pRdo() and is made on the copy that
+    // actually becomes addressVector.
+    if (rdo.addressVector.size() >= RPL_P2P_ADDRESS_VECTOR_MAX_ENTRIES)
+    {
+        return;
+    }
+    std::vector<Ipv6Address> route = rdo.addressVector;
+    route.push_back(ownAddress);
+
+    if (rank < dodag.p2p.candidateRank)
+    {
+        // A strictly better route supersedes the whole set rather than
+        // joining it, so the invariant "every entry ties candidateRank"
+        // holds without a sweep.
+        NS_LOG_INFO("A rank " << rank << " route supersedes " << dodag.p2p.candidateRoutes.size()
+                              << " candidate(s) at rank " << dodag.p2p.candidateRank);
+        dodag.p2p.candidateRoutes.clear();
+        dodag.p2p.candidateRank = rank;
+    }
+
+    for (const auto& known : dodag.p2p.candidateRoutes)
+    {
+        if (route == known)
+        {
+            return;
+        }
+    }
+
+    // Bounded by the same limit the Address Vector itself has. Without a cap
+    // this grows with the number of neighbours advertising a tied rank, and
+    // it is filled straight from received DIOs -- RFC 6997 puts no bound on
+    // it at all, so this one is this module's own.
+    if (dodag.p2p.candidateRoutes.size() >= RPL_P2P_ADDRESS_VECTOR_MAX_ENTRIES)
+    {
+        NS_LOG_LOGIC("Not keeping a further tied-rank route; the candidate set is full");
+        return;
+    }
+
+    NS_LOG_INFO("Keeping a rank " << rank << " route over " << route.size() - 1
+                                  << " hop(s) as candidate " << dodag.p2p.candidateRoutes.size());
+    dodag.p2p.candidateRoutes.push_back(std::move(route));
 }
 
 void

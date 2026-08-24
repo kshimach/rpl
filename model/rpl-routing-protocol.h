@@ -1168,6 +1168,24 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
             /// (Origin-side first), as this node would propagate it: its own
             /// address is already appended (RFC 6997 section 9.4).
             std::vector<Ipv6Address> addressVector;
+            /// RFC 6997 section 9.4's route diversity: every route heard for
+            /// this temporary DAG that ties the best rank this node can
+            /// advertise, each with this node's own address already
+            /// appended. SendDio() picks one uniformly at random per
+            /// transmission, which is what gives a Target more than one
+            /// route to find in the first place.
+            ///
+            /// Distinct from alternateRoutes below, which they are easy to
+            /// confuse: these are what this node ADVERTISES onward, and are
+            /// restricted to the tied-best rank because the RFC restricts
+            /// them ("as long as all these routes are the best seen so
+            /// far"); those are what a Target REPLIES with, are capped by
+            /// 'N' rather than by rank, and never reach a DIO.
+            std::vector<std::vector<Ipv6Address>> candidateRoutes;
+            /// The rank every entry in candidateRoutes ties at. A strictly
+            /// better one empties the set and starts it over; a worse one
+            /// is ignored.
+            uint16_t candidateRank{RPL_INFINITE_RANK};
             /// Target only, and only while numRoutes > 0: routes to this node
             /// that arrived on copies of the P2P mode DIO which addressVector
             /// itself refused, because they came from something other than
@@ -1578,6 +1596,31 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
                          uint8_t sequence,
                          bool stop,
                          bool trackAck);
+
+    /**
+     * @brief Remember a route heard for a temporary DAG, for re-advertising
+     *        onward, if it ties or beats the best rank this node has seen.
+     *
+     * RFC 6997 section 9.4: "To improve the diversity of the routes being
+     * discovered, an Intermediate Router SHOULD keep track of multiple
+     * routes (as long as all these routes are the best seen so far), one of
+     * which SHOULD be selected in a uniform random manner for inclusion in
+     * the P2P-RDO inside the router's next DIO." The selection half lives in
+     * SendDio(); this is the keeping-track half.
+     *
+     * "Better" is decided by RankViaParent(), because the same section says
+     * "the route comparison in a P2P-RPL route discovery is performed using
+     * the parent selection rules of the OF in use" -- not by comparing
+     * Address Vector lengths, which would be an OF0 assumption baked in
+     * where MRHOF is equally available.
+     *
+     * @param dodag the temporary DAG membership
+     * @param rdo the arriving DIO's P2P-RDO
+     * @param from the neighbour it came from, a link-local address
+     */
+    void RecordP2pCandidateRoute(DodagMembership& dodag,
+                                 const P2pRdoOption& rdo,
+                                 Ipv6Address from);
 
     /**
      * @brief Record a route that arrived on a copy of the P2P mode DIO this
@@ -2544,7 +2587,23 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     /// stale true behind, silently suppressing a genuinely new future
     /// trigger's own arm.
     bool m_disRefreshPending{false};
-    Ptr<UniformRandomVariable> m_jitter; //!< jitter applied to control messages
+    /// Jitter applied to control messages, and (SendDio()) the draw that
+    /// picks which of P2pState::candidateRoutes goes into the next P2P mode
+    /// DIO -- RFC 6997 section 9.4's "uniform random manner".
+    ///
+    /// Deliberately one variable rather than two. A second
+    /// RandomVariableStream would have to claim a stream index of its own,
+    /// which makes AssignStreams() report three streams per node instead of
+    /// two, which shifts every node's stream assignment, which changes every
+    /// simulation trajectory in the module. That is normally harmless
+    /// bookkeeping; here it reliably crashes the test suite on a latent
+    /// AODV-RPL forwarding loop that predates all of this (@see
+    /// design-constraints.md section 74 for the reproducer). Sharing the
+    /// stream costs only that a P2P route draw shifts the jitter sequence
+    /// after it, and it costs nothing at all in any scenario that never
+    /// accumulates two candidate routes, which is every scenario that
+    /// predates section 9.4 support.
+    Ptr<UniformRandomVariable> m_jitter;
 
     /**
      * @brief The RNG stream number to assign a DODAG membership's Trickle

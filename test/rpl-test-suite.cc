@@ -16575,6 +16575,138 @@ RplP2pNumRoutesPaddedTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief RFC 6997 section 9.4: an intermediate router with two equally good
+ *        parents advertises both routes across its DIOs, so the Target has
+ *        two to find.
+ *
+ * The shape the other 'N' tests deliberately avoid. Their diamond puts the
+ * parallel relays adjacent to the Target, so every alternate is the last hop
+ * and the Target hears it directly -- no intermediate router has to do
+ * anything for the diversity to exist. Here the fork is one hop further out:
+ * node 0 is the Origin, nodes 1 and 2 are two relays blacklisted from each
+ * other, node 3 hears both of them and is the only node adjacent to the
+ * Target, node 4.
+ *
+ * Node 3 therefore hears the Origin's P2P mode DIO twice, once via each of 1
+ * and 2, at the same rank. Section 9.4: "To improve the diversity of the
+ * routes being discovered, an Intermediate Router SHOULD keep track of
+ * multiple routes (as long as all these routes are the best seen so far),
+ * one of which SHOULD be selected in a uniform random manner for inclusion
+ * in the P2P-RDO inside the router's next DIO." Without that, node 3 pins
+ * whichever of 1 and 2 became its preferred parent and re-advertises only
+ * that route forever, node 4 hears a single route however long it collects,
+ * and 'N' > 0 buys nothing at all in this topology.
+ *
+ * The monitor sits on node 3, the Target's only neighbour, and counts what
+ * the Target sends back.
+ */
+class RplP2pRelayRouteDiversityTestCase : public RplP2pNumRoutesTestCaseBase
+{
+  public:
+    RplP2pRelayRouteDiversityTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplP2pRelayRouteDiversityTestCase::RplP2pRelayRouteDiversityTestCase()
+    : RplP2pNumRoutesTestCaseBase("An intermediate router with two equally good parents "
+                                  "advertises both routes",
+                                  2)
+{
+}
+
+void
+RplP2pRelayRouteDiversityTestCase::DoRun()
+{
+    m_nodes.Create(5);
+
+    m_channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(m_nodes, m_channel);
+
+    auto blacklist = [&](uint32_t a, uint32_t b) {
+        Ptr<SimpleNetDevice> devA = DynamicCast<SimpleNetDevice>(devices.Get(a));
+        Ptr<SimpleNetDevice> devB = DynamicCast<SimpleNetDevice>(devices.Get(b));
+        m_channel->BlackList(devA, devB);
+        m_channel->BlackList(devB, devA);
+    };
+    // Everything except 0-1, 0-2, 1-3, 2-3, 3-4.
+    blacklist(0, 3);
+    blacklist(0, 4);
+    blacklist(1, 2);
+    blacklist(1, 4);
+    blacklist(2, 4);
+
+    RplHelper rplHelper;
+    rplHelper.Set("P2pNumRoutes", UintegerValue(1));
+    rplHelper.Set("P2pDroCollectWindow", TimeValue(Seconds(3)));
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(m_nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < m_nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(m_nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(m_nodes, 1);
+
+    Simulator::Stop(Seconds(250));
+    Simulator::Run();
+
+    m_monitor = Socket::CreateSocket(m_nodes.Get(3), Ipv6RawSocketFactory::GetTypeId());
+    m_monitor->SetAttribute("Protocol",
+                            UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    m_monitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    m_monitor->BindToNetDevice(m_nodes.Get(3)->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+    m_monitor->SetRecvCallback(MakeCallback(&RplP2pRelayRouteDiversityTestCase::CaptureDro, this));
+
+    Ptr<RplRoutingProtocol> origin = m_nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> relay1 = m_nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> relay2 = m_nodes.Get(2)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> target = m_nodes.Get(4)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(target->IsJoined(), true, "The base DODAG did not reach the Target");
+
+    m_key = origin->DiscoverP2pRoute(target->GetGlobalAddress());
+    NS_TEST_ASSERT_MSG_NE(m_key.dodagId, Ipv6Address::GetAny(), "The discovery did not start");
+
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(m_routes.size(),
+                          2,
+                          "'N' = 1 should have produced two P2P-DROs: without section 9.4's "
+                          "relay-side diversity the fork at node 3 never reaches the Target");
+
+    // Both routes run Origin -> (1 or 2) -> 3, trimmed of the Target's own
+    // trailing entry, so they differ in their first element and agree on the
+    // second.
+    std::set<Ipv6Address> forks;
+    for (const auto& route : m_routes)
+    {
+        NS_TEST_ASSERT_MSG_EQ(route.size(), 2, "Every route here is two relays long");
+        forks.insert(route[0]);
+    }
+    NS_TEST_ASSERT_MSG_EQ(forks.size(),
+                          2,
+                          "The two P2P-DROs should fork at node 3's two parents");
+    NS_TEST_ASSERT_MSG_EQ((forks.count(relay1->GetGlobalAddress()) == 1 &&
+                           forks.count(relay2->GetGlobalAddress()) == 1),
+                          true,
+                          "The fork should be between node 3's two actual parents");
+
+    m_monitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief A Hop-by-hop discovery ('H' = 1) puts zero in 'N' on the wire and
  *        ignores it on receipt, however P2pNumRoutes is configured.
  *
@@ -22781,6 +22913,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplP2pNumRoutesPaddedTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pNumRoutesLateArrivalTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pNumRoutesHopByHopTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pRelayRouteDiversityTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDioRejectionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplParentLossRejoinTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplInterfaceRestartTestCase, TestCase::Duration::QUICK);

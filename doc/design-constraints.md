@@ -8460,6 +8460,7 @@ listed in the route" に対する乖離。これは §72 以前からある挙�
   Target への最終ホップになるダイヤモンド型 — §9.4 を必要としない
   唯一の形状 — を使っているため、この穴を踏まない。**'N' の価値を
   実際に効かせるには次に着手すべき項目**として記録する。
+  (**75節の通り対応済み**)
 - **Address Vector に載せる自アドレスが受信インタフェースのもので
   ない** (Angle 1)。§7 逐語: "The IPv6 address that a router adds to
   the vector MUST belong to the interface on which the router received
@@ -8502,4 +8503,211 @@ listed in the route" に対する乖離。これは §72 以前からある挙�
 `./ns3 build`(rpl モジュール・プロジェクト全体とも)、
 `test-runner --suite=rpl`(5 回連続実行して安定性を確認)、
 `./test.py -s rpl`を実行し、既存 140 件 + 新規 1 件 = 141 件全てが
+安定 PASS (1.0 秒前後) することを確認。
+
+## 74. 未修正の潜在バグ: AODV-RPL H=1 の転送ループ (再現手順つき)
+
+§75 (RFC 6997 §9.4) の実装中に、乱数ストリーム割当を1本増やしただけで
+テストスイートが確実にクラッシュする現象に当たった。調査の結果、**§75
+とも §72/§73 とも無関係な、以前から存在するバグ**と判明したので、
+再現手順を含めてここに記録する。**未修正。**
+
+§71.3 が「原因はここで切り上げ、断定はしない」として残した
+`packet-metadata.cc:403` の `NS_ASSERT` と同じ assert であり、あちらは
+テスト側の書き方を変えて回避しただけだった。今回は決定的な単独再現に
+到達している。
+
+### 74.1 再現手順
+
+`AssignStreams()` の戻り値を 2 から 3 に変えるだけ (新しい乱数変数を
+足す必要すら無い。ノード毎のストリーム割当がずれ、全ノードの Trickle
+ジッタが変わり、シミュレーション軌道全体が変わる):
+
+```cpp
+    m_dioTrickleStream = stream + 1;
+    return 3;   // was 2
+```
+
+これだけで
+
+```
+NS_ASSERT failed, cond="m_used != prev && m_used != next",
++304.856578369s 1 file=.../src/network/model/packet-metadata.cc, line=403
+```
+
+`RplAodvHopByHopRouteOutlivesRreqInstanceTestCase` **単独**で再現する
+(他のテストを一切登録しなくても落ちる)。commit `e1035cc` — つまり
+§71・§72・§73・§75 のいずれよりも前 — まで遡って同一時刻・同一
+シグネチャで再現することを確認済み。
+
+### 74.2 実際に起きていること
+
+`NS_LOG="RplRoutingProtocol=level_all|prefix_time|prefix_node"` で
+クラッシュ直前を取ると、原因は**ヘッダのサイズ不整合ではなく転送
+ループ**だった:
+
+```
++304.856578369s 1 Forwarding 2001:1::200:ff:fe00:1 over a Hop-by-hop Route
+                  via fe80::200:ff:fe00:3
++304.856578369s 2 Forwarding 2001:1::200:ff:fe00:1 over a Hop-by-hop Route
+                  via fe80::200:ff:fe00:2
+```
+
+同一宛先 (OrigNode = node 0 のグローバルアドレス) に対して
+**node 1 の next hop が node 2、node 2 の next hop が node 1**。
+`StoreHopByHopRoute()` が張った AODV-RPL の Hop-by-hop 状態が、
+OrigNode 方向について 2 ノード間ループになっている。
+
+同じ時刻のログで、ループしているパケットの Hop Limit は 232 → 231 と
+減っており、255 から既に約 23 周している。周回のたびに:
+
+- `PrepareOutgoingPacket()` が "Attached an RPL Option to a packet for..."
+  を出す (毎ホップ RPI を付け直す)
+- 経路が見つからないノードで ICMPv6 エラーが生成され、そのエラー自体も
+  経路が無くてさらにエラーを生む — payload が 168 → 176 → 224 と
+  単調増加している
+
+最終的に `PacketMetadata::AddBig()` の arena 整合性チェックが破綻する。
+assert 自体は結果であって原因ではない。
+
+ループしていたパケットは node 2 のグローバルアドレス発、root 宛、
+payload 74、Next Header 0 (hop-by-hop 拡張) — DAO に RPI が付いたもの。
+テスト自身のアプリ送信はこの時点ではまだ始まっていない。
+
+### 74.3 なぜ既定の乱数軌道では出ないのか
+
+このループが成立するかどうかは、RREQ フラッド中にどのノードがどの順で
+どちらを親に選んだかに依存する。既定のストリーム割当では成立しない
+組み合わせになっており、ストリームが1本ずれると成立する組み合わせに
+なる。つまり**既定値で通っているのは運**であり、トポロジや乱数種を
+変えれば同じ条件は現実に踏みうる。
+
+### 74.4 未修正の理由と、次に見るべき場所
+
+§75 の作業範囲 (P2P-RPL の経路多様性) と完全に別のサブシステム
+(AODV-RPL の H=1 経路設置) の問題であり、修正には `HandleAodvRreq()`/
+`HandleAodvRrep()`/`StoreHopByHopRoute()` の設置ロジックそのものの
+見直しが要る。§75 を止めてまで着手する筋ではないと判断し、記録に
+留めた。
+
+次に着手するときの手掛かり:
+
+1. 上記1行変更でテストを1件だけ登録すれば、確実に再現する。
+2. ループの向きは **TargNode → OrigNode** (Reverse 方向)。
+   `StoreHopByHopRoute()` の呼び出し元のうち、Reverse 方向の next hop を
+   決めている箇所を疑う。
+3. `RplP2pHopByHopRouteConflictTestCase` に相当する衝突検出
+   (§9.6 の「next hop が食い違う経路は捨てる」) が AODV-RPL 側にも
+   効いているか確認する — 効いていればループは張れないはずで、
+   張れているということはどこかで検出をすり抜けている。
+4. ICMPv6 エラーがエラーを生む増幅も、それ自体が独立した堅牢性の
+   問題として見る価値がある (ループが無くても、経路の無いノードで
+   同じ連鎖は起こりうる)。
+
+## 75. RFC 6997 §9.4 の中継側経路多様性を実装 — 'N' がようやく実効化
+
+§73.6 が「'N' の価値を実際に効かせるには次に着手すべき項目」として
+残した最大の穴。§72 で 'N' > 0 の Target 側 (収集ウィンドウとバッチ
+返信) は入ったが、**Target が集めるべき別経路をそもそも誰も作って
+いなかった**。
+
+### 75.1 RFC 本文
+
+§9.4 逐語:
+
+> To improve the diversity of the routes being discovered, an
+> Intermediate Router SHOULD keep track of multiple routes (as long as
+> all these routes are the best seen so far), one of which SHOULD be
+> selected in a uniform random manner for inclusion in the P2P-RDO
+> inside the router's next DIO.
+
+比較基準も同じ節が明示している:
+
+> Note that the route comparison in a P2P-RPL route discovery is
+> performed using the parent selection rules of the OF in use as
+> specified in Section 14 of RPL [RFC6550].
+
+### 75.2 実装
+
+新規状態 (`P2pState`):
+
+- `candidateRoutes`: 「今まで見た中で最良」の rank に並ぶ経路すべて。
+  各エントリは自アドレス追加済み。
+- `candidateRank`: それらが並んでいる rank。
+
+新規 `RecordP2pCandidateRoute()` を `HandleP2pRdo()` の**全ガードより
+手前**に置いた (`RecordP2pAlternateRoute()` と同じ理由 — ガードが
+捨てるコピーこそが別経路を運ぶ)。判定は `RankViaParent()` で行う。
+Address Vector の長さ比較にしなかったのは、それが OF0 前提を焼き込む
+ことになり、この モジュールは MRHOF も同じだけサポートしているため。
+
+- 現状より**悪い** rank: 無視。
+- **同じ** rank: 完全一致でなければ追加。
+- **良い** rank: 集合を丸ごと破棄して張り直す。これで「全エントリが
+  `candidateRank` に並ぶ」という不変条件が掃除なしで保たれる。
+
+上限は `RPL_P2P_ADDRESS_VECTOR_MAX_ENTRIES` (14)。RFC はこの集合に
+上限を与えていないので、これは この モジュール独自のもの — 受信 DIO
+から直接埋まる以上、同 rank を名乗る隣人の数だけ無制限に伸びる。
+
+**選択側**: `SendDio()` の P2P 分岐で、送信のたびに一様乱数で1本選ぶ。
+membership ごとに1回引いて固定しないのは、それでは discovery 全体で
+1本しか広告せず、この SHOULD が解消しようとしている状態そのものに
+なるため。`addressVector` は従来どおり preferred parent 由来のまま
+残し、広告する経路だけが揺れる。集合が空なら `addressVector` に
+フォールバックする (Origin — 空ベクタが正 — と、`HandleP2pRdo()` 以外の
+経路で membership が作られた場合が該当)。
+
+§39 で実装した P2P mode DIO の Trickle 一貫性判定は rank を比較して
+おり Address Vector を見ていないので、rank 一定のまま経路だけが変わる
+DIO は Trickle リセットを誘発しない。
+
+### 75.3 乱数ストリームを新設しなかった理由
+
+当初は専用の `UniformRandomVariable` を足し `AssignStreams()` の戻り値を
+2 から 3 にした。これがテストスイートを確実にクラッシュさせた —
+**§74 に記録した既存の潜在バグ**を、ノード毎ストリーム割当のずれが
+踏み抜くため。§74 のバグは §9.4 とも §72/§73 とも無関係で、
+`e1035cc` まで遡って再現する。
+
+そこで専用変数をやめ、既存の `m_jitter` を共用することにした。
+`AssignStreams()` の戻り値は 2 のまま、既存の全軌道は不変。代償は
+「P2P の経路抽選がその後のジッタ列をずらす」ことだけで、それも
+**候補経路が 2 本以上たまるシナリオでのみ**発生する = §9.4 以前から
+存在するシナリオでは 1 回も引かれない。
+
+これは §74 のバグを隠す判断ではない。§74 に再現手順一式を残した上で、
+別サブシステムの未修正バグに §75 を人質に取らせない、という切り分け。
+
+### 75.4 テスト
+
+新規 `RplP2pRelayRouteDiversityTestCase`。他の 'N' テストが**意図的に
+避けている**形状を使う: 従来のダイヤモンドは並列中継が Target に隣接
+していて、代替経路が全て最終ホップになるため中継ルータが何もしなくても
+多様性が存在する。こちらは分岐を1ホップ外側に置く —
+
+```
+    0 (Origin, base root)
+    |\
+    1 2   (相互ブラックリストの中継2台)
+    |/
+    3     (等価な親を2つ持つルータ)
+    |
+    4     (Target)
+```
+
+node 3 が同 rank の DIO を 1 経由と 2 経由で二重に聞く。'N' = 1 で
+Target が 2 通の P2P-DRO を返し、その 2 通が node 3 の**2つの親で
+分岐している**ことを確認する。
+
+load-bearing 検証: `SendDio()` の抽選を無効化すると
+`actual="1" limit="2"` で確実に FAIL。node 3 が preferred parent 1本に
+固定され、Target には 1 経路しか届かなくなる — Angle 1 がこの穴の
+失敗シナリオとして予測したとおりの形。
+
+### 75.5 検証
+
+`./ns3 build`(rpl モジュール・プロジェクト全体とも)、
+`test-runner --suite=rpl`(5 回連続実行して安定性を確認)、
+`./test.py -s rpl`を実行し、既存 141 件 + 新規 1 件 = 142 件全てが
 安定 PASS (1.0 秒前後) することを確認。

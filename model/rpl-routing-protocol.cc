@@ -1284,7 +1284,32 @@ RplRoutingProtocol::SendDio(DodagMembership& dodag, Ipv6Address dst, uint32_t in
         rdo.lifetime = dodag.p2p.lifetimeField;
         rdo.maxRankOrNh = dodag.p2p.maxRank;
         rdo.target = dodag.p2p.target;
-        rdo.addressVector = dodag.p2p.addressVector;
+        // RFC 6997 section 9.4: "...one of which SHOULD be selected in a
+        // uniform random manner for inclusion in the P2P-RDO inside the
+        // router's next DIO." Re-drawn per transmission, not once per
+        // membership: a router that picked once and stuck with it would
+        // advertise exactly one route for the whole discovery, which is
+        // the state of affairs this SHOULD exists to end. The Trickle
+        // consistency rules this module implements for P2P mode DIOs
+        // (section 9.2, @see design-constraints.md) compare ranks rather
+        // than Address Vectors, so a route that changes between DIOs at a
+        // constant rank does not itself provoke any Trickle reset.
+        //
+        // Falls back to addressVector whenever the candidate set is empty,
+        // which is every case that predates this: the Origin (whose vector
+        // is deliberately empty) and any node whose membership was built
+        // by some path other than HandleP2pRdo().
+        if (!dodag.p2p.candidateRoutes.empty())
+        {
+            uint32_t pick = m_jitter->GetInteger(
+                0,
+                static_cast<uint32_t>(dodag.p2p.candidateRoutes.size() - 1));
+            rdo.addressVector = dodag.p2p.candidateRoutes[pick];
+        }
+        else
+        {
+            rdo.addressVector = dodag.p2p.addressVector;
+        }
         dio.SetP2pRdo(rdo);
 
         // RFC 6997 section 9.3's own reuse of RFC 6550's RPL Target option
