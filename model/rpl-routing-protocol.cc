@@ -1299,12 +1299,17 @@ RplRoutingProtocol::SendDio(DodagMembership& dodag, Ipv6Address dst, uint32_t in
         // which is every case that predates this: the Origin (whose vector
         // is deliberately empty) and any node whose membership was built
         // by some path other than HandleP2pRdo().
+        // Pruned immediately before drawing, not only when a DIO arrives: a
+        // neighbour can go stale between two of this node's own Trickle
+        // firings, and advertising a route through it even once sends the
+        // eventual P2P-DRO into a node this router can no longer reach.
+        PruneP2pCandidateRoutes(dodag);
         if (!dodag.p2p.candidateRoutes.empty())
         {
             uint32_t pick = m_jitter->GetInteger(
                 0,
                 static_cast<uint32_t>(dodag.p2p.candidateRoutes.size() - 1));
-            rdo.addressVector = dodag.p2p.candidateRoutes[pick];
+            rdo.addressVector = dodag.p2p.candidateRoutes[pick].route;
         }
         else
         {
@@ -3178,9 +3183,8 @@ RplRoutingProtocol::StoreHopByHopRoute(uint8_t instanceId,
         // and destination address and the same RPLInstanceID, but a stale
         // Sequence Number (i.e., incoming Sequence Number is less than the
         // currently stored Sequence Number of the route entry), MUST be
-        // deleted." Stale means strictly less, and only a strictly newer
-        // Sequence Number carries a freshness argument strong enough to
-        // move the next hop.
+        // deleted." Stale means strictly less, so equal-or-newer is
+        // accepted.
         if (RplSequenceNewer(it->second.seqNo, seqNo))
         {
             NS_LOG_LOGIC("Refusing a Hop-by-hop Route to "
@@ -3189,31 +3193,31 @@ RplRoutingProtocol::StoreHopByHopRoute(uint8_t instanceId,
                         << +it->second.seqNo);
             return false;
         }
-        // Equal Sequence Number is the same discovery reaching this router
-        // again, so a next hop that disagrees with what is already held is
-        // not news about a fresher route -- it is this router being asked
-        // to point somewhere else within one discovery, which is how a
-        // forwarding loop gets built. Seen for real: as an RREQ-Instance
-        // decays toward its 'L' deadline, the OrigNode goes quiet first, a
-        // router one hop from it loses that parent to the staleness sweep,
-        // re-parents onto its own downstream neighbour -- the only
-        // candidate left -- and rewrites its upward route to point back at
-        // it, while that neighbour still points here. @see
-        // design-constraints.md section 76.
+        // An equal Sequence Number is the same discovery arriving again, and
+        // carries no freshness argument at all -- so by default it may not
+        // MOVE an established next hop. That is what stops a router being
+        // talked into pointing back the way the route came: two of them
+        // doing it at once is a forwarding loop, which spins packets until
+        // their Hop Limit runs out and generates an unroutable ICMPv6 error
+        // per lap (@see design-constraints.md sections 74, 76 and 78 --
+        // observed on the upward route toward OrigNode, then again on the
+        // downward route toward TargNode once the first was closed).
         //
-        // Only where the caller asks for it. The asymmetric RREP-Instance's
-        // own downward route must do the opposite and follow every parent
-        // switch, because RFC 9854 section 6.4.3 defines its next hop as
-        // "the preferred parent in the DODAG of RREP-Instance" and the
-        // flood legitimately reaches a router from a better neighbour after
-        // a worse one (@see section 50.2 and
-        // RplAodvAsymmetricHopByHopRouteFollowsParentTestCase).
+        // Callers that legitimately have to follow a moving preferred
+        // parent opt out. RFC 9854 section 6.4.3 defines the asymmetric
+        // RREP-Instance's downward next hop as "the preferred parent in the
+        // DODAG of RREP-Instance", and its flood reaches a router from a
+        // better neighbour after a worse one as a matter of course; so does
+        // the RREQ-Instance's own upward route, which decides the same
+        // question more precisely for itself (@see HandleAodvRreq()'s
+        // mayMove, which distinguishes a better live parent from a parent
+        // that has merely vanished).
         if (pinNextHop && it->second.seqNo == seqNo && it->second.nextHop != nextHop)
         {
             NS_LOG_LOGIC("Refusing a Hop-by-hop Route to "
                         << destination << " under Instance " << +instanceId << "/" << dodagId
                         << ": next hop " << nextHop << " disagrees with the " << it->second.nextHop
-                        << " already held at the same Orig SeqNo " << +seqNo);
+                        << " already held at the same Sequence Number " << +seqNo);
             return false;
         }
     }

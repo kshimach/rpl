@@ -689,14 +689,62 @@ RplRoutingProtocol::HandleAodvRreq(const RplDioHeader& dio, Ipv6Address from, ui
                                               "toward OrigNode at");
             return;
         }
-        if (!StoreHopByHopRoute(key.instanceId,
-                               key.dodagId,
-                               key.dodagId,
-                               dodag.preferredParent,
-                               Seconds(m_pathLifetime * m_lifetimeUnit),
-                               true,
-                               rreq.origSeqNo,
-                               true))
+        // Whether this router may move an upward route it already holds.
+        // RFC 9854 section 6.2.3 has the router "build or update" the entry
+        // and defines its next hop as the preferred parent, so a switch to
+        // a genuinely better parent MUST be followed -- an earlier version
+        // of this refused every same-Sequence-Number change and so pinned
+        // the first neighbour heard for the whole discovery, which the
+        // /protocol-test-matrix audit called out from two angles at once.
+        //
+        // The one switch that must not be followed is the one that builds a
+        // loop: the stored next hop has gone stale and been swept out of
+        // the parent set, leaving this router's own downstream neighbour as
+        // the only candidate, so it re-parents onto its own child while the
+        // child still points here (@see design-constraints.md section 74
+        // for that captured in the wild, and 76 for the diagnosis). The
+        // discriminator is therefore not "is the new parent better" on its
+        // own -- when the old one has vanished, anything looks better --
+        // but "is the old one still a parent at all, and is the new one
+        // better than it".
+        bool mayMove = true;
+        Ipv6Address storedNextHop;
+        uint8_t storedInstanceId = 0;
+        if (GetHopByHopRoute(key.dodagId, storedNextHop, storedInstanceId) &&
+            storedInstanceId == key.instanceId && storedNextHop != dodag.preferredParent)
+        {
+            auto stored = dodag.parents.find(storedNextHop);
+            auto chosen = dodag.parents.find(dodag.preferredParent);
+            uint16_t storedRank = stored == dodag.parents.end()
+                                      ? RPL_INFINITE_RANK
+                                      : RankViaParent(dodag, stored->second);
+            uint16_t chosenRank = chosen == dodag.parents.end()
+                                      ? RPL_INFINITE_RANK
+                                      : RankViaParent(dodag, chosen->second);
+            mayMove = storedRank != RPL_INFINITE_RANK && chosenRank < storedRank;
+            if (!mayMove)
+            {
+                NS_LOG_LOGIC("Keeping the upward Hop-by-hop Route to "
+                            << key.dodagId << " via " << storedNextHop << " rather than moving it "
+                            << "to " << dodag.preferredParent
+                            << ": the neighbour already held is not a live parent this one beats");
+            }
+        }
+
+        // Only a stale Sequence Number discards the DIO outright, which is
+        // what RFC 9854 section 6.2.3's "MUST be deleted" is about. Refusing
+        // to move the next hop above is not a reason to abandon the rest of
+        // this DIO's processing -- the instance's own 'L' refresh, the
+        // G-RREP short circuit and the RREP this router may owe all still
+        // apply.
+        if (mayMove && !StoreHopByHopRoute(key.instanceId,
+                                          key.dodagId,
+                                          key.dodagId,
+                                          dodag.preferredParent,
+                                          Seconds(m_pathLifetime * m_lifetimeUnit),
+                                          true,
+                                          rreq.origSeqNo,
+                                          false))
         {
             NS_LOG_LOGIC("Discarding an RREQ-DIO establishing a Hop-by-hop Route that conflicts "
                         "with or is staler than one already held for OrigNode "
@@ -1346,13 +1394,21 @@ RplRoutingProtocol::HandleAodvRrepInstance(const RplDioHeader& dio,
         // RREQ-Instance's (@see design-constraints.md for why the Rank
         // mismatch this was once thought to block on does not matter to a
         // bypass that never compares Ranks at all).
+        // Opts out of StoreHopByHopRoute()'s equal-Sequence-Number pin: RFC
+        // 9854 section 6.4.3 defines this next hop as "the preferred parent
+        // in the DODAG of RREP-Instance", read fresh, and the RREP-Instance
+        // flood legitimately reaches this router from a better neighbour
+        // after a worse one (@see
+        // RplAodvAsymmetricHopByHopRouteFollowsParentTestCase, which pins
+        // exactly that).
         if (!StoreHopByHopRoute(pairedInstanceId,
                                dodag.aodv.origNode,
                                key.dodagId,
                                dodag.preferredParent,
                                Seconds(m_pathLifetime * m_lifetimeUnit),
                                true,
-                               dodag.aodv.origSeqNo))
+                               dodag.aodv.origSeqNo,
+                               false))
         {
             NS_LOG_LOGIC("Discarding an RREP-Instance DIO establishing a Hop-by-hop Route that "
                         "conflicts with or is staler than one already held for "

@@ -8397,10 +8397,15 @@ listed in the route" に対する乖離。これは §72 以前からある挙�
    "all P2P-DRO transmissions and retransmissions MUST take place while
    the Target is still a part of the temporary DAG" 自体は
    `LeaveDodag()` が `droCollectEvent` を cancel するので違反しないが、
-   Target が何も答えず Origin がタイムアウトするだけになる。既定
-   256 ms でも 'L' = 0 (1 s) なら到達しうるし、§72 が追加したテスト
-   自身が 3 s のウィンドウを設定している。修正: `expiry` の残り時間の
-   半分にクランプし、`NS_LOG_WARN` を出す。
+   Target が何も答えず Origin がタイムアウトするだけになる。修正:
+   `expiry` の残り時間の半分にクランプし、`NS_LOG_WARN` を出す。
+
+   **訂正 (§78)**: この項は当初「既定 256 ms でも 'L' = 0 (1 s) なら
+   到達しうる」と書いていたが、256 ms < 1 s なので**算術的に誤り**。
+   到達するのは呼び出し側がウィンドウを 1 秒以上に設定した場合だけで、
+   §72 が追加したテスト自身 (3 s) がそれに当たる。また `remaining`
+   は同じ呼び出しの中で `ArmP2pExpiry()` が張り直した直後の値なので、
+   常に 'L' そのものであって「残り時間」ではない。
 3. **ウィンドウ満了時に、インラインだった頃は無料で効いていたガードが
    効かなくなっていた。** 満了コールバックは `m_dodags` 引きと
    `addressVector.empty()` しか見ておらず、`isTarget`・`reply` ('R')・
@@ -8869,3 +8874,213 @@ RFC が「一様乱数で選べ」と要求している以上、結論を構造�
 組み替え後は既定軌道・スイープ軌道の**両方**で通ることを確認済み。
 「乱数を含む挙動のテストは、サンプル数を先に確認してから中身を見る」
 という ns3-debug-pitfalls の教訓の、この モジュールでの実例。
+
+## 78. Angle 2・Angle 4 の監査 (§73 で未実行だった2角) — 9件を修正
+
+§73.6 が「session limit で起動に失敗、次サイクルで回す」として残した
+Angle 2 (境界値) と Angle 4 (シーケンス状態遷移) を、§72-§77 の累積
+(`4af9d00..73f47cd`) を対象に実行した。両角に doc §72-77 を「事実」
+ではなく「検証すべき主張」として渡している — §73.2 で RFC 誤引用の
+前科があるため。
+
+**3 点で 2 角が独立に収束した** (pin の過剰拒否、候補集合の無効化漏れ、
+clamp の記述が事実と違う)。収束した指摘は優先して扱った。
+
+### 78.1 §75 の候補集合が一度も無効化されない (両角)
+
+`P2pState::candidateRoutes` は DIO から埋まるだけで、**削除経路が
+一つも無かった**。`candidateRank` も下方向にしか動かない ratchet。
+2 通りの壊れ方がある:
+
+1. 隣人が沈黙して `SelectPreferredParent()` の staleness sweep が
+   `dodag.parents` から消しても、その隣人を通る経路は集合に残り、
+   **この ノードの DIO の半分がもう自分でも到達できない経路を広告
+   し続ける**。最終的に Target がその経路で P2P-DRO を返し、途中で
+   落ちる。Source Route なら Origin が `PathLifetime * LifetimeUnit`
+   = 1800 秒それを保持する。
+2. この ノード自身の最良 rank が正当に悪化した場合 (親の rank が
+   上がった、MRHOF の ETX が劣化した)、以後の経路は全て
+   「best seen so far より悪い」として弾かれ、**実際に転送に使う
+   `addressVector` の経路が一度も広告されない** —
+   `SendDio()` の `addressVector` フォールバックは集合が**空**の
+   ときしか効かないため。
+
+修正: 候補に出所の隣人 (link-local) を持たせ、新設
+`PruneP2pCandidateRoutes()` が (a) `dodag.parents` に居ない隣人の
+経路を捨て、(b) 生き残りの rank を**その場で計算し直して**
+`candidateRank` を再設定する。`RecordP2pCandidateRoute()` の冒頭と、
+`SendDio()` が抽選する直前の両方で呼ぶ — 隣人は この ノード自身の
+Trickle 発火の**間に**も stale になりうるので、DIO 到着時だけでは
+足りない。
+
+RFC 6997 §9.4 の "as long as all these routes are the best seen so
+far" は集合が内部で一貫していることの制約であって、集合が記述する
+トポロジより長生きしてよいという許可ではない。
+
+### 78.2 §76 の pin が、RFC が MUST とする更新まで拒否していた (両角)
+
+RFC 9854 §6.2.3 逐語: "the router MUST **build or update** its upward
+route entry towards OrigNode" で、next hop は "the preferred parent"。
+§6.2.1 は「OF を満たす RREQ-DIO を送ってきた上流隣人が preferred
+parent として選ばれる」。Orig SeqNo は discovery 中不変なので、
+**「同値 SeqNo」= 「同じ discovery」= 「update 動詞が適用されうる
+唯一の窓」**。§76 の無条件 pin はその窓を丸ごと閉じていた。
+
+実害: `O—A—X`, `O—B—X` で rank(B) < rank(A)。X が A の copy を先に
+聞いて next hop = A を記録 → B の copy 到着 → `SelectPreferredParent()`
+が B に切替 → store は pin で拒否 → **X は B 由来の rank を広告し
+ながら A へ転送する**。A の membership が 'L' で消えると X の subtree
+は OrigNode 方向へ blackhole。
+
+Angle 2 は同時に、**§76 のコミットメッセージの主張が誤りである**とも
+指摘した — 「`from` → `dodag.preferredParent` だけでループは構成
+不能になる」は偽で、pin は load-bearing。これは実測とも一致する
+(§76 の切り分けで preferredParent 単独では再発した)。
+
+修正: 判別を `HandleAodvRreq()` 側に移し、粒度を上げた。移動を
+許すのは「**既に保持している next hop がまだ生きた親であり、かつ
+新しい親がそれより厳密に良い**」ときだけ。古い親が消えた場合は
+拒否する — ループが生まれるのはまさにその場合 (親を失った ルータが
+唯一残った候補である自分の子へ付け替える) であり、「新しい方が
+良いか」だけでは判別できない (古い方が消えていれば何でも良く見える)。
+
+あわせて、経路更新の拒否で **DIO の処理全体を中断しない**ように
+した。従来は `return` していたため、'L' の張り直し (`ArmAodvExpiry()`)、
+G-RREP の短絡、この ルータが送る義務のある RREP まで全部飛んでいた。
+DIO を丸ごと捨ててよいのは stale SeqNo の場合だけ (§6.2.3 の
+"MUST be deleted")。
+
+### 78.3 下り経路にも同型のループがあった (§76 の続き)
+
+§76 で上りを直したあと、掃き出し (§77.1) を当て直したら**別のループ**
+が出た。計測:
+
+```
++271.983s 1 store dst=2001:1::…:4 nh=fe80::…:3 inst=128 seq=0
++272.313s 2 store dst=2001:1::…:4 nh=fe80::…:2 inst=128 seq=0
+```
+
+宛先が `…fe00:4` = **TargNode**、`seq=0` (ART の destSeqNo が
+「情報なし」)。node 1 → node 2、node 2 → node 1。RREP 経路
+(`HandleAodvRrep()`) が張る**下り**経路の、同じ「同値 SeqNo で
+next hop を動かせる」機構によるもの。
+
+修正: `StoreHopByHopRoute()` の同値 SeqNo pin を**既定 ON** にし、
+追従が必須の呼び出し元だけ opt-out させる形にした:
+
+- **opt-out**: 非対称 RREP-Instance (§6.4.3 が next hop を
+  "the preferred parent in the DODAG of RREP-Instance" と定義し、
+  フラッドが悪い隣人の後に良い隣人から届くのは正常。
+  `RplAodvAsymmetricHopByHopRouteFollowsParentTestCase` が固定済み)。
+- **opt-out**: RREQ の上り経路 (78.2 の、より精密な判別を自前で持つ)。
+- **既定の pin**: RREP の下り経路。対称 RREP は hop-by-hop unicast で
+  一方向に流れるので、最初に届いたものが正しい。
+
+結果、掃き出し軌道でクラッシュは消え、既知の未解決項目 (§77.2 の
+No-Path DAO 二重送出) まで到達するようになった。**クラッシュ系は
+これで閉じた。**
+
+### 78.4 収集ウィンドウまわり 3 件
+
+- **`stopped` の再確認が、約束した返信を握り潰していた** (Angle 4)。
+  §73.4 項3 で足した再確認に `stopped` を含めていたが、RFC 6997 §5 の
+  'S' の効果は "SHOULD NOT process any more DIOs" / "SHOULD NOT
+  generate any more DIOs" / "SHOULD cancel any pending DIO
+  transmissions" — **全て DIO についてであって、この Target が既に
+  送ると決めた P2P-DRO については何も言っていない**。§9.5 の
+  "the Target MUST select one or more discovered routes and send one
+  or more P2P-DRO messages" が果たすべき義務で、ウィンドウはその
+  返信の**延期**であって再検討ではない。含めていたせいで、別の
+  Target のバッチ (この ノードを経由して `stopped` を立てる) が
+  ウィンドウ中に着くと、この Target が**一通も返さず**終わりうる。
+  修正: `stopped` を再確認から外す (`isTarget` と `reply` は残す)。
+- **バッチが 'N' で束縛されていなかった** (Angle 2)。上限は
+  `RecordP2pAlternateRoute()` の挿入時にしか無く、しかもそれが
+  `HandleP2pRdo()` のガードより手前で走るため**前回の DIO の 'N'**
+  を読んでいた。N=3 の DIO の後に N=1 の DIO が来ると 4 通送って
+  「of the 2 asked for」と記録する。修正: 上限をこの DIO の 'N'
+  (`rdo.numRoutes`、H=1 ならゼロ) から引数で渡し、送信ループ側にも
+  `sent > numRoutes` の打ち切りを入れた。
+- **新サイクルがウィンドウを張るとき、前サイクルの `droRetryEvent`
+  を止めていなかった** (Angle 4)。'N' = 0 の枝は即送信して timer を
+  張り直すので問題無いが、'N' > 0 ではウィンドウが閉じるまで何も
+  出ないため、古い timer が**ウィンドウの最中に発火して slot 0 を
+  新しい Seq で先出しする** — ウィンドウが防ぐはずの送信であり、
+  retry でないものに retry 予算を 1 消費する。修正: ウィンドウを
+  張る際に `droRetryEvent.Cancel()`。
+
+### 78.5 テストが空コンテナを索引していた (Angle 2)
+
+`src/core/model/test.cc` の `m_continueOnFailure` は既定 true で、
+`--stop-on-failure` を付けるのは `test.py` が `--multiple` 無しの
+ときだけ。つまり `AGENTS.md` が NS_LOG デバッグ用に案内している
+`./ns3 run 'test-runner --suite=rpl'` では、`NS_TEST_ASSERT_MSG_EQ`
+は**失敗しても return しない**。
+
+§72/§75 で追加したテストは `m_routes.size()` を確認した直後に
+`m_ackRequested[0]` や `route[0]` を索引していたため、捕捉が空だった
+場合に「expected 3, got 0」という綺麗な失敗が**範囲外アクセス**に
+化ける。修正: 本数確認の直後に early return / `continue` ガードを
+入れた。ns3-debug-pitfalls の「`.empty()` ガードでクラッシュをテスト
+失敗に格下げする」の実例。
+
+### 78.6 訂正: clamp の記述が事実と違っていた (両角)
+
+§73.4 項2 の記述と対応するコードコメントを訂正した。詳細は §73.4 の
+訂正注記。要点は 2 つ — 既定 256 ms では 'L' = 1 s に届かないので
+**到達不能**であり、`remaining` は同じ呼び出しで `ArmP2pExpiry()` が
+張り直した直後の値なので**常に 'L' そのもの**で「残り時間」ではない。
+死んでいた `remaining > Time(0)` ガードも外した。
+
+### 78.7 修正しなかった指摘
+
+- **`RPL_P2P_ADDRESS_VECTOR_MAX_ENTRIES` = 14 は Compr=0 の上限**
+  (Angle 2、単独)。RFC 6997 §7 の
+  `n = (Option Length - 2 - (16 - Compr))/(16 - Compr)` から
+  Option Length が 8 bit であることを使って導くと、上限は
+  **Compr=0 で 14、Compr=8 で 30、Compr=15 で 252**。この モジュールは
+  `P2pElidedPrefixLength()` が同一 /64 では常に 8 を返すので、
+  実運用上の Compr は 8 であり、本来 30 まで載る。現状は 5 箇所
+  (`rpl-conf.h` の定義、`rpl-p2p.cc` の 3 箇所、`rpl-header.cc` の
+  deserializer と assert) が**一貫して 14** を使っている — 互いに
+  ずれてはいないが、揃って厳しすぎる。実害: 16 ホップの一直線
+  トポロジで深さ 14 の ルータが Target の 2 ホップ手前で
+  `LeaveDodag()` し、討伐が打ち切られる。また準拠実装が送る
+  Compr=8・15〜30 エントリの P2P-RDO を malformed として捨てる。
+  §72-§78 のいずれよりも前からある挙動で、修正は上限を Compr 依存に
+  する必要があり、ワイヤ受理範囲を変える。**独立した項目として次に
+  着手すべき**。
+- **retry 予算が DIO 到着ごとにリセットされ
+  `MAX_P2P_DRO_RETRANSMISSIONS` が実質束縛しない** (Angle 4)。
+  `HandleP2pRdo()` が受理した DIO ごとに `droRetriesLeft` を張り直す
+  のは §72 以前からの挙動。multi-Target 経路でしか反復到達しない。
+  あわせて 2 bit の Seq が 4 サイクルで一周するため、4 サイクル前の
+  P2P-DRO-ACK が現在の `droRetryEvent` を取り消しうる (Angle 2 も
+  同じ点を「この commit 群が導入したものではない」として挙げた)。
+  どちらも multi-Target 限定で、対応には Seq を含む ACK 追跡の
+  作り直しが要る。未修正。
+- **`HasOtherP2pTargets()` が TargetAddr を見ていない** (Angle 4)。
+  additionalTargets しか見ないので、TargetAddr が他ノードを名指し、
+  自分は Target option でのみ一致した ノードが「他に Target は無い」
+  と判断して 'S' を立てる。RFC 6997 §9.5 の条件は
+  "the corresponding DIO specified a unicast address of the router as
+  the TargetAddr inside the P2P-RDO **with no additional Targets
+  specified via RPL Target options**" なので文面上は誤り。ただし
+  これは §40 系で「§9.3 の条件のより寛容な読み」として**意図的に
+  選ばれた**挙動で、`RplP2pSoleTargetViaOptionStopsTestCase` が
+  固定している。害が出ていたのは 78.4 の `stopped` 再確認の側なので
+  そちらを直し、この判断自体は据え置いた。
+
+### 78.8 検証
+
+`./ns3 build`(rpl モジュール・プロジェクト全体とも)、
+`test-runner --suite=rpl`(5 回連続実行して安定性を確認)、
+`./test.py -s rpl`を実行し、142 件全てが安定 PASS (1.05 秒前後)。
+あわせて §77.1 の掃き出しを当てた状態でも、クラッシュせず §77.2 の
+既知の未解決項目まで到達することを確認した。
+
+**専用テストを持たない修正**: 78.1・78.2・78.3・78.4 の各修正。
+いずれも再現に multi-Target 経路、ウィンドウ中の親切替、instance
+decay といった仕込みが要る。78.3 だけは §77.1 の掃き出しが事実上の
+回帰テストになっている (当てるとクラッシュが再発するかどうかで
+判定できる)。

@@ -350,9 +350,15 @@ RplRoutingProtocol::HandleP2pRdo(const RplDioHeader& dio, Ipv6Address from, uint
     // guards for that reason, and only at a Target that has already
     // recognised itself: the copy that made this node a Target is the one
     // addressVector holds, and everything after it is a candidate alternate.
-    if (dodag.p2p.isTarget && dodag.p2p.numRoutes > 0)
+    // rdo.numRoutes, not dodag.p2p.numRoutes: this runs ahead of the guards
+    // below, and so ahead of the assignment that adopts this DIO's 'N', so
+    // reading the membership here would cap the collection by the PREVIOUS
+    // DIO's value. 'H' = 1 forces zero for the same reason it does there
+    // (RFC 6997 section 7's "ignored on reception").
+    uint8_t asked = rdo.hopByHop ? 0 : rdo.numRoutes;
+    if (dodag.p2p.isTarget && asked > 0)
     {
-        RecordP2pAlternateRoute(dodag, rdo);
+        RecordP2pAlternateRoute(dodag, rdo, asked);
     }
 
     if (dodag.p2p.isTarget && !HasOtherP2pTargets(dodag))
@@ -527,11 +533,21 @@ RplRoutingProtocol::HandleP2pRdo(const RplDioHeader& dio, Ipv6Address from, uint
                 // an over-long window can never violate that MUST -- it
                 // just means the Target silently never answers at all,
                 // which is worse than answering early with whatever it has.
-                // Reachable with the default window as soon as 'L' is 0
-                // (1 s), and with any window a caller configures above it.
-                Time remaining = dodag.p2p.expiry.GetDelayLeft();
+                //
+                // ArmP2pExpiry() ran earlier in this same call, so what
+                // GetDelayLeft() reports here is always the full 'L' rather
+                // than any partially elapsed remainder -- the comparison is
+                // effectively "is the configured window at least as long as
+                // 'L' itself". NOT reachable at the defaults: 256 ms is
+                // below even the shortest 'L' of 1 s. It takes a caller
+                // configuring a window of a second or more, which this
+                // module's own tests do. (An earlier version of this
+                // comment, and of design-constraints.md section 73.4,
+                // claimed the default reached it; that was arithmetically
+                // wrong and the /protocol-test-matrix audit caught it.)
                 Time window = m_p2pDroCollectWindow;
-                if (remaining > Time(0) && window >= remaining)
+                Time remaining = dodag.p2p.expiry.GetDelayLeft();
+                if (window >= remaining)
                 {
                     window = remaining / 2;
                     NS_LOG_WARN("P2pDroCollectWindow ("
@@ -539,6 +555,15 @@ RplRoutingProtocol::HandleP2pRdo(const RplDioHeader& dio, Ipv6Address from, uint
                                 << ") outlasts this temporary DAG; collecting for "
                                 << window.As(Time::MS) << " instead");
                 }
+                // The previous cycle's retry timer belongs to a Seq this
+                // cycle has just superseded, and nothing will be on the
+                // wire for the new one until the window closes. Left armed,
+                // it fires mid-window and pushes slot 0 out early under the
+                // new Seq -- a send the window exists to prevent, and one
+                // that spends a retry on something that is not a retry.
+                // (The 'N' = 0 branch above gets this for free: its
+                // SendP2pDro() re-arms the timer immediately.)
+                dodag.p2p.droRetryEvent.Cancel();
                 dodag.p2p.droCollecting = true;
                 dodag.p2p.droCollectEvent.SetFunction(&RplRoutingProtocol::P2pDroCollectExpire,
                                                       this);
@@ -694,6 +719,53 @@ RplRoutingProtocol::P2pDroRetry(DodagKey key)
 }
 
 void
+RplRoutingProtocol::PruneP2pCandidateRoutes(DodagMembership& dodag)
+{
+    uint16_t best = RPL_INFINITE_RANK;
+    std::vector<DodagMembership::P2pState::P2pCandidate> live;
+    live.reserve(dodag.p2p.candidateRoutes.size());
+
+    for (auto& candidate : dodag.p2p.candidateRoutes)
+    {
+        auto parent = dodag.parents.find(candidate.from);
+        if (parent == dodag.parents.end())
+        {
+            // The neighbour this route runs through is no longer a usable
+            // parent -- SelectPreferredParent()'s staleness sweep erased it.
+            // Advertising a path into it would send the eventual P2P-DRO
+            // through a node this router cannot reach itself.
+            NS_LOG_LOGIC("Dropping a candidate route through " << candidate.from
+                                                                << ", no longer a parent");
+            continue;
+        }
+        uint16_t rank = RankViaParent(dodag, parent->second);
+        if (rank == RPL_INFINITE_RANK)
+        {
+            continue;
+        }
+        best = std::min(best, rank);
+        live.push_back(std::move(candidate));
+    }
+
+    // "As long as all these routes are the best seen so far" (RFC 6997
+    // section 9.4) is a constraint on the set being internally consistent,
+    // so only the survivors that still tie the best rank stay. best is
+    // recomputed from the live parent set rather than remembered, which is
+    // what lets candidateRank rise again when this router's own best rank
+    // legitimately worsens.
+    dodag.p2p.candidateRoutes.clear();
+    for (auto& candidate : live)
+    {
+        auto parent = dodag.parents.find(candidate.from);
+        if (RankViaParent(dodag, parent->second) == best)
+        {
+            dodag.p2p.candidateRoutes.push_back(std::move(candidate));
+        }
+    }
+    dodag.p2p.candidateRank = best;
+}
+
+void
 RplRoutingProtocol::RecordP2pCandidateRoute(DodagMembership& dodag,
                                             const P2pRdoOption& rdo,
                                             Ipv6Address from)
@@ -716,6 +788,11 @@ RplRoutingProtocol::RecordP2pCandidateRoute(DodagMembership& dodag,
     {
         return;
     }
+
+    // Against the live set, not against a high-water mark: a route whose
+    // neighbour has since gone, or whose rank has since moved, must not go
+    // on defining what "best" means here.
+    PruneP2pCandidateRoutes(dodag);
 
     // Worse than what is already held: nothing to keep. "As long as all
     // these routes are the best seen so far" is the whole constraint on the
@@ -756,7 +833,7 @@ RplRoutingProtocol::RecordP2pCandidateRoute(DodagMembership& dodag,
 
     for (const auto& known : dodag.p2p.candidateRoutes)
     {
-        if (route == known)
+        if (route == known.route)
         {
             return;
         }
@@ -774,11 +851,13 @@ RplRoutingProtocol::RecordP2pCandidateRoute(DodagMembership& dodag,
 
     NS_LOG_INFO("Keeping a rank " << rank << " route over " << route.size() - 1
                                   << " hop(s) as candidate " << dodag.p2p.candidateRoutes.size());
-    dodag.p2p.candidateRoutes.push_back(std::move(route));
+    dodag.p2p.candidateRoutes.push_back({from, std::move(route)});
 }
 
 void
-RplRoutingProtocol::RecordP2pAlternateRoute(DodagMembership& dodag, const P2pRdoOption& rdo)
+RplRoutingProtocol::RecordP2pAlternateRoute(DodagMembership& dodag,
+                                            const P2pRdoOption& rdo,
+                                            uint8_t asked)
 {
     NS_LOG_FUNCTION(this << rdo.addressVector.size());
 
@@ -834,7 +913,7 @@ RplRoutingProtocol::RecordP2pAlternateRoute(DodagMembership& dodag, const P2pRdo
     // arrivals regardless of quality is not that. Hop count is the only
     // comparison available: OF0 is the objective function in use here, and
     // the Address Vector carries no metric of its own.
-    if (dodag.p2p.alternateRoutes.size() >= dodag.p2p.numRoutes)
+    if (dodag.p2p.alternateRoutes.size() >= asked)
     {
         auto worst = std::max_element(dodag.p2p.alternateRoutes.begin(),
                                       dodag.p2p.alternateRoutes.end(),
@@ -873,10 +952,21 @@ RplRoutingProtocol::P2pDroCollectExpire(DodagKey key)
 
     // Guards the pre-window code got for free by running inline with the
     // DIO that triggered it, and which the state can have left behind
-    // during the window: a P2P-DRO with 'S' relayed through this node sets
-    // stopped (RFC 6997 section 5 -- the discovery is over, so there is
-    // nothing left to answer), and a later DIO can clear 'R'.
-    if (!dodag.p2p.isTarget || !dodag.p2p.reply || dodag.p2p.stopped)
+    // during the window: a later DIO can clear 'R'.
+    //
+    // stopped is deliberately NOT among them, though an earlier version of
+    // this check included it. RFC 6997 section 5 says a router seeing 'S'
+    // "SHOULD NOT process any more DIOs", "SHOULD NOT generate any more
+    // DIOs" and "SHOULD cancel any pending DIO transmissions" -- all about
+    // DIOs, none about a P2P-DRO this Target has already committed to
+    // sending. Section 9.5's "the Target MUST select one or more discovered
+    // routes and send one or more P2P-DRO messages" is what it owes, and
+    // the window is a deferral of that reply, not a reconsideration of it.
+    // Including stopped here meant another Target's own batch -- which
+    // travels back through this node and sets stopped on it -- could land
+    // inside this Target's window and silence it outright, leaving the
+    // Origin with no route to it and no retry to recover with.
+    if (!dodag.p2p.isTarget || !dodag.p2p.reply)
     {
         NS_LOG_LOGIC("The collection window closed on a Target with nothing left to answer");
         dodag.p2p.alternateRoutes.clear();
@@ -919,6 +1009,14 @@ RplRoutingProtocol::P2pDroCollectExpire(DodagKey key)
     uint32_t sent = 1;
     for (const auto& route : dodag.p2p.alternateRoutes)
     {
+        // The set's own cap was applied per arrival, against whatever 'N'
+        // that DIO carried; a later DIO can have lowered it. Bounding the
+        // loop here as well is what makes "one plus 'N'" hold on the wire
+        // whatever order the values arrived in.
+        if (sent > dodag.p2p.numRoutes)
+        {
+            break;
+        }
         // Only genuinely distinct routes go out; a short batch is not
         // padded up to 'N' + 1 with copies of a route already sent. RFC
         // 6997 section 9.5's "one plus the value of the N field" describes

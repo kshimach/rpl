@@ -16481,6 +16481,16 @@ RplP2pNumRoutesDistinctTestCase::DoRun()
 
     NS_TEST_ASSERT_MSG_EQ(m_routes.size(), 3, "'N' = 2 should have produced exactly three "
                                               "P2P-DROs from the Target");
+    // ns-3's assertion macros only return early when the runner was asked
+    // to stop on failure, which is not how test.py invokes it by default --
+    // so without this an unexpectedly empty capture turns a clean "expected
+    // 3, got 0" into an out-of-bounds read on the indexing below.
+    if (m_routes.size() != 3)
+    {
+        m_monitor->Close();
+        Simulator::Destroy();
+        return;
+    }
 
     // Every route is one relay long here (Origin - relay - Target, the
     // Target's own trailing entry trimmed by SendP2pDroRoute()), so
@@ -16490,6 +16500,10 @@ RplP2pNumRoutesDistinctTestCase::DoRun()
     {
         NS_TEST_ASSERT_MSG_EQ(route.size(), 1, "Every route through this diamond is one relay "
                                                "long");
+        if (route.empty())
+        {
+            continue; // already reported; indexing it would be undefined
+        }
         relays.insert(route[0]);
     }
     NS_TEST_ASSERT_MSG_EQ(relays.size(),
@@ -16563,6 +16577,12 @@ RplP2pNumRoutesPaddedTestCase::DoRun()
                           1,
                           "With one path to the Target, 'N' = 3 should still produce exactly "
                           "one P2P-DRO: the batch carries distinct routes, not copies");
+    if (m_routes.empty())
+    {
+        m_monitor->Close();
+        Simulator::Destroy();
+        return;
+    }
 
     NS_TEST_ASSERT_MSG_EQ(m_ackRequested[0], true, "The tracked P2P-DRO should ask for an ack");
     NS_TEST_ASSERT_MSG_EQ(m_stop[0], true, "'S' belongs on every route of the batch");
@@ -16742,6 +16762,10 @@ RplP2pRelayRouteDiversityTestCase::DoRun()
         NS_TEST_ASSERT_MSG_EQ(route.size(),
                               2,
                               "Every route node 3 advertises is two hops from the Origin");
+        if (route.empty())
+        {
+            continue; // already reported; indexing it would be undefined
+        }
         forks.insert(route[0]);
     }
     NS_TEST_ASSERT_MSG_EQ(forks.size(),

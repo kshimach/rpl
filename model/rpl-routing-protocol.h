@@ -1168,10 +1168,23 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
             /// (Origin-side first), as this node would propagate it: its own
             /// address is already appended (RFC 6997 section 9.4).
             std::vector<Ipv6Address> addressVector;
+            /// One entry of candidateRoutes below.
+            struct P2pCandidate
+            {
+                /// The neighbour whose DIO carried this route, a link-local
+                /// address -- kept so PruneP2pCandidateRoutes() can ask
+                /// whether that neighbour is still a usable parent at all.
+                /// Without it a route survives the neighbour it runs
+                /// through, and this node goes on advertising a path into a
+                /// node that has already left its parent set.
+                Ipv6Address from;
+                /// The route itself, this node's own address appended.
+                std::vector<Ipv6Address> route;
+            };
+
             /// RFC 6997 section 9.4's route diversity: every route heard for
             /// this temporary DAG that ties the best rank this node can
-            /// advertise, each with this node's own address already
-            /// appended. SendDio() picks one uniformly at random per
+            /// advertise. SendDio() picks one uniformly at random per
             /// transmission, which is what gives a Target more than one
             /// route to find in the first place.
             ///
@@ -1181,10 +1194,12 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
             /// them ("as long as all these routes are the best seen so
             /// far"); those are what a Target REPLIES with, are capped by
             /// 'N' rather than by rank, and never reach a DIO.
-            std::vector<std::vector<Ipv6Address>> candidateRoutes;
-            /// The rank every entry in candidateRoutes ties at. A strictly
-            /// better one empties the set and starts it over; a worse one
-            /// is ignored.
+            std::vector<P2pCandidate> candidateRoutes;
+            /// The rank every entry in candidateRoutes ties at.
+            /// Recomputed from the live parent set by
+            /// PruneP2pCandidateRoutes() rather than ratcheted downward, so
+            /// that a node whose own best rank legitimately worsens can
+            /// still advertise the route it would actually use.
             uint16_t candidateRank{RPL_INFINITE_RANK};
             /// Target only, and only while numRoutes > 0: routes to this node
             /// that arrived on copies of the P2P mode DIO which addressVector
@@ -1623,6 +1638,30 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
                                  Ipv6Address from);
 
     /**
+     * @brief Drop candidate routes whose neighbour is no longer a usable
+     *        parent, and recompute the rank the survivors tie at.
+     *
+     * P2pState::candidateRoutes is filled from DIOs and nothing else ever
+     * removed from it, which left two ways for it to go wrong. A neighbour
+     * that goes silent is erased from DodagMembership::parents by
+     * SelectPreferredParent()'s staleness sweep, but its route stayed in
+     * the set and kept being advertised -- half this node's DIOs would name
+     * a path through a node it can no longer reach itself. And because
+     * candidateRank only ever moved downward, a node whose own best rank
+     * legitimately worsened (its parent's own rank rose, or MRHOF's ETX to
+     * it degraded) refused every later route as "worse than the best seen
+     * so far" and went on advertising only the historical one, never the
+     * route it would actually forward over.
+     *
+     * Recomputing from the live parent set fixes both: the RFC's "as long
+     * as all these routes are the best seen so far" constrains the set to
+     * be internally consistent, not to outlive the topology it describes.
+     *
+     * @param dodag the temporary DAG membership to prune
+     */
+    void PruneP2pCandidateRoutes(DodagMembership& dodag);
+
+    /**
      * @brief Record a route that arrived on a copy of the P2P mode DIO this
      *        Target is not otherwise going to act on.
      *
@@ -1635,7 +1674,7 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      * @param dodag the temporary DAG membership, at this Target
      * @param rdo the arriving DIO's P2P-RDO
      */
-    void RecordP2pAlternateRoute(DodagMembership& dodag, const P2pRdoOption& rdo);
+    void RecordP2pAlternateRoute(DodagMembership& dodag, const P2pRdoOption& rdo, uint8_t asked);
 
     /**
      * @brief Send this Target's batch of P2P-DROs once the collection
@@ -1875,7 +1914,7 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
                             Time lifetime,
                             bool hasSeqNo = false,
                             uint8_t seqNo = 0,
-                            bool pinNextHop = false);
+                            bool pinNextHop = true);
 
     /**
      * @brief Arm the 'L' field's deadline for an RREQ-Instance.
