@@ -3166,24 +3166,54 @@ RplRoutingProtocol::StoreHopByHopRoute(uint8_t instanceId,
                                        Ipv6Address nextHop,
                                        Time lifetime,
                                        bool hasSeqNo,
-                                       uint8_t seqNo)
+                                       uint8_t seqNo,
+                                       bool pinNextHop)
 {
     auto it = m_hopByHopRoutes.find(destination);
     bool sameRoute = it != m_hopByHopRoutes.end() && it->second.expire > Simulator::Now() &&
                      it->second.instanceId == instanceId && it->second.dodagId == dodagId;
     if (sameRoute && hasSeqNo)
     {
-        // RFC 9854 sections 6.2.1/6.2.3: an incoming Orig SeqNo older than
-        // what is already stored is dropped outright; equal-or-newer is
-        // accepted and overwrites below, even if the next hop differs --
-        // unlike P2P-RPL's own check, a fresher route legitimately
-        // supersedes an older one regardless of next hop.
+        // RFC 9854 sections 6.2.1/6.2.3: "A route entry with the same source
+        // and destination address and the same RPLInstanceID, but a stale
+        // Sequence Number (i.e., incoming Sequence Number is less than the
+        // currently stored Sequence Number of the route entry), MUST be
+        // deleted." Stale means strictly less, and only a strictly newer
+        // Sequence Number carries a freshness argument strong enough to
+        // move the next hop.
         if (RplSequenceNewer(it->second.seqNo, seqNo))
         {
             NS_LOG_LOGIC("Refusing a Hop-by-hop Route to "
                         << destination << " under Instance " << +instanceId << "/" << dodagId
                         << ": stale Orig SeqNo " << +seqNo << ", already holding "
                         << +it->second.seqNo);
+            return false;
+        }
+        // Equal Sequence Number is the same discovery reaching this router
+        // again, so a next hop that disagrees with what is already held is
+        // not news about a fresher route -- it is this router being asked
+        // to point somewhere else within one discovery, which is how a
+        // forwarding loop gets built. Seen for real: as an RREQ-Instance
+        // decays toward its 'L' deadline, the OrigNode goes quiet first, a
+        // router one hop from it loses that parent to the staleness sweep,
+        // re-parents onto its own downstream neighbour -- the only
+        // candidate left -- and rewrites its upward route to point back at
+        // it, while that neighbour still points here. @see
+        // design-constraints.md section 76.
+        //
+        // Only where the caller asks for it. The asymmetric RREP-Instance's
+        // own downward route must do the opposite and follow every parent
+        // switch, because RFC 9854 section 6.4.3 defines its next hop as
+        // "the preferred parent in the DODAG of RREP-Instance" and the
+        // flood legitimately reaches a router from a better neighbour after
+        // a worse one (@see section 50.2 and
+        // RplAodvAsymmetricHopByHopRouteFollowsParentTestCase).
+        if (pinNextHop && it->second.seqNo == seqNo && it->second.nextHop != nextHop)
+        {
+            NS_LOG_LOGIC("Refusing a Hop-by-hop Route to "
+                        << destination << " under Instance " << +instanceId << "/" << dodagId
+                        << ": next hop " << nextHop << " disagrees with the " << it->second.nextHop
+                        << " already held at the same Orig SeqNo " << +seqNo);
             return false;
         }
     }

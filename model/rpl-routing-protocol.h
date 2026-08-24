@@ -1874,7 +1874,8 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
                             Ipv6Address nextHop,
                             Time lifetime,
                             bool hasSeqNo = false,
-                            uint8_t seqNo = 0);
+                            uint8_t seqNo = 0,
+                            bool pinNextHop = false);
 
     /**
      * @brief Arm the 'L' field's deadline for an RREQ-Instance.
@@ -2592,17 +2593,17 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     /// DIO -- RFC 6997 section 9.4's "uniform random manner".
     ///
     /// Deliberately one variable rather than two. A second
-    /// RandomVariableStream would have to claim a stream index of its own,
-    /// which makes AssignStreams() report three streams per node instead of
-    /// two, which shifts every node's stream assignment, which changes every
-    /// simulation trajectory in the module. That is normally harmless
-    /// bookkeeping; here it reliably crashes the test suite on a latent
-    /// AODV-RPL forwarding loop that predates all of this (@see
-    /// design-constraints.md section 74 for the reproducer). Sharing the
-    /// stream costs only that a P2P route draw shifts the jitter sequence
-    /// after it, and it costs nothing at all in any scenario that never
-    /// accumulates two candidate routes, which is every scenario that
-    /// predates section 9.4 support.
+    /// RandomVariableStream has to claim a stream index of its own, taking
+    /// AssignStreams() from two streams per node to three, which shifts
+    /// every node's assignment and so every simulation trajectory in the
+    /// module. That is meant to be harmless bookkeeping; here it walks
+    /// straight into this module's trajectory-sensitive test suite (@see
+    /// design-constraints.md section 77, which uses exactly that one-line
+    /// change as a sweep and lists what it has turned up so far). Sharing
+    /// the stream costs only that a P2P route draw shifts the jitter
+    /// sequence after it, and costs nothing at all where fewer than two
+    /// candidate routes ever accumulate, which is everywhere that predates
+    /// section 9.4 support.
     Ptr<UniformRandomVariable> m_jitter;
 
     /**

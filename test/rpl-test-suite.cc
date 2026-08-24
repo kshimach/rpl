@@ -16607,7 +16607,40 @@ class RplP2pRelayRouteDiversityTestCase : public RplP2pNumRoutesTestCaseBase
 
   private:
     void DoRun() override;
+
+    /// @brief Record the Address Vector of every P2P mode DIO seen.
+    /// @param socket the monitoring socket
+    void CaptureDioRoute(Ptr<Socket> socket);
+
+    /// Address Vectors of the P2P mode DIOs node 3 put on the wire.
+    std::vector<std::vector<Ipv6Address>> m_advertised;
 };
+
+void
+RplP2pRelayRouteDiversityTestCase::CaptureDioRoute(Ptr<Socket> socket)
+{
+    Address sender;
+    Ptr<Packet> packet = socket->RecvFrom(sender);
+    if (!packet)
+    {
+        return;
+    }
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ipv6Header);
+    Icmpv6Header icmpv6Header;
+    packet->RemoveHeader(icmpv6Header);
+    if (icmpv6Header.GetType() != ICMPV6_RPL || icmpv6Header.GetCode() != RPL_CODE_DIO)
+    {
+        return;
+    }
+    RplDioHeader dio;
+    packet->RemoveHeader(dio);
+    if (!dio.HasP2pRdo())
+    {
+        return; // an ordinary base-DODAG DIO
+    }
+    m_advertised.push_back(dio.GetP2pRdo().addressVector);
+}
 
 RplP2pRelayRouteDiversityTestCase::RplP2pRelayRouteDiversityTestCase()
     : RplP2pNumRoutesTestCaseBase("An intermediate router with two equally good parents "
@@ -16641,6 +16674,17 @@ RplP2pRelayRouteDiversityTestCase::DoRun()
     RplHelper rplHelper;
     rplHelper.Set("P2pNumRoutes", UintegerValue(1));
     rplHelper.Set("P2pDroCollectWindow", TimeValue(Seconds(3)));
+    // What makes this test's conclusion structural rather than lucky. The
+    // selection is random by RFC mandate, so the only way to pin it down is
+    // to observe enough draws that "never once picked the other parent" is
+    // not a plausible run: 'L' = 3 keeps the temporary DAG alive for 64 s
+    // instead of the default 16 s, and a Trickle redundancy of 0 disables
+    // suppression outright so node 3 actually transmits on every interval
+    // rather than falling silent behind its neighbours. The assertion below
+    // then requires 20 observations before it draws any conclusion, which
+    // puts a false failure at 2^-19.
+    rplHelper.Set("P2pLifetime", UintegerValue(3));
+    rplHelper.Set("P2pDioRedundancy", UintegerValue(0));
     InternetStackHelper internetv6;
     internetv6.SetRoutingHelper(rplHelper);
     internetv6.Install(m_nodes);
@@ -16658,12 +16702,15 @@ RplP2pRelayRouteDiversityTestCase::DoRun()
     Simulator::Stop(Seconds(250));
     Simulator::Run();
 
-    m_monitor = Socket::CreateSocket(m_nodes.Get(3), Ipv6RawSocketFactory::GetTypeId());
+    // Node 4's only neighbour is node 3, so every P2P mode DIO that reaches
+    // this monitor is one node 3 chose an Address Vector for.
+    m_monitor = Socket::CreateSocket(m_nodes.Get(4), Ipv6RawSocketFactory::GetTypeId());
     m_monitor->SetAttribute("Protocol",
                             UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
     m_monitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
-    m_monitor->BindToNetDevice(m_nodes.Get(3)->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
-    m_monitor->SetRecvCallback(MakeCallback(&RplP2pRelayRouteDiversityTestCase::CaptureDro, this));
+    m_monitor->BindToNetDevice(m_nodes.Get(4)->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+    m_monitor->SetRecvCallback(
+        MakeCallback(&RplP2pRelayRouteDiversityTestCase::CaptureDioRoute, this));
 
     Ptr<RplRoutingProtocol> origin = m_nodes.Get(0)->GetObject<RplRoutingProtocol>();
     Ptr<RplRoutingProtocol> relay1 = m_nodes.Get(1)->GetObject<RplRoutingProtocol>();
@@ -16674,30 +16721,38 @@ RplP2pRelayRouteDiversityTestCase::DoRun()
     m_key = origin->DiscoverP2pRoute(target->GetGlobalAddress());
     NS_TEST_ASSERT_MSG_NE(m_key.dodagId, Ipv6Address::GetAny(), "The discovery did not start");
 
-    Simulator::Stop(Seconds(10));
+    // Long enough for node 3's own Trickle to fire many times. Each firing
+    // draws independently, so the chance of never once picking the other
+    // parent halves per DIO -- observing a dozen or more puts this well past
+    // the point where a run could plausibly miss the diversity by luck. The
+    // temporary DAG's own 'L' (16 s by default) outlasts this.
+    Simulator::Stop(Seconds(40));
     Simulator::Run();
 
-    NS_TEST_ASSERT_MSG_EQ(m_routes.size(),
-                          2,
-                          "'N' = 1 should have produced two P2P-DROs: without section 9.4's "
-                          "relay-side diversity the fork at node 3 never reaches the Target");
+    NS_TEST_ASSERT_MSG_GT_OR_EQ(m_advertised.size(),
+                                20,
+                                "Too few of node 3's P2P mode DIOs were observed to conclude "
+                                "anything about how it picks between them");
 
-    // Both routes run Origin -> (1 or 2) -> 3, trimmed of the Target's own
-    // trailing entry, so they differ in their first element and agree on the
-    // second.
+    // Every Address Vector node 3 advertises runs Origin -> (1 or 2) -> 3,
+    // so they differ only in their first element.
     std::set<Ipv6Address> forks;
-    for (const auto& route : m_routes)
+    for (const auto& route : m_advertised)
     {
-        NS_TEST_ASSERT_MSG_EQ(route.size(), 2, "Every route here is two relays long");
+        NS_TEST_ASSERT_MSG_EQ(route.size(),
+                              2,
+                              "Every route node 3 advertises is two hops from the Origin");
         forks.insert(route[0]);
     }
     NS_TEST_ASSERT_MSG_EQ(forks.size(),
                           2,
-                          "The two P2P-DROs should fork at node 3's two parents");
+                          "Node 3 advertised only one of its two equally good parents across "
+                          "every DIO: RFC 6997 section 9.4's uniform random selection is not "
+                          "happening");
     NS_TEST_ASSERT_MSG_EQ((forks.count(relay1->GetGlobalAddress()) == 1 &&
                            forks.count(relay2->GetGlobalAddress()) == 1),
                           true,
-                          "The fork should be between node 3's two actual parents");
+                          "The two advertised routes should fork at node 3's two actual parents");
 
     m_monitor->Close();
     Simulator::Destroy();

@@ -659,20 +659,44 @@ RplRoutingProtocol::HandleAodvRreq(const RplDioHeader& dio, Ipv6Address from, ui
         // RFC 9854 sections 4.1/6.2.5: "In hop-by-hop mode (H=1), this
         // field MUST be set to zero and ignored" -- no Address Vector
         // maintenance at all. Instead, record this node's own next hop
-        // toward OrigNode (section 6.2.3): from, the neighbour this RREQ-
-        // DIO copy was accepted from (the guard above already refused any
-        // copy not from dodag.preferredParent). Passed through as received
-        // rather than resolved to a global address first: RouteToNeighbour()
-        // accepts either form (its own neighbour.IsLinkLocal() check), and
-        // InterfaceForNeighbour() matches on the interface identifier
-        // shared by both forms regardless.
+        // toward OrigNode, which section 6.2.3 names outright: "The Source
+        // Address is the address used by the router to send data to the
+        // Next Hop, i.e., the preferred parent."
+        //
+        // dodag.preferredParent, not from. The two agree on every copy the
+        // guard above lets through -- but that guard only bites once this
+        // router has already recorded a route, so the very first copy is
+        // accepted from whichever neighbour happened to send it, preferred
+        // parent or not. Storing that neighbour is how two routers came to
+        // hold Hop-by-hop Routes to OrigNode pointing at each other: a
+        // forwarding loop that spun a DAO between them until the packet's
+        // Hop Limit ran out, generating an ICMPv6 error per lap that could
+        // not be routed either, until PacketMetadata's own arena assertion
+        // brought the process down (@see design-constraints.md section 74,
+        // where this was characterised before it was understood). Taking
+        // the preferred parent instead makes the loop unconstructible: a
+        // router only ever points at a neighbour of strictly better Rank,
+        // and Rank cannot be strictly better in both directions at once.
+        //
+        // Passed through as the link-local it is rather than resolved to a
+        // global address first: RouteToNeighbour() accepts either form (its
+        // own neighbour.IsLinkLocal() check), and InterfaceForNeighbour()
+        // matches on the interface identifier shared by both forms.
+        if (dodag.preferredParent.IsAny())
+        {
+            NS_LOG_LOGIC("No preferred parent yet in RREQ-Instance "
+                        << +key.instanceId << ", nothing to point an upward Hop-by-hop Route "
+                                              "toward OrigNode at");
+            return;
+        }
         if (!StoreHopByHopRoute(key.instanceId,
                                key.dodagId,
                                key.dodagId,
-                               from,
+                               dodag.preferredParent,
                                Seconds(m_pathLifetime * m_lifetimeUnit),
                                true,
-                               rreq.origSeqNo))
+                               rreq.origSeqNo,
+                               true))
         {
             NS_LOG_LOGIC("Discarding an RREQ-DIO establishing a Hop-by-hop Route that conflicts "
                         "with or is staler than one already held for OrigNode "

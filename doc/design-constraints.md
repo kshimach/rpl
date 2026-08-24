@@ -8505,7 +8505,7 @@ listed in the route" に対する乖離。これは §72 以前からある挙�
 `./test.py -s rpl`を実行し、既存 140 件 + 新規 1 件 = 141 件全てが
 安定 PASS (1.0 秒前後) することを確認。
 
-## 74. 未修正の潜在バグ: AODV-RPL H=1 の転送ループ (再現手順つき)
+## 74. 潜在バグ: AODV-RPL H=1 の転送ループ (再現手順つき、**76節の通り対応済み**)
 
 §75 (RFC 6997 §9.4) の実装中に、乱数ストリーム割当を1本増やしただけで
 テストスイートが確実にクラッシュする現象に当たった。調査の結果、**§75
@@ -8582,7 +8582,7 @@ payload 74、Next Header 0 (hop-by-hop 拡張) — DAO に RPI が付いたも�
 なる。つまり**既定値で通っているのは運**であり、トポロジや乱数種を
 変えれば同じ条件は現実に踏みうる。
 
-### 74.4 未修正の理由と、次に見るべき場所
+### 74.4 当時、未修正とした理由 (その後 §76 で修正)
 
 §75 の作業範囲 (P2P-RPL の経路多様性) と完全に別のサブシステム
 (AODV-RPL の H=1 経路設置) の問題であり、修正には `HandleAodvRreq()`/
@@ -8700,10 +8700,13 @@ node 3 が同 rank の DIO を 1 経由と 2 経由で二重に聞く。'N' = 1 
 Target が 2 通の P2P-DRO を返し、その 2 通が node 3 の**2つの親で
 分岐している**ことを確認する。
 
-load-bearing 検証: `SendDio()` の抽選を無効化すると
-`actual="1" limit="2"` で確実に FAIL。node 3 が preferred parent 1本に
-固定され、Target には 1 経路しか届かなくなる — Angle 1 がこの穴の
-失敗シナリオとして予測したとおりの形。
+load-bearing 検証: `SendDio()` の抽選を無効化すると確実に FAIL。
+node 3 が preferred parent 1本に固定され、DIO には 1 経路しか載らなく
+なる — Angle 1 がこの穴の失敗シナリオとして予測したとおりの形。
+
+なお、このテストの当初版は Target が受け取る P2P-DRO の本数を測って
+おり、**確率的に脆かった**。測定対象と観測サンプル数を組み替えた
+経緯は §77.4。
 
 ### 75.5 検証
 
@@ -8711,3 +8714,158 @@ load-bearing 検証: `SendDio()` の抽選を無効化すると
 `test-runner --suite=rpl`(5 回連続実行して安定性を確認)、
 `./test.py -s rpl`を実行し、既存 141 件 + 新規 1 件 = 142 件全てが
 安定 PASS (1.0 秒前後) することを確認。
+
+## 76. §74 の AODV-RPL H=1 転送ループを修正
+
+§74 が再現手順まで特定して未修正のまま残した件。原因まで到達して直した。
+
+### 76.1 計測で見えたこと
+
+`StoreHopByHopRoute()` の成功時に一時的な `NS_LOG_INFO` を仕込み、
+どの呼び出しが誤った next hop を書くのかを直接見た:
+
+```
++250.114s 1 store hbh dst=2001:1::…:1 nh=fe80::…:1 inst=128 seq=1   <- 正しい (node 0)
++250.237s 2 store hbh dst=2001:1::…:1 nh=fe80::…:2 inst=128 seq=1   <- 正しい (node 1)
+   …同じ組み合わせが 20 分ほど繰り返される…
++271.657s 1 store hbh dst=2001:1::…:1 nh=fe80::…:3 inst=128 seq=1   <- ここでループ成立 (node 2)
+```
+
+リンクローカルの対応は `fe80::200:ff:fe00:1` = node 0、`:2` = node 1、
+`:3` = node 2、`:4` = node 3。**+271.657s に node 1 が OrigNode 宛の
+next hop を自分の下流である node 2 に書き換えている**。node 2 側は
+node 1 を指したままなので、そこで 1↔2 のループが完成する。
+
+なぜ node 1 が下流を指すのか: RREQ-Instance が 'L' 期限に向かって
+枯れていく過程で、まず OrigNode が沈黙する → node 1 が staleness
+sweep でその親を失う → 残る候補は下流の node 2 だけなので、そちらを
+preferred parent に取り直す → その親を next hop として上り経路を
+書き直す。Orig SeqNo は discovery 中ずっと同じ値なので、この上書きは
+何にも止められない。
+
+### 76.2 修正
+
+`StoreHopByHopRoute()` の判定は、これまで
+
+> 「incoming が stale なら拒否、**equal-or-newer なら next hop が
+> 違っていても上書き**」
+
+だった。RFC 9854 §6.2.3 が削除を要求しているのは stale の場合だけで、
+逐語:
+
+> A route entry with the same source and destination address and the
+> same RPLInstanceID, but a stale Sequence Number (i.e., incoming
+> Sequence Number is **less than** the currently stored Sequence Number
+> of the route entry), MUST be deleted.
+
+**同値**の Sequence Number は「同じ discovery がもう一度届いた」
+だけであり、next hop を動かす根拠になる新しさを何も持たない。よって
+同値かつ next hop 相違の場合を拒否するようにした。
+
+**この拒否は呼び出し側がオプトインしたときだけ効く** (`pinNextHop`
+引数)。非対称 RREP-Instance の下り経路は**逆に**毎回の親切替へ追従
+しなければならない — §6.4.3 が next hop を "the preferred parent in
+the DODAG of RREP-Instance" と定義しており、フラッドが悪い rank の
+隣人の後に良い隣人から届くのは正常な経路だから (§50.2 および
+`RplAodvAsymmetricHopByHopRouteFollowsParentTestCase`)。最初に blanket
+で適用したところ、まさにそのテストが落ちて教えてくれた。
+オプトインしているのは RREQ の上り経路 1 箇所のみ。
+
+あわせて `HandleAodvRreq()` の H=1 分岐で、上り経路の next hop を
+`from` から `dodag.preferredParent` に変えた。§6.2.3 逐語:
+
+> The Source Address is the address used by the router to send data to
+> the Next Hop, **i.e., the preferred parent.**
+
+既存コメントは「上のガードが preferred parent 以外を弾いている」と
+書いていたが、そのガード (`aodvAlreadyProcessed && from !=
+dodag.preferredParent`) は**この router が既に経路を記録した後に
+しか効かない**ので、**最初の 1 通は誰から来ても受け入れて**その
+送信者を next hop にしていた。
+
+この 2 つ目の変更は**このクラッシュに対して load-bearing ではない**
+(1 つ目だけで直る)。それでも入れたのは、1 つ目によって「最初に
+記録した next hop が discovery 中ずっと固定される」ようになった以上、
+その 1 通を正しく選ぶ意味がむしろ増したから。
+
+### 76.3 検証
+
+- 修正前: `RplAodvHopByHopRouteOutlivesRreqInstanceTestCase` **単独**で
+  §74.1 の 1 行変更を当てると確実にクラッシュ。
+- 修正後: 同じ条件でスイート全体が先へ進む (load-bearing 検証として、
+  `pinNextHop` の判定を `if (false && …)` で無効化すると確実に
+  クラッシュが再発することを確認)。
+- 出荷構成 (§74.1 の変更を当てない状態) で `test-runner --suite=rpl`
+  を 5 回連続実行、`./test.py -s rpl`、142 件全て安定 PASS。
+
+## 77. 乱数軌道スイープという道具と、それが今出している未解決 1 件
+
+§74/§76 の経験から、この モジュールには**乱数軌道を変えると露出する
+バグ**があり、しかも既定の軌道で通っているのは運でしかない、という
+ことが分かった。同じ手口を今後も使えるように、道具として記録する。
+
+### 77.1 やり方
+
+`AssignStreams()` の戻り値を 1 増やすだけ:
+
+```cpp
+    m_dioTrickleStream = stream + 1;
+    return 3;   // was 2
+```
+
+新しい乱数変数を足す必要すら無い。ノード毎のストリーム割当がずれ、
+全ノードの Trickle ジッタが変わり、シミュレーション軌道全体が変わる。
+`./test.py -s rpl` を回すだけで、既定軌道では踏まない経路を踏む。
+
+角1〜5 が diff スコープに閉じているのに対し、これは
+`/protocol-test-matrix` の Angle 6 (無指向スイープ) と同じ位置づけ —
+一度も diff に入らない行のバグを拾える。
+
+### 77.2 現時点の結果
+
+- **AODV-RPL H=1 転送ループ**: §74 で特定、§76 で修正。
+- **未解決 1 件**: `RplNoPathDaoOnce…` 系のテスト
+  「A preferred parent that goes stale exactly as a better one is heard
+  is withdrawn once, not twice」が、この軌道では
+
+  ```
+  test="noPathDaoCountAfter (actual) == 1 (limit)" actual="2" limit="1"
+  ```
+
+  で落ちる。アサーションメッセージ自身が「staleness sweep 側の
+  withdrawal と通常の切替ブロック側の withdrawal が同じアドレスに
+  対して両方発火した場合と整合する」と述べており、これは §67 が
+  修正したはずの二重送出そのもの。**§67 の修正が別経路で不完全なのか、
+  テストの仕込み (「stale と better を同時に起こす」) がこの軌道では
+  別の状況を作っているのか、まだ切り分けていない。** 次に着手する
+  ときの入口はこのアサーションと §67。
+
+### 77.3 §9.4 の乱数がストリームを新設しない理由
+
+§75.3 に書いたとおり。§76 でクラッシュが直った後、専用ストリームに
+戻せるか試したところ、今度は 77.2 の未解決 1 件で落ちた。出荷構成を
+既知良好に保つため `m_jitter` 共用のままにしてある。77.2 が解けたら
+専用ストリームへ戻すのが本来の形。
+
+### 77.4 このスイープが暴いたテスト側の脆さ
+
+`RplP2pRelayRouteDiversityTestCase` (§75.4) は当初、Target が受け取る
+P2P-DRO の本数で多様性を測っていた。既定軌道では通ったが、スイープ
+軌道では落ちた — 3 秒の収集ウィンドウ中に中継が引いた抽選が全部同じ側
+だっただけで、候補 2 本なら 3 回引いて全同一になる確率は 25% ある。
+**確率的に脆いテストだった。**
+
+RFC が「一様乱数で選べ」と要求している以上、結論を構造的にするには
+十分なサンプル数を観測するしかない。テストを組み替えた:
+
+- 測る対象を「Target が受け取った P2P-DRO」から
+  **「中継が put on the wire した P2P mode DIO の Address Vector」**へ。
+  §9.4 が規定しているのはまさにそこ。
+- `P2pLifetime` = 3 (64 秒) で temporary DAG を長生きさせ、
+  `P2pDioRedundancy` = 0 で Trickle の抑制を切り、40 秒走らせる。
+- **20 サンプル観測できるまで結論を出さない**アサーションにした。
+  誤検出は 2^-19。
+
+組み替え後は既定軌道・スイープ軌道の**両方**で通ることを確認済み。
+「乱数を含む挙動のテストは、サンプル数を先に確認してから中身を見る」
+という ns3-debug-pitfalls の教訓の、この モジュールでの実例。
