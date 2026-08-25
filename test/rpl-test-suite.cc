@@ -13956,6 +13956,185 @@ RplP2pMultiTargetTestCase::DoRun()
     monitor->Close();
     Simulator::Destroy();
 }
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief A repeat DIO that carries the exact Address Vector already
+ *        replied to starts no fresh P2P-DRO cycle.
+ *
+ * The multi-Target repeat guard (`isTarget && !HasOtherP2pTargets()`)
+ * only short-circuits once every other Target is gone; while one remains
+ * outstanding, a DIO from the preferred parent keeps reaching
+ * HandleP2pRdo()'s reply branch on every Trickle re-transmission. Before
+ * the /protocol-test-matrix audit that led to this test, a genuinely
+ * unchanged Address Vector still started a fresh cycle every time --
+ * minting a new 'Seq' and resetting droRetriesLeft to the full budget --
+ * which both defeated P2pDroMaxRetransmissions's own bound and, since
+ * 'Seq' is only 2 bits wide, could collide with a still-outstanding
+ * P2P-DRO-ACK within four cycles (@see design-constraints.md section 82,
+ * and RplP2pSoleTargetViaOptionStopsTestCase for the sibling case where
+ * every other Target is gone, which the repeat guard alone already
+ * handles).
+ *
+ * Same construction as RplP2pMultiTargetTestCase -- node 1 matches via an
+ * RPL Target option while a second, unrelated Target option keeps
+ * HasOtherP2pTargets() true -- but the identical DIO is delivered twice.
+ * Only the first delivery should produce a P2P-DRO.
+ */
+class RplP2pRepeatDioNoFreshCycleTestCase : public TestCase
+{
+  public:
+    RplP2pRepeatDioNoFreshCycleTestCase();
+
+  private:
+    void DoRun() override;
+
+    /// @brief Count every P2P-DRO seen at the monitor and record its Seq.
+    /// @param socket the monitoring socket
+    void CaptureDro(Ptr<Socket> socket);
+
+    uint32_t m_droCount{0};             //!< P2P-DROs observed
+    std::vector<uint8_t> m_sequences;   //!< each one's 'Seq', in order
+};
+
+RplP2pRepeatDioNoFreshCycleTestCase::RplP2pRepeatDioNoFreshCycleTestCase()
+    : TestCase("A repeat P2P mode DIO with an unchanged Address Vector starts no fresh "
+              "P2P-DRO cycle")
+{
+}
+
+void
+RplP2pRepeatDioNoFreshCycleTestCase::CaptureDro(Ptr<Socket> socket)
+{
+    Address sender;
+    Ptr<Packet> packet = socket->RecvFrom(sender);
+    if (!packet)
+    {
+        return;
+    }
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ipv6Header);
+    Icmpv6Header icmpv6Header;
+    packet->RemoveHeader(icmpv6Header);
+    if (icmpv6Header.GetType() != ICMPV6_RPL || icmpv6Header.GetCode() != RPL_CODE_P2P_DRO)
+    {
+        return;
+    }
+    RplP2pDroHeader dro;
+    packet->RemoveHeader(dro);
+    m_droCount++;
+    m_sequences.push_back(dro.GetSequence());
+}
+
+void
+RplP2pRepeatDioNoFreshCycleTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.AssignWithoutAddress(devices);
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    Ptr<Node> node = nodes.Get(1);
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoined(), true, "The base DODAG did not reach node 1");
+
+    Ptr<SimpleNetDevice> dev0 = DynamicCast<SimpleNetDevice>(devices.Get(0));
+    Ptr<SimpleNetDevice> dev1 = DynamicCast<SimpleNetDevice>(devices.Get(1));
+    channel->BlackList(dev0, dev1);
+
+    Ptr<Socket> monitor = Socket::CreateSocket(nodes.Get(0), Ipv6RawSocketFactory::GetTypeId());
+    monitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    monitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    monitor->BindToNetDevice(nodes.Get(0)->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+    monitor->SetRecvCallback(
+        MakeCallback(&RplP2pRepeatDioNoFreshCycleTestCase::CaptureDro, this));
+
+    Ipv6Address origin("2001:9::1");         // no real node owns this address
+    Ipv6Address primaryTarget("2001:9::99"); // unrelated to node 1, still undiscovered
+    Ipv6Address otherTarget("2001:9::77");   // a second Target option, kept outstanding
+                                             // throughout so the repeat guard does not
+                                             // short-circuit on its own
+    Ipv6Address neighbour("fe80::a");
+    static constexpr uint8_t INSTANCE = 0x82;
+
+    RplDioHeader dio;
+    dio.SetInstanceId(INSTANCE);
+    dio.SetVersionNumber(0);
+    dio.SetRank(RPL_MIN_HOPRANKINC);
+    dio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+    dio.SetGrounded(true);
+    dio.SetDodagId(origin);
+    dio.SetDtsn(0);
+    dio.SetDagConfiguration(4, 6, 0, 0, RPL_MIN_HOPRANKINC, RPL_OCP_OF0, RPL_DEFAULT_LIFETIME,
+                            RPL_DEFAULT_LIFETIME_UNIT);
+    P2pRdoOption rdo;
+    rdo.reply = true;
+    rdo.hopByHop = false;
+    rdo.numRoutes = 0;
+    rdo.lifetime = 2;
+    rdo.maxRankOrNh = 3;
+    rdo.target = primaryTarget; // not node 1 -- only the Target option below is
+    rdo.addressVector = {};
+    dio.SetP2pRdo(rdo);
+
+    RplDioHeader::TargetOption ownTarget;
+    ownTarget.target = rpl->GetGlobalAddress();
+    dio.AddTarget(ownTarget);
+    RplDioHeader::TargetOption stillOutstanding;
+    stillOutstanding.target = otherTarget;
+    dio.AddTarget(stillOutstanding);
+
+    // Delivered twice, byte-for-byte identical: the second copy is what
+    // this test is about.
+    for (int i = 0; i < 2; i++)
+    {
+        DeliverRawRplMessage<RplDioHeader>(node,
+                                           1,
+                                           dio,
+                                           static_cast<uint8_t>(RPL_CODE_DIO),
+                                           neighbour,
+                                           Ipv6Address(RPL_ALL_NODES_MULTICAST));
+        // SendP2pDro()'s multicast is scheduled onto the channel, not
+        // delivered synchronously (@see RplP2pDroAckWrongSequenceTestCase's
+        // own comment) -- let it land before the next delivery so the two
+        // do not race.
+        Simulator::Stop(MilliSeconds(10));
+        Simulator::Run();
+    }
+
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsP2pTarget(INSTANCE, origin),
+                          true,
+                          "The node did not recognise itself as a Target via an RPL Target "
+                          "option");
+    NS_TEST_ASSERT_MSG_EQ(m_droCount,
+                          1,
+                          "A repeat DIO with an unchanged Address Vector started a second "
+                          "P2P-DRO cycle -- droRetriesLeft was reset and a new Seq minted for "
+                          "content already replied to");
+    if (m_droCount >= 1)
+    {
+        NS_TEST_ASSERT_MSG_EQ(+m_sequences[0], 1, "The one reply should carry Seq 1");
+    }
+
+    monitor->Close();
+    Simulator::Destroy();
+}
+
 
 /**
  * @ingroup rpl
@@ -23157,6 +23336,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplP2pDroGeneratedTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pDroRetryTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pMultiTargetTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pRepeatDioNoFreshCycleTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pMultiTargetRelayTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pSoleTargetViaOptionStopsTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pDroAckWrongSequenceTestCase, TestCase::Duration::QUICK);

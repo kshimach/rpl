@@ -1242,6 +1242,20 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
             /// temporary DAG (RFC 6997 section 7).
             Timer expiry{Timer::CANCEL_ON_DESTROY};
 
+            /// The addressVector a reply cycle was last started for.
+            /// HandleP2pRdo() compares the current addressVector against
+            /// this before minting a fresh 'Seq' and resetting the retry
+            /// budget: a DIO that repeats content already replied to is not
+            /// new information, and starting a cycle for it anyway is what
+            /// let a steady stream of Trickle-driven repeats (while another
+            /// Target remained outstanding) defeat
+            /// MAX_P2P_DRO_RETRANSMISSIONS entirely and, since 'Seq' is only
+            /// 2 bits, collide with a still-outstanding P2P-DRO-ACK within a
+            /// handful of cycles (@see design-constraints.md section 82).
+            /// Empty until the first cycle, which a non-empty addressVector
+            /// (this node's own entry is always appended) never equals.
+            std::vector<Ipv6Address> lastRepliedAddressVector;
+
             /// Target only, RFC 6997 sections 9.5/10: state for the P2P-DRO
             /// this node is waiting on a P2P-DRO-ACK for. droSequence is the
             /// 'Seq' the outstanding (or most recently sent) P2P-DRO carried,

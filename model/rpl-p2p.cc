@@ -472,33 +472,47 @@ RplRoutingProtocol::HandleP2pRdo(const RplDioHeader& dio, Ipv6Address from, uint
         // the 'N' field's business: one when it is zero, sent from here,
         // and otherwise a batch assembled by P2pDroCollectExpire() once
         // the collection window closes.
-        if (dodag.p2p.reply)
+        // A fresh transmission cycle starts only when there is something new
+        // to send it for: RFC 6997 section 10's 'Seq' exists to let the
+        // Origin's P2P-DRO-ACK be matched back to the P2P-DRO it
+        // acknowledges, which only means anything if the content could have
+        // changed. A DIO from the preferred parent that repeats the exact
+        // Address Vector already replied to carries nothing new -- whatever
+        // cycle is already in flight (droRetryEvent's own bounded retries,
+        // or an open droCollectEvent window) continues on its own schedule
+        // regardless, and RecordP2pAlternateRoute() above still collects
+        // into it.
+        //
+        // Without this gate, a Target with a temporary DAG membership that
+        // outlives its own 'L' deadline by little enough, or one that keeps
+        // re-matching a Target named only via an RPL Target option (@see
+        // DodagMembership::P2pState::additionalTargets, never filtered down
+        // to exclude this node's own already-matched entry), ran this every
+        // time a fresh-looking DIO arrived for as long as the membership
+        // existed and another Target remained outstanding: every Trickle
+        // re-transmission from the preferred parent reset droRetriesLeft to
+        // the full budget, so MAX_P2P_DRO_RETRANSMISSIONS never actually
+        // bound, and minted a new 'Seq' each time -- wire-field 2 bits wide,
+        // so it wrapped every four cycles and could then match a stale
+        // P2P-DRO-ACK to the current cycle. Found by /protocol-test-matrix's
+        // own multi-Target relay test (an NS_ASSERT in
+        // RplP2pDroHeader::SetSequence(), "Seq does not fit its 2-bit
+        // field", past four cycles without any gate at all) and by a later
+        // audit pass that traced the same unbounded-repeat root cause
+        // through to the retry budget and the Seq collision separately
+        // (@see design-constraints.md section 82).
+        if (dodag.p2p.reply && dodag.p2p.addressVector != dodag.p2p.lastRepliedAddressVector)
         {
-            // A fresh transmission cycle, distinct from P2pDroRetry()'s own
-            // resend of the same content on timeout -- RFC 6997 section 10's
-            // 'Seq' is what lets the Origin's P2P-DRO-ACK be matched back to
-            // the P2P-DRO it acknowledges, so a P2P-DRO whose Address Vector
-            // just changed (this DIO may have arrived with a different one
-            // than the last) needs a Seq of its own. Resets the retry budget
-            // for the same reason: this supersedes whatever cycle (if any)
-            // was already in flight for the old Seq.
-            //
+            dodag.p2p.lastRepliedAddressVector = dodag.p2p.addressVector;
+
             // Wrapped at the wire field's own 2-bit width rather than left
             // to grow (distinct from RplSequenceIncrement(), this module's
             // RFC 6550 section 7.2 wraparound for its 8-bit lollipop
             // counters like dodag.version in GlobalRepairFire() -- this
             // 'Seq' is a P2P-RPL/RFC 6997 field of its own, unrelated
-            // width and rule):
-            // a Target with a temporary DAG membership that outlives its
-            // own 'L' deadline by little enough, or one that keeps
-            // re-matching a Target named only via an RPL Target option
-            // (@see DodagMembership::P2pState::additionalTargets, never
-            // filtered down to exclude this node's own already-matched
-            // entry), can run this every time a fresh-looking DIO arrives
-            // for as long as the membership exists -- found by
-            // /protocol-test-matrix's own multi-Target relay test, an
-            // NS_ASSERT in RplP2pDroHeader::SetSequence() ("Seq does not
-            // fit its 2-bit field") past four cycles without this.
+            // width and rule). Resets the retry budget for the same reason
+            // Seq itself is fresh: this genuinely supersedes whatever cycle
+            // (if any) was already in flight for the old content.
             dodag.p2p.droSequence =
                 (dodag.p2p.droSequence + 1) & (RPL_P2P_DRO_SEQ_MASK >> RPL_P2P_DRO_SEQ_SHIFT);
             dodag.p2p.droAckPending = m_p2pDroAckRequested;
@@ -583,6 +597,11 @@ RplRoutingProtocol::HandleP2pRdo(const RplDioHeader& dio, Ipv6Address from, uint
                             << window.As(Time::MS) << " to collect up to "
                             << +dodag.p2p.numRoutes << " alternate route(s)");
             }
+        }
+        else if (dodag.p2p.reply)
+        {
+            NS_LOG_LOGIC("Address Vector unchanged since the last P2P-DRO reply; nothing new "
+                        "to send");
         }
         return;
     }

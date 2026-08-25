@@ -9045,14 +9045,10 @@ No-Path DAO 二重送出) まで到達するようになった。**クラッシ�
   §72-§78 のいずれよりも前からある挙動で、修正は上限を Compr 依存に
   する必要があり、ワイヤ受理範囲を変える。(**79節の通り対応済み**)
 - **retry 予算が DIO 到着ごとにリセットされ
-  `MAX_P2P_DRO_RETRANSMISSIONS` が実質束縛しない** (Angle 4)。
-  `HandleP2pRdo()` が受理した DIO ごとに `droRetriesLeft` を張り直す
-  のは §72 以前からの挙動。multi-Target 経路でしか反復到達しない。
-  あわせて 2 bit の Seq が 4 サイクルで一周するため、4 サイクル前の
-  P2P-DRO-ACK が現在の `droRetryEvent` を取り消しうる (Angle 2 も
-  同じ点を「この commit 群が導入したものではない」として挙げた)。
-  どちらも multi-Target 限定で、対応には Seq を含む ACK 追跡の
-  作り直しが要る。未修正。
+  `MAX_P2P_DRO_RETRANSMISSIONS` が実質束縛しない**、および **2 bit の
+  Seq が 4 サイクルで一周し古い P2P-DRO-ACK と衝突しうる** (Angle 4、
+  Angle 2)。(**82節の通り、根本原因の方を対応済み — 完全な排除には
+  なお Seq を含む ACK 追跡の作り直しが要る**)
 - **`HasOtherP2pTargets()` が TargetAddr を見ていない** (Angle 4)。
   additionalTargets しか見ないので、TargetAddr が他ノードを名指し、
   自分は Target option でのみ一致した ノードが「他に Target は無い」
@@ -9289,3 +9285,90 @@ RFC 6997 §9.4 の一様乱数抽選 (`SendDio()` の候補経路選択) は、
   PASS。** §77.1 の掃き出しは道具として健在で、かつスイートは少なくとも
   2 通りの軌道シフトに対して頑健になった。§77 が「既定軌道で通って
   いるのは運でしかない」と書いた状態からは一歩進んだことになる。
+
+## 82. §78.7 の retry 予算リセットと Seq 一周 — 根本原因を軽い側だけ潰した
+
+「軽い方から」という判断で着手。§78.7 が未修正として残していた 2 点
+(retry 予算が実質束縛しない、Seq が 4 サイクルで一周して古い ACK と
+衝突しうる) は、コードを読み直すと**根が同じ**だと分かった。
+
+### 82.1 根本原因
+
+`HandleP2pRdo()` は、`isTarget && !HasOtherP2pTargets()` の repeat
+ガードを通過すれば (= 他に未発見の Target が残っている限り)、
+**preferred parent からの DIO が届くたびに**「新しい返信サイクル」
+として扱っていた: `droSequence` を 1 進め、`droAckPending`/
+`droRetriesLeft` を満額へ張り直し、N=0 なら即座に新しい P2P-DRO を
+送信する。
+
+multi-Target discovery が続く間、preferred parent は自分の Trickle
+周期で同じ DIO を再送出し続ける。**Address Vector の中身が前回と
+一切変わっていなくても**、このループはサイクルを開始し続ける。
+結果:
+
+- `droRetriesLeft` が Trickle 間隔ごとに満額へ戻るので、
+  `MAX_P2P_DRO_RETRANSMISSIONS` は退行的なケース以外では実質
+  効かない。
+- `droSequence` が Trickle 間隔ごとに進むので、2 bit 幅 (4 値) を
+  数サイクルで一周する。遅延した古い P2P-DRO-ACK が、たまたま
+  一致した現在の Seq に対して `droAckPending = false` を立ててしまい、
+  本来の再送を止めてしまいうる。
+
+つまり「retry 予算」と「Seq 一周」は**同じ不要なサイクル開始**が
+生む2つの症状であって、別々の不具合ではなかった。
+
+### 82.2 何を直したか、何を直していないか
+
+**直した (軽い方)**: 「新しい内容が無いのに新サイクルを始める」こと
+自体を止めた。`P2pState` に `lastRepliedAddressVector` を追加し、
+直前に返信サイクルを開始した時点の `addressVector` を憶えておく。
+`HandleP2pRdo()` の返信分岐は、**現在の `addressVector` がそれと
+異なる場合のみ**サイクルを開始する。一致していれば、既に走っている
+サイクル (`droRetryEvent` の有限回再送、または開いている
+`droCollectEvent` のウィンドウ) をそのまま継続させ、何もしない。
+
+これで:
+
+- 内容が変わらない限り、Trickle 再送のたびに予算がリセットされる
+  ことは無くなった。`MAX_P2P_DRO_RETRANSMISSIONS` が実際に効くように
+  なった。
+- Seq は内容が実際に変わったときだけ進むようになった。トポロジの
+  変化頻度に束縛されるので、Trickle のフラッド頻度に束縛されていた
+  頃より一周ずっと起きにくい。
+
+**直していない (重い方)**: Seq の衝突を**理論上ゼロ**にするには
+至っていない。内容が変わるたびにサイクルが始まる以上、変化が短時間に
+4 回続けば依然として一周しうる。これを完全に塞ぐには、Seq ごとに
+独立した ACK 待ち状態を追跡する作り直し (§78.7 が「Seq を含む ACK
+追跡の作り直し」と呼んだもの) が要り、今回はそこまで踏み込んでいない。
+`droSequence`/`droAckPending`/`droRetriesLeft`/`droRetryEvent` は
+今回も 1 membership につき 1 組の scalar のまま。
+
+### 82.3 なぜこの切り分けを「軽い」と判断したか
+
+書き換えは `HandleP2pRdo()` の返信分岐の条件式 1 行と、`P2pState` へ
+の 1 フィールド追加のみ。`P2pDroRetry()`・`HandleP2pDroAck()`・
+`SendP2pDro()`・`P2pDroCollectExpire()` はいずれも無変更。既存の
+multi-Target 系テスト (`RplP2pMultiTargetTestCase` など) はどれも
+DIO を 1 回しか配送しないため、この変更の影響範囲に触れない。
+
+### 82.4 テスト
+
+新規 `RplP2pRepeatDioNoFreshCycleTestCase`。`RplP2pMultiTargetTestCase`
+と同じ構成 (Target option 経由で一致、もう1つの Target option を
+未解決のまま残して `HasOtherP2pTargets()` を true に保つ) だが、
+**内容が完全に同一の DIO を 2 回配送**する。1 回目だけ P2P-DRO が
+送出され、2 回目は送出されないこと (`m_droCount == 1`)、送出された
+1 通が `Seq == 1` を持つこと (2 回目でサイクルが始まっていれば
+`Seq == 2` になるはず) を確認する。
+
+load-bearing 検証: 返信分岐の条件を `dodag.p2p.reply` のみに戻すと、
+`m_droCount` が `actual="2"` で確実に FAIL する。
+
+### 82.5 検証
+
+`./ns3 build`(rpl モジュール・プロジェクト全体とも)、
+`test-runner --suite=rpl`(5 回連続実行して安定性を確認)、
+`./test.py -s rpl`を実行し、既存 143 件 + 新規 1 件 = 144 件全てが
+安定 PASS (1.05 秒前後)。§77.1 の乱数ストリーム掃き出しを当てた状態
+でも 144 件全て PASS することを確認した。
