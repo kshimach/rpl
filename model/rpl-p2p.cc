@@ -419,15 +419,24 @@ RplRoutingProtocol::HandleP2pRdo(const RplDioHeader& dio, Ipv6Address from, uint
     }
 
     dodag.p2p.addressVector = rdo.addressVector;
-    if (dodag.p2p.addressVector.size() >= RPL_P2P_ADDRESS_VECTOR_MAX_ENTRIES)
+    dodag.p2p.addressVector.push_back(ownAddress);
+    // Measured against the Compr this node's own re-serialization will
+    // actually use, computed over the vector with this address already
+    // appended -- appending it can itself change Compr, if this node's
+    // global address does not share the DODAGID's prefix. Using the Compr 0
+    // figure unconditionally, which this did until the /protocol-test-matrix
+    // audit derived the real limit, gives up on a discovery at 14 hops in a
+    // network where the wire format would carry 30 (@see
+    // design-constraints.md section 79).
+    uint8_t compr = P2pRdoCompr(rdo.target, dodag.p2p.addressVector, key.dodagId);
+    if (dodag.p2p.addressVector.size() > RplP2pMaxAddressVectorEntries(compr))
     {
         NS_LOG_WARN("The Address Vector is full at "
-                    << dodag.p2p.addressVector.size() << " entries; leaving temporary DAG "
-                    << +key.instanceId);
+                    << dodag.p2p.addressVector.size() << " entries (Compr " << +compr
+                    << "); leaving temporary DAG " << +key.instanceId);
         LeaveDodag(key, false);
         return;
     }
-    dodag.p2p.addressVector.push_back(ownAddress);
 
     ArmP2pExpiry(dodag, key);
 
@@ -813,12 +822,12 @@ RplRoutingProtocol::RecordP2pCandidateRoute(DodagMembership& dodag,
     // a reason to drop the candidate, not to leave the DAG: the membership
     // decision belongs to HandleP2pRdo() and is made on the copy that
     // actually becomes addressVector.
-    if (rdo.addressVector.size() >= RPL_P2P_ADDRESS_VECTOR_MAX_ENTRIES)
+    std::vector<Ipv6Address> route = rdo.addressVector;
+    route.push_back(ownAddress);
+    if (route.size() > RplP2pMaxAddressVectorEntries(P2pRdoCompr(rdo.target, route, dodag.dodagId)))
     {
         return;
     }
-    std::vector<Ipv6Address> route = rdo.addressVector;
-    route.push_back(ownAddress);
 
     if (rank < dodag.p2p.candidateRank)
     {
@@ -839,11 +848,8 @@ RplRoutingProtocol::RecordP2pCandidateRoute(DodagMembership& dodag,
         }
     }
 
-    // Bounded by the same limit the Address Vector itself has. Without a cap
-    // this grows with the number of neighbours advertising a tied rank, and
-    // it is filled straight from received DIOs -- RFC 6997 puts no bound on
-    // it at all, so this one is this module's own.
-    if (dodag.p2p.candidateRoutes.size() >= RPL_P2P_ADDRESS_VECTOR_MAX_ENTRIES)
+    // @see RPL_P2P_MAX_CANDIDATE_ROUTES for why there is a cap here at all.
+    if (dodag.p2p.candidateRoutes.size() >= RPL_P2P_MAX_CANDIDATE_ROUTES)
     {
         NS_LOG_LOGIC("Not keeping a further tied-rank route; the candidate set is full");
         return;
@@ -874,12 +880,12 @@ RplRoutingProtocol::RecordP2pAlternateRoute(DodagMembership& dodag,
     // this node is a Target, and the route it is actually replying with is
     // addressVector's, which is nowhere near the limit or it would have
     // left already.
-    if (rdo.addressVector.size() >= RPL_P2P_ADDRESS_VECTOR_MAX_ENTRIES)
+    std::vector<Ipv6Address> route = rdo.addressVector;
+    route.push_back(ownAddress);
+    if (route.size() > RplP2pMaxAddressVectorEntries(P2pRdoCompr(rdo.target, route, dodag.dodagId)))
     {
         return;
     }
-    std::vector<Ipv6Address> route = rdo.addressVector;
-    route.push_back(ownAddress);
 
     // Exact-duplicate rejection only. RFC 6997 section 9.5 says "the Target
     // SHOULD avoid selecting routes that have large segments in common",

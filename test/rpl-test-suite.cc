@@ -16979,6 +16979,155 @@ RplP2pNumRoutesLateArrivalTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief An Address Vector that shares the DODAGID's prefix gets the room
+ *        Compr 8 actually buys, not the Compr 0 figure.
+ *
+ * RFC 6997 section 7 lays the P2P-RDO out as a 2-byte flags/L-MaxRank part
+ * followed by TargetAddr and every Address Vector entry, each of them
+ * (16 - Compr) octets after prefix elision, all counted by an eight-bit Opt
+ * Data Len -- so the vector holds up to 253 / (16 - Compr) - 1 entries. That
+ * is 14 at Compr 0 but 30 at Compr 8, and Compr 8 is what
+ * P2pRdoCompr() returns for any discovery whose DODAGID, TargetAddr,
+ * hops and this router's own global address all sit in one /64, which is
+ * every discovery this module's own scenarios build.
+ *
+ * The distinction is invisible to RplP2pAddressVectorFullTestCase: it uses a
+ * DODAGID under 2001:a:: while the node's own global address is under
+ * 2001:1::, so appending that address breaks the elision and the Compr 0
+ * limit is the right one there. Here the DODAGID is put in the node's own
+ * prefix, so the elision survives and the larger limit applies.
+ *
+ * Before the /protocol-test-matrix audit derived the Compr-dependent form,
+ * a 14-entry vector was refused here too -- giving up on a discovery less
+ * than halfway into the space the wire format offers.
+ */
+class RplP2pAddressVectorComprTestCase : public TestCase
+{
+  public:
+    RplP2pAddressVectorComprTestCase();
+
+  private:
+    void DoRun() override;
+
+    /**
+     * @brief Feed one fabricated P2P mode DIO whose addresses all share the
+     *        node's own /64, and report whether the temporary DAG was joined.
+     *
+     * @param node the node under test
+     * @param vectorEntries how many fabricated hops to put in the Address
+     *                      Vector before delivery
+     * @return true if the node ended up joined to the temporary DAG
+     */
+    bool TryJoin(Ptr<Node> node, uint8_t vectorEntries);
+};
+
+RplP2pAddressVectorComprTestCase::RplP2pAddressVectorComprTestCase()
+    : TestCase("A prefix-sharing Address Vector may hold Compr 8's 30 entries, not Compr 0's 14")
+{
+}
+
+bool
+RplP2pAddressVectorComprTestCase::TryJoin(Ptr<Node> node, uint8_t vectorEntries)
+{
+    static uint16_t sequence = 0;
+    sequence++;
+    // Everything under 2001:1::, the same /64 the node's own global address
+    // sits in, so P2pRdoCompr() elides eight octets and the option's own
+    // length limit works out to 30 entries rather than 14.
+    std::ostringstream originSuffix;
+    originSuffix << "2001:1::dead:" << sequence;
+    Ipv6Address origin(originSuffix.str().c_str());
+    Ipv6Address neighbour("fe80::a");
+
+    static constexpr uint8_t INSTANCE = 0x83;
+
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+
+    RplDioHeader dio;
+    dio.SetInstanceId(INSTANCE);
+    dio.SetVersionNumber(0);
+    dio.SetRank(RPL_MIN_HOPRANKINC);
+    dio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+    dio.SetGrounded(true);
+    dio.SetDodagId(origin);
+    dio.SetDtsn(0);
+
+    P2pRdoOption rdo;
+    rdo.reply = true;
+    rdo.hopByHop = false;
+    rdo.numRoutes = 0;
+    rdo.lifetime = 0;
+    rdo.maxRankOrNh = RPL_P2P_MAX_RANK_INFINITE; // out of the way: this test is about the AV
+    rdo.target = Ipv6Address("2001:1::beef:1");  // never this node: an ordinary relay throughout
+    for (uint8_t i = 0; i < vectorEntries; i++)
+    {
+        std::ostringstream hopSuffix;
+        hopSuffix << "2001:1::" << sequence << ":" << +i;
+        rdo.addressVector.push_back(Ipv6Address(hopSuffix.str().c_str()));
+    }
+    dio.SetP2pRdo(rdo);
+
+    DeliverRawRplMessage<RplDioHeader>(node,
+                                       1,
+                                       dio,
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       neighbour,
+                                       Ipv6Address(RPL_ALL_NODES_MULTICAST));
+
+    return rpl->IsJoinedTo(INSTANCE, origin);
+}
+
+void
+RplP2pAddressVectorComprTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(1);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.AssignWithoutAddress(devices);
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    Simulator::Stop(Seconds(2));
+    Simulator::Run();
+
+    Ptr<Node> node = nodes.Get(0);
+
+    const uint8_t limit = RplP2pMaxAddressVectorEntries(8);
+    NS_TEST_ASSERT_MSG_EQ(+limit, 30, "Compr 8 should allow 30 Address Vector entries");
+
+    // The entry count the Compr 0 figure would have refused, and which the
+    // wire format at Compr 8 carries with room to spare.
+    NS_TEST_ASSERT_MSG_EQ(TryJoin(node, RPL_P2P_ADDRESS_VECTOR_MAX_ENTRIES),
+                          true,
+                          "A relay was refused a prefix-sharing temporary DAG at the Compr 0 "
+                          "entry count, which Compr 8 carries with room to spare");
+
+    NS_TEST_ASSERT_MSG_EQ(TryJoin(node, static_cast<uint8_t>(limit - 1)),
+                          true,
+                          "A relay was refused a temporary DAG whose Address Vector still had "
+                          "room for its own entry at Compr 8");
+
+    NS_TEST_ASSERT_MSG_EQ(TryJoin(node, limit),
+                          false,
+                          "A relay joined a temporary DAG whose Address Vector was already full "
+                          "at Compr 8, with no room left to append its own entry");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Check which DIOs RplRoutingProtocol::HandleDio() acts on and which
  *        it turns away: a mode of operation it does not implement, another
  *        RPL instance or DODAG, a stale DODAG version, and the infinite
@@ -22988,6 +23137,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplP2pDroRelayTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pHopByHopRouteConflictTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pAddressVectorFullTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pAddressVectorComprTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pNumRoutesDistinctTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pNumRoutesPaddedTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pNumRoutesLateArrivalTestCase, TestCase::Duration::QUICK);

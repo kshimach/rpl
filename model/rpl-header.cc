@@ -89,10 +89,12 @@ namespace
  * @return 8 if target and every addressVector entry share their first 8
  *         octets with dodagId, 0 otherwise
  */
+} // namespace
+
 uint8_t
-P2pElidedPrefixLength(Ipv6Address target,
-                      const std::vector<Ipv6Address>& addressVector,
-                      Ipv6Address dodagId)
+P2pRdoCompr(Ipv6Address target,
+            const std::vector<Ipv6Address>& addressVector,
+            Ipv6Address dodagId)
 {
     uint8_t dodagIdBuf[16];
     dodagId.Serialize(dodagIdBuf);
@@ -115,12 +117,10 @@ P2pElidedPrefixLength(Ipv6Address target,
     return 8;
 }
 
-} // namespace
-
 uint32_t
 P2pRdoSerializedSize(const P2pRdoOption& rdo, Ipv6Address dodagId)
 {
-    uint8_t compr = P2pElidedPrefixLength(rdo.target, rdo.addressVector, dodagId);
+    uint8_t compr = P2pRdoCompr(rdo.target, rdo.addressVector, dodagId);
     uint8_t entrySize = static_cast<uint8_t>(16 - compr);
     // Type + Length (2) + flags + L/MaxRank (2) + TargetAddr and each
     // Address Vector entry, all entrySize octets after Compr elision.
@@ -130,8 +130,15 @@ P2pRdoSerializedSize(const P2pRdoOption& rdo, Ipv6Address dodagId)
 void
 P2pRdoSerialize(Buffer::Iterator& i, const P2pRdoOption& rdo, Ipv6Address dodagId)
 {
-    uint8_t compr = P2pElidedPrefixLength(rdo.target, rdo.addressVector, dodagId);
+    uint8_t compr = P2pRdoCompr(rdo.target, rdo.addressVector, dodagId);
     uint8_t entrySize = static_cast<uint8_t>(16 - compr);
+    // The only place both halves of the constraint are known at once, so the
+    // only place the fit can actually be asserted: SetP2pRdo() has the vector
+    // but not the DODAGID that decides Compr. Silent truncation of this cast
+    // is what the check is for.
+    NS_ASSERT_MSG(rdo.addressVector.size() <= RplP2pMaxAddressVectorEntries(compr),
+                  "The Address Vector does not fit the P2P-RDO's 8-bit Opt Data Len at this "
+                  "Compr");
     uint8_t length =
         static_cast<uint8_t>(2 + (1 + rdo.addressVector.size()) * entrySize);
 
@@ -173,7 +180,7 @@ P2pRdoDeserialize(Buffer::Iterator& i, uint8_t length, Ipv6Address dodagId, P2pR
     uint8_t remaining = static_cast<uint8_t>(length - 2);
     uint8_t blocks = static_cast<uint8_t>(remaining / entrySize);
     if (remaining % entrySize != 0 || blocks < 1 ||
-        static_cast<uint8_t>(blocks - 1) > RPL_P2P_ADDRESS_VECTOR_MAX_ENTRIES)
+        static_cast<uint8_t>(blocks - 1) > RplP2pMaxAddressVectorEntries(compr))
     {
         NS_LOG_LOGIC("Skipping a malformed P2P-RDO (Compr " << +compr << ", length " << +length
                                                              << ")");
@@ -1178,8 +1185,12 @@ RplDioHeader::HasP2pRdo() const
 void
 RplDioHeader::SetP2pRdo(const P2pRdoOption& rdo)
 {
-    NS_ASSERT_MSG(rdo.addressVector.size() <= RPL_P2P_ADDRESS_VECTOR_MAX_ENTRIES,
-                  "The Address Vector does not fit the P2P-RDO's 8-bit Opt Data Len");
+    // The loosest bound any Compr allows. The Compr that will actually
+    // apply depends on the DODAGID, which this setter does not have, so the
+    // binding check lives in P2pRdoSerialize(); this one only catches a
+    // vector no Compr could ever carry.
+    NS_ASSERT_MSG(rdo.addressVector.size() <= RplP2pMaxAddressVectorEntries(RPL_P2P_COMPR_MASK),
+                  "The Address Vector cannot fit the P2P-RDO's 8-bit Opt Data Len at any Compr");
     NS_ASSERT_MSG(rdo.numRoutes <= (RPL_P2P_N_MASK >> RPL_P2P_N_SHIFT),
                   "N does not fit its 2-bit field");
     NS_ASSERT_MSG(rdo.lifetime <= (RPL_P2P_LIFETIME_MASK >> RPL_P2P_LIFETIME_SHIFT),
@@ -1426,8 +1437,12 @@ RplP2pDroHeader::HasP2pRdo() const
 void
 RplP2pDroHeader::SetP2pRdo(const P2pRdoOption& rdo)
 {
-    NS_ASSERT_MSG(rdo.addressVector.size() <= RPL_P2P_ADDRESS_VECTOR_MAX_ENTRIES,
-                  "The Address Vector does not fit the P2P-RDO's 8-bit Opt Data Len");
+    // The loosest bound any Compr allows. The Compr that will actually
+    // apply depends on the DODAGID, which this setter does not have, so the
+    // binding check lives in P2pRdoSerialize(); this one only catches a
+    // vector no Compr could ever carry.
+    NS_ASSERT_MSG(rdo.addressVector.size() <= RplP2pMaxAddressVectorEntries(RPL_P2P_COMPR_MASK),
+                  "The Address Vector cannot fit the P2P-RDO's 8-bit Opt Data Len at any Compr");
     NS_ASSERT_MSG(rdo.numRoutes <= (RPL_P2P_N_MASK >> RPL_P2P_N_SHIFT),
                   "N does not fit its 2-bit field");
     NS_ASSERT_MSG(rdo.lifetime <= (RPL_P2P_LIFETIME_MASK >> RPL_P2P_LIFETIME_SHIFT),

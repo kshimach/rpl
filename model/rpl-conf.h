@@ -380,14 +380,56 @@ constexpr uint8_t RPL_P2P_MAX_RANK_MASK = 0x3F;
 /// Zero means "MaxRank is infinity" (RFC 6997 section 7).
 constexpr uint8_t RPL_P2P_MAX_RANK_INFINITE = 0;
 
-/// How many Address Vector entries a P2P-RDO can carry. Not a policy choice:
-/// the option's own Opt Data Len is eight bits, and unlike the AODV-RPL
-/// RREQ/RREP options, TargetAddr shares the option with the Address Vector
-/// rather than living in a separate ART option, so with the 2-byte flags/L
-/// part, an uncompressed (Compr 0) 16-byte TargetAddr, and 16 bytes per
-/// entry, the wire format stops at 14: 2 + 16 + 14 * 16 = 242 <= 255, one
-/// more entry would need 258.
-constexpr uint8_t RPL_P2P_ADDRESS_VECTOR_MAX_ENTRIES = 14;
+/**
+ * @brief How many Address Vector entries a P2P-RDO can carry at a given
+ *        Compr.
+ *
+ * Not a policy choice, and not a single number: it falls out of the wire
+ * format, which is Compr-dependent. RFC 6997 section 7 lays the option out
+ * as a 2-byte flags/L-MaxRank part followed by TargetAddr and every Address
+ * Vector entry, each of them (16 - Compr) octets after prefix elision, all
+ * of it counted by an eight-bit Opt Data Len. So
+ * `2 + (1 + n) * (16 - Compr) <= 255`, i.e. `n <= 253 / (16 - Compr) - 1`.
+ *
+ * A second, independent ceiling applies on top: a P2P-DRO carries the
+ * vector's own entry count in the NH field ("the NH field is set to
+ * n = (Option Length - 2 - (16 - Compr)) / (16 - Compr)", section 8.2),
+ * which shares its six bits with MaxRank. Past Compr 12 the length stops
+ * being what binds and NH's 63 does.
+ *
+ * Concretely: 14 entries at Compr 0, 30 at Compr 8, 63 from Compr 13 up.
+ * Applying the Compr 0 figure everywhere -- which this module did until the
+ * /protocol-test-matrix audit derived this, @see design-constraints.md
+ * section 79 -- truncates discoveries less than halfway into the space the
+ * wire format actually offers, since P2pElidedPrefixLength() returns 8 for
+ * any network sharing one /64.
+ *
+ * @param compr the P2P-RDO's Compr field, 0..15
+ * @return the largest Address Vector entry count that fits
+ */
+constexpr uint8_t
+RplP2pMaxAddressVectorEntries(uint8_t compr)
+{
+    uint32_t entrySize = 16u - (compr & RPL_P2P_COMPR_MASK);
+    uint32_t blocks = 253u / entrySize; // TargetAddr plus the vector entries
+    uint32_t entries = blocks > 0 ? blocks - 1 : 0;
+    return static_cast<uint8_t>(entries < RPL_P2P_MAX_RANK_MASK ? entries
+                                                                : RPL_P2P_MAX_RANK_MASK);
+}
+
+/// The Compr 0 figure, which is the smallest RplP2pMaxAddressVectorEntries()
+/// ever returns -- what a check has to use when the Compr that will apply is
+/// not yet known.
+constexpr uint8_t RPL_P2P_ADDRESS_VECTOR_MAX_ENTRIES = RplP2pMaxAddressVectorEntries(0);
+
+/// How many tied-rank routes a router keeps for RFC 6997 section 9.4's own
+/// diversity ("an Intermediate Router SHOULD keep track of multiple routes").
+/// The RFC puts no bound on it at all, so this one is this module's: the set
+/// is filled straight from received DIOs and would otherwise grow with the
+/// number of neighbours advertising a tied rank. Unrelated to how long an
+/// Address Vector may be, though it once borrowed that constant because the
+/// two numbers happened to coincide.
+constexpr uint8_t RPL_P2P_MAX_CANDIDATE_ROUTES = 14;
 
 /**
  * @brief How long the 'L' field of a P2P-RDO lets a node stay in the

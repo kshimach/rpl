@@ -76,6 +76,24 @@ struct P2pRdoOption
  *                elision is computed
  * @return the size in octets
  */
+/**
+ * @brief The Compr a P2P-RDO carrying this content would be serialized with.
+ *
+ * RFC 6997 section 7's prefix elision: 8 when TargetAddr and every Address
+ * Vector entry share their first 8 octets with the enclosing message's
+ * DODAGID, 0 otherwise. Exposed because Compr decides how many entries the
+ * option can hold (@see RplP2pMaxAddressVectorEntries()), so a caller
+ * accumulating a route has to know it before deciding the vector is full.
+ *
+ * @param target the P2P-RDO's TargetAddr
+ * @param addressVector its Address Vector
+ * @param dodagId the DODAGID of the enclosing message
+ * @return 8 or 0
+ */
+uint8_t P2pRdoCompr(Ipv6Address target,
+                    const std::vector<Ipv6Address>& addressVector,
+                    Ipv6Address dodagId);
+
 uint32_t P2pRdoSerializedSize(const P2pRdoOption& rdo, Ipv6Address dodagId);
 
 /**

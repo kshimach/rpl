@@ -9048,8 +9048,7 @@ No-Path DAO 二重送出) まで到達するようになった。**クラッシ�
   `LeaveDodag()` し、討伐が打ち切られる。また準拠実装が送る
   Compr=8・15〜30 エントリの P2P-RDO を malformed として捨てる。
   §72-§78 のいずれよりも前からある挙動で、修正は上限を Compr 依存に
-  する必要があり、ワイヤ受理範囲を変える。**独立した項目として次に
-  着手すべき**。
+  する必要があり、ワイヤ受理範囲を変える。(**79節の通り対応済み**)
 - **retry 予算が DIO 到着ごとにリセットされ
   `MAX_P2P_DRO_RETRANSMISSIONS` が実質束縛しない** (Angle 4)。
   `HandleP2pRdo()` が受理した DIO ごとに `droRetriesLeft` を張り直す
@@ -9084,3 +9083,98 @@ No-Path DAO 二重送出) まで到達するようになった。**クラッシ�
 decay といった仕込みが要る。78.3 だけは §77.1 の掃き出しが事実上の
 回帰テストになっている (当てるとクラッシュが再発するかどうかで
 判定できる)。
+
+## 79. §78.7 の Address Vector 上限を Compr 依存にした
+
+Angle 2 が単独で挙げた指摘。`RPL_P2P_ADDRESS_VECTOR_MAX_ENTRIES = 14`
+は **Compr = 0 の値**なのに、全 Compr に適用していた。
+
+### 79.1 導出
+
+RFC 6997 §7 の P2P-RDO は、2 バイトの flags/L-MaxRank 部のあとに
+TargetAddr と Address Vector の各エントリが続き、いずれも prefix 省略後
+`16 - Compr` オクテット。全体を 8 bit の Opt Data Len が数える:
+
+```
+2 + (1 + n) * (16 - Compr) <= 255
+n <= 253 / (16 - Compr) - 1
+```
+
+- Compr = 0 → 14
+- Compr = 8 → **30**
+- Compr = 15 → 252
+
+さらに独立した上限がもう一段ある。P2P-DRO はエントリ数を NH フィールドに
+載せる (§8.2 "the NH field is set to n = (Option Length - 2 -
+(16 - Compr)) / (16 - Compr)") が、この 6 bit は MaxRank と共有なので
+**63 が上限**。Compr 13 以降は長さではなく NH の方が先に効く。
+
+したがって実際の上限は `min(253 / (16 - Compr) - 1, 63)`。
+
+### 79.2 なぜ実害があるか
+
+`P2pRdoCompr()` (旧 `P2pElidedPrefixLength()`) は、DODAGID・TargetAddr・
+Address Vector の全エントリが先頭 8 オクテットを共有していれば 8 を返す。
+**同一 /64 のネットワークでは常に 8** — この モジュールのシナリオは
+ほぼ全てそれに当たる。つまり実運用の Compr は 8 で本来 30 まで載るのに、
+14 で打ち切っていた。ワイヤ形式が提供する空間の半分以下しか使っていない。
+
+- 送信・蓄積側: 16 ホップの一直線トポロジで、深さ 14 の ルータが Target
+  の 2 ホップ手前で `LeaveDodag()` し、discovery が打ち切られる。
+- 受信側: 準拠実装が送る Compr = 8・15〜30 エントリの P2P-RDO を
+  malformed として捨てる。
+
+5 箇所 (定義、`rpl-p2p.cc` の 3 箇所、`rpl-header.cc` の deserializer と
+`SetP2pRdo()` の assert) が**一貫して 14** を使っていた — 互いにズレては
+いないが、揃って厳しすぎた。§73.5 で「4 箇所を比較したが一貫していて
+off-by-one は無い」と確認したのはこの意味では正しく、しかし**全部が同じ
+向きに間違っている**ことは見えていなかった。角の性質の差がそのまま出た
+例として記録する。
+
+### 79.3 実装
+
+`RplP2pMaxAddressVectorEntries(compr)` を `rpl-conf.h` に constexpr で
+追加し、5 箇所を Compr の分かる形に置き換えた。
+
+- **deserializer**: Compr はワイヤから読めるので、そのまま渡す。
+- **`P2pRdoSerialize()`**: Compr を計算した直後、`length` の
+  `uint8_t` キャストが黙って切り詰まる前に assert する。**両方の値が
+  同時に分かる唯一の場所**。
+- **`SetP2pRdo()` (DIO/P2P-DRO 両方)**: ここは DODAGID を持たないので
+  Compr が決まらない。どの Compr でも載らない値だけを弾く緩い上限
+  (Compr 15 の 63) に変えた。実効的な検査は serialize 側へ移した。
+- **`HandleP2pRdo()` の蓄積側**: 自アドレスを**追加してから**、その
+  ベクタに対して Compr を計算して判定する。自アドレスの追加自体が
+  Compr を変えうる (自分のグローバルアドレスが DODAGID の prefix を
+  共有しない場合) ため、追加前に測ると誤る。
+- **`RecordP2pAlternateRoute()` / `RecordP2pCandidateRoute()`**: 同型。
+  ただし溢れは候補を捨てるだけで、DAG からは離脱しない。
+
+あわせて `candidateRoutes` の**件数**上限が Address Vector の**長さ**
+上限を流用していたのを分離した (`RPL_P2P_MAX_CANDIDATE_ROUTES`)。
+数字が 14 で一致していただけで、無関係な 2 つの制約だった。
+
+### 79.4 テスト
+
+新規 `RplP2pAddressVectorComprTestCase`。既存の
+`RplP2pAddressVectorFullTestCase` はこの差を**構造的に観測できない** —
+DODAGID が `2001:a::` 系なのに ノード自身のグローバルアドレスは
+`2001:1::` 系なので、自アドレスを追加した時点で省略が壊れ Compr 0 に
+落ちる。そちらでは 14 が正解であり、テストは正しいまま。
+
+新規テストは DODAGID・TargetAddr・全ホップを ノード自身の /64 に置き、
+省略が生き残る条件を作る。確認するのは 3 点:
+
+- `RplP2pMaxAddressVectorEntries(8)` が 30 であること
+- Compr 0 の上限 (14) では**まだ入る**こと — 修正前はここで拒否された
+- 29 で入り、30 で溢れて離脱すること (自アドレス 1 つ分の余地)
+
+load-bearing 検証: 判定を `RPL_P2P_ADDRESS_VECTOR_MAX_ENTRIES` に戻すと
+`actual="0" limit="1"` で確実に FAIL。
+
+### 79.5 検証
+
+`./ns3 build`(rpl モジュール・プロジェクト全体とも)、
+`test-runner --suite=rpl`(5 回連続実行して安定性を確認)、
+`./test.py -s rpl`を実行し、既存 142 件 + 新規 1 件 = 143 件全てが
+安定 PASS (1.07 秒前後)。
