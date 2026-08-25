@@ -441,6 +441,7 @@ RplRoutingProtocol::RplRoutingProtocol()
 {
     NS_LOG_FUNCTION(this);
     m_jitter = CreateObject<UniformRandomVariable>();
+    m_p2pRouteSelector = CreateObject<UniformRandomVariable>();
     // dioTrickle's function is bound per DodagMembership, once that
     // membership is created (JoinDodag(), HandleDadSuccess()'s root
     // branch): it needs the DodagKey identifying which membership fired, and
@@ -1306,7 +1307,7 @@ RplRoutingProtocol::SendDio(DodagMembership& dodag, Ipv6Address dst, uint32_t in
         PruneP2pCandidateRoutes(dodag);
         if (!dodag.p2p.candidateRoutes.empty())
         {
-            uint32_t pick = m_jitter->GetInteger(
+            uint32_t pick = m_p2pRouteSelector->GetInteger(
                 0,
                 static_cast<uint32_t>(dodag.p2p.candidateRoutes.size() - 1));
             rdo.addressVector = dodag.p2p.candidateRoutes[pick].route;
@@ -5235,11 +5236,12 @@ RplRoutingProtocol::AssignStreams(int64_t stream)
 {
     NS_LOG_FUNCTION(this << stream);
     m_jitter->SetStream(stream);
+    m_p2pRouteSelector->SetStream(stream + 2);
     // No DodagMembership -- and so no RplTrickleTimer to assign this to --
     // necessarily exists yet (this runs before Simulator::Run()); JoinDodag()
     // and HandleDadSuccess()'s root branch apply it once one is constructed.
     m_dioTrickleStream = stream + 1;
-    return 2;
+    return 3;
 }
 
 } // namespace rpl

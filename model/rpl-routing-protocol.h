@@ -2627,23 +2627,24 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     /// stale true behind, silently suppressing a genuinely new future
     /// trigger's own arm.
     bool m_disRefreshPending{false};
-    /// Jitter applied to control messages, and (SendDio()) the draw that
-    /// picks which of P2pState::candidateRoutes goes into the next P2P mode
-    /// DIO -- RFC 6997 section 9.4's "uniform random manner".
+    Ptr<UniformRandomVariable> m_jitter; //!< jitter applied to control messages
+    /// Picks which of P2pState::candidateRoutes goes into the next P2P mode
+    /// DIO -- RFC 6997 section 9.4's "uniform random manner". A stream of
+    /// its own rather than m_jitter's, so that a route draw does not shift
+    /// the jitter sequence after it and the two stay independently
+    /// reproducible.
     ///
-    /// Deliberately one variable rather than two. A second
-    /// RandomVariableStream has to claim a stream index of its own, taking
-    /// AssignStreams() from two streams per node to three, which shifts
-    /// every node's assignment and so every simulation trajectory in the
-    /// module. That is meant to be harmless bookkeeping; here it walks
-    /// straight into this module's trajectory-sensitive test suite (@see
-    /// design-constraints.md section 77, which uses exactly that one-line
-    /// change as a sweep and lists what it has turned up so far). Sharing
-    /// the stream costs only that a P2P route draw shifts the jitter
-    /// sequence after it, and costs nothing at all where fewer than two
-    /// candidate routes ever accumulate, which is everywhere that predates
-    /// section 9.4 support.
-    Ptr<UniformRandomVariable> m_jitter;
+    /// It was m_jitter's for a while, because claiming a stream of its own
+    /// takes AssignStreams() from two streams per node to three, which
+    /// shifts every node's assignment and so every trajectory in the module
+    /// -- and at the time that reliably crashed the suite on two AODV-RPL
+    /// forwarding loops and tripped a test whose observable was coarser
+    /// than the invariant it meant to pin. All three are fixed (@see
+    /// design-constraints.md sections 76, 78.3 and 80), so the bookkeeping
+    /// is now the harmless thing it was always supposed to be. That
+    /// one-line stream shift remains useful on its own as a sweep, @see
+    /// section 77.
+    Ptr<UniformRandomVariable> m_p2pRouteSelector;
 
     /**
      * @brief The RNG stream number to assign a DODAG membership's Trickle
