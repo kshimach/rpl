@@ -20683,6 +20683,8 @@ class RplStaleAndSwitchCoincideTestCase : public TestCase
     void RecordNoPathDao(Ptr<Socket> socket);
 
     uint32_t m_noPathDaoCount{0}; //!< No-Path DAOs observed at the root
+    /// When each arrived, and whose prefix it withdrew.
+    std::vector<std::pair<Time, Ipv6Address>> m_noPathDaoSeen;
 };
 
 RplStaleAndSwitchCoincideTestCase::RplStaleAndSwitchCoincideTestCase()
@@ -20708,6 +20710,7 @@ RplStaleAndSwitchCoincideTestCase::RecordNoPathDao(Ptr<Socket> socket)
                 if (packet->RemoveHeader(dao) != 0 && dao.GetPathLifetime() == 0)
                 {
                     m_noPathDaoCount++;
+                    m_noPathDaoSeen.emplace_back(Simulator::Now(), dao.GetTarget());
                 }
             }
         }
@@ -20837,13 +20840,42 @@ RplStaleAndSwitchCoincideTestCase::DoRun()
                           "force never actually happened");
 
     uint32_t noPathDaoCountAfter = m_noPathDaoCount - noPathDaoCountBefore;
-    NS_TEST_ASSERT_MSG_EQ(noPathDaoCountAfter,
-                          1,
-                          "oldParent going stale at the same moment root won produced "
-                              << noPathDaoCountAfter
-                              << " No-Path DAOs for it, not the expected 1 -- consistent with "
-                                 "the staleness sweep's own withdrawal and the ordinary "
-                                 "switch block's withdrawal both firing for the same address");
+    NS_TEST_ASSERT_MSG_GT_OR_EQ(noPathDaoCountAfter,
+                                1,
+                                "oldParent going stale as root won produced no withdrawal at "
+                                "all -- the coinciding scenario this test means to force never "
+                                "actually happened");
+
+    // The invariant is "one address is withdrawn at most once per
+    // SelectPreferredParent() call", not "exactly one withdrawal reaches
+    // root in this window". Counting withdrawals was the original test and
+    // it silently assumed the child switches parent exactly once here; under
+    // a different random trajectory it legitimately flaps (root -> oldParent
+    // -> root), each leg withdrawing a different address, and the count is 2
+    // for entirely correct reasons. @see design-constraints.md section 80.
+    //
+    // The duplicate this test exists to catch is different in kind: one node
+    // withdraws one prefix twice inside a single call, so both carry the
+    // same Simulator::Now() AND the same Target. Neither half is enough on
+    // its own -- a whole subtree reacting to one event withdraws at the same
+    // instant too, and a node that flaps withdraws the same prefix twice at
+    // different times, and both of those are correct.
+    for (uint32_t i = 0; i < m_noPathDaoSeen.size(); i++)
+    {
+        for (uint32_t j = i + 1; j < m_noPathDaoSeen.size(); j++)
+        {
+            bool sameCall = m_noPathDaoSeen[i].first == m_noPathDaoSeen[j].first &&
+                            m_noPathDaoSeen[i].second == m_noPathDaoSeen[j].second;
+            NS_TEST_ASSERT_MSG_EQ(sameCall,
+                                  false,
+                                  "The prefix "
+                                      << m_noPathDaoSeen[i].second
+                                      << " was withdrawn twice at the same instant, i.e. twice "
+                                         "within one SelectPreferredParent() call -- the "
+                                         "staleness sweep's own withdrawal and the ordinary "
+                                         "switch block's withdrawal both firing for it");
+        }
+    }
 
     daoMonitor->Close();
     Simulator::Destroy();
