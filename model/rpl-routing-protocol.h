@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2026 ns-3 RPL module contributors
+ * Copyright (c) 2026 kawashy
  *
  * SPDX-License-Identifier: GPL-2.0-only
  *
@@ -384,6 +384,14 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      * @param instanceId the RPLInstanceID the inconsistent packet belongs to
      */
     void NotifyRankInconsistency(uint8_t instanceId);
+
+    /**
+     * @brief TracedCallback signature for the "RankErrorConfirmed" trace
+     *        source.
+     * @param instanceId the RPLInstanceID the confirmed-inconsistent packet
+     *        belongs to
+     */
+    typedef void (*RankErrorTracedCallback)(uint8_t instanceId);
 
     /**
      * @brief Act on a Forwarding-Error reported by the RPL Option (RFC 6553,
@@ -2860,6 +2868,11 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
 
     Ipv6Address m_rootPrefix;    //!< the root's own GUA/ULA prefix (RootPrefix attribute)
     uint8_t m_rootPrefixLength; //!< prefix length of m_rootPrefix, in bits
+
+    /// Fired from NotifyRankInconsistency() when the confirmed-inconsistency
+    /// branch (RPI 'R' bit already set on arrival) was the one that called
+    /// it -- i.e. a routing loop was actually walked. @see RankErrorTracedCallback.
+    TracedCallback<uint8_t> m_rankErrorConfirmedTrace;
 
     /**
      * @brief React to Neighbour Discovery confirming an address is unique.

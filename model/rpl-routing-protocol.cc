@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2026 ns-3 RPL module contributors
+ * Copyright (c) 2026 kawashy
  *
  * SPDX-License-Identifier: GPL-2.0-only
  *
@@ -415,7 +415,18 @@ RplRoutingProtocol::GetTypeId()
                           "RFC default; matches DaoRetries.",
                           UintegerValue(3),
                           MakeUintegerAccessor(&RplRoutingProtocol::m_p2pDroMaxRetransmissions),
-                          MakeUintegerChecker<uint8_t>());
+                          MakeUintegerChecker<uint8_t>())
+            .AddTraceSource("RankErrorConfirmed",
+                            "Fired when RplIpv6OptionRpl::Process() confirms a rank "
+                            "inconsistency (RFC 6550 section 11.2: the RPI's own 'R' bit was "
+                            "already set on arrival) -- i.e. a routing loop was actually walked "
+                            "by a packet. Purely additive instrumentation: this detection "
+                            "previously had no externally observable effect (the packet is "
+                            "neither dropped nor rerouted by it, only NotifyRankInconsistency()'s "
+                            "Trickle reset follows), so this is the only way a test/scratch "
+                            "program can count confirmed loops.",
+                            MakeTraceSourceAccessor(&RplRoutingProtocol::m_rankErrorConfirmedTrace),
+                            "ns3::rpl::RplRoutingProtocol::RankErrorTracedCallback");
     return tid;
 }
 
@@ -4867,6 +4878,7 @@ void
 RplRoutingProtocol::NotifyRankInconsistency(uint8_t instanceId)
 {
     NS_LOG_FUNCTION(this << +instanceId);
+    m_rankErrorConfirmedTrace(instanceId);
     DodagMembership* dodag = FindDodagByInstance(instanceId);
     if (dodag)
     {

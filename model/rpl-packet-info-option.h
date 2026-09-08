@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2026 ns-3 RPL module contributors
+ * Copyright (c) 2026 kawashy
  *
  * SPDX-License-Identifier: GPL-2.0-only
  *
