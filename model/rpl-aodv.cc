@@ -707,11 +707,38 @@ RplRoutingProtocol::HandleAodvRreq(const RplDioHeader& dio, Ipv6Address from, ui
         // own -- when the old one has vanished, anything looks better --
         // but "is the old one still a parent at all, and is the new one
         // better than it".
+        // FindHopByHopRoute() (checks instanceId AND dodagId), not
+        // GetHopByHopRoute() (checks instanceId only): m_hopByHopRoutes is
+        // one flat map keyed solely by destination address, shared between
+        // this upward route (keyed by OrigNode's address) and every
+        // downward route HandleAodvRrep() stores (keyed by TargNode's
+        // address, under whatever *other* RREQ-Instance produced it). Local
+        // RPLInstanceIDs are drawn from a small, heavily-reused pool across
+        // concurrent discoveries (@see RFC 9854 section 4's 7-bit space),
+        // so instanceId alone collides constantly; whenever some node's
+        // address is both an OrigNode for one discovery and a TargNode for
+        // another sharing that instanceId, GetHopByHopRoute() found the
+        // *other* discovery's unrelated downward entry, matched it on
+        // instanceId by coincidence, and treated it as this route "already
+        // held via a different neighbour". That neighbour is never in
+        // dodag.parents (it was never this dodag's parent to begin with),
+        // so it scores RPL_INFINITE_RANK and mayMove works out false --
+        // silently skipping the store below while leaving the wrong-purpose
+        // entry in place, which SendAodvRrep()'s own dodagId-checked
+        // FindHopByHopRoute() then correctly refuses, previously firing
+        // "HandleAodvRreq() must have stored the upward route by now"
+        // (reproduced reliably on a Grid topology, where two nodes filling
+        // both roles under the same reused instanceId is common; not
+        // reproduced on Cluster, where the branch/tier pair selection this
+        // test suite used never happened to construct it). Requiring
+        // dodagId to also match here means a genuinely unrelated entry no
+        // longer registers as "already held" at all, so mayMove correctly
+        // defaults to true and StoreHopByHopRoute()'s own dodagId-aware
+        // sameRoute check (already correct) does the actual store/overwrite.
         bool mayMove = true;
         Ipv6Address storedNextHop;
-        uint8_t storedInstanceId = 0;
-        if (GetHopByHopRoute(key.dodagId, storedNextHop, storedInstanceId) &&
-            storedInstanceId == key.instanceId && storedNextHop != dodag.preferredParent)
+        if (FindHopByHopRoute(key.instanceId, key.dodagId, key.dodagId, storedNextHop) &&
+            storedNextHop != dodag.preferredParent)
         {
             auto stored = dodag.parents.find(storedNextHop);
             auto chosen = dodag.parents.find(dodag.preferredParent);

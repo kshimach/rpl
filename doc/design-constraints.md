@@ -9372,3 +9372,71 @@ load-bearing 検証: 返信分岐の条件を `dodag.p2p.reply` のみに戻す�
 `./test.py -s rpl`を実行し、既存 143 件 + 新規 1 件 = 144 件全てが
 安定 PASS (1.05 秒前後)。§77.1 の乱数ストリーム掃き出しを当てた状態
 でも 144 件全て PASS することを確認した。
+
+## 83. AODV-RPL H=1 上り経路: instanceId しか見ない照合が別目的のエントリを取り違えていた
+
+大規模評価用の比較評価計画 (ns-3-dev 側 `scratch/rpl-large-scale-system-test.cc`
+の評価拡張作業) でGridトポロジを新たに走らせたところ、AODV-RPL・H=1
+(hop-by-hop)・Gridの組み合わせで `SendAodvRrep()` の
+`NS_ASSERT_MSG(found, "HandleAodvRreq() must have stored the upward route
+by now")` が確定的に落ちる (100ノード・シナリオ6の該当条件で約19%の
+試行が失敗) ことが判明した。Clusterトポロジでは一度も再現しなかった。
+
+### 83.1 再現と特定
+
+NS_LOG (`RplAodv=level_logic`) でクラッシュ直前のシーケンスを追った
+ところ、同一のローカル `RPLInstanceID` (RFC 9854 の 7-bit 空間なので
+値そのものは頻繁に使い回される) の下で、あるノードが**あるDiscoveryの
+Origin**であると同時に**別のDiscoveryのTarget**にもなっている構図が
+確認できた。`m_hopByHopRoutes` はDestinationアドレス1つだけをキーにした
+単一のflatマップで、Originへの上り経路 (キー=Origin自身のアドレス) と
+Targetへの下り経路 (キー=Target自身のアドレス、`HandleAodvRrep()` が
+格納) の両方をこのマップで共有している。あるノードのアドレスが
+「あるDiscoveryのTarget」と「別のDiscoveryのOrigin」を偶然兼ねると、
+両者が同じマップキーを取り合う。
+
+`HandleAodvRreq()` の `mayMove` 判定 (「既存の上り経路を新しい
+preferredParentへ動かしてよいか」) は `GetHopByHopRoute(destination,
+nextHop, instanceId)` というinstanceIdしか照合しない緩い版を使っていた
+ため、上記の別目的エントリを「同じDiscoveryの、別の(古い)next hop」と
+誤認する。誤認されたnext hopは`dodag.parents`に存在しない(そもそも
+このdodagの親候補ではないので当然)ため`RPL_INFINITE_RANK`扱いとなり、
+`mayMove`が`false`に倒れて`StoreHopByHopRoute()`自体が呼ばれずスキップ
+される。結果、別目的の古いエントリがそのまま残り、`SendAodvRrep()`側の
+`FindHopByHopRoute(instanceId, dodagId, destination, nextHop)`
+(dodagIdまで照合する厳密版)がこれを正しく「別物」として拒否し、
+「格納されているはず」という前提のアサートが落ちる。
+
+### 83.2 修正
+
+`mayMove`判定の事前チェックを、instanceIdしか見ない
+`GetHopByHopRoute()`から、dodagIdまで照合する`FindHopByHopRoute(
+key.instanceId, key.dodagId, key.dodagId, storedNextHop)`に差し替えた。
+これにより別目的のエントリは「既存の同一経路」として認識されなくなり
+`mayMove`は既定の`true`に留まる。`StoreHopByHopRoute()`自身の
+`sameRoute`判定は元々instanceIdとdodagIdの両方を見ているため
+(§本体`rpl-routing-protocol.cc`)、`mayMove=true`で実際に呼ばれれば
+正しく「別物」と判断して上書き格納する。事前チェックと実格納ロジックの
+厳密さの非対称 (前者が緩く後者が厳密) が今回の不整合の直接原因であり、
+両者を同じ厳密さに揃えたことで解消した。
+
+### 83.3 なぜClusterでは一度も踏まなかったか
+
+大規模評価のClusterトポロジ用ペア選択 (`BranchNodes()`ベース) は
+Branch0のノード群をOrigin、Branch1のノード群をTargetに固定的に
+割り当てており、1回の実行内で「あるノードがOriginとTargetを兼ねる」
+配置になることが構造上なかった。Gridトポロジ向けに追加した汎用ペア
+選択 (`SelectShortcutPairs()`、評価計画のitem C-6) はノードの重複を
+禁止していなかったため、この既存バグが初めて表面化した。バグ自体は
+トポロジに依存しない一般的な実装上の欠陥であり、Cluster限定で評価を
+続けていた限り検出できなかった。
+
+### 83.4 検証
+
+`./test.py -s rpl` で既存144件全てPASS (回帰なし)。修正前に確定的に
+再現していた条件 (`--scenario=6 --reactiveProtocol=aodvrpl
+--edgeSuccessRate=0.5 --topology=grid --hopByHop=true --RngRun=2`) が
+修正後は正常終了することを確認。さらに、評価計画の6 Study全126条件
+&times; RngRun 1-3 (計378試行) を修正前後で比較: 修正前7件クラッシュ
+(全てAODV-RPL &times; Grid &times; H=1の組み合わせ、edgeSuccessRateや
+シナリオ番号によらない)、修正後は0件。
