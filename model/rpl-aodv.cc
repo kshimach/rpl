@@ -633,6 +633,10 @@ RplRoutingProtocol::HandleAodvRreq(const RplDioHeader& dio, Ipv6Address from, ui
         }
     }
     dodag.aodv.isTarget = wasTarget || matchedThisTime;
+    if (!wasTarget && dodag.aodv.isTarget)
+    {
+        m_discoveryTargetReachedTrace(key.instanceId, key.dodagId);
+    }
 
     // RFC 9854 section 6.2.4. The incoming 'S' having been cleared anywhere
     // upstream is final -- "If the S bit arrives already set to be 0, then

@@ -394,6 +394,29 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     typedef void (*RankErrorTracedCallback)(uint8_t instanceId);
 
     /**
+     * @brief TracedCallback signature for the "DiscoveryTargetReached" trace
+     *        source.
+     *
+     * Fired once, on the node that just recognised itself as the TargNode/
+     * Target of an incoming P2P-RPL or AODV-RPL discovery (RFC 6997 section
+     * 9.5's isTarget, RFC 9854 section 6.2.4's isTarget), the first time
+     * that transition happens for a given temporary DODAG. This is the
+     * "did the request reach the target" half of a discovery attempt, as
+     * distinct from "did the reply make it back to the Origin" (which
+     * GetP2pRoute()/GetAodvRoute() on the Origin already answers once
+     * fully complete) -- separating the two is what Baccelli/Philipp/Goyal,
+     * "The P2P-RPL Routing Protocol for IPv6 Sensor Networks: Testbed
+     * Experiments" (SoftCOM 2011), section 4.2 measured (99.16% vs 57.87%)
+     * and flagged as an open reliability gap for the reply direction.
+     *
+     * @param instanceId the temporary DODAG's RPLInstanceID
+     * @param dodagId the temporary DODAG's DODAGID -- the Origin's own
+     *        address, per RFC 6997/RFC 9854's "temporary DODAG rooted at
+     *        the Origin"
+     */
+    typedef void (*DiscoveryTargetReachedTracedCallback)(uint8_t instanceId, Ipv6Address dodagId);
+
+    /**
      * @brief Act on a Forwarding-Error reported by the RPL Option (RFC 6553,
      *        RFC 6550 section 11.2.2.3): a Storing mode descendant this node
      *        forwarded a downward packet through no longer actually holds a
@@ -2873,6 +2896,11 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     /// branch (RPI 'R' bit already set on arrival) was the one that called
     /// it -- i.e. a routing loop was actually walked. @see RankErrorTracedCallback.
     TracedCallback<uint8_t> m_rankErrorConfirmedTrace;
+
+    /// Fired the first time this node's isTarget becomes true for a given
+    /// temporary DODAG, in HandleP2pDio() and HandleAodvRreq(). @see
+    /// DiscoveryTargetReachedTracedCallback.
+    TracedCallback<uint8_t, Ipv6Address> m_discoveryTargetReachedTrace;
 
     /**
      * @brief React to Neighbour Discovery confirming an address is unique.

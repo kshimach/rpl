@@ -426,7 +426,16 @@ RplRoutingProtocol::GetTypeId()
                             "Trickle reset follows), so this is the only way a test/scratch "
                             "program can count confirmed loops.",
                             MakeTraceSourceAccessor(&RplRoutingProtocol::m_rankErrorConfirmedTrace),
-                            "ns3::rpl::RplRoutingProtocol::RankErrorTracedCallback");
+                            "ns3::rpl::RplRoutingProtocol::RankErrorTracedCallback")
+            .AddTraceSource("DiscoveryTargetReached",
+                            "Fired once, on the node that just recognised itself as the "
+                            "TargNode/Target of an incoming P2P-RPL or AODV-RPL discovery, the "
+                            "first time that happens for a given temporary DODAG -- the "
+                            "'request reached the target' half of a discovery attempt, "
+                            "distinct from the reply making it back to the Origin.",
+                            MakeTraceSourceAccessor(
+                                &RplRoutingProtocol::m_discoveryTargetReachedTrace),
+                            "ns3::rpl::RplRoutingProtocol::DiscoveryTargetReachedTracedCallback");
     return tid;
 }
 

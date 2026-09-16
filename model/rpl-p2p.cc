@@ -393,7 +393,12 @@ RplRoutingProtocol::HandleP2pRdo(const RplDioHeader& dio, Ipv6Address from, uint
     // happens to differ (RFC 6997 gives routers no way to un-become a
     // Target); MatchesP2pTarget() also catches an RPL Target option match,
     // which the old IsOwnAddress(rdo.target) alone missed entirely.
+    bool wasP2pTarget = dodag.p2p.isTarget;
     dodag.p2p.isTarget = dodag.p2p.isTarget || MatchesP2pTarget(dio);
+    if (!wasP2pTarget && dodag.p2p.isTarget)
+    {
+        m_discoveryTargetReachedTrace(key.instanceId, key.dodagId);
+    }
 
     // Raw copy of this DIO's own RPL Target options, unfiltered: RFC 6997
     // has no rule removing a Target option once it matches this router
