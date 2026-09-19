@@ -24,6 +24,7 @@
 #include "ns3/timer.h"
 
 #include <map>
+#include <set>
 #include <tuple>
 
 namespace ns3
@@ -1106,6 +1107,13 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
             /// is. A symmetric discovery never sets this: its RREP is a
             /// unicast that builds no DODAG at all (section 6.3.1).
             bool isRrepInstance{false};
+            /// Targets this router has already answered with a Gratuitous
+            /// RREP for this RREQ-Instance, consulted only when
+            /// AodvGratuitousRrepOnce is set. RFC 9854 section 7 pairs the
+            /// G-RREP with unicasting the RREQ onward, which stops the relay
+            /// hearing repeated multicast copies of it; without that half,
+            /// nothing else bounds how often the G-RREP re-fires.
+            std::set<Ipv6Address> gratuitousRrepSent;
             /// The RREQ-InstanceID this RREP-Instance is paired with (RFC
             /// 9854 section 6.3.3). The RREP-Instance's own RPLInstanceID
             /// is this plus the RREP option's Delta; both ends need the
@@ -2758,6 +2766,18 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     /// DODAG's Imin is chosen for steady-state upkeep instead.
     Time m_aodvDioIntervalMin;
     uint8_t m_aodvDioIntervalDoublings; //!< doublings for the RREQ-DIO Trickle timer
+    /// Redundancy constant k for RREQ-/RREP-DIOs, or -1 to inherit the base
+    /// DODAG's DioRedundancy the way a local Instance otherwise would.
+    /// @see the AodvDioRedundancy attribute.
+    int16_t m_aodvDioRedundancy{-1};
+    /// Reset the RREQ-/RREP-Instance Trickle timer only on a rank
+    /// improvement, the way RFC 6997 section 9.2 has P2P-RPL do it, instead
+    /// of on any preferred-parent or rank change.
+    /// @see the AodvTrickleRankOnlyReset attribute.
+    bool m_aodvTrickleRankOnlyReset{false};
+    /// Send at most one Gratuitous RREP per (RREQ-Instance, target) from this
+    /// router. @see the AodvGratuitousRrepOnce attribute.
+    bool m_aodvGratuitousRrepOnce{false};
     uint8_t m_aodvRankLimit;   //!< RankLimit put on RREQ-DIOs, 0 meaning no limit
     uint8_t m_aodvLifetime;    //!< the 'L' field put on RREQ-DIOs, 0..3
     /// REJOIN_REENABLE (RFC 9854 section 2): how long after leaving an

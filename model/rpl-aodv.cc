@@ -183,6 +183,10 @@ RplRoutingProtocol::DiscoverRoute(Ipv6Address target, bool hopByHop)
     // far faster than the base DODAG's steady-state upkeep.
     dodag.dioIntervalMin = m_aodvDioIntervalMin;
     dodag.dioIntervalDoublings = m_aodvDioIntervalDoublings;
+    if (m_aodvDioRedundancy >= 0)
+    {
+        dodag.dioRedundancy = static_cast<uint8_t>(m_aodvDioRedundancy);
+    }
     dodag.dioTrickle.SetParameters(dodag.dioIntervalMin,
                                    dodag.dioIntervalDoublings,
                                    dodag.dioRedundancy);
@@ -799,7 +803,9 @@ RplRoutingProtocol::HandleAodvRreq(const RplDioHeader& dio, Ipv6Address from, ui
         auto cachedRoute = m_hopByHopRoutes.find(dodag.aodv.target);
         if (!dodag.aodv.isTarget && cachedRoute != m_hopByHopRoutes.end() &&
             cachedRoute->second.expire > Simulator::Now() &&
-            !RplSequenceNewer(dio.GetArt().destSeqNo, cachedRoute->second.seqNo))
+            !RplSequenceNewer(dio.GetArt().destSeqNo, cachedRoute->second.seqNo) &&
+            (!m_aodvGratuitousRrepOnce ||
+             dodag.aodv.gratuitousRrepSent.insert(dodag.aodv.target).second))
         {
             SendAodvGratuitousRrep(dodag,
                                    key,
@@ -1056,6 +1062,10 @@ RplRoutingProtocol::StartAodvRrepInstance(const DodagMembership& rreqDodag, Doda
     // RREP has to reach the OrigNode inside the same 'L' lifetime.
     rrepDodag.dioIntervalMin = m_aodvDioIntervalMin;
     rrepDodag.dioIntervalDoublings = m_aodvDioIntervalDoublings;
+    if (m_aodvDioRedundancy >= 0)
+    {
+        rrepDodag.dioRedundancy = static_cast<uint8_t>(m_aodvDioRedundancy);
+    }
     rrepDodag.dioTrickle.SetParameters(rrepDodag.dioIntervalMin,
                                        rrepDodag.dioIntervalDoublings,
                                        rrepDodag.dioRedundancy);

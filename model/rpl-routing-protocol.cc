@@ -17,6 +17,7 @@
 #include "ns3/icmpv6-header.h"
 #include "ns3/icmpv6-l4-protocol.h"
 #include "ns3/inet6-socket-address.h"
+#include "ns3/integer.h"
 #include "ns3/ipv6-extension.h"
 #include "ns3/ipv6-option-demux.h"
 #include "ns3/ipv6-option.h"
@@ -248,6 +249,41 @@ RplRoutingProtocol::GetTypeId()
                           UintegerValue(4),
                           MakeUintegerAccessor(&RplRoutingProtocol::m_aodvDioIntervalDoublings),
                           MakeUintegerChecker<uint8_t>())
+            .AddAttribute("AodvDioRedundancy",
+                          "Redundancy constant k of the Trickle timer pacing RREQ-/RREP-DIOs, "
+                          "or -1 to inherit DioRedundancy the way a local Instance otherwise "
+                          "does. RFC 9854 names no value of its own, so -1 is the default and "
+                          "preserves that inheritance; P2P-RPL, by contrast, has RFC 6997 "
+                          "section 9.2's recommended k=1 in P2pDioRedundancy. Provided because "
+                          "the inherited value governs how much of a discovery flood is "
+                          "suppressed and so dominates AODV-RPL's control cost, which is worth "
+                          "being able to vary independently of the base DODAG's own k.",
+                          IntegerValue(-1),
+                          MakeIntegerAccessor(&RplRoutingProtocol::m_aodvDioRedundancy),
+                          MakeIntegerChecker<int16_t>(-1, 255))
+            .AddAttribute("AodvTrickleRankOnlyReset",
+                          "Restart the RREQ-/RREP-Instance Trickle timer only when a DIO lets "
+                          "this router advertise a better rank, the way RFC 6997 section 9.2 "
+                          "has P2P-RPL treat its own temporary DAG, instead of on any "
+                          "preferred-parent or rank change as the generic RFC 6550 section 8.3 "
+                          "rule does. False by default, i.e. the generic rule, which is what "
+                          "RFC 9854 leaves AODV-RPL with: it defines no consistency rule of its "
+                          "own. Provided to separate the cost of the generic rule's extra "
+                          "Trickle restarts from AODV-RPL's other control-plane costs.",
+                          BooleanValue(false),
+                          MakeBooleanAccessor(&RplRoutingProtocol::m_aodvTrickleRankOnlyReset),
+                          MakeBooleanChecker())
+            .AddAttribute("AodvGratuitousRrepOnce",
+                          "Send at most one Gratuitous RREP per (RREQ-Instance, target) from a "
+                          "given router. RFC 9854 section 7 has a relay that takes the G-RREP "
+                          "shortcut then \"unicast[] the RREQ towards TargNode\", which is what "
+                          "stops it hearing the multicast RREQ-DIO again and re-firing; that "
+                          "half is not implemented here (@see rpl-aodv.cc's file header), so "
+                          "without this bound the G-RREP repeats once per Trickle interval for "
+                          "the instance's whole life. False by default, i.e. today's behaviour.",
+                          BooleanValue(false),
+                          MakeBooleanAccessor(&RplRoutingProtocol::m_aodvGratuitousRrepOnce),
+                          MakeBooleanChecker())
             .AddAttribute("AodvRankLimit",
                           "RankLimit advertised in RREQ-DIOs (RFC 9854 section 4.1): the upper "
                           "bound on DAGRank() a router may reach and still join the discovery, "
@@ -1733,7 +1769,11 @@ RplRoutingProtocol::HandleDio(const RplDioHeader& dio,
         }
     }
 
-    if (dio.HasP2pRdo())
+    // AodvTrickleRankOnlyReset borrows the same rules for an RREQ-/RREP-DIO,
+    // which RFC 9854 otherwise leaves on the generic rule below. Off by
+    // default; it exists so the cost of the generic rule's extra Trickle
+    // restarts can be measured on its own.
+    if (dio.HasP2pRdo() || (m_aodvTrickleRankOnlyReset && (dio.HasRreq() || dio.HasRrep())))
     {
         // RFC 6997 section 9.2's own Trickle consistency rules for a P2P
         // mode DIO, distinct from the generic rule below (shared by base
