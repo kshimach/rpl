@@ -2770,6 +2770,10 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     /// DODAG's DioRedundancy the way a local Instance otherwise would.
     /// @see the AodvDioRedundancy attribute.
     int16_t m_aodvDioRedundancy{-1};
+    /// DAGMaxRankIncrease for an RREQ-/RREP-Instance, or -1 to inherit the
+    /// base DODAG's the way a local Instance otherwise would.
+    /// @see the AodvMaxRankIncrease attribute.
+    int32_t m_aodvMaxRankIncrease{-1};
     /// Reset the RREQ-/RREP-Instance Trickle timer only on a rank
     /// improvement, the way RFC 6997 section 9.2 has P2P-RPL do it, instead
     /// of on any preferred-parent or rank change.

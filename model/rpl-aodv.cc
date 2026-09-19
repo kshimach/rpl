@@ -187,6 +187,10 @@ RplRoutingProtocol::DiscoverRoute(Ipv6Address target, bool hopByHop)
     {
         dodag.dioRedundancy = static_cast<uint8_t>(m_aodvDioRedundancy);
     }
+    if (m_aodvMaxRankIncrease >= 0)
+    {
+        dodag.maxRankIncrease = static_cast<uint16_t>(m_aodvMaxRankIncrease);
+    }
     dodag.dioTrickle.SetParameters(dodag.dioIntervalMin,
                                    dodag.dioIntervalDoublings,
                                    dodag.dioRedundancy);
@@ -1065,6 +1069,10 @@ RplRoutingProtocol::StartAodvRrepInstance(const DodagMembership& rreqDodag, Doda
     if (m_aodvDioRedundancy >= 0)
     {
         rrepDodag.dioRedundancy = static_cast<uint8_t>(m_aodvDioRedundancy);
+    }
+    if (m_aodvMaxRankIncrease >= 0)
+    {
+        rrepDodag.maxRankIncrease = static_cast<uint16_t>(m_aodvMaxRankIncrease);
     }
     rrepDodag.dioTrickle.SetParameters(rrepDodag.dioIntervalMin,
                                        rrepDodag.dioIntervalDoublings,

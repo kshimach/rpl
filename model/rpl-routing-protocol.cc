@@ -261,6 +261,20 @@ RplRoutingProtocol::GetTypeId()
                           IntegerValue(-1),
                           MakeIntegerAccessor(&RplRoutingProtocol::m_aodvDioRedundancy),
                           MakeIntegerChecker<int16_t>(-1, 255))
+            .AddAttribute("AodvMaxRankIncrease",
+                          "DAGMaxRankIncrease advertised by an RREQ-/RREP-Instance, or -1 to "
+                          "inherit MaxRankIncrease the way a local Instance otherwise does. "
+                          "0 disables local repair of the temporary DODAG, which is what RFC "
+                          "6997 section 6.1 makes P2P-RPL's Origin do (\"MUST set the "
+                          "MaxRankIncrease parameter to zero\", @see rpl-p2p.cc); RFC 9854 says "
+                          "nothing about it, so -1 is the default and AODV-RPL keeps the base "
+                          "DODAG's value -- RPL_MAX_RANKINC, i.e. eight Ranks of slack before "
+                          "the count-to-infinity guard poisons a router out. Provided because "
+                          "that slack lets a router stay in a discovery while re-parenting to "
+                          "steadily worse parents, which is the classic transient-loop regime.",
+                          IntegerValue(-1),
+                          MakeIntegerAccessor(&RplRoutingProtocol::m_aodvMaxRankIncrease),
+                          MakeIntegerChecker<int32_t>(-1, RPL_INFINITE_RANK))
             .AddAttribute("AodvTrickleRankOnlyReset",
                           "Restart the RREQ-/RREP-Instance Trickle timer only when a DIO lets "
                           "this router advertise a better rank, the way RFC 6997 section 9.2 "
