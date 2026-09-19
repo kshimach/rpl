@@ -3704,7 +3704,9 @@ G-RREP を実装するなら、この中継ノードだけ「多重化して flo
 
 **判断**: RFC 自体が MAY (完全に任意) としている最適化であり、
 届かなければ通常の RREQ flood がそのまま経路を見つける (正しさに
-影響しない、純粋な高速化)。かつ、このモジュールでは中継ノードが
+影響しない、純粋な高速化)。<!-- この「MAY」は G-RREP を送るか否かに
+かかる。G-RREP を送ると決めた後に続く MUST 群については §52.5 の
+訂正 (2026-09-19) を参照 -->かつ、このモジュールでは中継ノードが
 「別の discovery の OrigNode として、たまたま同じ target への経路を
 既に知っている」場合のみ発火する狭いケースで、効果も限定的。
 実装コストと得られる効果を天秤にかけ、見送った。地雷埋め (半端な
@@ -6064,9 +6066,35 @@ RFC本文はG-RREPを送るだけでなく、その中継ルータが「自分�
   一致しなければ無視」ガードは、2つの経路が異なるタイミング・
   異なるrankで届くケースを想定した設計になっておらず、
   意図しないpreferredParentの揺れを招く恐れがある。
-- **判断**: RFC自身が"MAY"の最適化として位置づけている部分であり、
-  実装コストと干渉リスクに見合う効果が無いと判断した。§35.13/
+- **判断**: 実装コストと干渉リスクに見合う効果が無いと判断した。§35.13/
   §48.8と同じ「地雷埋めより明記して除外」の方針を踏襲する。
+
+> **訂正 (2026-09-19)**: この項は当初「RFC自身が"MAY"の最適化として
+> 位置づけている部分であり」を判断の根拠に挙げていたが、**RFC原文の
+> 読み違いだった**。RFC 9854 §7 の "MAY" が支配するのは「そもそも
+> G-RREPを送るか否か」だけで、送ると決めた後は規範的な要求が続く —
+> 「After unicasting the G-RREP to the OrigNode, the intermediate router
+> then unicasts the RREQ towards TargNode」、および「For establishing
+> hop-by-hop routes, the intermediate router **MUST** unicast the received
+> RREQ-DIO to the Next Hop on the route. The Next Hop router along the
+> route **MUST** build new route entries ... Then, the TargNode and each
+> router along the path towards OrigNode **MUST** unicast the RREP-DIO
+> hop-by-hop towards OrigNode」。同文書 §48.8 側の記述 (「その中継ノードが
+> RREQ を TargNode へ unicast で転送する」…ところまでが規定に含まれる)
+> の方が正しく、本項と矛盾していた。
+>
+> したがって現状は「MAYの最適化を見送った」のではなく、**MAYを採りつつ
+> 対になるMUSTを実装していない**状態である。見送りの判断自体は維持するが、
+> 根拠は「RFCが任意としているから」ではなく「実装コストと干渉リスク」の
+> 一点のみになる。なお上に挙げた「干渉リスク」(同じRREQ-Instanceが2経路で
+> 届く) は、RFCの流れではそもそも生じない — MUST側はfloodを**置き換える**
+> ものであって、並走させるものではないからである。
+>
+> 実測された代償: G-RREPを出した中継はmulticastのRREQ-DIOを受け続けるため、
+> Trickle間隔ごとにG-RREPを撃ち直す。25ノードGridで応答方向のパケット1,040通
+> (1実行あたり) が**すべて**G-RREPで、真のRREPではなかった。AODV-RPLの制御
+> バイトの約11%にあたる。一度きりに制限する`AodvGratuitousRrepOnce`属性を
+> 計測用に用意してある (既定は現行動作)。
 
 ### 52.6 テスト
 

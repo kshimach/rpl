@@ -39,14 +39,26 @@
  * to reach TargNode and a real RREP to come all the way back
  * (SendAodvGratuitousRrep(), triggered from HandleAodvRreq()). Only
  * meaningful for H=1: an H=0 relay never caches anything to answer from.
- * Deliberately NOT implemented: section 7's own further optimization of
- * unicast-relaying the RREQ itself along the cached route hop by hop
- * (rather than continuing to rely on the ordinary multicast Trickle flood
- * that still, independently, reaches TargNode either way) -- correctness
- * does not depend on it, and it would risk confusing the preferred-parent
- * tracking downstream nodes already do for the multicast copy, by having
- * the same RREQ-Instance arrive over two different paths. @see
- * design-constraints.md.
+ * Deliberately NOT implemented: the rest of section 7, in which the relay
+ * that took the shortcut "then unicasts the RREQ towards TargNode" and, for
+ * hop-by-hop routes, "MUST unicast the received RREQ-DIO to the Next Hop on
+ * the route" while each Next Hop "MUST build new route entries". Note what
+ * the section's MAY does and does not cover: it governs whether to send a
+ * G-RREP at all, not whether to follow it with the unicast relaying -- so
+ * this is not an optional optimization left on the table but the MAY taken
+ * without its paired MUSTs. Correctness does not depend on it (the ordinary
+ * multicast Trickle flood still reaches TargNode independently), which is
+ * why it was left out, but there are two consequences worth naming. The
+ * preferred-parent confusion it was meant to avoid -- the same
+ * RREQ-Instance arriving over two different paths -- is a product of the
+ * partial implementation rather than a reason for it: in the RFC's own flow
+ * the unicast *replaces* the flood downstream of the relay. And because the
+ * relay keeps hearing the multicast RREQ-DIO, nothing stops it re-firing a
+ * G-RREP every Trickle interval: measured on a 25-node grid, all 1040
+ * reply-direction packets per run were G-RREPs and none were real RREPs,
+ * about 11% of AODV-RPL's control bytes. @see the AodvGratuitousRrepOnce
+ * attribute, which bounds that for measurement, and design-constraints.md
+ * section 52.5.
  */
 
 #include "rpl-conf.h"
