@@ -227,10 +227,39 @@ RplRoutingProtocol::ArmAodvExpiry(DodagMembership& dodag, DodagKey key)
         return;
     }
 
+    // RFC 9854 section 4.1: L is "the time duration that a node is able to
+    // belong to the RREQ-Instance", counted from when this node joined it --
+    // not a lease every DIO renews. Every caller is a join-or-accept path,
+    // so re-arming here would slide the deadline forward for as long as the
+    // flood kept arriving, which is exactly the "memory and network
+    // resources are likely to be consumed unnecessarily" the field exists to
+    // bound. The first caller sets the deadline; the rest leave it alone.
+    if (dodag.aodv.expiry.IsRunning())
+    {
+        return;
+    }
+
+    Time deadline = Seconds(seconds);
+
+    // Section 4.2: "The lifetime of the RREP-Instance SHOULD be no greater
+    // than the lifetime of the RREQ-Instance to which it is paired, so that
+    // the memory required to store the RREP-Instance can be reclaimed when
+    // no longer needed." The pair is this node's own membership under
+    // pairedInstanceId at the OrigNode's address -- both set before any
+    // caller reaches here. A node that never joined the RREQ-Instance has
+    // no pair to bound against and keeps its own L.
+    if (dodag.aodv.isRrepInstance && !dodag.aodv.origNode.IsAny())
+    {
+        auto paired = m_dodags.find(DodagKey{dodag.aodv.pairedInstanceId, dodag.aodv.origNode});
+        if (paired != m_dodags.end() && paired->second.aodv.expiry.IsRunning())
+        {
+            deadline = std::min(deadline, paired->second.aodv.expiry.GetDelayLeft());
+        }
+    }
+
     dodag.aodv.expiry.SetFunction(&RplRoutingProtocol::AodvInstanceExpired, this);
     dodag.aodv.expiry.SetArguments(key);
-    dodag.aodv.expiry.Cancel();
-    dodag.aodv.expiry.Schedule(Seconds(seconds));
+    dodag.aodv.expiry.Schedule(deadline);
 }
 
 void
