@@ -9468,3 +9468,51 @@ Branch0のノード群をOrigin、Branch1のノード群をTargetに固定的に
 &times; RngRun 1-3 (計378試行) を修正前後で比較: 修正前7件クラッシュ
 (全てAODV-RPL &times; Grid &times; H=1の組み合わせ、edgeSuccessRateや
 シナリオ番号によらない)、修正後は0件。
+
+### 52.6 AODV-RPL 一時インスタンスの既定値: 測定と見送りの記録 (2026-09-19)
+
+RFC 9854 は探索用の Trickle パラメータを一切定めず、&sect;8 で RFC 6550 &sect;8.3 に
+委ねる。その結果、AODV-RPL の一時インスタンス (RREQ-/RREP-Instance) は基盤
+DODAG 向けの値をそのまま継ぐ。対する P2P-RPL は RFC 6997 &sect;6.1/&sect;9.2 が探索
+専用の既定 (DIORedundancyConstant 1、MaxRankIncrease 0) を持ち、`rpl-p2p.cc`
+はそれに従っている。
+
+この差が実測でどれだけ効くかを確かめるために `AodvDioRedundancy` /
+`AodvMaxRankIncrease` / `AodvGratuitousRrepOnce` の3属性を用意し、既定として
+採用できるかを掃引した (`scratch/run-aodv-defaults-sweep.sh`、
+`scratch/analyze-aodv-defaults.py`)。
+
+**掃引の規模**: 25ノードGrid、リンク余裕 {6, 9} dB × 非対称 {対称, 受信ノード別
+&sigma;=6dB, root方向 6dB} の6動作点 × 応答2モード (対称ユニキャストRREP /
+`AodvForceAsymmetric` による RREP-Instance フラッディング) × 50シード。
+採用条件は「制御バイトが有意に減り、発見成功率・背景PDR・発見レイテンシの
+いずれも有意に悪化しない」を全セルで満たすこと。
+
+**結果と判断**:
+
+- `AodvDioRedundancy=1`: 全12セルで制御バイトが 240〜677 KB/実行 減り、品質指標の
+  悪化はゼロ。対 P2P-RPL の制御コスト比は 1.79〜2.74 倍から 0.99〜1.12 倍になる。
+  **それでも既定にしない** — 単体試験が2つの構造変化を捉えたため。(1) 抑制で
+  中継の DIO が途切れ、TargNode が RREQ-Instance の最後の親を失って脱落・再加入し、
+  RREP-Instance を二重に作る (これは下記のとおり別途修正した)。(2) RREP-Instance が
+  `L` フィールドで区切られるはずの寿命を越えて生き残る。期限は受理した DIO ごとに
+  再武装される既存設計なので、Trickle が遅くなった分だけ絶対時刻が後ろにずれる。
+  後者は既定値の選択ではなくプロトコル挙動の設計判断であり、別項目として残す。
+- `AodvMaxRankIncrease=0`: **逆効果**。k=1 と併用しても単体でも制御バイトが
+  111〜440 KB/実行 増える。局所修復を止めると、ランクが悪化したノードが
+  INFINITE_RANK を広告して抜ける — その毒出し自体が DIO であり、受け取った隣接の
+  Trickle を全部リセットするため。発見成功率・背景PDR は動かない。採用しない。
+- `AodvGratuitousRrepOnce=true`: 単独では**全12セルで制御バイトの減少が有意でない**
+  (信頼区間が0をまたぐ)。k を継承したまま (基盤 k=10、事実上まったく抑制されない)
+  だと、G-RREP を削った分だけ RREQ-DIO が増えて相殺される。k=1 と組み合わせたとき
+  だけ 14〜62 KB/実行 の上積みになる。単独では採用しない。
+
+**したがって3属性はいずれも既定値を変えていない。** 3属性は計測用に残し、既定は
+現行動作 (`-1` / `-1` / `false`) のままとする。ハーネス
+(`scratch/rpl-large-scale-system-test.cc`) は3属性を毎回明示設定するので、仮に
+将来既定を変えても既発表の数値はビット単位で再現する。
+
+**掃引が一度見落とした点**: 最初の1,800実行は `aodvForceAsymmetric=0` だけで、
+非対称 RREP 経路を一度も踏んでいなかった。k=1 の問題を先に捉えたのは掃引ではなく
+単体試験であり、その後で非対称モードの掃引 (1,800実行) を足している。系の KPI が
+全セルで改善していても、プロトコル構造の変化は見えないことがある。

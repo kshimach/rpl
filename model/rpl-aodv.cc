@@ -999,6 +999,27 @@ RplRoutingProtocol::StartAodvRrepInstance(const DodagMembership& rreqDodag, Doda
     uint8_t rankLimit = rreqDodag.aodv.rankLimit;
     uint8_t lifetimeField = rreqDodag.aodv.lifetimeField;
 
+    // One discovery gets one RREP-Instance from this TargNode. Nothing in
+    // RFC 9854 contemplates a second: section 6.4's "a router that already
+    // belongs to the RREP-Instance SHOULD drop the RREP-DIO" is the same
+    // rule seen from the relay's side, and aodv.rrepHandled applies it
+    // there. The TargNode needs its own guard because it can be asked
+    // twice -- it leaves the RREQ-Instance when it loses its last parent
+    // (two maximum DIO intervals of silence, @see SelectPreferredParent())
+    // and answers again on rejoining, which roots a second DODAG under a
+    // second Delta and floods it alongside the first. Any Trickle setting
+    // that quietens the relays makes that silence likelier, which is how
+    // this surfaced (AodvDioRedundancy=1), but the path does not depend on
+    // one.
+    DodagKey existing;
+    if (FindAodvRrepInstance(origNode, existing))
+    {
+        NS_LOG_LOGIC("Already rooting RREP-Instance "
+                     << +existing.instanceId << " at " << existing.dodagId << " towards OrigNode "
+                     << origNode << "; not rooting a second one");
+        return;
+    }
+
     // RFC 9854 section 6.3.3: the RREP-InstanceID is the RREQ-InstanceID
     // plus Delta, and "the RPLInstanceID of an already active RREP-Instance
     // MUST NOT be used again for assigning RPLInstanceID for the later

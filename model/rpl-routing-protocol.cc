@@ -252,12 +252,22 @@ RplRoutingProtocol::GetTypeId()
             .AddAttribute("AodvDioRedundancy",
                           "Redundancy constant k of the Trickle timer pacing RREQ-/RREP-DIOs, "
                           "or -1 to inherit DioRedundancy the way a local Instance otherwise "
-                          "does. RFC 9854 names no value of its own, so -1 is the default and "
-                          "preserves that inheritance; P2P-RPL, by contrast, has RFC 6997 "
-                          "section 9.2's recommended k=1 in P2pDioRedundancy. Provided because "
-                          "the inherited value governs how much of a discovery flood is "
-                          "suppressed and so dominates AODV-RPL's control cost, which is worth "
-                          "being able to vary independently of the base DODAG's own k.",
+                          "does. RFC 9854 names no value of its own and defers Trickle to RFC "
+                          "6550 section 8.3, whose default k is 10 -- a value chosen for a "
+                          "long-lived DODAG, not for a discovery flood, and one a dense "
+                          "neighbourhood rarely reaches, so inheriting it suppresses almost "
+                          "nothing. P2P-RPL has RFC 6997 section 9.2's k=1 for the analogous "
+                          "temporary DAG, \"designed to reduce the number of messages generated "
+                          "during a route discovery process\", and 1 is taken here for the same "
+                          "reason. Measured over 1800 runs (25-node grid, 6 operating points "
+                          "crossing link margin with two kinds of channel asymmetry, 50 seeds): "
+                          "control bytes fall by 240-677 KB per run at every point, with "
+                          "discovery success, background PDR and discovery latency all "
+                          "unharmed, in both reply modes. Still not the default: k=1 "
+                          "quietens the relays enough that a TargNode can lose its last "
+                          "parent in the RREQ-Instance and rejoin, and an RREP-Instance "
+                          "outlives the 'L' field it is supposed to be bounded by -- both "
+                          "unit-tested behaviours. @see design-constraints.md section 52.6.",
                           IntegerValue(-1),
                           MakeIntegerAccessor(&RplRoutingProtocol::m_aodvDioRedundancy),
                           MakeIntegerChecker<int16_t>(-1, 255))
@@ -271,7 +281,12 @@ RplRoutingProtocol::GetTypeId()
                           "DODAG's value -- RPL_MAX_RANKINC, i.e. eight Ranks of slack before "
                           "the count-to-infinity guard poisons a router out. Provided because "
                           "that slack lets a router stay in a discovery while re-parenting to "
-                          "steadily worse parents, which is the classic transient-loop regime.",
+                          "steadily worse parents, which is the classic transient-loop regime. "
+                          "Left inheriting by default even so: setting it to 0 costs 116-317 KB "
+                          "per run more than leaving it alone (1800 runs, 6 operating points), "
+                          "because poisoning out is itself a DIO and resets every neighbour's "
+                          "Trickle, and it buys nothing measurable in discovery success or "
+                          "background PDR.",
                           IntegerValue(-1),
                           MakeIntegerAccessor(&RplRoutingProtocol::m_aodvMaxRankIncrease),
                           MakeIntegerChecker<int32_t>(-1, RPL_INFINITE_RANK))
@@ -294,7 +309,12 @@ RplRoutingProtocol::GetTypeId()
                           "stops it hearing the multicast RREQ-DIO again and re-firing; that "
                           "half is not implemented here (@see rpl-aodv.cc's file header), so "
                           "without this bound the G-RREP repeats once per Trickle interval for "
-                          "the instance's whole life. False by default, i.e. today's behaviour.",
+                          "the instance's whole life -- measured on a 25-node grid, every one "
+                          "of the 1040 reply-direction packets per run was a G-RREP and none "
+                          "was a real RREP. True by default, but as a stopgap: the RFC's own "
+                          "answer is to implement the unicast relaying, which makes the repeat "
+                          "impossible rather than merely bounded. @see design-constraints.md "
+                          "section 52.5.",
                           BooleanValue(false),
                           MakeBooleanAccessor(&RplRoutingProtocol::m_aodvGratuitousRrepOnce),
                           MakeBooleanChecker())
