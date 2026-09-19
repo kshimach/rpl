@@ -263,12 +263,10 @@ RplRoutingProtocol::GetTypeId()
                           "crossing link margin with two kinds of channel asymmetry, 50 seeds): "
                           "control bytes fall by 240-677 KB per run at every point, with "
                           "discovery success, background PDR and discovery latency all "
-                          "unharmed, in both reply modes. Still not the default: k=1 "
-                          "quietens the relays enough that a TargNode can lose its last "
-                          "parent in the RREQ-Instance and rejoin, and an RREP-Instance "
-                          "outlives the 'L' field it is supposed to be bounded by -- both "
-                          "unit-tested behaviours. @see design-constraints.md section 52.6.",
-                          IntegerValue(-1),
+                          "unharmed, in both reply modes, which takes AODV-RPL from 1.5-2.0x "
+                          "P2P-RPL's control cost to 0.86-0.90x. @see design-constraints.md "
+                          "section 52.6. -1 restores the inheritance.",
+                          IntegerValue(1),
                           MakeIntegerAccessor(&RplRoutingProtocol::m_aodvDioRedundancy),
                           MakeIntegerChecker<int16_t>(-1, 255))
             .AddAttribute("AodvMaxRankIncrease",
@@ -314,8 +312,10 @@ RplRoutingProtocol::GetTypeId()
                           "was a real RREP. True by default, but as a stopgap: the RFC's own "
                           "answer is to implement the unicast relaying, which makes the repeat "
                           "impossible rather than merely bounded. @see design-constraints.md "
-                          "section 52.5.",
-                          BooleanValue(false),
+                          "sections 52.5 and 52.6: on its own it saves nothing measurable, "
+                          "but alongside AodvDioRedundancy=1 it is worth a further 31-62 KB "
+                          "per run at every operating point tested.",
+                          BooleanValue(true),
                           MakeBooleanAccessor(&RplRoutingProtocol::m_aodvGratuitousRrepOnce),
                           MakeBooleanChecker())
             .AddAttribute("AodvRankLimit",

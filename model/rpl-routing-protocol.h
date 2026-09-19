@@ -2769,7 +2769,7 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     /// Redundancy constant k for RREQ-/RREP-DIOs, or -1 to inherit the base
     /// DODAG's DioRedundancy the way a local Instance otherwise would.
     /// @see the AodvDioRedundancy attribute.
-    int16_t m_aodvDioRedundancy{-1};
+    int16_t m_aodvDioRedundancy{1};
     /// DAGMaxRankIncrease for an RREQ-/RREP-Instance, or -1 to inherit the
     /// base DODAG's the way a local Instance otherwise would.
     /// @see the AodvMaxRankIncrease attribute.
@@ -2781,7 +2781,7 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     bool m_aodvTrickleRankOnlyReset{false};
     /// Send at most one Gratuitous RREP per (RREQ-Instance, target) from this
     /// router. @see the AodvGratuitousRrepOnce attribute.
-    bool m_aodvGratuitousRrepOnce{false};
+    bool m_aodvGratuitousRrepOnce{true};
     uint8_t m_aodvRankLimit;   //!< RankLimit put on RREQ-DIOs, 0 meaning no limit
     uint8_t m_aodvLifetime;    //!< the 'L' field put on RREQ-DIOs, 0..3
     /// REJOIN_REENABLE (RFC 9854 section 2): how long after leaving an
