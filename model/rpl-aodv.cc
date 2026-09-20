@@ -39,20 +39,29 @@
  * to reach TargNode and a real RREP to come all the way back
  * (SendAodvGratuitousRrep(), triggered from HandleAodvRreq()). Only
  * meaningful for H=1: an H=0 relay never caches anything to answer from.
- * Section 7 is gated on a MAY, and this module declines it by default
- * (AodvGratuitousRrep, false): measured over six operating points and 50
- * seeds, not taking the shortcut saves 15-24 KB of control traffic per run
- * everywhere with no cost in discovery success, background PDR or latency.
- * Both halves are implemented for anyone who wants them -- the G-RREP itself,
- * and the unicast relaying section 7 pairs it with, which a router that sends
- * a G-RREP MUST do (AodvGratuitousRrepRelay). Taking the shortcut properly
- * measures worse than declining it: no control saving anywhere, and real
- * losses in latency and discovery success at some points, because a relay
- * that has handed the RREQ to a cached route and gone quiet loses whatever
- * the flood would have found if that route is stale. Source routing is out of
- * scope either way -- section 7 bounds it with further MUSTs about the
- * Address Vector, and an H=0 relay caches nothing to answer from to begin
- * with. @see design-constraints.md section 52.5.
+ * Both halves of section 7 are implemented: the G-RREP itself, and the
+ * unicast relaying a router that has sent one MUST perform
+ * (AodvGratuitousRrepRelay). The relaying is not optional once the shortcut
+ * is taken, which is why it is here -- taking the MAY without it, as this
+ * module used to, is simply wrong.
+ *
+ * The shortcut is nonetheless declined by default (AodvGratuitousRrep,
+ * false), which section 7's MAY permits. That is a configuration choice from
+ * one measurement, not a judgement on the mechanism: over a 25-node grid on
+ * 802.15.4 at six operating points and 50 seeds, where a discovery settles
+ * inside a second, declining saves 15-24 KB of control traffic per run
+ * everywhere with no cost in discovery success, background PDR or latency,
+ * while taking it with the relaying on saves nothing measurable and loses
+ * latency and discovery success at some points -- a relay that has handed the
+ * RREQ to a cached route and gone quiet loses whatever the flood would have
+ * found if that route is stale. Expect the balance to move where a discovery
+ * runs long enough for the head start to matter, where the flood is dear
+ * because the network is large, or where cached routes are stable; none of
+ * those is what was measured here.
+ *
+ * Source routing is out of scope either way -- section 7 bounds it with
+ * further MUSTs about the Address Vector, and an H=0 relay caches nothing to
+ * answer from to begin with. @see design-constraints.md section 52.5.
  */
 
 #include "rpl-conf.h"

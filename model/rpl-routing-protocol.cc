@@ -306,12 +306,16 @@ RplRoutingProtocol::GetTypeId()
                           "unicast a Gratuitous RREP-DIO\" -- so declining it is as conformant "
                           "as taking it, and cheaper than taking it properly: the MUSTs that "
                           "follow (@see AodvGratuitousRrepRelay) only bind a router that has "
-                          "sent one. False by default, on measurement: declining the shortcut "
-                          "saves 15-24 KB of control traffic per run at every operating point "
-                          "tested (6 points x 50 seeds) with no cost in discovery success, "
-                          "background PDR or latency, while taking it properly (relay on) saves "
-                          "nothing measurable and costs latency. @see design-constraints.md "
-                          "section 52.5.",
+                          "sent one, and this module implements that too. False by default on "
+                          "one measurement, not as a judgement on the mechanism: over a 25-node "
+                          "grid on 802.15.4 at six operating points and 50 seeds, where a "
+                          "discovery settles inside a second, declining saves 15-24 KB per run "
+                          "everywhere at no cost, while taking it with the relaying on saves "
+                          "nothing measurable and loses latency and discovery success at some "
+                          "points. Expect a different answer where a discovery runs long enough "
+                          "for the head start to pay, where the flood is dear because the "
+                          "network is large, or where cached routes are stable. @see "
+                          "design-constraints.md section 52.5.",
                           BooleanValue(false),
                           MakeBooleanAccessor(&RplRoutingProtocol::m_aodvGratuitousRrep),
                           MakeBooleanChecker())
