@@ -13042,6 +13042,168 @@ RplP2pFloodTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief A P2P-DRO carrying 'S' stops the routers it passes sending any
+ *        more P2P mode DIOs for that temporary DAG.
+ *
+ * RFC 6997 section 9.1: "After receiving a P2P-DRO with the Stop flag set to
+ * one, a router SHOULD NOT send or process any more DIOs for this temporary
+ * DAG and SHOULD also cancel any pending DIO transmissions."
+ *
+ * The same four-node line RplP2pFloodTestCase uses:
+ *
+ *     orig(0) ---- relay1(1) ---- relay2(2) ---- targ(3)
+ *
+ * The Target is the only one, so its P2P-DRO carries 'S' (section 9.5), and
+ * it travels back along the route the flood built. Node 3's monitor hears
+ * relay2, which is both on that route and still well inside its own 'L' when
+ * the P2P-DRO passes: DIOs from it before the reply, none after.
+ *
+ * The "no DIOs after" half is what the send side buys. Refusing to process
+ * further DIOs, on its own, has the opposite effect -- a router that discards
+ * every P2P mode DIO it hears never counts a consistent one, so Trickle never
+ * suppresses and it transmits at Imax for the rest of 'L'.
+ */
+class RplP2pStopSilencesDiosTestCase : public TestCase
+{
+  public:
+    RplP2pStopSilencesDiosTestCase();
+
+  private:
+    void DoRun() override;
+
+    /// @brief Count a P2P mode DIO seen at the monitor.
+    /// @param socket the monitoring socket
+    void CountP2pDio(Ptr<Socket> socket);
+
+    uint32_t m_dioCount{0}; //!< P2P mode DIOs seen at the monitor
+};
+
+RplP2pStopSilencesDiosTestCase::RplP2pStopSilencesDiosTestCase()
+    : TestCase("A P2P-DRO carrying 'S' stops the DIOs of the routers it passes")
+{
+}
+
+void
+RplP2pStopSilencesDiosTestCase::CountP2pDio(Ptr<Socket> socket)
+{
+    Address sender;
+    Ptr<Packet> packet = socket->RecvFrom(sender);
+    if (!packet)
+    {
+        return;
+    }
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ipv6Header);
+    Icmpv6Header icmpv6Header;
+    packet->RemoveHeader(icmpv6Header);
+    if (icmpv6Header.GetType() != ICMPV6_RPL || icmpv6Header.GetCode() != RPL_CODE_DIO)
+    {
+        return;
+    }
+    RplDioHeader dio;
+    packet->RemoveHeader(dio);
+    if (dio.HasP2pRdo())
+    {
+        m_dioCount++;
+    }
+}
+
+void
+RplP2pStopSilencesDiosTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(4); // 0 = Origin and base root, 1 and 2 = relays, 3 = Target
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    auto blacklist = [&](uint32_t a, uint32_t b) {
+        Ptr<SimpleNetDevice> devA = DynamicCast<SimpleNetDevice>(devices.Get(a));
+        Ptr<SimpleNetDevice> devB = DynamicCast<SimpleNetDevice>(devices.Get(b));
+        channel->BlackList(devA, devB);
+        channel->BlackList(devB, devA);
+    };
+    blacklist(0, 2);
+    blacklist(0, 3);
+    blacklist(1, 3);
+
+    RplHelper rplHelper;
+    // 'L' = 3 is section 7's 64-second encoding, so the quiet window below
+    // is one this membership would otherwise have spent transmitting: the
+    // count has to be zero because of the Stop flag, not because the
+    // temporary DAG had already retired. Redundancy 0 removes the other
+    // way a DIO can fail to appear -- Trickle suppressing it behind a
+    // neighbour's.
+    rplHelper.Set("P2pLifetime", UintegerValue(3));
+    rplHelper.Set("P2pDioRedundancy", UintegerValue(0));
+    rplHelper.Set("P2pDioIntervalDoublings", UintegerValue(0));
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(250));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> orig = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> relay2 = nodes.Get(2)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> targ = nodes.Get(3)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(targ->IsJoined(), true, "The base DODAG did not reach the far end");
+
+    // The Target's own node hears relay2 and nobody else, so every P2P mode
+    // DIO counted here is one relay2 sent.
+    Ptr<Socket> monitor = Socket::CreateSocket(nodes.Get(3), Ipv6RawSocketFactory::GetTypeId());
+    monitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    monitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    monitor->BindToNetDevice(nodes.Get(3)->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+    monitor->SetRecvCallback(MakeCallback(&RplP2pStopSilencesDiosTestCase::CountP2pDio, this));
+
+    RplRoutingProtocol::DodagKey key = orig->DiscoverP2pRoute(targ->GetGlobalAddress());
+    NS_TEST_ASSERT_MSG_NE(key.dodagId, Ipv6Address::GetAny(), "The discovery did not start");
+
+    // Long enough for the flood to reach the Target and its P2P-DRO to get
+    // back past relay2, three hops each way at a 64 ms Trickle interval.
+    Simulator::Stop(Seconds(5));
+    Simulator::Run();
+
+    std::vector<Ipv6Address> hops;
+    NS_TEST_ASSERT_MSG_GT(m_dioCount, 0, "relay2 never sent a P2P mode DIO at all");
+    NS_TEST_ASSERT_MSG_EQ(orig->GetP2pRoute(targ->GetGlobalAddress(), hops),
+                          true,
+                          "The discovery never completed, so no P2P-DRO carried 'S' anywhere");
+    NS_TEST_ASSERT_MSG_EQ(relay2->IsJoinedTo(key.instanceId, key.dodagId),
+                          true,
+                          "relay2 left the temporary DAG early; 'L' = 64 s has not elapsed");
+
+    uint32_t before = m_dioCount;
+    Simulator::Stop(Seconds(20));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(m_dioCount - before,
+                          0,
+                          "relay2 sent " << m_dioCount - before
+                                         << " more P2P mode DIO(s) after relaying a P2P-DRO with "
+                                            "'S' set; RFC 6997 section 9.1 says it should have "
+                                            "cancelled them");
+
+    monitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief A P2P mode DIO is only joined if the router's own resulting
  *        DAGRank would stay within the MaxRank, relaxed by one step for the
  *        Target, mirroring AODV-RPL's own RankLimit boundary test.
@@ -16904,8 +17066,16 @@ RplP2pRelayRouteDiversityTestCase::DoRun()
     // rather than falling silent behind its neighbours. The assertion below
     // then requires 20 observations before it draws any conclusion, which
     // puts a false failure at 2^-19.
+    //
+    // The draws all have to land inside the collection window above, because
+    // the batch that closes it is a P2P-DRO carrying 'S' and node 3 relays
+    // it -- RFC 6997 section 9.1 then has node 3 stop sending DIOs for this
+    // temporary DAG, which is the point of RplP2pStopSilencesDiosTestCase.
+    // Holding the Trickle interval at Imin (no doublings) fits some 45 draws
+    // into those three seconds; letting it double fits six.
     rplHelper.Set("P2pLifetime", UintegerValue(3));
     rplHelper.Set("P2pDioRedundancy", UintegerValue(0));
+    rplHelper.Set("P2pDioIntervalDoublings", UintegerValue(0));
     InternetStackHelper internetv6;
     internetv6.SetRoutingHelper(rplHelper);
     internetv6.Install(m_nodes);
@@ -23353,6 +23523,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplP2pRoutesInPrintedTablesTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pDiscoverRouteTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pFloodTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pStopSilencesDiosTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pMaxRankTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pTrickleRuleSuppressionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pDroGeneratedTestCase, TestCase::Duration::QUICK);

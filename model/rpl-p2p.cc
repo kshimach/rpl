@@ -189,6 +189,31 @@ RplRoutingProtocol::P2pInstanceExpired(DodagKey key)
     LeaveDodag(key, false);
 }
 
+void
+RplRoutingProtocol::RecordP2pStop(DodagMembership& dodag, bool stop)
+{
+    if (!stop || dodag.p2p.stopped)
+    {
+        return;
+    }
+
+    NS_LOG_INFO("A P2P-DRO carrying 'S' ends this router's part in temporary DAG "
+                << dodag.dodagId);
+
+    // RFC 6997 section 9.1: "a router SHOULD NOT send or process any more
+    // DIOs for this temporary DAG and SHOULD also cancel any pending DIO
+    // transmissions". The flag is the "process" half, read by
+    // ShouldRefuseP2pRdo(); Stop() is the other two, since RplTrickleTimer
+    // cancels its pending transmission when it stops.
+    //
+    // The two halves have to travel together. On its own the flag makes this
+    // router refuse every P2P mode DIO it hears, so Trickle never counts a
+    // consistent one, never suppresses, and transmits at Imax for whatever
+    // is left of 'L' -- louder after the discovery finished than during it.
+    dodag.p2p.stopped = true;
+    dodag.dioTrickle.Stop();
+}
+
 bool
 RplRoutingProtocol::MatchesP2pTarget(const RplDioHeader& dio) const
 {
@@ -271,10 +296,9 @@ RplRoutingProtocol::ShouldRefuseP2pRdo(const RplDioHeader& dio, Ipv6Address from
         return true;
     }
 
-    // RFC 6997 sections 8/9.6/9.7: once a P2P-DRO with 'S' = 1 has been seen
-    // for this temporary DAG, "SHOULD NOT...process any more DIOs" for it --
-    // @see DodagMembership::P2pState::stopped's own comment for the other
-    // half (not generating any more).
+    // RFC 6997 sections 8/9.1/9.6/9.7: once a P2P-DRO with 'S' = 1 has been
+    // seen for this temporary DAG, "SHOULD NOT...process any more DIOs" for
+    // it -- @see RecordP2pStop() for the other half (not sending any more).
     auto existing = m_dodags.find(key);
     if (existing != m_dodags.end() && existing->second.p2p.stopped)
     {
@@ -1289,19 +1313,9 @@ RplRoutingProtocol::HandleP2pDro(const RplP2pDroHeader& dro, Ipv6Address from, u
 
         // RFC 6997 section 9.7: "If the Stop flag...is set to one, the
         // Origin SHOULD NOT generate any more DIOs for this temporary DAG
-        // and SHOULD cancel any pending DIO transmissions." Only the
-        // "SHOULD NOT...generate" half is implemented, via
-        // ShouldRefuseP2pRdo()'s own stopped check refusing this node's own
-        // rejoin/reprocessing path -- not dioTrickle.Stop() itself. Calling
-        // that here was tried and reverted: it silences this node's DIOs
-        // for the temporary DAG immediately, but a downstream router whose
-        // preferredParent is this node is still an ordinary DodagMembership
-        // as far as the generic staleness sweep in SelectPreferredParent()
-        // is concerned, and going silent reads to it as "parent died", not
-        // "discovery is over" -- it loses its last parent and poisons
-        // itself out within a few Trickle intervals, well before its own
-        // 'L' deadline. @see design-constraints.md.
-        dodag.p2p.stopped = dodag.p2p.stopped || dro.GetStop();
+        // and SHOULD cancel any pending DIO transmissions." Both halves,
+        // @see RecordP2pStop().
+        RecordP2pStop(dodag, dro.GetStop());
         return;
     }
 
@@ -1323,10 +1337,12 @@ RplRoutingProtocol::HandleP2pDro(const RplP2pDroHeader& dro, Ipv6Address from, u
         // carried inside a P2P-RDO". Recording it before returning is what
         // lets ShouldRefuseP2pRdo() apply that MUST to a router the route
         // happens not to pass through; returning first left the flag working
-        // only for the handful of routers on the route.
-        dodag.p2p.stopped = dodag.p2p.stopped || dro.GetStop();
+        // only for the handful of routers on the route. Section 9.1's other
+        // half, the one that stops this router's own DIOs, binds the same
+        // audience and is applied from the same place (@see RecordP2pStop()).
+        RecordP2pStop(dodag, dro.GetStop());
         NS_LOG_LOGIC("Not named at the current NH position, ignoring this P2P-DRO"
-                     << (dro.GetStop() ? " (its Stop flag is recorded all the same)" : ""));
+                     << (dro.GetStop() ? " (its Stop flag is acted on all the same)" : ""));
         return;
     }
 
@@ -1394,12 +1410,11 @@ RplRoutingProtocol::HandleP2pDro(const RplP2pDroHeader& dro, Ipv6Address from, u
     NS_LOG_INFO("Relaying a P2P-DRO for " << rdo.target << " onward, NH now "
                                           << +relayedRdo.maxRankOrNh);
 
-    // RFC 6997 section 9.6: same Stop handling as the Origin branch above
-    // (@see its own comment for why dioTrickle.Stop() is deliberately not
-    // called here), after relaying rather than before -- relaying this
-    // P2P-DRO is unaffected by its own Stop flag, the same "P2P-DRO
-    // processing continues regardless" rule.
-    dodag.p2p.stopped = dodag.p2p.stopped || dro.GetStop();
+    // RFC 6997 section 9.6: same Stop handling as the Origin branch above,
+    // after relaying rather than before -- relaying this P2P-DRO is
+    // unaffected by its own Stop flag, the same "P2P-DRO processing
+    // continues regardless" rule. Only DIOs stop.
+    RecordP2pStop(dodag, dro.GetStop());
 }
 
 void

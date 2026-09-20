@@ -1189,22 +1189,26 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
             uint8_t numRoutes{0};
             bool reply{true};         //!< 'R': whether the Target should send a P2P-DRO back
             bool hopByHop{false};     //!< 'H': false for a Source Route, true for a Hop-by-hop Route
-            /// RFC 6997 sections 8/9.6/9.7: set once a P2P-DRO with 'S' = 1
-            /// has been seen for this temporary DAG. ShouldRefuseP2pRdo()
-            /// refuses every further P2P mode DIO once this is true -- the
-            /// "SHOULD NOT...process any more DIOs" half only.
-            /// dioTrickle.Stop() (the "SHOULD NOT generate any more
-            /// DIOs...cancel any pending transmissions" half) is
-            /// deliberately not called: it was tried and reverted, because
-            /// it silences this node immediately, and a downstream router
-            /// whose preferredParent is this node is still an ordinary
-            /// DodagMembership as far as the generic staleness sweep in
-            /// SelectPreferredParent() is concerned -- going silent reads
-            /// to it as "parent died", not "discovery is over", so it loses
-            /// its last parent and poisons itself out well before its own
-            /// 'L' deadline. This node's own Trickle is instead left to
-            /// wind down naturally and the temporary DAG to retire on 'L'
-            /// like any other, the same as every other P2P-RPL membership.
+            /// RFC 6997 sections 8/9.1/9.6/9.7: set once a P2P-DRO with
+            /// 'S' = 1 has been seen for this temporary DAG, by
+            /// RecordP2pStop(), which also stops dioTrickle. This flag is
+            /// the "SHOULD NOT...process any more DIOs" half, read by
+            /// ShouldRefuseP2pRdo(); the Trickle stop is the "SHOULD NOT
+            /// send...and SHOULD also cancel any pending DIO
+            /// transmissions" half.
+            ///
+            /// The send half was tried once before and reverted, because
+            /// silencing this node read to a downstream router -- whose
+            /// preferredParent is this node -- as "parent died" rather than
+            /// "discovery is over", through the generic staleness sweep in
+            /// SelectPreferredParent(); it lost its last parent and poisoned
+            /// itself out well before its own 'L' deadline. That sweep no
+            /// longer runs for a temporary instance, so the objection is
+            /// gone, and leaving the half out had a measured cost: a router
+            /// that refuses incoming DIOs never registers a consistent one,
+            /// so Trickle never suppresses and it transmits at Imax until
+            /// 'L'. @see design-constraints.md.
+            ///
             /// P2P-DRO processing itself is unaffected either way, per the
             /// RFC's own "MUST continue to process the P2P-DRO messages"
             /// even after Stop.
@@ -1523,6 +1527,29 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      * @return true if the DIO must be dropped without joining
      */
     bool ShouldRefuseP2pRdo(const RplDioHeader& dio, Ipv6Address from) const;
+
+    /**
+     * @brief Apply a P2P-DRO's Stop flag to a temporary DAG membership.
+     *
+     * RFC 6997 section 9.1: "After receiving a P2P-DRO with the Stop flag
+     * set to one, a router SHOULD NOT send or process any more DIOs for this
+     * temporary DAG and SHOULD also cancel any pending DIO transmissions."
+     * Two obligations, and both belong to the same moment, so both are
+     * discharged here: the flag that ShouldRefuseP2pRdo() reads for the
+     * "process" half, and dioTrickle.Stop() for the "send" half and the
+     * pending transmission it cancels with it.
+     *
+     * Called from all three of HandleP2pDro()'s branches -- the Origin, the
+     * router named at the current NH position, and a router the route does
+     * not pass through at all, which section 8 binds just the same ("All the
+     * routers receiving such a P2P-DRO, including those not listed in the
+     * route carried inside a P2P-RDO"). Relaying the P2P-DRO itself is
+     * untouched by any of this; only DIOs are.
+     *
+     * @param dodag the temporary DAG membership the P2P-DRO names
+     * @param stop the P2P-DRO's Stop flag
+     */
+    void RecordP2pStop(DodagMembership& dodag, bool stop);
 
     /**
      * @brief Whether this node is (one of) the Target(s) a P2P mode DIO
