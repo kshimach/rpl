@@ -1266,25 +1266,20 @@ RplRoutingProtocol::HandleP2pDro(const RplP2pDroHeader& dro, Ipv6Address from, u
     if (rdo.maxRankOrNh == 0 || rdo.maxRankOrNh > rdo.addressVector.size() ||
         !IsOwnAddress(rdo.addressVector[rdo.maxRankOrNh - 1]))
     {
-        // NOT recorded here, although RFC 6997 section 9.3 says it should
-        // be: "A router MUST discard a received P2P mode DIO with no further
-        // processing ... if the router previously received a P2P-DRO message
-        // with the same RPLInstanceID and DODAGID as the received DIO and
-        // with the Stop flag set to one", and section 8 puts it beyond doubt
-        // that this binds every listener, "All the routers receiving such a
-        // P2P-DRO, including those not listed in the route carried inside a
-        // P2P-RDO". So today the Stop flag only reaches the handful of
-        // routers the route passes through, which is a real gap.
-        //
-        // Setting dodag.p2p.stopped here was tried and reverted: it makes
-        // RplP2pFloodTestCase fail with the flood never reaching past the
-        // first hop, by a route this analysis has not yet pinned down --
-        // the flood plainly does complete in the logs, so the interaction is
-        // with what the membership looks like afterwards rather than with
-        // propagation itself. Left out until that is understood; shipping a
-        // conformance fix whose side effect is not explained would trade one
-        // unexamined behaviour for another.
-        NS_LOG_LOGIC("Not named at the current NH position, ignoring this P2P-DRO");
+        // Not this router's turn to relay -- but the Stop flag still binds
+        // it. RFC 6997 section 9.3: "A router MUST discard a received P2P
+        // mode DIO with no further processing ... if the router previously
+        // received a P2P-DRO message with the same RPLInstanceID and DODAGID
+        // as the received DIO and with the Stop flag set to one", and
+        // section 8 puts the audience beyond doubt -- "All the routers
+        // receiving such a P2P-DRO, including those not listed in the route
+        // carried inside a P2P-RDO". Recording it before returning is what
+        // lets ShouldRefuseP2pRdo() apply that MUST to a router the route
+        // happens not to pass through; returning first left the flag working
+        // only for the handful of routers on the route.
+        dodag.p2p.stopped = dodag.p2p.stopped || dro.GetStop();
+        NS_LOG_LOGIC("Not named at the current NH position, ignoring this P2P-DRO"
+                     << (dro.GetStop() ? " (its Stop flag is recorded all the same)" : ""));
         return;
     }
 

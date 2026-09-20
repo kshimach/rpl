@@ -3732,11 +3732,27 @@ RplRoutingProtocol::SelectPreferredParent(DodagMembership& dodag)
 
     // Two maximum DIO intervals without a DIO is two missed announcements in a
     // row, which is taken as the neighbour being gone.
+    //
+    // Not applied to a temporary instance, where silence is the normal end
+    // of a discovery rather than a dead neighbour. Both protocols tell a
+    // router to stop transmitting once its work is done -- RFC 9854 section
+    // 6.2.2's "If the intersection is empty, it means that all the targets
+    // have been reached, and the router MUST NOT transmit any RREQ-DIO", and
+    // RFC 6997 section 9.5's "A Target MUST NOT forward a P2P mode DIO any
+    // further if no other Targets are to be discovered" -- so a router that
+    // obeys them reads, to this sweep, exactly like one that died. What
+    // followed was that its children dropped it, lost their last parent, and
+    // LeaveDodag() erased memberships mid-discovery; both protocols' own
+    // conformance fixes surfaced it from opposite directions. A temporary
+    // instance needs no staleness rule of its own because its lifetime is
+    // already bounded, by the 'L' field, which both ArmAodvExpiry() and
+    // ArmP2pExpiry() now count from joining.
+    bool temporary = dodag.mop == RPL_MOP_P2P_ROUTE_DISCOVERY;
     Time maxInterval = dodag.dioIntervalMin * (int64_t(1) << dodag.dioIntervalDoublings);
     Time staleBefore = Simulator::Now() - 2 * maxInterval;
     for (auto it = dodag.parents.begin(); it != dodag.parents.end();)
     {
-        if (it->second.lastHeard < staleBefore)
+        if (!temporary && it->second.lastHeard < staleBefore)
         {
             NS_LOG_LOGIC("Dropping the stale neighbour " << it->first);
             // Withdrawing has to happen here, before erase(), rather than

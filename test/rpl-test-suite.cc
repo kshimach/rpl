@@ -11909,14 +11909,27 @@ RplRootJoinsForeignRreqInstanceParentLossTestCase::DoRun()
                           true,
                           "Did not join the fabricated RREQ-Instance");
 
-    // Nothing more is ever sent from onlyNeighbour. Two full Trickle
-    // intervals is the staleness threshold SelectPreferredParent() itself
-    // uses (AodvDioIntervalMin/AodvDioIntervalDoublings default to 128ms/4,
-    // so Imax is ~2.048s); waiting well past that lets the root's own
-    // Trickle-fired re-evaluation of this membership find no parent left in
-    // it and take the "lost the last parent" path -- which is exactly what
-    // used to crash the whole process before a single assertion below could
-    // even run.
+    // Now take the parent away. Silence no longer does it: a temporary
+    // instance is exempt from SelectPreferredParent()'s staleness sweep,
+    // because both protocols require a router to stop transmitting once its
+    // work is done (RFC 9854 section 6.2.2, RFC 6997 section 9.5) and a
+    // sweep cannot tell that apart from a dead neighbour -- @see
+    // SelectPreferredParent() for the discoveries that collapsed mid-flight
+    // when it could not. The poisoning path is what remains and is what this
+    // test needs: RFC 6550 section 8.2.2.5 has an infinite rank poison the
+    // sub-DODAG, HandleDio() erases the advertiser from the parent set, and
+    // the root is left with no parent at all in this membership -- exactly
+    // the "lost the last parent" path that used to crash the whole process
+    // before a single assertion below could even run.
+    dio.SetRank(RPL_INFINITE_RANK);
+    Simulator::Schedule(Seconds(1),
+                        &DeliverRawRplMessage<RplDioHeader>,
+                        node,
+                        1,
+                        dio,
+                        static_cast<uint8_t>(RPL_CODE_DIO),
+                        onlyNeighbour,
+                        nodeLinkLocal);
     Simulator::Stop(Seconds(10));
     Simulator::Run();
 

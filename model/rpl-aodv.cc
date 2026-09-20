@@ -651,7 +651,20 @@ RplRoutingProtocol::HandleAodvRreq(const RplDioHeader& dio,
     {
         incomingTargets.push_back(art.target);
     }
-    if (dodag.aodv.addressVector.empty())
+    // "Is this the first RREQ-DIO this router has processed for the
+    // instance?" -- aodvAlreadyProcessed, computed above, is that question
+    // asked in a way that works for both forwarding modes. Testing
+    // addressVector.empty() directly, as this did, only works for H=0: RFC
+    // 9854 section 4.1 gives hop-by-hop mode no Address Vector at all, so
+    // under H=1 the vector is empty forever and every RREQ-DIO reseeded the
+    // record instead of intersecting with it. That breaks two of section
+    // 6.2.2's rules at once -- "the intersection of all received lists MUST
+    // be included", and "Those deleted nodes are not to be reinserted back
+    // into the list of destinations", since a TargNode that had erased its
+    // own address got it handed back on the next copy and answered again.
+    // The guard above already asks the same question the H=1-aware way; this
+    // was simply left behind when hop-by-hop support arrived.
+    if (!aodvAlreadyProcessed)
     {
         dodag.aodv.targets = incomingTargets;
     }
