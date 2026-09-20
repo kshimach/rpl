@@ -9771,3 +9771,83 @@ P2P-DRO messages」)。止まるのは DIO だけである。
   ルータでのみ問題になる。
 
 どちらも設計記録に項目として立っていない。正式に扱うならここが次の候補である。
+
+## 85. Trickle Imin の既定値を測って決めた — P2P-RPL 64ms → 128ms
+
+§84.8 の修正で P2P-RPL の制御バイトが半減した結果、Tier 2 の「出荷時設定では
+AODV-RPL の方が制御コストが安い」(0.69〜0.81倍) という所見が**両者の Imin 既定値の
+差だけで説明できる**ことが分かった。モジュール既定は P2P 64ms / AODV 128ms で、
+doublings はどちらも4なので Imax も 1.024秒 対 2.048秒 と2倍違う。
+
+### 85.1 両既定の来歴
+
+- **`P2pDioIntervalMin` = 64ms** — RFC 6997 §6.1 の推奨 default DODAG Configuration
+  Option (DIOIntervalMin 6) そのもの。RFC に紐付いている。
+- **`AodvDioIntervalMin` = 128ms** — RFC 9854 は Trickle パラメータを一切定めず
+  §8 で RFC 6550 §8.3 (基盤DODAG向け) に委ねる。**128 という数字の根拠は本設計記録
+  にも属性の doc にも無かった**。「`DioIntervalMin` より十分短く」としか書いていない。
+
+比較の主要な所見が、片方は RFC 由来・片方は根拠不明という既定値の差でできていた。
+
+### 85.2 掃引
+
+各プロトコルの Imin を 32/64/128/256/512 ms の5水準、6動作点 (リンク余裕 {6,9} dB
+× 非対称 {対称 / 受信ノード別 3dB / root方向 3dB})、50シード。3,000実行。
+判定規則は §52.6 と同じ — **制御バイトが有意に減り、発見成功率・背景PDR・発見
+レイテンシのいずれも有意に悪化しない**ことを全セルで満たす。
+
+`scratch/run-imin-sweep.sh` と `scratch/analyze-trickle-imin.py`。各プロトコルは
+**自分の現行既定とだけ**比較する (「どちらのプロトコルが勝つか」ではなく
+「この数字が正しいか」を問うため)。
+
+### 85.3 AODV-RPL: 128ms は据え置き — 実測が膝を示した
+
+- 32ms・64ms: 制御バイトが増えるだけ (+70〜+327 KB/実行)。品質指標に見返りなし
+- 256ms: 制御バイトは減る (&minus;30〜&minus;47 KB) が、**6動作点中4点でレイテンシが
+  有意に悪化** (+73〜+120 ms)
+- 512ms: 6点すべてでレイテンシ悪化 (+188〜+303 ms)
+
+128ms が転換点である。根拠の無い数字だったが、結果として正しかった。属性の doc に
+この掃引への参照を書き、数字が選ばれたものであることを明示した。
+
+### 85.4 P2P-RPL: 64ms → 128ms
+
+128ms と 256ms が**6動作点すべてで PASS** した。制御バイトは 128ms で
+&minus;55〜&minus;132 KB/実行、256ms で &minus;80〜&minus;178 KB/実行。発見成功率・
+背景PDR は悪化せず、**レイテンシはむしろ改善する**セルが多い (128ms で
+&minus;49〜&minus;149 ms)。32ms と 512ms は落ちる。
+
+**128ms を採り、256ms は採らない。** 理由は `L` に対する猶予である。doublings=4 の
+下で Imax は 128ms→2.048秒、256ms→4.096秒。P2P-RPL の `L` 既定は16秒なので、
+フラッディングが網を渡り切るまでに使える Trickle 間隔は前者で約8回、後者で約4回に
+なる。掃引は25ノード (最大8ホップ程度) で行っており、より深い網では間隔数が効く。
+AODV-RPL 側が 256ms でレイテンシを落としたのも同じ機序と読める。加えて 128ms は
+AODV-RPL と揃うので、出荷時設定どうしの比較から既定値の非対称という人工物が消える。
+
+### 85.5 RFC 6997 の内部で矛盾しないこと
+
+§6.1 の推奨値から離れるが、**同じ RFC の §9.2 がそれを求めている**:
+
+> The Imin parameter SHOULD be set taking into account the connectivity within
+> the network. For highly connected networks, a small Imin value ... may lead to
+> congestion in the network as a large number of routers reset their Trickle
+> timers in response to the first receipt of a DIO from the Origin.
+
+実測がまさにこの記述どおりの挙動を示した。§6.1 の表は「Origin が他に指定するものを
+持たないときに広告する既定の DODAG Configuration」であって、§9.2 は配備ごとの
+チューニングを求め、さらに「Applicability Statements that specify the use of P2P-RPL
+MUST provide guidance for setting Trickle parameters, particularly Imin and the
+redundancy constant」と続ける。§6.1 の表をチューニングせずに使うことの方が、
+§9.2 に対して不作為である。
+
+### 85.6 検証
+
+`./test.py -s rpl` 全PASS (既定値変更で落ちる試験は無かった)。ハーネス側の既定も
+128ms に合わせ、Tier 2 の3研究 (2,800実行) を測り直した。
+
+### 85.7 範囲
+
+25ノードGrid・802.15.4・基盤 Trickle Imin 4096ms/k=10 という一つの動作点系での
+測定である。他の PHY やより大きな網で 128ms が最適である保証は無い。RFC 6997 §9.2
+自身が「典型的なDIO送信遅延の1桁上」という目安を与えており、127Bフレーム・250kb/s
+なら送信時間は約4ms なので、この目安からも 128ms は妥当な範囲にある。

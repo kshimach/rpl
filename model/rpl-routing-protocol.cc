@@ -239,7 +239,11 @@ RplRoutingProtocol::GetTypeId()
                           "Imin of the Trickle timer pacing AODV-RPL RREQ-DIOs (RFC 9854). "
                           "Deliberately far shorter than DioIntervalMin: a route discovery has "
                           "to reach its target and be answered inside the RREQ option's own 'L' "
-                          "field, 16 seconds at the shortest.",
+                          "field, 16 seconds at the shortest. RFC 9854 names no Trickle "
+                          "parameters of its own, so the value is this module's; 128 ms is where "
+                          "a sweep of 32/64/128/256/512 ms over six operating points turns -- "
+                          "below it costs control bytes for nothing, above it costs discovery "
+                          "latency. @see design-constraints.md.",
                           TimeValue(MilliSeconds(128)),
                           MakeTimeAccessor(&RplRoutingProtocol::m_aodvDioIntervalMin),
                           MakeTimeChecker())
@@ -394,9 +398,16 @@ RplRoutingProtocol::GetTypeId()
                           MakeBooleanChecker())
             .AddAttribute("P2pDioIntervalMin",
                           "Imin of the Trickle timer pacing P2P-RPL P2P mode DIOs (RFC 6997). "
-                          "Default matches the RFC's own recommended default DODAG "
-                          "Configuration Option (section 6.1): DIOIntervalMin 6, i.e. 64 ms.",
-                          TimeValue(MilliSeconds(64)),
+                          "The RFC's own recommended default DODAG Configuration Option "
+                          "(section 6.1) says DIOIntervalMin 6, i.e. 64 ms, but section 9.2 "
+                          "tells a deployment to set Imin from its connectivity and warns that "
+                          "a small one lets 'a large number of routers reset their Trickle "
+                          "timers in response to the first receipt of a DIO from the Origin'. "
+                          "Measured, that is what 64 ms does here, so the default follows "
+                          "section 9.2 rather than section 6.1's table: 128 ms saves 55-132 kB "
+                          "of control traffic per run across six operating points with nothing "
+                          "measurably worse. @see design-constraints.md.",
+                          TimeValue(MilliSeconds(128)),
                           MakeTimeAccessor(&RplRoutingProtocol::m_p2pDioIntervalMin),
                           MakeTimeChecker())
             .AddAttribute("P2pDioIntervalDoublings",
