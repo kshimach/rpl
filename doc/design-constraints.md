@@ -9582,3 +9582,192 @@ it is paired」— を実装した。これは従来まったく実装されて�
 &rarr; 18.4 秒 (`L` = 16 秒に対して。網全体の最初の DIO から最後の DIO までを
 測っているので、後から加入したノードの分だけ 16 秒を超える)。発見成功率は 7.13/8 で
 不変。**この修正以前に公表した AODV-RPL の Tier 2 数値はすべて置き換えられる。**
+
+## 84. RFC 監査 (2026-09-20) — 6件の指摘、共通の根本原因、そして7件目
+
+`/protocol-test-matrix` とは別に、RFC 9854 §7 の実装 (§52.5) を終えた時点で
+「他にも MUST の実装漏れがないか」を別コンテキストの監査にかけた。結果は
+RFC 6997 側 4件・RFC 9854 側 2件。修正の過程で両 RFC に共通する構造的な問題が
+1つ浮かび、さらにその修正が7件目を露出させた。
+
+### 84.1 指摘1 — P2P-RPL の `L` も加入時点から数えていなかった (RFC 6997 §7, §9.1)
+
+AODV-RPL 側と**まったく同じ欠陥** (§52.7) が P2P-RPL 側にもあった。
+RFC 6997 §7 は `L` を「the exact duration that a router joining the temporary
+DAG ... MUST maintain its membership」と定め、「A router MUST leave the
+temporary DAG once the time elapsed **since it joined** reaches the value
+indicated by this field」と続ける。§9.1 も反対側から同じことを言う。
+
+`ArmP2pExpiry()` は呼ばれるたびに `Cancel()` してから `Schedule(L)` し直して
+おり、`HandleP2pRdo()` は preferred parent からの DIO を常に受理するので、
+フラッディングが続く限り期限は今から `L` 秒後へ押し出され続ける。修正前の
+実測 (20ノード): 52件の membership のうち **34件が `L` = 16 秒を超過**、
+最長で 40.2 秒超過。一度だけ張るように直した (`7993927`)。
+
+### 84.2 指摘2 — 唯一の Target が答えたあとも中継し続けていた (RFC 6997 §9.5)
+
+> A Target MUST NOT forward a P2P mode DIO any further if no other Targets are
+> to be discovered ... Otherwise, the Target MUST generate DIOs for this route
+> discovery as an Intermediate Router would.
+
+`SendDio()` の P2P 分岐は `p2p.isTarget` を一度も見ていなかった。AODV-RPL 側の
+同趣旨の規則 (RFC 9854 §6.2.2) はその数行上に実装済みで、両者を区別する
+`HasOtherP2pTargets()` も既にあった。呼ぶだけで済んだ (`7993927`)。
+
+指摘1と2の合計 (25ノードGrid、802.15.4、30シード): 制御バイト 309.9 &rarr;
+268.1 KB/実行、空中バイト 370.0 &rarr; 337.6 KB、P2P-RDO を載せた DIO
+1,687 &rarr; 1,359通、一時DAGの平均生存 36.4 &rarr; 29.9 秒。フラッディングが
+Target の先へ届かなくなる (送信ノード 24.97 &rarr; 23.22 / 25)。発見成功率は
+7.97/8 で不変。
+
+### 84.3 指摘3 — Stop フラグが経路上のルータにしか届いていなかった (RFC 6997 §9.3)
+
+> A router MUST discard a received P2P mode DIO with no further processing ...
+> if the router previously received a P2P-DRO message with the same
+> RPLInstanceID and DODAGID as the received DIO and with the Stop flag set to
+> one
+
+そして §8 が対象を明示する — 「All the routers receiving such a P2P-DRO,
+**including those not listed in the route** carried inside a P2P-RDO」。
+`HandleP2pDro()` は「自分が現在の NH 位置に名指されていない」場合にフラグを
+記録する前に `return` していたため、Stop は経路が通る数台にしか効いていなかった。
+
+この1件は `7993927` の時点では**修正を見送り**、その旨をコード内に書いて出した。
+記録してみると `RplP2pFloodTestCase` がフラッディング1ホップ目で止まる形で落ち、
+その経路が特定できなかったためである。原因不明の副作用を伴う準拠修正を出すのは、
+未検証の挙動を別の未検証の挙動と取り替えるだけなので見送った。原因は84.5で判明する。
+
+### 84.4 指摘4 — H=1 で積集合の判定が効いていなかった (RFC 9854 §6.2.2)
+
+§6.2.2 は「the intersection of the target lists received so far」を求め、
+「Those deleted nodes are **not to be reinserted back** into the list of
+destinations」と続ける。`HandleAodvRreq()` は「以前に同じ RREQ-DIO を見たか」を
+`addressVector.empty()` で判定していたが、これが成立するのは H=0 のときだけで
+ある — §4.1 は hop-by-hop モードに Address Vector を与えない。H=1 では
+コピーが届くたびに記録が初期化され、**自分のアドレスを消したはずの TargNode に
+それが戻され、もう一度応答していた**。数行上の join 判定が同じ問いをモード非依存
+の形で既に持っていたので、それを使った (`4328177`)。
+
+### 84.5 共通の根本原因 — 「終わったら黙れ」と「黙った親は死んだ親」の衝突
+
+指摘3と指摘4は、直した瞬間に**どちらも探索を空中分解させた**。原因は1つである。
+
+両 RFC とも、仕事が終わったルータに送信をやめろと言う — RFC 9854 §6.2.2 の
+「If the intersection is empty, it means that all the targets have been
+reached, and the router MUST NOT transmit any RREQ-DIO」、RFC 6997 §9.5 の
+「A Target MUST NOT forward a P2P mode DIO any further」。ところが
+`SelectPreferredParent()` の staleness 掃引は長寿命 DODAG 向けに書かれており
+(2 Trickle 間隔の沈黙 = 隣接ノードの死)、**「終わった」と「死んだ」を区別できない**。
+規則に従って黙ったルータは子から親として外され、子は最後の親を失い、
+`LeaveDodag()` が membership を消す — 探索の最中に。
+
+一時インスタンス (`RPL_MOP_P2P_ROUTE_DISCOVERY`) に対しては掃引を行わないことに
+した。一時インスタンスに固有の staleness 規則は要らない — 寿命は `L` で既に
+上限が引かれており、その `L` を `ArmAodvExpiry()` も `ArmP2pExpiry()` も加入時点
+から数えるようになった (§52.7, §84.1) からである。
+
+実測 (25ノードGrid、30シード、監査開始前の状態との比較)。AODV-RPL は全面的に
+改善: 制御バイト 225.8 &rarr; 153.7 KB、空中 328.7 &rarr; 237.3 KB、背景PDR
+0.89 &rarr; 0.96、PDR 0.82 &rarr; 0.89、発見成功 7.63 &rarr; 7.70。P2P-RPL は
+まちまちで、制御 309.9 &rarr; 298.8 KB・空中 370.0 &rarr; 357.5 KB と下がる一方、
+背景PDR 0.99 &rarr; 0.95、PDR 0.89 &rarr; 0.87 と落ちた。この P2P 側の劣化は
+84.7 で原因が判明し、解消する。
+
+`RplAodvRreqLostLastParentTestCase` はこの掃引を通って被験ノードから最後の親を
+奪っていたので、poisoning (RFC 6550 §8.2.2.5) で奪う形に変えた。クラッシュ安全性
+の試験であり、必要な経路は残っている。
+
+### 84.6 狭い規則は測って却下した (`542ac4f`)
+
+「掃引は続けるが最後の1つは落とさない」という狭い版を実装して測った。
+50シード、25ノードGrid、狭い版 / 一律免除の順で: P2P-RPL 制御バイト
+298.8 &rarr; 504.4 KB [+167.1, +243.0]、一時DAGの平均生存 23.9 &rarr; 44.2 秒
+(`L` = 16 秒に対して)、AODV-RPL 制御バイト +17.3 KB [+9.9, +24.6]。背景PDR・
+PDR・発見成功率はいずれも動かないか、わずかに悪い方へ動く。**全軸で悪い。**
+
+理由は、1つまで掃いてから止めると**残った1つが何であれ固定される**ことにある。
+ルータは「親がいない」と認識する代わりに、応答していない親から導いたランクを
+広告し続け、そこから生じる churn が掃引で節約した分を上回って再フラッディングする。
+
+一律免除を採用し、この測定をコードの隣に残した。次に誰かが狭い版を思いついたとき、
+盲目的に試さないで済むように。
+
+### 84.7 指摘5・6 — 受信側の検査 (`829908e`)
+
+どちらも「何を受け入れるか」の話で、このモジュールが**送るもの**は変わらない
+(両プロトコル30シードで全列ビット一致)。
+
+**RFC 9854 §4.1 — Address Vector のエントリ数上限が Compr 0 で固定されていた。**
+同条は option の長さを「variable due to the presence of the Address Vector and
+the number of octets elided according to the Compr value」と定める。パーサは
+Compr 0 由来の定数で上限を決めていた。単一 /64 の網では `ElidedPrefixLength()`
+が 8 を返し 31 エントリ入るので、**準拠したピアの 16〜31 エントリの option が
+malformed として弾かれる** — そして §4.1 は RREQ option の無いメッセージを
+「MUST be dropped」とするので、正常な RREQ-DIO が素の MOP=4 DIO として扱われて
+いた。`AodvMaxAddressVectorEntries(compr)` を導入した (P2P-RPL 側が §79 以来
+持っていたものの対応物)。**蓄積側の上限は意図的に Compr 0 の値 (15) のまま**
+とした — 追記するルータは自分の送信が使う Compr をまだ知らないので、保守的な
+上限だけが、受信した31エントリのベクタがシリアライザのアサートに達するのを防ぐ。
+
+**RFC 6997 §6.1 — Base object の5フィールドと DODAG Configuration の 'A' が
+一切検査されていなかった。**同条は5フィールドを固定した上で「A received P2P
+mode DIO MUST be discarded if it does not follow the above-listed rules
+regarding the RPLInstanceID, Version Number, G flag, MOP, and Prf fields inside
+the Base object」と述べ、さらに「A received P2P mode DIO MUST be discarded if
+the A flag inside the DODAG Configuration Option is not zero」と続ける。
+`JoinDodag()` は届いたものをそのまま採用し、中継はそれを伝播していた。
+**歯があるのは Version Number である** — 非ゼロだと `HandleDio()` の lollipop
+比較が一時DAGを leave-and-rejoin の移行経路へ持っていき、p2p 状態を
+(`stopped` フラグごと) 初期化する。DIO 1通につき1回、探索の終了を取り消せた。
+'A' ビットを読むために `GetDagConfAuthEnabled()` を足した。
+
+### 84.8 指摘7 — 監査の修正そのものが露出させた: §9.1 の送信側 (`3bead2f`)
+
+84.5 の免除を入れたあと Tier 2 の3研究 (2,800実行) を測り直したところ、
+**P2P-RPL の制御バイトが 380.5 &rarr; 671.3 KB へ跳ね上がっていた** (25ノード
+Grid、余裕9dB、対称、50シード)。背景PDR も 0.879 &rarr; 0.802、PDR 0.790 &rarr;
+0.723。監査の4コミットを1つずつ測って `4328177` に特定した。
+
+原因は RFC 6997 §9.1 の**対の規定を半分しか実装していなかった**ことである。
+
+> After receiving a P2P-DRO with the Stop flag set to one, a router SHOULD NOT
+> **send** or **process** any more DIOs for this temporary DAG and SHOULD also
+> **cancel any pending DIO transmissions**.
+
+実装は `p2p.stopped` フラグ = 「process しない」側だけだった。「send しない」側
+(`dioTrickle.Stop()`) は過去に一度試して撤回されている — ノードを黙らせると、
+その子から見れば staleness 掃引を通じて「親が死んだ」に見えるからである。
+**その掃引は 84.5 で一時インスタンスから外れた。撤回の理由は消えていた。**
+
+半分だけの実装は中立ではなかった。受信 DIO を全部拒否するルータは consistent な
+DIO を一度も数えないので、**Trickle が一度も抑制されず、`L` が切れるまで Imax で
+撃ち続ける — 探索が終わったあとの方が、探索中より騒がしい**。84.3 の修正は、
+その状態に入れる対象を経路上の数台から全リスナーへ広げた。だから跳ねた。
+
+`HandleP2pDro()` の3分岐すべてを `RecordP2pStop()` に通し、フラグと Trickle 停止
+を一緒に行う。P2P-DRO の中継自体は影響を受けない (「MUST continue to process the
+P2P-DRO messages」)。止まるのは DIO だけである。
+
+実測 (同条件、50シード)。直前の状態に対して: 制御バイト 671.3 &rarr; **193.6 KB**、
+空中 647.9 &rarr; **275.7 KB**、背景PDR 0.802 &rarr; **0.933**、PDR 0.723 &rarr;
+**0.848**、発見成功 7.94 &rarr; 7.96/8。**監査開始前の状態 (`823122c`、Stop が
+経路上のルータにしか届いていなかった頃) に対しても** 380.5 &rarr; 193.6 KB、
+背景PDR 0.832 &rarr; 0.933。AODV-RPL は Stop フラグを持たないので影響なし
+(153.3 KB で三状態とも一致)。
+
+`RplP2pStopSilencesDiosTestCase` を追加した。`dioTrickle.Stop()` を外すと
+「Stop 後に 313通」で落ち、入れると 0通で通る。
+`RplP2pRelayRouteDiversityTestCase` は node 3 の DIO を応答が通過したあとまで
+数えていたので、Trickle 間隔を Imin に固定する形にした (収集窓の3秒に約45回の
+抽選が入る。従来は6回)。
+
+### 84.9 監査が報告枠に入れなかった2点 (原文照合のみ、未実測)
+
+- **RFC 6997 §9.4 の Compr prefix 検査** — 受信インタフェースが Compr の示す
+  プレフィックスを持つかの検査。実装はグローバルアドレスの有無だけを見て prefix
+  一致は見ない (送出時に Compr を再計算する、より寛容な設計)。
+- **RFC 9854 §6.2.5 の2つ目の MUST** — 受信インタフェースと送信インタフェースの
+  アドレスが異なる場合、両方を Address Vector に積む。マルチインタフェースの
+  ルータでのみ問題になる。
+
+どちらも設計記録に項目として立っていない。正式に扱うならここが次の候補である。
