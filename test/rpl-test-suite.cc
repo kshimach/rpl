@@ -11306,6 +11306,11 @@ RplAodvGratuitousRrepTestCase::DoRun()
     channel->BlackList(devC, devA);
 
     RplHelper rplHelper;
+    // RFC 9854 section 7's shortcut is a MAY the module declines by default
+    // (@see the AodvGratuitousRrep attribute and design-constraints.md
+    // section 52.5), so this test, whose whole subject is the shortcut, asks
+    // for it explicitly.
+    rplHelper.Set("AodvGratuitousRrep", BooleanValue(true));
     InternetStackHelper internetv6;
     internetv6.SetRoutingHelper(rplHelper);
     internetv6.Install(nodes);
@@ -11480,6 +11485,10 @@ RplAodvGratuitousRrepFreshnessBoundaryTestCase::DoRun()
     NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
 
     RplHelper rplHelper;
+    // Same reason as RplAodvGratuitousRrepTestCase: section 7's MAY is
+    // declined by default, and this test's subject is the shortcut's own
+    // freshness rule.
+    rplHelper.Set("AodvGratuitousRrep", BooleanValue(true));
     InternetStackHelper internetv6;
     internetv6.SetRoutingHelper(rplHelper);
     internetv6.Install(nodes);

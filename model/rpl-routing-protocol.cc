@@ -300,6 +300,39 @@ RplRoutingProtocol::GetTypeId()
                           BooleanValue(false),
                           MakeBooleanAccessor(&RplRoutingProtocol::m_aodvTrickleRankOnlyReset),
                           MakeBooleanChecker())
+            .AddAttribute("AodvGratuitousRrep",
+                          "Take RFC 9854 section 7's shortcut at all. The section is gated on a "
+                          "MAY -- \"an intermediate router that receives an RREQ-DIO message MAY "
+                          "unicast a Gratuitous RREP-DIO\" -- so declining it is as conformant "
+                          "as taking it, and cheaper than taking it properly: the MUSTs that "
+                          "follow (@see AodvGratuitousRrepRelay) only bind a router that has "
+                          "sent one. False by default, on measurement: declining the shortcut "
+                          "saves 15-24 KB of control traffic per run at every operating point "
+                          "tested (6 points x 50 seeds) with no cost in discovery success, "
+                          "background PDR or latency, while taking it properly (relay on) saves "
+                          "nothing measurable and costs latency. @see design-constraints.md "
+                          "section 52.5.",
+                          BooleanValue(false),
+                          MakeBooleanAccessor(&RplRoutingProtocol::m_aodvGratuitousRrep),
+                          MakeBooleanChecker())
+            .AddAttribute("AodvGratuitousRrepRelay",
+                          "Follow a Gratuitous RREP with the unicast relaying RFC 9854 section 7 "
+                          "pairs it with: \"After unicasting the G-RREP to the OrigNode, the "
+                          "intermediate router then unicasts the RREQ towards TargNode\", and "
+                          "for hop-by-hop routes \"MUST unicast the received RREQ-DIO to the "
+                          "Next Hop on the route\" while each Next Hop \"MUST build new route "
+                          "entries\". Without it this module takes section 7's MAY and leaves "
+                          "those MUSTs, so the relay keeps hearing the multicast RREQ-DIO and "
+                          "re-firing; with it, the relay hands the RREQ to its cached next hop "
+                          "and drops that target from the set it still owes, which silences its "
+                          "own multicast through the section 6.2.2 rule SendDio() already "
+                          "applies. Hop-by-hop only: section 7's source-routing half is a "
+                          "separate set of MUSTs and an H=0 relay caches nothing to answer from "
+                          "in the first place. False by default until measured. @see "
+                          "design-constraints.md section 52.5.",
+                          BooleanValue(false),
+                          MakeBooleanAccessor(&RplRoutingProtocol::m_aodvGratuitousRrepRelay),
+                          MakeBooleanChecker())
             .AddAttribute("AodvGratuitousRrepOnce",
                           "Send at most one Gratuitous RREP per (RREQ-Instance, target) from a "
                           "given router. RFC 9854 section 7 has a relay that takes the G-RREP "
@@ -1891,7 +1924,7 @@ RplRoutingProtocol::HandleDio(const RplDioHeader& dio,
     // same reason the Trickle reset above is.
     if (dio.HasRreq() && m_dodags.find(dioKey) != m_dodags.end())
     {
-        HandleAodvRreq(dio, from, interface);
+        HandleAodvRreq(dio, from, interface, toMulticast);
     }
 
     // The asymmetric RREP-Instance's own equivalent, in the same position

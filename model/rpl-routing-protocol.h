@@ -1114,6 +1114,12 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
             /// hearing repeated multicast copies of it; without that half,
             /// nothing else bounds how often the G-RREP re-fires.
             std::set<Ipv6Address> gratuitousRrepSent;
+            /// Targets this router has already relayed onward by unicast for
+            /// this RREQ-Instance, under AodvGratuitousRrepRelay. A cached
+            /// route can be stale enough to point back the way the RREQ came,
+            /// and one relay per target per instance is all RFC 9854 section
+            /// 7 asks for; the same shape as rrepHandled below.
+            std::set<Ipv6Address> unicastRreqRelayed;
             /// The RREQ-InstanceID this RREP-Instance is paired with (RFC
             /// 9854 section 6.3.3). The RREP-Instance's own RPLInstanceID
             /// is this plus the RREP option's Delta; both ends need the
@@ -1405,7 +1411,45 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      * @param from the link-local address of the neighbour that sent it
      * @param interface the interface it arrived on
      */
-    void HandleAodvRreq(const RplDioHeader& dio, Ipv6Address from, uint32_t interface);
+    void HandleAodvRreq(const RplDioHeader& dio,
+                        Ipv6Address from,
+                        uint32_t interface,
+                        bool toMulticast);
+
+    /**
+     * @brief Unicast an RREQ-DIO to one neighbour.
+     *
+     * RFC 9854 section 7's "the intermediate router MUST unicast the
+     * received RREQ-DIO to the Next Hop on the route". The RREP counterpart
+     * is SendAodvRrepTo(), and this addresses the neighbour the same way and
+     * for the same reason.
+     *
+     * @param dodag the RREQ-Instance membership it belongs to
+     * @param dio the RREQ-DIO to forward, options already filled in
+     * @param nextHop the neighbour's global address
+     */
+    void SendAodvRreqTo(const DodagMembership& dodag,
+                        const RplDioHeader& dio,
+                        Ipv6Address nextHop);
+
+    /**
+     * @brief Hand an RREQ-DIO to the cached route that reaches its target.
+     *
+     * The half of RFC 9854 section 7 that pairs with the Gratuitous RREP.
+     * Also drops the target from the set this router still owes the flood,
+     * which silences its own multicast through the section 6.2.2 rule
+     * SendDio() already applies. A no-op unless AodvGratuitousRrepRelay is
+     * set, and for source routing, which section 7 bounds differently.
+     *
+     * @param dodag the RREQ-Instance membership, whose targets this updates
+     * @param key that instance's key, for logging
+     * @param dio the RREQ-DIO as received, forwarded unchanged
+     * @param cachedNextHop the next hop on the cached route to the target
+     */
+    void RelayAodvRreqOnCachedRoute(DodagMembership& dodag,
+                                    DodagKey key,
+                                    const RplDioHeader& dio,
+                                    Ipv6Address cachedNextHop);
 
     /**
      * @brief Whether an AODV-RPL DIO should be refused before it is joined.
@@ -2781,7 +2825,13 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     bool m_aodvTrickleRankOnlyReset{false};
     /// Send at most one Gratuitous RREP per (RREQ-Instance, target) from this
     /// router. @see the AodvGratuitousRrepOnce attribute.
+    /// Take RFC 9854 section 7's shortcut at all; the section's own MAY.
+    /// @see the AodvGratuitousRrep attribute.
+    bool m_aodvGratuitousRrep{false};
     bool m_aodvGratuitousRrepOnce{true};
+    /// Follow a Gratuitous RREP with the unicast RREQ relaying RFC 9854
+    /// section 7 pairs it with. @see the AodvGratuitousRrepRelay attribute.
+    bool m_aodvGratuitousRrepRelay{false};
     uint8_t m_aodvRankLimit;   //!< RankLimit put on RREQ-DIOs, 0 meaning no limit
     uint8_t m_aodvLifetime;    //!< the 'L' field put on RREQ-DIOs, 0..3
     /// REJOIN_REENABLE (RFC 9854 section 2): how long after leaving an

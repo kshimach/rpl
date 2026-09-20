@@ -39,26 +39,20 @@
  * to reach TargNode and a real RREP to come all the way back
  * (SendAodvGratuitousRrep(), triggered from HandleAodvRreq()). Only
  * meaningful for H=1: an H=0 relay never caches anything to answer from.
- * Deliberately NOT implemented: the rest of section 7, in which the relay
- * that took the shortcut "then unicasts the RREQ towards TargNode" and, for
- * hop-by-hop routes, "MUST unicast the received RREQ-DIO to the Next Hop on
- * the route" while each Next Hop "MUST build new route entries". Note what
- * the section's MAY does and does not cover: it governs whether to send a
- * G-RREP at all, not whether to follow it with the unicast relaying -- so
- * this is not an optional optimization left on the table but the MAY taken
- * without its paired MUSTs. Correctness does not depend on it (the ordinary
- * multicast Trickle flood still reaches TargNode independently), which is
- * why it was left out, but there are two consequences worth naming. The
- * preferred-parent confusion it was meant to avoid -- the same
- * RREQ-Instance arriving over two different paths -- is a product of the
- * partial implementation rather than a reason for it: in the RFC's own flow
- * the unicast *replaces* the flood downstream of the relay. And because the
- * relay keeps hearing the multicast RREQ-DIO, nothing stops it re-firing a
- * G-RREP every Trickle interval: measured on a 25-node grid, all 1040
- * reply-direction packets per run were G-RREPs and none were real RREPs,
- * about 11% of AODV-RPL's control bytes. @see the AodvGratuitousRrepOnce
- * attribute, which bounds that for measurement, and design-constraints.md
- * section 52.5.
+ * Section 7 is gated on a MAY, and this module declines it by default
+ * (AodvGratuitousRrep, false): measured over six operating points and 50
+ * seeds, not taking the shortcut saves 15-24 KB of control traffic per run
+ * everywhere with no cost in discovery success, background PDR or latency.
+ * Both halves are implemented for anyone who wants them -- the G-RREP itself,
+ * and the unicast relaying section 7 pairs it with, which a router that sends
+ * a G-RREP MUST do (AodvGratuitousRrepRelay). Taking the shortcut properly
+ * measures worse than declining it: no control saving anywhere, and real
+ * losses in latency and discovery success at some points, because a relay
+ * that has handed the RREQ to a cached route and gone quiet loses whatever
+ * the flood would have found if that route is stale. Source routing is out of
+ * scope either way -- section 7 bounds it with further MUSTs about the
+ * Address Vector, and an H=0 relay caches nothing to answer from to begin
+ * with. @see design-constraints.md section 52.5.
  */
 
 #include "rpl-conf.h"
@@ -520,9 +514,12 @@ RplRoutingProtocol::ShouldRefuseAodvRrep(const RplDioHeader& dio, Ipv6Address fr
 }
 
 void
-RplRoutingProtocol::HandleAodvRreq(const RplDioHeader& dio, Ipv6Address from, uint32_t interface)
+RplRoutingProtocol::HandleAodvRreq(const RplDioHeader& dio,
+                                   Ipv6Address from,
+                                   uint32_t interface,
+                                   bool toMulticast)
 {
-    NS_LOG_FUNCTION(this << from << interface);
+    NS_LOG_FUNCTION(this << from << interface << toMulticast);
 
     DodagKey key{dio.GetInstanceId(), dio.GetDodagId()};
 
@@ -592,9 +589,18 @@ RplRoutingProtocol::HandleAodvRreq(const RplDioHeader& dio, Ipv6Address from, ui
     // equivalent "already processed at least one copy" signal is instead
     // whether this router has already recorded an upward Hop-by-hop Route
     // for this exact RREQ-Instance.
+    // A unicast RREQ-DIO is exempt, but only while section 7's relay chain
+    // is switched on: that chain's sender is deliberately not this router's
+    // preferred parent in the instance -- it is the previous hop on a cached
+    // route to TargNode -- so dropping it here would leave the chain one hop
+    // short of the target every time. A unicast DIO arrives for other
+    // reasons too (answering a unicast DIS, @see HandleDis()), so with the
+    // relay off this has to keep treating every copy the same way it always
+    // did.
+    bool relayChainCopy = !toMulticast && m_aodvGratuitousRrepRelay;
     bool aodvAlreadyProcessed = rreq.hopByHop ? HasHopByHopRoute(key.instanceId, key.dodagId)
                                               : !dodag.aodv.addressVector.empty();
-    if (aodvAlreadyProcessed && from != dodag.preferredParent)
+    if (!relayChainCopy && aodvAlreadyProcessed && from != dodag.preferredParent)
     {
         NS_LOG_LOGIC("Already part of RREQ-Instance "
                     << +key.instanceId << " via a better parent than " << from
@@ -846,7 +852,7 @@ RplRoutingProtocol::HandleAodvRreq(const RplDioHeader& dio, Ipv6Address from, ui
         // (isTarget): it answers for real, via SendAodvRrep() below, once
         // matchedThisTime is known.
         auto cachedRoute = m_hopByHopRoutes.find(dodag.aodv.target);
-        if (!dodag.aodv.isTarget && cachedRoute != m_hopByHopRoutes.end() &&
+        if (m_aodvGratuitousRrep && !dodag.aodv.isTarget && cachedRoute != m_hopByHopRoutes.end() &&
             cachedRoute->second.expire > Simulator::Now() &&
             !RplSequenceNewer(dio.GetArt().destSeqNo, cachedRoute->second.seqNo) &&
             (!m_aodvGratuitousRrepOnce ||
@@ -857,6 +863,7 @@ RplRoutingProtocol::HandleAodvRreq(const RplDioHeader& dio, Ipv6Address from, ui
                                    dodag.aodv.target,
                                    cachedRoute->second.seqNo,
                                    from);
+            RelayAodvRreqOnCachedRoute(dodag, key, dio, cachedRoute->second.nextHop);
         }
     }
     else
@@ -947,6 +954,96 @@ RplRoutingProtocol::SendAodvRrepTo(const DodagMembership& dodag,
     packet->AddHeader(dio);
     SendRplMessageOn(interface, packet, RPL_CODE_DIO, linkLocal);
     NS_LOG_INFO("Sent an RREP towards the OrigNode via " << nextHop);
+}
+
+void
+RplRoutingProtocol::RelayAodvRreqOnCachedRoute(DodagMembership& dodag,
+                                               DodagKey key,
+                                               const RplDioHeader& dio,
+                                               Ipv6Address cachedNextHop)
+{
+    // RFC 9854 section 7's other half: "After unicasting the G-RREP to the
+    // OrigNode, the intermediate router then unicasts the RREQ towards
+    // TargNode", and for hop-by-hop routes "MUST unicast the received
+    // RREQ-DIO to the Next Hop on the route ... This process repeats at each
+    // node until the RREQ-DIO arrives at the TargNode."
+    if (!m_aodvGratuitousRrepRelay)
+    {
+        return;
+    }
+
+    // Source routing would also have to put an Address Vector on the
+    // forwarded RREQ-DIO, which is a separate MUST in the same section; H=0
+    // never reaches here anyway, having cached no route to answer from.
+    if (!dodag.aodv.hopByHop)
+    {
+        return;
+    }
+
+    // Once per target per instance. A cached route can be stale enough to
+    // point back the way the RREQ came, and relaying again on every copy
+    // would rebuild the storm this is meant to remove.
+    if (!dodag.aodv.unicastRreqRelayed.insert(dodag.aodv.target).second)
+    {
+        return;
+    }
+
+    if (cachedNextHop.IsAny())
+    {
+        NS_LOG_LOGIC("No next hop on the cached route to " << dodag.aodv.target
+                                                          << "; not relaying the RREQ onward");
+        return;
+    }
+
+    SendAodvRreqTo(dodag, dio, cachedNextHop);
+    NS_LOG_INFO("Relayed the RREQ for " << dodag.aodv.target << " onward by unicast via "
+                                        << cachedNextHop << " (RFC 9854 section 7)");
+
+    // Having handed the RREQ to the route that reaches this target, this
+    // router owes the flood nothing more for it. Erasing it from the set of
+    // targets still to relay is what silences this router's own multicast --
+    // through the RFC 9854 section 6.2.2 rule SendDio() already applies
+    // ("If the intersection ... is empty ... the router MUST NOT transmit
+    // any RREQ-DIO"), rather than through a second suppression path. That is
+    // also what keeps the unicast from running alongside the flood: in the
+    // RFC's own flow the unicast replaces it downstream of the relay.
+    auto entry = std::find(dodag.aodv.targets.begin(),
+                          dodag.aodv.targets.end(),
+                          dodag.aodv.target);
+    if (entry != dodag.aodv.targets.end())
+    {
+        dodag.aodv.targets.erase(entry);
+        NS_LOG_LOGIC("Dropped " << dodag.aodv.target << " from the targets still to relay for "
+                                << "RREQ-Instance " << +key.instanceId
+                                << "; this router now stays quiet on it");
+    }
+}
+
+void
+RplRoutingProtocol::SendAodvRreqTo(const DodagMembership& dodag,
+                                   const RplDioHeader& dio,
+                                   Ipv6Address nextHop)
+{
+    // Addressed exactly as SendAodvRrepTo() addresses an RREP, and for the
+    // same reason: one radio hop, so it has to go to the neighbour's
+    // link-local address, because RouteOutput() never treats a global one as
+    // on-link and would hand the packet to this node's own preferred parent
+    // instead of to the neighbour the cached route names.
+    Ipv6Address linkLocal = LinkLocalOf(nextHop);
+    uint32_t interface = InterfaceForNeighbour(dodag, linkLocal);
+    if (interface == 0)
+    {
+        interface = m_ifcToSocket.empty() ? 0 : m_ifcToSocket.begin()->first;
+        if (interface == 0)
+        {
+            NS_LOG_WARN("No interface to unicast an RREQ to " << nextHop << " on");
+            return;
+        }
+    }
+
+    Ptr<Packet> packet = Create<Packet>();
+    packet->AddHeader(dio);
+    SendRplMessageOn(interface, packet, RPL_CODE_DIO, linkLocal);
 }
 
 void
