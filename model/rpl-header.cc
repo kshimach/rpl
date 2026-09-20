@@ -687,7 +687,7 @@ RplDioHeader::Deserialize(Buffer::Iterator start)
             uint8_t entrySize = static_cast<uint8_t>(AODV_ADDRESS_VECTOR_ENTRY_SIZE - compr);
             uint8_t remaining = static_cast<uint8_t>(length - AODV_RREQ_OPTION_BASE_LENGTH);
             uint8_t entries = static_cast<uint8_t>(remaining / entrySize);
-            if (remaining % entrySize != 0 || entries > AODV_ADDRESS_VECTOR_MAX_ENTRIES)
+            if (remaining % entrySize != 0 || entries > AodvMaxAddressVectorEntries(compr))
             {
                 NS_LOG_LOGIC("Skipping a malformed AODV-RPL RREQ option (Compr "
                             << +compr << ", length " << +length << ")");
@@ -727,7 +727,7 @@ RplDioHeader::Deserialize(Buffer::Iterator start)
             uint8_t entrySize = static_cast<uint8_t>(AODV_ADDRESS_VECTOR_ENTRY_SIZE - compr);
             uint8_t remaining = static_cast<uint8_t>(length - AODV_RREP_OPTION_BASE_LENGTH);
             uint8_t entries = static_cast<uint8_t>(remaining / entrySize);
-            if (remaining % entrySize != 0 || entries > AODV_ADDRESS_VECTOR_MAX_ENTRIES)
+            if (remaining % entrySize != 0 || entries > AodvMaxAddressVectorEntries(compr))
             {
                 NS_LOG_LOGIC("Skipping a malformed AODV-RPL RREP option (Compr "
                             << +compr << ", length " << +length << ")");
@@ -911,6 +911,14 @@ bool
 RplDioHeader::HasDagConfiguration() const
 {
     return m_hasDagConf;
+}
+
+bool
+RplDioHeader::GetDagConfAuthEnabled() const
+{
+    // RFC 6550 section 6.7.6: the option's flags octet is
+    // "Flags (3 bits) | A (1 bit) | PCS (3 bits)", so 'A' is 0x08.
+    return (m_dagConfFlags & 0x08) != 0;
 }
 
 void

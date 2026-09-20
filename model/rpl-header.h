@@ -273,6 +273,19 @@ class RplDioHeader : public Header
     bool HasDagConfiguration() const;
 
     /**
+     * @brief The DODAG Configuration option's Authentication Enabled flag.
+     *
+     * RFC 6550 section 6.7.6's 'A' bit. RFC 6997 section 6.1 requires an
+     * Origin to clear it and a receiver to police that: "the Origin MUST set
+     * the Authentication Enabled (A) flag to zero. A received P2P mode DIO
+     * MUST be discarded if the A flag inside the DODAG Configuration Option
+     * is not zero."
+     *
+     * @return true if the flag is set
+     */
+    bool GetDagConfAuthEnabled() const;
+
+    /**
      * @brief Attach a DODAG Configuration option, RFC 6550 section 6.7.6.
      *
      * @param intervalDoublings DIOIntervalDoublings, i.e. Imax = Imin << this
@@ -649,11 +662,37 @@ class RplDioHeader : public Header
      */
     const P2pRdoOption& GetP2pRdo() const;
 
-    /// How many Address Vector entries an RREQ/RREP option can carry. Not a
-    /// policy choice: the option's own Opt Data Len is eight bits, so with a
-    /// 3-byte fixed part and 16 bytes per entry (Compr is always 0 here) the
-    /// wire format itself stops at 15, since 3 + 16 * 16 = 259 > 255.
+    /// The Compr 0 figure, which is the smallest AodvMaxAddressVectorEntries()
+    /// ever returns -- what a check has to use when the Compr that will apply
+    /// is not yet known, as it is not while a router is still accumulating
+    /// the vector it will later send. Not a policy choice: the option's own
+    /// Opt Data Len is eight bits, so with a 3-byte fixed part and 16 bytes
+    /// per entry the wire format itself stops at 15.
     static constexpr uint8_t AODV_ADDRESS_VECTOR_MAX_ENTRIES = 15;
+
+    /**
+     * @brief How many Address Vector entries fit at a given Compr.
+     *
+     * The option's Opt Data Len is eight bits and its fixed part is three
+     * octets, so the vector gets 252 and each entry costs 16 - Compr. RFC
+     * 9854 section 4.1 defines the field that way -- the length "is variable
+     * due to the presence of the Address Vector and the number of octets
+     * elided according to the Compr value" -- so a fixed bound taken at
+     * Compr 0 refuses well-formed options from a conforming peer. Concretely
+     * 15 entries at Compr 0, 31 at Compr 8, which is what
+     * ElidedPrefixLength() returns for any network sharing one /64.
+     *
+     * The P2P-RPL side derived the same thing first; @see
+     * RplP2pMaxAddressVectorEntries() and design-constraints.md section 79.
+     *
+     * @param compr the option's Compr field, 0..15
+     * @return the largest Address Vector entry count that fits
+     */
+    static constexpr uint8_t AodvMaxAddressVectorEntries(uint8_t compr)
+    {
+        uint32_t entrySize = 16u - (compr & 0x0f);
+        return static_cast<uint8_t>(252u / entrySize);
+    }
 
   private:
     /// Serialized size of the DODAG Configuration option, type and length byte
