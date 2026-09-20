@@ -3747,6 +3747,15 @@ RplRoutingProtocol::SelectPreferredParent(DodagMembership& dodag)
     // instance needs no staleness rule of its own because its lifetime is
     // already bounded, by the 'L' field, which both ArmAodvExpiry() and
     // ArmP2pExpiry() now count from joining.
+    // Skipping the sweep entirely, rather than only refusing to drop the
+    // last parent. That narrower rule was tried and measured worse on every
+    // axis (50 seeds): P2P-RPL's control bytes went 298.8 -> 504.4 KB
+    // [+167.1, +243.0] and its mean temporary-DAG lifespan 23.9 -> 44.2 s
+    // against an 'L' of 16 s, AODV-RPL's control bytes rose 17.3 KB, and
+    // nothing improved in exchange. Sweeping down to one entry leaves that
+    // entry stale and pinned, so the router keeps a bad Rank instead of no
+    // parent, and the churn that follows re-floods more than the sweep ever
+    // saved.
     bool temporary = dodag.mop == RPL_MOP_P2P_ROUTE_DISCOVERY;
     Time maxInterval = dodag.dioIntervalMin * (int64_t(1) << dodag.dioIntervalDoublings);
     Time staleBefore = Simulator::Now() - 2 * maxInterval;
