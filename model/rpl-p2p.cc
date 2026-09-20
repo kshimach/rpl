@@ -146,9 +146,25 @@ RplRoutingProtocol::ArmP2pExpiry(DodagMembership& dodag, DodagKey key)
 {
     uint32_t seconds = RplP2pLifetimeSeconds(dodag.p2p.lifetimeField);
 
+    // RFC 6997 section 7: 'L' is "the exact duration that a router joining
+    // the temporary DAG ... MUST maintain its membership", and "A router
+    // MUST leave the temporary DAG once the time elapsed *since it joined*
+    // reaches the value indicated by this field"; section 9.1 says the same
+    // from the other side, "once the duration of *its membership* in the DAG
+    // has reached the value indicated by the L field". Both count from
+    // joining, so this arms once and later calls leave the deadline alone.
+    // Cancelling and rescheduling instead pushed it to now+L on every P2P
+    // mode DIO accepted from the preferred parent, which HandleP2pRdo()
+    // always accepts -- so a membership never reached its deadline while the
+    // flood kept arriving. Exactly the defect fixed on the AODV-RPL side in
+    // ArmAodvExpiry(); this is the same rule in the other protocol's words.
+    if (dodag.p2p.expiry.IsRunning())
+    {
+        return;
+    }
+
     dodag.p2p.expiry.SetFunction(&RplRoutingProtocol::P2pInstanceExpired, this);
     dodag.p2p.expiry.SetArguments(key);
-    dodag.p2p.expiry.Cancel();
     dodag.p2p.expiry.Schedule(Seconds(seconds));
 }
 
@@ -1250,6 +1266,24 @@ RplRoutingProtocol::HandleP2pDro(const RplP2pDroHeader& dro, Ipv6Address from, u
     if (rdo.maxRankOrNh == 0 || rdo.maxRankOrNh > rdo.addressVector.size() ||
         !IsOwnAddress(rdo.addressVector[rdo.maxRankOrNh - 1]))
     {
+        // NOT recorded here, although RFC 6997 section 9.3 says it should
+        // be: "A router MUST discard a received P2P mode DIO with no further
+        // processing ... if the router previously received a P2P-DRO message
+        // with the same RPLInstanceID and DODAGID as the received DIO and
+        // with the Stop flag set to one", and section 8 puts it beyond doubt
+        // that this binds every listener, "All the routers receiving such a
+        // P2P-DRO, including those not listed in the route carried inside a
+        // P2P-RDO". So today the Stop flag only reaches the handful of
+        // routers the route passes through, which is a real gap.
+        //
+        // Setting dodag.p2p.stopped here was tried and reverted: it makes
+        // RplP2pFloodTestCase fail with the flood never reaching past the
+        // first hop, by a route this analysis has not yet pinned down --
+        // the flood plainly does complete in the logs, so the interaction is
+        // with what the membership looks like afterwards rather than with
+        // propagation itself. Left out until that is understood; shipping a
+        // conformance fix whose side effect is not explained would trade one
+        // unexamined behaviour for another.
         NS_LOG_LOGIC("Not named at the current NH position, ignoring this P2P-DRO");
         return;
     }

@@ -2035,8 +2035,10 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     /**
      * @brief Arm the 'L' field's deadline for a P2P-RPL temporary DAG.
      *
-     * Unlike ArmAodvExpiry(), never a no-op: RFC 6997 section 7's 'L' field
-     * has no "unlimited" encoding, every value names a real duration.
+     * A no-op once armed, for the same reason ArmAodvExpiry() is: RFC 6997
+     * section 7 counts 'L' from when the router joined, not from the last
+     * DIO it accepted. Unlike ArmAodvExpiry() there is no "unlimited"
+     * encoding to opt out of -- every value of 'L' names a real duration.
      *
      * @param dodag the membership to arm
      * @param key its key, which the expiry callback needs to find it again

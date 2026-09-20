@@ -1266,6 +1266,25 @@ RplRoutingProtocol::SendDio(DodagMembership& dodag, Ipv6Address dst, uint32_t in
         return;
     }
 
+    // P2P-RPL's counterpart of the rule just above. RFC 6997 section 9.5:
+    // "A Target MUST NOT forward a P2P mode DIO any further if no other
+    // Targets are to be discovered, i.e., if a unicast IPv6 address (of this
+    // Target) is specified as the TargetAddr inside the P2P-RDO and no
+    // additional Targets are specified via RPL Target options inside the
+    // DIOs for this route discovery. Otherwise, the Target MUST generate
+    // DIOs for this route discovery as an Intermediate Router would" -- so
+    // HasOtherP2pTargets() decides which of the two sentences applies, and
+    // only the first one suppresses. Without this a Target kept flooding
+    // after it had already answered, growing the temporary DAG past itself
+    // for the rest of the instance's lifetime.
+    if (dodag.mop == RPL_MOP_P2P_ROUTE_DISCOVERY && !dodag.p2p.target.IsAny() &&
+        dodag.p2p.isTarget && !HasOtherP2pTargets(dodag))
+    {
+        NS_LOG_LOGIC("This router is the only Target of temporary DAG "
+                    << +dodag.instanceId << "; suppressing this P2P mode DIO");
+        return;
+    }
+
     RplDioHeader dio;
     dio.SetInstanceId(dodag.instanceId);
     dio.SetVersionNumber(dodag.version);
