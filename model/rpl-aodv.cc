@@ -594,10 +594,14 @@ RplRoutingProtocol::HandleAodvRreq(const RplDioHeader& dio,
     // RFC 9854 section 6.2.1's own MaxUsefulRank language backs this: a
     // router already in the instance re-evaluates a later RREQ against the
     // best Rank it has seen, it does not simply keep the first one.
-    // H=1 keeps no Address Vector to read this from (@see below), so the
-    // equivalent "already processed at least one copy" signal is instead
-    // whether this router has already recorded an upward Hop-by-hop Route
-    // for this exact RREQ-Instance.
+    // H=1 keeps no Address Vector to read this from, so the equivalent
+    // "already processed at least one copy" signal is dodag.aodv.
+    // targetsSeeded instead, intrinsic to this membership rather than a
+    // lookup into m_hopByHopRoutes -- @see its own doc comment for why an
+    // earlier version's HasHopByHopRoute(instanceId, dodagId) read a stale
+    // route left by an unrelated, already-finished discovery under a reused
+    // instanceId as this one's own signal, found by /protocol-test-matrix's
+    // angle 1.
     // A unicast RREQ-DIO is exempt, but only while section 7's relay chain
     // is switched on: that chain's sender is deliberately not this router's
     // preferred parent in the instance -- it is the previous hop on a cached
@@ -607,7 +611,7 @@ RplRoutingProtocol::HandleAodvRreq(const RplDioHeader& dio,
     // relay off this has to keep treating every copy the same way it always
     // did.
     bool relayChainCopy = !toMulticast && m_aodvGratuitousRrepRelay;
-    bool aodvAlreadyProcessed = rreq.hopByHop ? HasHopByHopRoute(key.instanceId, key.dodagId)
+    bool aodvAlreadyProcessed = rreq.hopByHop ? dodag.aodv.targetsSeeded
                                               : !dodag.aodv.addressVector.empty();
     if (!relayChainCopy && aodvAlreadyProcessed && from != dodag.preferredParent)
     {
@@ -683,6 +687,7 @@ RplRoutingProtocol::HandleAodvRreq(const RplDioHeader& dio,
     if (!aodvAlreadyProcessed)
     {
         dodag.aodv.targets = incomingTargets;
+        dodag.aodv.targetsSeeded = true;
     }
     else
     {
@@ -1588,10 +1593,33 @@ RplRoutingProtocol::HandleAodvRrepInstance(const RplDioHeader& dio,
     // First arrival: record what this instance is. Re-recorded on a later,
     // better copy the same way HandleAodvRreq() does, which is what keeps
     // the Address Vector in step with the preferred parent. H=1 keeps no
-    // Address Vector to read this from (@see below), so the equivalent
-    // "already processed at least one copy" signal is instead whether this
-    // router has already recorded a downward Hop-by-hop Route for this
-    // exact RREP-Instance's own TargNode.
+    // Address Vector to read this from, so the equivalent "already
+    // processed at least one copy" signal is instead whether this router
+    // has already recorded a downward Hop-by-hop Route for this exact
+    // RREP-Instance's own TargNode.
+    //
+    // /protocol-test-matrix's angle 1 raised the same reused-instanceId
+    // concern here that HandleAodvRreq() actually has (@see its own
+    // targetsSeeded, and design-constraints.md): a completed discovery's
+    // Local RPLInstanceID is freed and can be reused by an unrelated new
+    // one from the same OrigNode long before the Hop-by-hop Route it stored
+    // expires, so HasHopByHopRoute(pairedInstanceId, dodagId) can read a
+    // stale route as this fresh membership's own "already processed"
+    // signal. Investigated and confirmed NOT reachable here, unlike the
+    // RREQ-Instance case: this guard's only use of alreadyProcessed is the
+    // "from != dodag.preferredParent" check just below, and that condition
+    // cannot be true on a membership's genuinely first copy -- JoinDodag()
+    // and SelectPreferredParent() (both run by HandleDio() before this
+    // function, on every DIO) populate dodag.parents with only this DIO's
+    // own from and then pick it as preferredParent, since it is the only
+    // candidate. A wrongly-true alreadyProcessed therefore can never flip
+    // "from != preferredParent" from false to true on a first copy, so it
+    // never causes the return below to fire when it should not have. This
+    // differs from HandleAodvRreq()'s targets, which alreadyProcessed also
+    // gates a second time, independently of that same early-return guard,
+    // to choose between seeding and intersecting -- the branch where the
+    // RREQ-Instance bug actually bit. No intrinsic per-membership flag is
+    // needed here as a result.
     bool alreadyProcessed = rrep.hopByHop ? HasHopByHopRoute(pairedInstanceId, key.dodagId)
                                           : !dodag.aodv.addressVector.empty();
     if (alreadyProcessed && from != dodag.preferredParent)

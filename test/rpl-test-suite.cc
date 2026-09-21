@@ -10341,6 +10341,162 @@ RplAodvAsymmetricRouteCompletesTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief A relay's H=1 "already processed this RREQ-Instance" check does not
+ *        false-positive on a stale Hop-by-hop Route left by an earlier,
+ *        unrelated discovery from the same OrigNode reusing the same
+ *        RPLInstanceID.
+ *
+ * HandleAodvRreq() decides whether a copy is the first this router has seen
+ * for the instance with `HasHopByHopRoute(key.instanceId, key.dodagId)` for
+ * H=1 (no Address Vector to test emptiness on, unlike H=0). That function
+ * checks only the stored instanceId, not the destination's own dodagId --
+ * unlike FindHopByHopRoute(), used a few lines below it in the very same
+ * function for exactly this reason (@see its own doc comment, and
+ * design-constraints.md section 83 for the sibling bug this asymmetry
+ * already caused once on the downward side).
+ *
+ * DiscoverRoute() reuses the lowest free Local RPLInstanceID, and a
+ * completed discovery frees its own once its 'L' deadline passes -- but the
+ * Hop-by-hop Route a relay stored toward that OrigNode lives for
+ * PathLifetime (minutes), far longer than 'L' (16 s by default). A second,
+ * unrelated discovery from the same OrigNode -- a different Target,
+ * anything -- started after the first's 'L' has passed but before
+ * PathLifetime has, reuses the freed instanceId. At the relay, the stale
+ * route (same instanceId, same destination -- OrigNode's own address, which
+ * is also this new discovery's own dodagId) reads as "already processed",
+ * so the very first RREQ-DIO of the new discovery intersects its ART
+ * targets against the brand new membership's empty record instead of
+ * seeding it, leaving the relay's target list empty and RFC 9854 section
+ * 6.2.2's own "if the intersection is empty ... MUST NOT transmit any
+ * RREQ-DIO" silences it on the spot.
+ */
+class RplAodvHopByHopInstanceReuseTestCase : public TestCase
+{
+  public:
+    RplAodvHopByHopInstanceReuseTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplAodvHopByHopInstanceReuseTestCase::RplAodvHopByHopInstanceReuseTestCase()
+    : TestCase("A reused RPLInstanceID's stale Hop-by-hop Route does not empty a new "
+              "discovery's own targets")
+{
+}
+
+void
+RplAodvHopByHopInstanceReuseTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2); // 0 = OrigNode and base root, 1 = the relay under test
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    // Named explicitly rather than relied on as the module default: this
+    // test's own timing (waiting past 'L' but well short of PathLifetime)
+    // depends on it being much shorter than PathLifetime, not on its
+    // specific value.
+    rplHelper.Set("AodvLifetime", UintegerValue(1)); // 16 s
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> orig = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> relay = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(relay->IsJoined(), true, "The base DODAG did not reach the relay");
+
+    Ipv6Address origAddress = orig->GetGlobalAddress();
+    Ipv6Address target1 = Ipv6Address("2001:9::1");
+    Ipv6Address target2 = Ipv6Address("2001:9::2");
+
+    RplRoutingProtocol::DodagKey key1 = orig->DiscoverRoute(target1, true);
+    NS_TEST_ASSERT_MSG_NE(key1.dodagId, Ipv6Address::GetAny(), "The first discovery did not start");
+
+    Simulator::Stop(Seconds(5));
+    Simulator::Run();
+
+    Ipv6Address nextHop;
+    uint8_t storedInstance = 0;
+    NS_TEST_ASSERT_MSG_EQ(relay->GetHopByHopRoute(origAddress, nextHop, storedInstance),
+                          true,
+                          "The relay never stored the upward Hop-by-hop Route to OrigNode");
+    NS_TEST_ASSERT_MSG_EQ(storedInstance,
+                          key1.instanceId,
+                          "The stored upward route is under the wrong RPLInstanceID");
+
+    // Past the first discovery's 'L' (16 s) *and* AodvRejoinReenable (15 min
+    // default, RFC 9854 section 4.1's REJOIN_REENABLE): that bar refuses
+    // this exact {instanceId, dodagId} pair outright at ShouldRefuseAodvRreq()
+    // for 15 minutes after leaving, an earlier version of this test learned
+    // by waiting only 20 s and finding the second discovery refused before
+    // it ever reached the bug this test means to isolate. Still short of the
+    // Hop-by-hop Route's own PathLifetime (30 min default), so the stale
+    // route this test depends on survives the wait.
+    Simulator::Stop(Seconds(950));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(orig->IsJoinedTo(key1.instanceId, key1.dodagId),
+                          false,
+                          "OrigNode's own RREQ-Instance membership never expired at 'L', so the "
+                          "instanceId this test needs freed again is still in use");
+    NS_TEST_ASSERT_MSG_EQ(relay->IsJoinedTo(key1.instanceId, key1.dodagId),
+                          false,
+                          "The relay's RREQ-Instance membership never expired at 'L'");
+    NS_TEST_ASSERT_MSG_EQ(relay->GetHopByHopRoute(origAddress, nextHop, storedInstance),
+                          true,
+                          "The stale Hop-by-hop Route this test depends on expired too early "
+                          "(PathLifetime should far outlast 'L')");
+
+    // A second, unrelated discovery from the same OrigNode. DiscoverRoute()
+    // reuses the lowest free Local RPLInstanceID, and dodagId is always
+    // OrigNode's own address, so this reuses the exact {instanceId, dodagId}
+    // key the stale route above is still filed under.
+    RplRoutingProtocol::DodagKey key2 = orig->DiscoverRoute(target2, true);
+    NS_TEST_ASSERT_MSG_EQ(key2.instanceId,
+                          key1.instanceId,
+                          "The second discovery did not reuse the freed instanceId -- this "
+                          "test's own precondition does not hold");
+    NS_TEST_ASSERT_MSG_EQ(key2.dodagId, key1.dodagId, "OrigNode's own address should not change");
+
+    Simulator::Stop(Seconds(5));
+    Simulator::Run();
+
+    std::vector<Ipv6Address> targets;
+    NS_TEST_ASSERT_MSG_EQ(relay->GetAodvTargets(key2.instanceId, key2.dodagId, targets),
+                          true,
+                          "The relay never joined the second RREQ-Instance at all");
+    NS_TEST_ASSERT_MSG_EQ(std::find(targets.begin(), targets.end(), target2) != targets.end(),
+                          true,
+                          "The relay's target record for the second discovery does not include "
+                          "its own Target; HasHopByHopRoute()'s missing dodagId check treated a "
+                          "stale route left by the first, unrelated discovery as this one's own "
+                          "'already processed' signal, intersecting its first RREQ-DIO's targets "
+                          "against nothing instead of seeding them");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief An asymmetric AODV-RPL Hop-by-hop Route (H=1) discovery completes,
  *        using the RREP-Instance's own preferred parent as the downward next
  *        hop, and carries data ("Increment B").
@@ -24461,6 +24617,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplAodvAsymmetricRrepInstanceTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvAsymmetricRrepFloodTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvAsymmetricRouteCompletesTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplAodvHopByHopInstanceReuseTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvAsymmetricHopByHopRouteCompletesTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRrepCompletesTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvHopByHopRouteCompletesTestCase, TestCase::Duration::QUICK);

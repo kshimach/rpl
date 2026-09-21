@@ -10056,3 +10056,85 @@ entry}`を使ったところ、entry=1がノード自身のアドレスの末尾
 (`{0,0,1}`、ns-3の自動割当アドレスが小さい数字になりがちなため) と衝突し、
 「Address Vectorが自分を2回含む」側のガードに化けて別の分岐に落ちるという
 自己撞着を踏んだ。ダミーの先頭バイトに`0xAA`を挟んで解消した。
+
+## 89. H=1の「既に処理済み」判定 — RREQ-Instance側は誤検知、RREP-Instance側は無害と判明
+
+§86の角1 (境界値) が実測で確認した候補。`m_hopByHopRoutes`は宛先だけをキーに
+する1枚のフラットマップで、各エントリは自分の`instanceId`/`dodagId`を付帯情報
+として持つだけ (ディスカバリ単位の状態ではない)。ローカルRPLInstanceIDは
+7ビットの小さいプールから使い回され、あるディスカバリが自分の`L`で解放すると
+すぐ次のディスカバリ (多くは同じOrigNodeからの再探索) が再利用できるが、
+そのディスカバリが張ったHop-by-hop Routeは`PathLifetime` (既定30分) まで生き
+残る — instanceId解放から数分〜30分近くの間、**古い、無関係なディスカバリの
+経路エントリがまだ生きている**窓がある。
+
+### 89.1 HandleAodvRreq() (RREQ-Instance) — 誤検知を確認、修正
+
+`HandleAodvRreq()`のH=1側は「このメンバーシップは最初のコピーを既に処理した
+か」を`HasHopByHopRoute(key.instanceId, key.dodagId)`で判定していた —
+membership自身の状態ではなく、外側の`m_hopByHopRoutes`を覗くだけ。同じ
+OrigNodeが同じinstanceIdを再利用して新しいディスカバリを始めると、新しい
+membershipはまっさらなのに、古いディスカバリの経路がまだ`m_hopByHopRoutes`
+に残っているため「既に処理済み」と誤読する。dodagIdは常にOrigNode自身の
+アドレスなので、同一OrigNodeによる再利用では新旧で完全に一致し、§83で
+使った「dodagIdも見る」という修正 (`FindHopByHopRoute`) はここでは効かない
+ことをプローブで確認した。
+
+誤検知の結果、`HandleAodvRreq()`のtargets seed/intersectの分岐
+(`if (!aodvAlreadyProcessed) { targets = incomingTargets; } else { intersect(...); }`)
+が「seedすべき最初のRREQ-DIO」を「intersectすべき2件目以降」と誤判定し、
+何もない状態とintersectして**targetsを空にする**。RFC 9854 §6.2.2の
+「intersectionが空ならRREQ-DIOを送らない」規則がそのまま発火し、その
+ルータは正当な最初のディスカバリで即座に沈黙する。
+
+修正: `DodagMembership::AodvRreqState`に`targetsSeeded`をメンバー自身の
+真偽値として追加し、`HasHopByHopRoute()`の代わりにこれを見る。新規試験
+`RplAodvHopByHopInstanceReuseTestCase` — 2ノード実トポロジで1回目の
+ディスカバリを完了させ、`L`(16秒)とAODV_REJOIN_REENABLE(既定15分)の両方
+を使い切る950秒待ってから同じOrigNodeで2回目のディスカバリを開始し、中継が
+2回目のtargetsを正しく保持することを確認。修正を外すとtargetsが空になり
+試験が失敗することを確認済み (load-bearing)。
+
+### 89.2 HandleAodvRrepInstance() (RREP-Instance) — 構造的に無害と判明、修正不要
+
+`HandleAodvRrepInstance()`にも見た目上まったく同じ形の判定
+(`HasHopByHopRoute(pairedInstanceId, dodagId)`) があり、当初は89.1と対称の
+バグ (最初のRREP-Instanceコピーを丸ごと落とす) を疑い、`rrepInstanceSeeded`
+という同型の修正を実装した。ところがこの修正を入れても外しても新規試験の
+結果が変わらず、`/protocol-test-matrix`の検証原則 (プローブで再現しない
+限り「直った」と主張しない) に従って原因を追った結果、**この判定の誤りは
+現在のガード構造の下では一度も観測可能な形で発火し得ない**ことが分かった。
+
+この`alreadyProcessed`の唯一の使い道は
+`if (alreadyProcessed && from != dodag.preferredParent) { return; }`
+であり、`targetsSeeded`と違って以降のコードで二度目に参照されることは無い
+(89.1のRREQ-Instance側は`aodvAlreadyProcessed`をseed/intersectの分岐でも
+使うため、ここが実際にバグの効いた場所だった — RREP-Instance側にはこの
+「二度目の参照」が存在しない)。
+
+そして`from != dodag.preferredParent`は、まっさらな (今回のDIOで初めて
+`JoinDodag()`されたばかりの) membershipの**本当に最初のコピー**では構造的に
+真になり得ない: `HandleDio()`は`SelectPreferredParent()`をこの関数より前に
+毎回呼び、`dodag.parents`にはこのDIOの送信元 (`from`) しかまだ登録されて
+いない (他に比較対象がない) ため、`preferredParent`は必ず`from`に決まる。
+つまり`alreadyProcessed`が (バグにより) 誤って真であっても、「本当に最初の
+コピー」で`from != preferredParent`が真になることは無く、誤った早期returnは
+一度も発火しない。誤読が意味を持ちうる唯一の状況 (2件目以降のコピーが
+非preferred-parentから届く) では、そのmembership自身の1件目が既に正しく
+`StoreHopByHopRoute()`を呼んで実在のルートを上書き済みのため、そもそも
+「古い、無関係な」経路を読むことがない。
+
+結論: RREP-Instance側にRREQ-Instance側と対称のバグは存在しない。
+`rrepInstanceSeeded`は追加せず、`HasHopByHopRoute(pairedInstanceId, dodagId)`
+のまま残し、この非対称性 (ガードに使われるだけのRREP-Instance側と、
+seed/intersect分岐にも使われるRREQ-Instance側の違い) をコード自身の
+コメントに書き残した。狙いを外した仮の修正 (`rrepInstanceSeeded`とその
+専用試験) はいずれも取り下げた — 挙動を変えない変更と、それを検証したと
+主張するだけの試験を残さないため。
+
+### 89.3 検証
+
+`./test.py -s rpl`全PASS (153件)。`RplAodvHopByHopInstanceReuseTestCase`の
+load-bearing確認は89.1の通り。RREP-Instance側は「修正してもしなくても
+挙動が変わらない」こと自体を確認済み (`rrepInstanceSeeded`を入れた版・
+外した版の両方で全試験PASS)。

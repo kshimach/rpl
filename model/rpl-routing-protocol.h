@@ -1089,6 +1089,35 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
             /// exactly one ART (section 4.3) built straight from origNode
             /// instead.
             std::vector<Ipv6Address> targets;
+            /// Whether this membership's own targets above has been seeded
+            /// from a first RREQ-DIO yet. H=0 reads addressVector's own
+            /// emptiness for the same question instead (targets is seeded
+            /// in the same step addressVector stops being empty, so the two
+            /// always agree there), but H=1 keeps no Address Vector at all
+            /// (section 4.1: "In hop-by-hop mode...this field MUST be set to
+            /// zero and ignored"), so this exists for that mode alone.
+            ///
+            /// An earlier version used HasHopByHopRoute(instanceId, dodagId)
+            /// as H=1's own stand-in -- true once *any* upward route to
+            /// dodagId exists under instanceId, regardless of which
+            /// membership stored it. A Local RPLInstanceID is drawn from a
+            /// small, reused pool a completed discovery frees at its own
+            /// 'L', far sooner than the Hop-by-hop Route it stored survives
+            /// (PathLifetime, minutes) -- so a second, unrelated discovery
+            /// from the *same* OrigNode (dodagId is always OrigNode's own
+            /// address, so it is identical for both) reusing the freed
+            /// instanceId read the first discovery's still-live route as
+            /// its own brand new membership's "already processed" signal on
+            /// its very first RREQ-DIO, intersecting targets against
+            /// nothing instead of seeding them and silencing this router
+            /// immediately under section 6.2.2's own rule above. Checking
+            /// dodagId too (FindHopByHopRoute() over HasHopByHopRoute(), the
+            /// fix section 83 already made on the downward side) does not
+            /// help here, since dodagId is identical for both discoveries
+            /// by construction; only a flag intrinsic to *this* membership
+            /// does. Found by /protocol-test-matrix's angle 1, confirmed
+            /// with this exact reused-instanceId scenario.
+            bool targetsSeeded{false};
             /// The route the RREQ-DIO took to get here, OrigNode-side first,
             /// as this node would propagate it: its own address is already
             /// appended (RFC 9854 section 6.2.5).
