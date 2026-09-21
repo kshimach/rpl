@@ -10138,3 +10138,98 @@ seed/intersect分岐にも使われるRREQ-Instance側の違い) をコード自
 load-bearing確認は89.1の通り。RREP-Instance側は「修正してもしなくても
 挙動が変わらない」こと自体を確認済み (`rrepInstanceSeeded`を入れた版・
 外した版の両方で全試験PASS)。
+
+## 90. HandleP2pDro() の早期returnがStopフラグ記録を素通りしていた4箇所を修正
+
+ユーザーの「おすすめ順で」の指示に沿った候補リストの4番目・5番目に着手。
+4番目 (`HasOtherP2pTargets()`がTargetAddrを見ていない) は調査した結果
+**既に§45で意図的に解決済み**と判明した (90.1)。5番目
+(`HandleP2pDro()`の早期returnがRecordP2pStop()を飛ばす) は実在するバグ
+として修正した (90.2)。
+
+### 90.1 候補4は誤り — §45が既にRFC文言上の限界として解決済み
+
+`HasOtherP2pTargets()`がRPL Target option経由の`additionalTargets`だけを
+見て、P2P-RDO自身のPrimary TargetAddr(`dodag.p2p.target`)を見ていない
+ことを新たなバグと考え、`!IsOwnAddress(dodag.p2p.target)`も真になる条件に
+加える修正を実装し、専用試験
+(`RplP2pTargetOptionNotSoleTargetTestCase`)を書いたところ、既存の
+`RplP2pSoleTargetViaOptionStopsTestCase`(§45.2で新設、load-bearing確認済み)
+が**FAILし始めた**。
+
+`RplP2pSoleTargetViaOptionStopsTestCase`自身の設計コメントと§41.3/§45.1を
+読み直すと、これはRFC 6997 §9.5の文言 (Primary TargetAddr経由の一致だけを
+前提にした書き方) がRPL Target option経由のみで一致したTargetを一切
+想定していないという**文言上のギャップ**を、このモジュールが意図的に
+「additionalTargetsから自分の一致分を除外したリストが空か」という、より
+寛容な独自解釈で埋めた箇所だった。TargetAddr自体は一切参照しない
+という選択は見落としではなく、Target option経由の一致を**それ自体で
+完結する独立したTarget**として扱う (Primary TargetAddr側の探索が
+終わっているかどうかを待たない) という明示的な設計判断であり、§45.2の
+専用試験・load-bearing確認までペアで揃っている。
+
+結論として`HasOtherP2pTargets()`への変更は取り下げ、新設した試験も削除
+した。候補4は**新規バグではなく、既に正しく解決済みの設計判断を再発見
+しただけ**だった、と記録する — 誤った候補も含めて過程を残すのが
+`/protocol-test-matrix`の方針(有効性が確認できなかった仮説を黙って
+消さない)であるため、ここに明記する。
+
+### 90.2 候補5: `HandleP2pDro()`の4箇所の早期returnがRecordP2pStop()を飛ばしていた
+
+`HandleP2pDro()`には、Stopフラグの記録先である`RecordP2pStop()`呼び出し
+より手前に位置する早期returnが複数ある。うち、以下の3箇所は既に
+「§9.6/§9.7が定める理由でこの1通を処理しない」だけの話であり、
+DodagMembership自体が見つかっていない・そもそもP2P-RPLの一時DAGでない
+場合の早期return (妥当、対象が無いので記録しようがない) とは性質が違う:
+
+1. Origin分岐、H=1のHop-by-hop Route保存が競合で失敗した場合
+   (`StoreHopByHopRoute()`がfalseを返すreturn)
+2. Intermediate Router分岐、Address Vectorが自分自身を2回含む
+   ループ検出のreturn
+3. Intermediate Router分岐、H=1のHop-by-hop Route保存が競合で
+   失敗した場合のreturn
+4. Intermediate Router分岐、§88で追加したCompr不一致検出のreturn
+
+これら4箇所はいずれも「このP2P-DROは確かにこのルータに届いた
+(temporary DAGも特定できた) が、局所的な理由でこの1通の処理を
+続けない」というreturnであり、既存の「自分の番でない」分岐
+(`rdo.maxRankOrNh`の範囲外／NH位置不一致)がRecordP2pStop()を**先に
+呼んでから**returnしているのと全く同じ形をしている。その分岐自身の
+コメントがRFC 6997 §8「このP2P-DROを受け取った**すべての**ルータ」・
+§9.1「Stop受信後はこのtemporary DAGのDIOをこれ以上送らない」という
+対象範囲の広さを既に明記しており、4箇所はこの原則の見落としだった。
+
+影響: これら4つの経路のいずれかで処理が止まる状況 (経路競合、
+Address Vectorのループ、Comprミスマッチ) が、たまたまStopフラグを
+運んでいるP2P-DROで起きると、そのルータだけがStopを記録し損ね、
+'L'期限までP2P mode DIOを送り(受け)続ける — 他のルータは正しく
+沈黙する中、この1ルータだけがtemporary DAGを生かし続けてしまう。
+
+### 90.3 修正
+
+4箇所それぞれのreturn直前に`RecordP2pStop(dodag, dro.GetStop());`を
+追加。`RecordP2pStop()`自体は`!stop || dodag.p2p.stopped`で即returnする
+ため、複数箇所から呼んでも副作用は無い (既存の「自分の番でない」分岐も
+含め、この関数は既に複数箇所から呼ばれている)。
+
+新規試験`RplP2pDroRelayComprMismatchStopTestCase`。§88の
+`RplP2pDroRelayComprMismatchTestCase`と同じComprミスマッチ構成
+(単一ノード、Compr 13・40エントリの生バイトP2P-RDO) を再利用しつつ、
+今回はP2P-DRO自身のStopフラグをtrueにする。Comprミスマッチで中継
+できない1件目の後、大きく良いRankを広告する2件目の通常DIOを別の
+隣接ノードから届け、`GetRankIn()`が**変化しないこと**(=
+`ShouldRefuseP2pRdo()`のstopped判定がこの2件目を拒否したこと) を
+確認する。修正を外すとRankが更新されてしまい試験が失敗することを
+確認済み (load-bearing)。他の3箇所 (Hop-by-hop Route競合×2、
+ループ検出) は、Compr不一致ほど到達しやすい経路ではなく
+(前者2つはStoreHopByHopRoute()自体が既に別の理由でリソースを
+使い切っていないと届かない競合状態、後者は自分自身を2回含む
+Address Vectorという非常に稀な入力が要る)、専用試験は追加せず
+コード修正のみに留めた — 4箇所とも同じ1行 (`RecordP2pStop()`呼び出し)
+の追加であり、Comprミスマッチ経路での確認がこの追加パターン自体の
+正しさを裏付けている。
+
+### 90.4 検証
+
+`./ns3 build`clean、`test-runner --suite=rpl`(154件、全PASS)・
+`./test.py -s rpl`PASS。既存試験に回帰なし。

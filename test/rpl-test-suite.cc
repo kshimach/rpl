@@ -14233,6 +14233,215 @@ RplP2pDroRelayComprMismatchTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief A P2P-DRO that HandleP2pDro() discards for a local reason before
+ *        relaying still records its own Stop flag.
+ *
+ * RFC 6997 sections 8/9.1: "All the routers receiving such a P2P-DRO...
+ * SHOULD NOT...process any more DIOs for this temporary DAG" once its Stop
+ * flag is seen -- an audience that HandleP2pDro()'s own "not this router's
+ * turn" branch already reads literally (@see its own doc comment: recording
+ * Stop there, before returning, is what lets a router the route does not
+ * even pass through still honour it). The same reasoning was missing from
+ * every OTHER early return in the function that discards a P2P-DRO for a
+ * purely local reason -- an Address Vector naming this router twice, a
+ * conflicting Hop-by-hop Route, or (this test's own scenario) an Address
+ * Vector that does not fit this router's own Compr elision -- each of which
+ * left the temporary DAG never marked stopped despite this router having
+ * received a P2P-DRO whose own Stop flag said to quiet down.
+ *
+ * Reuses RplP2pDroRelayComprMismatchTestCase's exact Compr-mismatch
+ * scenario (a single relay, joined to a fabricated temporary DAG, fed a
+ * raw-byte P2P-DRO whose Address Vector fits Compr 13 but not this
+ * router's own recomputed Compr 8) with one difference: this P2P-DRO's own
+ * Stop flag is set. A second, ordinary join DIO for the same temporary DAG
+ * then arrives from a new, much-better-Rank neighbour -- observable via
+ * GetRankIn() only if ShouldRefuseP2pRdo()'s own stopped check let it
+ * through, since a stopped temporary DAG refuses every DIO before ever
+ * reaching SelectPreferredParent().
+ */
+class RplP2pDroRelayComprMismatchStopTestCase : public TestCase
+{
+  public:
+    RplP2pDroRelayComprMismatchStopTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplP2pDroRelayComprMismatchStopTestCase::RplP2pDroRelayComprMismatchStopTestCase()
+    : TestCase("A P2P-DRO discarded for a Compr mismatch still records its own Stop flag")
+{
+}
+
+void
+RplP2pDroRelayComprMismatchStopTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(1);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.AssignWithoutAddress(devices);
+
+    Ptr<Node> node = nodes.Get(0);
+    rplHelper.SetRoot(node, Ipv6Address("2001:1::"), 64);
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+    Ipv6Address ownAddress = rpl->GetGlobalAddress();
+    NS_TEST_ASSERT_MSG_NE(ownAddress, Ipv6Address::GetAny(), "node has no global address yet");
+    uint8_t ownBuf[16];
+    ownAddress.Serialize(ownBuf);
+
+    uint8_t dodagIdBuf[16];
+    std::copy(ownBuf, ownBuf + 16, dodagIdBuf);
+    dodagIdBuf[15] = static_cast<uint8_t>(dodagIdBuf[15] + 1);
+    Ipv6Address dodagId = Ipv6Address::Deserialize(dodagIdBuf);
+
+    Ipv6Address peerLinkLocal("fe80::a");
+    Ipv6Address betterLinkLocal("fe80::b");
+    static constexpr uint8_t INSTANCE = 0x81;
+    // Well within MaxRank (5, below) at either Rank this test advertises --
+    // advertisedDagRank must stay strictly under 5, not just under the
+    // resulting ownDagRank's own bound -- and comfortably worse than
+    // betterRank so SelectPreferredParent() would switch to it if the DIO
+    // carrying it were ever processed.
+    const uint16_t worseRank = static_cast<uint16_t>(3 * RPL_MIN_HOPRANKINC);
+    const uint16_t betterRank = RPL_MIN_HOPRANKINC;
+
+    auto buildJoinDio = [&](uint16_t rank) {
+        RplDioHeader dio;
+        dio.SetInstanceId(INSTANCE);
+        dio.SetVersionNumber(0);
+        dio.SetRank(rank);
+        dio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+        dio.SetGrounded(true);
+        dio.SetDodagId(dodagId);
+        dio.SetDtsn(0);
+        P2pRdoOption rdo;
+        rdo.reply = false;
+        rdo.hopByHop = false;
+        rdo.numRoutes = 0;
+        rdo.lifetime = 3;
+        rdo.maxRankOrNh = 5;
+        rdo.target = dodagId; // a placeholder, not this node
+        rdo.addressVector = {};
+        dio.SetP2pRdo(rdo);
+        return dio;
+    };
+
+    // Step 1: an ordinary join at a deliberately worse Rank.
+    DeliverRawRplMessage<RplDioHeader>(node,
+                                       1,
+                                       buildJoinDio(worseRank),
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       peerLinkLocal,
+                                       Ipv6Address(RPL_ALL_NODES_MULTICAST));
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(INSTANCE, dodagId),
+                          true,
+                          "The join DIO was not accepted at all");
+    uint16_t rankAfterJoin = rpl->GetRankIn(INSTANCE, dodagId);
+
+    // Step 2: the Compr-mismatch P2P-DRO, this time carrying Stop.
+    // Byte layout identical to RplP2pDroRelayComprMismatchTestCase's own.
+    constexpr uint8_t compr = 13;
+    constexpr uint8_t entrySize = 16 - compr;
+    constexpr uint32_t entries = 40;
+    constexpr uint8_t nh = 5;
+    constexpr uint8_t length = static_cast<uint8_t>(2 + (1 + entries) * entrySize);
+
+    std::vector<uint8_t> rdoBytes;
+    rdoBytes.push_back(RPL_OPTION_P2P_RDO);
+    rdoBytes.push_back(length);
+    rdoBytes.push_back(compr & RPL_P2P_COMPR_MASK);
+    rdoBytes.push_back(nh & RPL_P2P_MAX_RANK_MASK);
+    rdoBytes.insert(rdoBytes.end(), dodagIdBuf + compr, dodagIdBuf + 16);
+    for (uint32_t entry = 0; entry < entries; entry++)
+    {
+        if (entry == nh - 1)
+        {
+            rdoBytes.insert(rdoBytes.end(), ownBuf + compr, ownBuf + 16);
+        }
+        else
+        {
+            rdoBytes.push_back(0xAA);
+            rdoBytes.push_back(static_cast<uint8_t>(entry >> 8));
+            rdoBytes.push_back(static_cast<uint8_t>(entry));
+        }
+    }
+    NS_TEST_ASSERT_MSG_EQ(rdoBytes.size(), 2u + length, "Built the wrong number of bytes");
+
+    RplP2pDroHeader dro;
+    dro.SetInstanceId(INSTANCE);
+    dro.SetStop(true); // the crux of this test
+    dro.SetAckRequested(false);
+    dro.SetSequence(0);
+    dro.SetDodagId(dodagId);
+    Ptr<Packet> packet = Create<Packet>();
+    packet->AddHeader(dro);
+    packet->AddAtEnd(Create<Packet>(rdoBytes.data(), rdoBytes.size()));
+
+    Icmpv6Header icmpv6Header;
+    icmpv6Header.SetType(ICMPV6_RPL);
+    icmpv6Header.SetCode(static_cast<uint8_t>(RPL_CODE_P2P_DRO));
+    icmpv6Header.CalculatePseudoHeaderChecksum(
+        peerLinkLocal,
+        Ipv6Address(RPL_ALL_NODES_MULTICAST),
+        packet->GetSize() + icmpv6Header.GetSerializedSize(),
+        Icmpv6L4Protocol::GetStaticProtocolNumber());
+    packet->AddHeader(icmpv6Header);
+
+    Ipv6Header ipv6Header;
+    ipv6Header.SetSource(peerLinkLocal);
+    ipv6Header.SetDestination(Ipv6Address(RPL_ALL_NODES_MULTICAST));
+    ipv6Header.SetNextHeader(Icmpv6L4Protocol::GetStaticProtocolNumber());
+    ipv6Header.SetPayloadLength(packet->GetSize());
+    ipv6Header.SetHopLimit(255);
+    packet->AddHeader(ipv6Header);
+
+    Ptr<Ipv6L3Protocol> ipv6l3 = node->GetObject<Ipv6L3Protocol>();
+    Ptr<NetDevice> device = ipv6l3->GetNetDevice(1);
+    ipv6l3->Receive(device, packet, 0x86dd, device->GetAddress(), device->GetAddress(),
+                   NetDevice::PACKET_HOST);
+
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(INSTANCE, dodagId),
+                          true,
+                          "Processing the oversized P2P-DRO disturbed the temporary DAG "
+                          "membership it should only have refused to relay");
+
+    // Step 3: a much-better-Rank join DIO for the same temporary DAG, from
+    // a new neighbour. If the Stop flag from step 2 was recorded despite
+    // the Compr mismatch, ShouldRefuseP2pRdo() refuses this DIO outright
+    // and the Rank stays exactly what step 1 left it at.
+    DeliverRawRplMessage<RplDioHeader>(node,
+                                       1,
+                                       buildJoinDio(betterRank),
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       betterLinkLocal,
+                                       Ipv6Address(RPL_ALL_NODES_MULTICAST));
+
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetRankIn(INSTANCE, dodagId),
+                          rankAfterJoin,
+                          "A DIO reached SelectPreferredParent() after Stop should have "
+                          "silenced this temporary DAG entirely -- the Compr-mismatch return "
+                          "must have skipped RecordP2pStop()");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief A P2P mode DIO is only joined if the router's own resulting
  *        DAGRank would stay within the MaxRank, relaxed by one step for the
  *        Target, mirroring AODV-RPL's own RankLimit boundary test.
@@ -24641,6 +24850,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplP2pTemporaryInstanceArmsWithoutAddressTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvTemporaryInstanceArmsWithoutAddressTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pDroRelayComprMismatchTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pDroRelayComprMismatchStopTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pMaxRankTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pTrickleRuleSuppressionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pDroGeneratedTestCase, TestCase::Duration::QUICK);

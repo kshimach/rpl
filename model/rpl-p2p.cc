@@ -1267,6 +1267,15 @@ RplRoutingProtocol::HandleP2pDro(const RplP2pDroHeader& dro, Ipv6Address from, u
                 NS_LOG_LOGIC("Discarding a P2P-DRO establishing a Hop-by-hop Route that "
                             "conflicts with one already held for "
                             << rdo.target);
+                // Stop still binds: this Origin received the P2P-DRO, and
+                // whether to keep advertising DIOs for this temporary DAG
+                // (section 9.1) has nothing to do with whether this
+                // particular route conflicted with one already held (@see
+                // the "not this router's turn" branch below for the same
+                // principle already applied once, and its own doc comment
+                // for why returning first left Stop working only for
+                // whichever copy happened to process cleanly).
+                RecordP2pStop(dodag, dro.GetStop());
                 return;
             }
             NS_LOG_INFO("P2P-RPL Hop-by-hop Route discovery to "
@@ -1395,6 +1404,13 @@ RplRoutingProtocol::HandleP2pDro(const RplP2pDroHeader& dro, Ipv6Address from, u
     if (ownCount > 1)
     {
         NS_LOG_LOGIC("Dropping a P2P-DRO whose Address Vector names this router more than once");
+        // Stop still binds (@see the "not this router's turn" branch above
+        // for the same principle already applied, and its own doc comment):
+        // this router received the P2P-DRO, and a loop in its Address
+        // Vector is a reason to discard this copy, not a reason to keep
+        // this router noisy about a temporary DAG the Stop flag says to
+        // quiet down for.
+        RecordP2pStop(dodag, dro.GetStop());
         return;
     }
 
@@ -1420,6 +1436,10 @@ RplRoutingProtocol::HandleP2pDro(const RplP2pDroHeader& dro, Ipv6Address from, u
             NS_LOG_LOGIC("Discarding a P2P-DRO establishing a Hop-by-hop Route that conflicts "
                         "with one already held for "
                         << rdo.target);
+            // Stop still binds, the same reason as the Origin's own
+            // identically-shaped branch above and the "not this router's
+            // turn" branch further up.
+            RecordP2pStop(dodag, dro.GetStop());
             return;
         }
     }
@@ -1457,6 +1477,12 @@ RplRoutingProtocol::HandleP2pDro(const RplP2pDroHeader& dro, Ipv6Address from, u
                     << relayedRdo.addressVector.size()
                     << " entries does not fit this router's own Compr elision ("
                     << +relayedCompr << ")");
+        // Stop still binds, the same reason as the other early returns
+        // above: this router received the P2P-DRO, and a Compr mismatch is
+        // a reason not to relay this specific copy, not a reason to keep
+        // this router noisy about a temporary DAG the Stop flag says to
+        // quiet down for.
+        RecordP2pStop(dodag, dro.GetStop());
         return;
     }
 
