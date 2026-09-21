@@ -1296,6 +1296,31 @@ RplRoutingProtocol::SendDio(DodagMembership& dodag, Ipv6Address dst, uint32_t in
         return;
     }
 
+    // The send-side half of HandleDio()'s MOP/option consistency check. The
+    // three MOP 4 branches below each attach their own discovery option, and
+    // a membership none of them recognises would go out with none at all --
+    // a DIO RFC 6997 section 6.1 says "MUST be discarded", and one that,
+    // before HandleDio() refused it, had every neighbour join an ordinary
+    // DODAG with no 'L' deadline and re-advertise it the same way. Refusing
+    // on receipt already stops that; refusing here too keeps a membership
+    // that should not exist, however it came to, from producing traffic.
+    //
+    // No dedicated test drives this branch: HandleDio()'s own gate (@see its
+    // comment) already keeps a membership matching this condition from ever
+    // being created, so nothing in the test suite reaches SendDio() in this
+    // state. Removing the check does not fail the suite either, for the
+    // same reason -- confirmed with /protocol-test-matrix's load-bearing
+    // check. Left in as defense in depth against a membership reaching this
+    // state some other way (a future MOP 4 use, a bug in the receive-side
+    // gate), at the cost of one comparison per DIO sent.
+    if (dodag.mop == RPL_MOP_P2P_ROUTE_DISCOVERY && !dodag.aodv.isRrepInstance &&
+        dodag.aodv.target.IsAny() && dodag.p2p.target.IsAny())
+    {
+        NS_LOG_LOGIC("Not sending a P2P mode DIO for " << dodag.dodagId
+                                                       << ": it would carry no discovery option");
+        return;
+    }
+
     RplDioHeader dio;
     dio.SetInstanceId(dodag.instanceId);
     dio.SetVersionNumber(dodag.version);
@@ -1665,6 +1690,44 @@ RplRoutingProtocol::HandleDio(const RplDioHeader& dio,
                     << ", only non-storing, storing (no multicast) and P2P route discovery are "
                        "implemented");
         return;
+    }
+
+    // The MOP and the discovery option have to agree, in both directions,
+    // and everything below branches on the option rather than the MOP -- the
+    // refusal checks just after this, the join, and HandleP2pRdo()/
+    // HandleAodvRreq() at the end -- so this is the one place that decides it.
+    //
+    // A P2P mode DIO "MUST carry one (and only one) P2P-RDO ... A received
+    // P2P mode DIO MUST be discarded if it does not contain exactly one
+    // P2P-RDO" (RFC 6997 section 6.1), and AODV-RPL puts its RREQ or RREP
+    // option under the same MOP (RFC 9854 section 9, "AODV-RPL uses the 'P2P
+    // Route Discovery Mode of Operation' (MOP == 4)"). A MOP 4 DIO with none
+    // of the three would otherwise be joined as an ordinary DODAG with no
+    // 'L' deadline at all, since only the option handlers arm one; with more
+    // than one, which protocol it belongs to is undefined.
+    //
+    // The other direction: RFC 6997 section 6.1 also lists the MOP among
+    // the Base object fields whose violation means "A received P2P mode DIO
+    // MUST be discarded". Processing a discovery option under MOP 1 or 2
+    // would build the temporary DAG's state while every guard keyed on
+    // RPL_MOP_P2P_ROUTE_DISCOVERY -- the base-DODAG exclusion in JoinDodag()
+    // among them -- looks the other way.
+    {
+        uint32_t discoveryOptions = (dio.HasP2pRdo() ? 1 : 0) + (dio.HasRreq() ? 1 : 0) +
+                                    (dio.HasRrep() ? 1 : 0);
+        bool p2pMode = dio.GetMop() == RPL_MOP_P2P_ROUTE_DISCOVERY;
+        if (p2pMode && discoveryOptions != 1)
+        {
+            NS_LOG_LOGIC("Discarding a P2P mode DIO carrying " << discoveryOptions
+                                                               << " discovery options, not one");
+            return;
+        }
+        if (!p2pMode && discoveryOptions != 0)
+        {
+            NS_LOG_LOGIC("Discarding a mode " << +dio.GetMop()
+                                              << " DIO carrying a route discovery option");
+            return;
+        }
     }
 
     // On a symmetric route an RREP-DIO is not an advertisement to join --
@@ -4348,9 +4411,25 @@ RplRoutingProtocol::RouteOutput(Ptr<Packet> p,
     // membership could join and rank successfully but never actually get a
     // route registered at its own root, its DAO instead heading towards
     // the base DODAG's parent, who has no idea what to do with it.
+    //
+    // Excludes P2P-RPL/AODV-RPL temporary DAGs (RPL_MOP_P2P_ROUTE_DISCOVERY):
+    // SendDao() already refuses to send a DAO for one ("AODV-RPL does not
+    // utilize the...DAO", RFC 9854 section 1; RFC 6997 has no DAO analogue
+    // either), so the traffic this loop exists to route never originates
+    // from one, and RFC 6997 section 9.1 forbids using it for anything else
+    // -- "The temporary DAG MUST NOT be used to route data packets...
+    // joining a temporary DAG does not allow a router to provision routing
+    // table entries listing the router's parents in the temporary DAG as
+    // the next hops". Without this, an ordinary outbound packet whose
+    // destination happened to equal a temporary DAG's own DODAGID (its
+    // Origin's global address) would route via that DAG's preferredParent
+    // instead of the base DODAG for as long as the temporary membership
+    // lasted, including base DAO/DAO-ACK traffic to that same address
+    // (@see design-constraints.md).
     for (auto& [key, other] : m_dodags)
     {
-        if (dodag == &other || other.dodagId != dst)
+        if (dodag == &other || other.dodagId != dst ||
+            other.mop == RPL_MOP_P2P_ROUTE_DISCOVERY)
         {
             continue;
         }

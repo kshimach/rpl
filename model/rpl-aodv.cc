@@ -624,6 +624,22 @@ RplRoutingProtocol::HandleAodvRreq(const RplDioHeader& dio,
     dodag.aodv.target = dio.GetArt().target;
     dodag.aodv.isOrigin = false;
 
+    // Armed here, with lifetimeField already set, rather than left to fall
+    // out at the end of this function alongside the Address Vector: H=0's
+    // "no global address yet" branch below returns before reaching there,
+    // and JoinDodag() (which ran just before this function, from HandleDio())
+    // starts this membership's Trickle but never arms 'L' itself. Without
+    // this, a router that joined an RREQ-Instance before SLAAC on the base
+    // DODAG had finished kept the membership -- Trickle running, exempt from
+    // SelectPreferredParent()'s staleness sweep as every temporary instance
+    // is -- with no deadline at all until some later DIO happened to reach
+    // this same point with an address in hand. RFC 9854 section 4.1 counts
+    // 'L' "from when this node joined it", not from when its own Address
+    // Vector entry was appended (@see /protocol-test-matrix's angle 4
+    // verification pass, which measured this surviving past 'L' by orders
+    // of magnitude and, once Stop-silenced, indefinitely).
+    ArmAodvExpiry(dodag, key);
+
     // RFC 9854 section 6.2.2: "the intermediate router maintains a record
     // of the targets that have been requested for a given RREQ-Instance"
     // and, once a later RREQ-DIO's own list differs from what came before,
@@ -1596,6 +1612,19 @@ RplRoutingProtocol::HandleAodvRrepInstance(const RplDioHeader& dio,
     dodag.aodv.target = key.dodagId; // an RREP-Instance is rooted at the TargNode
     dodag.aodv.isTarget = false;
     dodag.aodv.isOrigin = IsOwnAddress(dodag.aodv.origNode);
+
+    // Armed here rather than only in the two branches below (H=1 after
+    // StoreHopByHopRoute() succeeds, H=0's OrigNode case), for the same
+    // reason HandleAodvRreq() now does the same: lifetimeField, origNode and
+    // isRrepInstance are already set for ArmAodvExpiry()'s section 4.2
+    // pairing logic to use, and H=0's non-OrigNode relay case below has no
+    // arming call of its own at all -- it returns on "no global address
+    // yet" without one, the same gap /protocol-test-matrix's angle 4 found
+    // on the RREQ-Instance side. The two calls further down are now no-ops
+    // (ArmAodvExpiry() arms once, on the first call after a join) and are
+    // left in place rather than removed, so each branch still visibly pairs
+    // "this membership is complete" with "its clock is running".
+    ArmAodvExpiry(dodag, key);
 
     if (rrep.hopByHop)
     {

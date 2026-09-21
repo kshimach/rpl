@@ -469,6 +469,22 @@ RplRoutingProtocol::HandleP2pRdo(const RplDioHeader& dio, Ipv6Address from, uint
     dodag.p2p.target = rdo.target;
     dodag.p2p.maxRank = rdo.maxRankOrNh;
     dodag.p2p.lifetimeField = rdo.lifetime;
+
+    // Armed as soon as lifetimeField is known, rather than at the end of
+    // this function alongside the Address Vector: the "no global address
+    // yet" branch below returns before reaching there, and JoinDodag()
+    // (already run, from HandleDio(), before this function) starts this
+    // membership's Trickle but never arms 'L' itself. Without this, a
+    // router that heard this discovery before SLAAC on the base DODAG had
+    // finished kept the membership -- Trickle running, exempt from
+    // SelectPreferredParent()'s staleness sweep as every temporary instance
+    // is -- with no deadline until some later DIO happened to reach this
+    // point with an address in hand, which a Stop-silenced neighbour (@see
+    // RecordP2pStop()) may never send. RFC 6997 sections 7/9.1 count 'L'
+    // "since it joined", not since its Address Vector entry was appended
+    // (@see /protocol-test-matrix's angle 4 verification pass).
+    ArmP2pExpiry(dodag, key);
+
     // "...and ignored on reception" (section 7). Zeroed rather than merely
     // skipped at the branch below, so that this node also re-emits zero
     // when it relays the DIO onward (@see SendDio()) -- a peer that sets
@@ -1194,6 +1210,24 @@ RplRoutingProtocol::HandleP2pDro(const RplP2pDroHeader& dro, Ipv6Address from, u
         return;
     }
     DodagMembership& dodag = it->second;
+
+    // The same rule, applied to what the lookup found rather than whether it
+    // found anything. m_dodags keys every membership this node holds by
+    // {RPLInstanceID, DODAGID} -- the base DODAG and AODV-RPL's instances as
+    // well as P2P-RPL's temporary DAGs -- so a match says nothing about
+    // which kind it is. Sections 9.6/9.7 only apply to "the temporary DAG
+    // identified by the RPLInstanceID and the DODAGID", and section 8 scopes
+    // every Stop obligation to it ("SHOULD NOT generate any more DIOs for
+    // this temporary DAG"). Without this, RecordP2pStop() would apply
+    // dioTrickle.Stop() to whatever membership happened to share the key,
+    // and a stopped Trickle is never restarted for a DODAG this node does
+    // not leave -- the base DODAG's root included.
+    if (dodag.mop != RPL_MOP_P2P_ROUTE_DISCOVERY || dodag.p2p.target.IsAny())
+    {
+        NS_LOG_LOGIC("Dropping a P2P-DRO naming DODAG " << dodag.dodagId
+                                                        << ", which is not a P2P-RPL temporary DAG");
+        return;
+    }
     const P2pRdoOption& rdo = dro.GetP2pRdo();
 
     if (dodag.p2p.isOrigin)

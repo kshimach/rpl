@@ -9851,3 +9851,94 @@ redundancy constant」と続ける。§6.1 の表をチューニングせずに�
 測定である。他の PHY やより大きな網で 128ms が最適である保証は無い。RFC 6997 §9.2
 自身が「典型的なDIO送信遅延の1桁上」という目安を与えており、127Bフレーム・250kb/s
 なら送信時間は約4ms なので、この目安からも 128ms は妥当な範囲にある。
+
+## 86. `/protocol-test-matrix` による監査 (§84・§85 の3マイルストーン) — 4件の実装バグを修正
+
+§84 の6件、§84.8 の§9.1修正、§85 のImin変更、計7コミットを対象に `/protocol-test-matrix`
+を実装者と別コンテキストで走らせた。5角 (正常系・境界値・異常系・状態遷移・移行漏れ) の
+うち4角が完走し、10件超の候補を得た。うち4件をプローブで実証し、修正した。
+
+### 86.1 候補A — 偽造したP2P-DROで無関係なDODAGのDIOを恒久的に止められる
+
+`HandleP2pDro()` は `m_dodags` を `{RPLInstanceID, DODAGID}` だけで引き、見つかった
+membership が P2P-RPL の一時DAGかどうかを確認せずに `RecordP2pStop()` を呼んでいた。
+`m_dodags` は基盤DODAG・AODV-RPLインスタンス・P2P-RPL一時DAGを区別なく同じマップに
+格納するため、**両フィールドが平文で乗るDIOの鍵さえ揃えれば任意のmembershipのTrickleを
+止められる**。`RecordP2pStop()` は §9.1 修正 (`3bead2f`) で `dioTrickle.Stop()` を
+呼ぶようになっており、止まったTrickleは離脱以外で再始動しないため、**1パケットで
+root を恒久的に沈黙させられる**ことをプローブで実証した (2ノード構成、偽造した
+Stop=1のP2P-DROを1通注入 → 攻撃前後で root のDIO数が 1/3通 → 0/0通)。
+
+修正: `HandleP2pDro()` のmembership解決直後に `dodag.mop == RPL_MOP_P2P_ROUTE_DISCOVERY
+&& !dodag.p2p.target.IsAny()` を確認するガードを追加。新規テスト
+`RplP2pStopDoesNotReachOtherDodagsTestCase`。ガードを外すと確実に落ちることを確認済み
+(load-bearing)。
+
+### 86.2 候補D — MOPと探索オプションの不一致を検査していなかった
+
+`ShouldRefuseP2pRdo()`/`ShouldRefuseAodvRreq()`/`ShouldRefuseAodvRrep()` はいずれも
+自分のオプションの有無 (`HasP2pRdo()`/`HasRreq()`/`HasRrep()`) でしか呼ばれず、
+**MOP自体の一致は一度も検査していなかった**。2方向の実害をプローブで確認した:
+
+- **MOP=4でオプションを一つも持たないDIO**: `JoinDodag()`はTrickleを起動するが
+  `ArmP2pExpiry()`/`ArmAodvExpiry()`はオプション別ハンドラの中でしか呼ばれないため、
+  この幽霊membershipは`L`が一度も張られない。しかも掃引免除 (§84.5) の対象でもあるため
+  **retireする経路が存在しない**。4ノード直列への1回の注入で、`L`満了後もt=3275まで
+  全ノードが参加したまま、DAG Config同梱で1ノードあたり毎秒15.6本のDIOが止まらないことを
+  実測した。
+- **MOP≠4でP2P-RDO/RREQ/RREPを持つDIO**: `JoinDodag()`の`!m_hasBaseDodag`判定はMOPを
+  見て基盤DODAGへの昇格を防ぐが、通常のDIO処理経路 (`ShouldRefuseP2pRdo`等) はMOPを
+  見ないのでオプションの処理自体は素通りする。基盤をまだ持たないノードにこれを送ると、
+  `L`満了で`LeaveDodag(key, false)` (poison=false) が走り、`m_hasBaseDodag`が存在しない
+  キーを指したまま残る。**そのノードは以後どのDODAGも基盤にできなくなる**ことを実測した。
+
+修正: `HandleDio()`のMOPフィルタ直後に、MOP=4なら探索オプションがちょうど1つ、
+MOP≠4ならゼロであることを検査するブロックを追加 (受信側)。`SendDio()`にも対応する
+送信側ガードを追加 (どちらの探索先も持たないMOP=4 membershipから何も送信しない;
+既存試験では到達しない防御的多重化のため、その旨をコメントに明記)。新規テスト
+`RplMop4WithNoDiscoveryOptionRefusedTestCase`。既存試験
+`RplAodvMopAcceptedTestCase`はBase objectのみのMOP=4 DIOを想定していたため、
+本物のRREQ-DIO (RREQオプション+ART) を組むよう書き直した — 修正前の想定自体が
+今回の準拠規則に反していた。
+
+### 86.3 候補R — 一時DAGがデータパケットの経路として使われていた
+
+`RouteOutput()`の「dstは別DODAGの自分のDODAGIDかもしれない」ループは、DAO/DAO-ACK再送
+(非rootの一時DAGは送らない、`SendDao()`が既にMOP判定で拒否) を想定したものだが、
+一時DAG (`RPL_MOP_P2P_ROUTE_DISCOVERY`) を除外していなかった。`RouteViaPreferredParent()`
+は`dst`を検査せず`dodag.preferredParent`をそのままゲートウェイにするため、**一時DAGの
+DODAGID宛ての任意のパケットが、その一時DAGのpreferredParent経由で送出される** —
+RFC 6997 §9.1「The temporary DAG MUST NOT be used to route data packets」への違反。
+
+修正: ループの継続条件に`other.mop == RPL_MOP_P2P_ROUTE_DISCOVERY`を追加。新規テスト
+`RplTemporaryDagNotUsedForRoutingTestCase` (root--mid--otherの直列、otherが一時DAGを
+root; mid宛てのother向けパケットのゲートウェイがroot経由であることを確認)。ガードを
+外すとゲートウェイが一時DAGの親 (`fe80::200:ff:fe00:3`) に変わることを確認済み。
+
+### 86.4 候補C — グローバルアドレス未取得のまま加入すると`L`が一度も張られない
+
+`HandleP2pRdo()`/`HandleAodvRreq()`/`HandleAodvRrepInstance()`はいずれも
+「Address Vectorに積む自分のグローバルアドレスがまだ無い」場合に`return`するが、
+その`return`は`ArmP2pExpiry()`/`ArmAodvExpiry()`より**手前**にあった。§84.5の基盤DODAG
+のstaleness掃引免除と組み合わさると、この状態のmembershipは**`L`もstaleness掃引も
+効かないまま無期限に残る**。単体注入では1760通/時間 (P2P) を実測。現実的な構成では
+近隣が救済のDIOを再送するため大抵は自己修復するが、AODV-RPLはREJOIN_REENABLE
+(既定15分) 分だけ救済が遅れ、§9.1 (`3bead2f`) でStop済みの近隣は救済のDIOを二度と
+送らないため、その場合は無期限になることを実測した。
+
+修正: `lifetimeField`を設定した直後、Address Vectorを組む前に`ArmP2pExpiry()`/
+`ArmAodvExpiry()`を呼ぶよう移動 (`HandleP2pRdo()`、`HandleAodvRreq()`、
+`HandleAodvRrepInstance()`の3箇所)。既存の呼び出しは冪等 (`IsRunning()`で早期return)
+なのでそのまま残し、「membershipが完成した」と「時計が動いている」の対応を各分岐に
+残した。新規テスト2件 — `RplP2pTemporaryInstanceArmsWithoutAddressTestCase`、
+`RplAodvTemporaryInstanceArmsWithoutAddressTestCase` (グローバルアドレスを一切持たない
+単一ノードに探索DIOを直接注入し、`L`満了で確実に離脱することを確認)。それぞれの
+`Arm*Expiry()`呼び出しを個別に外すと対応する試験が落ちることを確認済み。
+`HandleAodvRrepInstance()`側の対応する専用試験は無い (時間の制約、次点候補)。
+
+### 86.5 未検証で持ち越したもの
+
+角3の残り (P2P-DRO中継のCompr再直列化assert、Serialize()のOpt Data Len不整合、
+doublings上限62/63でのハング) と角5の残り (H=1でのRREQ積集合誤判定の退行、
+`HasOtherP2pTargets()`のTargetAddr不参照) は実証まで進めていない。角4
+(状態遷移) は起動したが上限に達し未完走。次サイクルで拾う。

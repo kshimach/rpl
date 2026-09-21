@@ -7996,6 +7996,29 @@ RplAodvMopAcceptedTestCase::DoRun()
                                 RPL_DEFAULT_LIFETIME_UNIT);
     // No Prefix Information: an AODV-RPL local instance never SLAACs
     // (@see CreateLocalDodag()).
+    //
+    // The RREQ option and its ART are what make this an RREQ-DIO at all. An
+    // earlier version of this test sent the Base object alone and expected
+    // it joined, which is exactly what RFC 6997 section 6.1 forbids for MOP
+    // 4 -- "A received P2P mode DIO MUST be discarded if it does not contain
+    // exactly one P2P-RDO", with AODV-RPL's RREQ/RREP standing in for the
+    // P2P-RDO under the same MOP -- and HandleDio() now refuses it. What
+    // this test is about, staying out of DAO and DIS, needs a well-formed
+    // RREQ-DIO to say anything. The Trickle Imin above (2^20 ms) keeps this
+    // node's own relay of it out of the monitor's windows below.
+    RplDioHeader::RreqOption rreq;
+    rreq.symmetric = true;
+    rreq.hopByHop = false;
+    rreq.compr = 0;
+    rreq.lifetime = 1; // 16 s, longer than everything this test waits for
+    rreq.rankLimit = 0;
+    rreq.origSeqNo = 1;
+    rreqDio.SetRreq(rreq);
+    RplDioHeader::ArtOption art;
+    art.destSeqNo = 0;
+    art.prefixLength = 0;
+    art.target = Ipv6Address("2001:9::99"); // not this node, so it only relays
+    rreqDio.SetArt(art);
     DeliverRawRplMessage<RplDioHeader>(node,
                                        1,
                                        rreqDio,
@@ -13197,6 +13220,630 @@ RplP2pStopSilencesDiosTestCase::DoRun()
                                             "cancelled them");
 
     monitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief A forged P2P-DRO naming the base DODAG's own RPLInstanceID and
+ *        DODAGID does not silence the base DODAG's DIO Trickle.
+ *
+ * m_dodags keys every membership this node holds -- the base DODAG,
+ * AODV-RPL instances, and P2P-RPL temporary DAGs alike -- by
+ * {RPLInstanceID, DODAGID} alone, and both fields travel in the clear in
+ * every DIO. RFC 6997 sections 8/9.6/9.7 scope every Stop obligation to
+ * "this temporary DAG"; HandleP2pDro() found the membership by key without
+ * confirming which kind it is, so it applied dioTrickle.Stop() to whatever
+ * matched. Because that Timer is never restarted for a DODAG this node does
+ * not leave, one forged packet silences the root permanently -- discovered
+ * by /protocol-test-matrix's angle 3, which built this exact scenario as a
+ * probe before this test existed.
+ */
+class RplP2pStopDoesNotReachOtherDodagsTestCase : public TestCase
+{
+  public:
+    RplP2pStopDoesNotReachOtherDodagsTestCase();
+
+  private:
+    void DoRun() override;
+
+    /// @brief Count a DIO for the base DODAG seen at the monitor.
+    /// @param socket the monitoring socket
+    void CountBaseDio(Ptr<Socket> socket);
+
+    Ipv6Address m_baseDodagId; //!< set once known, to tell the base DODAG's own DIOs apart
+    uint32_t m_dioCount{0};    //!< base DODAG DIOs seen at the monitor
+};
+
+RplP2pStopDoesNotReachOtherDodagsTestCase::RplP2pStopDoesNotReachOtherDodagsTestCase()
+    : TestCase("A forged P2P-DRO naming the base DODAG does not stop its DIOs")
+{
+}
+
+void
+RplP2pStopDoesNotReachOtherDodagsTestCase::CountBaseDio(Ptr<Socket> socket)
+{
+    Address sender;
+    Ptr<Packet> packet = socket->RecvFrom(sender);
+    if (!packet)
+    {
+        return;
+    }
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ipv6Header);
+    Icmpv6Header icmpv6Header;
+    packet->RemoveHeader(icmpv6Header);
+    if (icmpv6Header.GetType() != ICMPV6_RPL || icmpv6Header.GetCode() != RPL_CODE_DIO)
+    {
+        return;
+    }
+    RplDioHeader dio;
+    packet->RemoveHeader(dio);
+    if (dio.GetDodagId() == m_baseDodagId)
+    {
+        m_dioCount++;
+    }
+}
+
+void
+RplP2pStopDoesNotReachOtherDodagsTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2); // 0 = root, 1 = a neighbour (and where the forgery comes from)
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> root = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(root->IsJoined(), true, "The root never formed its own base DODAG");
+    m_baseDodagId = root->GetDodagId();
+
+    Ipv6Address rootLinkLocal =
+        nodes.Get(0)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address neighbourLinkLocal =
+        nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    Ptr<Socket> monitor = Socket::CreateSocket(nodes.Get(1), Ipv6RawSocketFactory::GetTypeId());
+    monitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    monitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    monitor->BindToNetDevice(nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+    monitor->SetRecvCallback(MakeCallback(&RplP2pStopDoesNotReachOtherDodagsTestCase::CountBaseDio,
+                                          this));
+
+    Simulator::Stop(Seconds(30));
+    Simulator::Run();
+    NS_TEST_ASSERT_MSG_GT(m_dioCount, 0, "The root never sent a base DIO at all");
+
+    // A P2P-DRO naming the base DODAG's own key, S=1, and a NH position that
+    // does not name this node -- the branch that, before this fix, recorded
+    // the Stop flag on whatever membership the key matched without asking
+    // whether it was a P2P-RPL temporary DAG. A real Target is irrelevant to
+    // the root, which never joined any discovery; the point is the key
+    // collision alone.
+    RplP2pDroHeader dro;
+    dro.SetInstanceId(RPL_DEFAULT_INSTANCE);
+    dro.SetStop(true);
+    dro.SetAckRequested(false);
+    dro.SetSequence(0);
+    dro.SetDodagId(m_baseDodagId);
+    P2pRdoOption rdo;
+    rdo.reply = false;
+    rdo.hopByHop = false;
+    rdo.numRoutes = 0;
+    rdo.lifetime = 0;
+    rdo.maxRankOrNh = 0; // never this node's turn to relay
+    rdo.target = Ipv6Address("2001:9::1"); // unrelated to anything real
+    dro.SetP2pRdo(rdo);
+
+    DeliverRawRplMessage<RplP2pDroHeader>(nodes.Get(0),
+                                          1,
+                                          dro,
+                                          static_cast<uint8_t>(RPL_CODE_P2P_DRO),
+                                          neighbourLinkLocal,
+                                          rootLinkLocal);
+
+    uint32_t before = m_dioCount;
+    Simulator::Stop(Seconds(60));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_GT(m_dioCount,
+                         before,
+                         "The root stopped sending its own DIOs after a forged P2P-DRO named "
+                         "its RPLInstanceID and DODAGID; the base DODAG is not a P2P-RPL "
+                         "temporary DAG and RFC 6997's Stop obligations do not apply to it");
+    NS_TEST_ASSERT_MSG_EQ(root->IsJoined(), true, "The root left its own base DODAG");
+
+    monitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief A MOP 4 DIO carrying none of P2P-RPL's or AODV-RPL's own discovery
+ *        options is discarded rather than joined as an ordinary DODAG.
+ *
+ * RFC 6997 section 6.1: "A P2P mode DIO MUST carry exactly one P2P-RDO ...
+ * A received P2P mode DIO MUST be discarded if it does not contain exactly
+ * one P2P-RDO." AODV-RPL (RFC 9854 section 9) puts its RREQ/RREP option
+ * under the same MOP. HandleDio()'s per-option refusal checks
+ * (ShouldRefuseP2pRdo() and friends) only run when their own option is
+ * present, so a MOP 4 DIO carrying none of the three used to fall through
+ * every one of them and reach JoinDodag() regardless -- a membership with no
+ * discovery option ever arms 'L' (only HandleP2pRdo()/HandleAodvRreq()/
+ * HandleAodvRrepInstance() do that), so it never expired, and
+ * SelectPreferredParent()'s staleness sweep exempts every MOP 4 membership.
+ * Discovered by /protocol-test-matrix's angle 5 and confirmed by angle 2's
+ * verification pass, which measured it spreading to every node in a line
+ * topology from one injected packet.
+ */
+class RplMop4WithNoDiscoveryOptionRefusedTestCase : public TestCase
+{
+  public:
+    RplMop4WithNoDiscoveryOptionRefusedTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplMop4WithNoDiscoveryOptionRefusedTestCase::RplMop4WithNoDiscoveryOptionRefusedTestCase()
+    : TestCase("A MOP 4 DIO with no discovery option is discarded, not joined")
+{
+}
+
+void
+RplMop4WithNoDiscoveryOptionRefusedTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2); // 0 = the node under test, 1 = a neighbour, the forgery's source
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    interfaces.SetForwarding(0, true);
+    interfaces.SetForwarding(1, true);
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    Ptr<Node> node = nodes.Get(0);
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoined(), true, "The node never formed its own base DODAG");
+    uint32_t dodagCountBefore = rpl->GetDodagCount();
+
+    Ipv6Address nodeLinkLocal = node->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address neighbourLinkLocal =
+        nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    // Base object only: MOP 4, a fresh Local RPLInstanceID and DODAGID, and
+    // none of P2P-RDO, RREQ or RREP. Well-formed by every other rule -- the
+    // Version, G, Prf and RPLInstanceID checks in ShouldRefuseP2pRdo() all
+    // pass -- so the discovery-option gate is the only thing that can catch
+    // it.
+    static constexpr uint8_t GHOST_INSTANCE = 0x82;
+    Ipv6Address ghostDodagId("2001:9::1"); // never used by any real discovery
+    RplDioHeader ghostDio;
+    ghostDio.SetInstanceId(GHOST_INSTANCE);
+    ghostDio.SetVersionNumber(0);
+    ghostDio.SetRank(RPL_MIN_HOPRANKINC);
+    ghostDio.SetGrounded(true);
+    ghostDio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+    ghostDio.SetPreference(0);
+    ghostDio.SetDodagId(ghostDodagId);
+    ghostDio.SetDtsn(0);
+
+    DeliverRawRplMessage<RplDioHeader>(node,
+                                       1,
+                                       ghostDio,
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       neighbourLinkLocal,
+                                       nodeLinkLocal);
+
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(GHOST_INSTANCE, ghostDodagId),
+                          false,
+                          "A MOP 4 DIO with no P2P-RDO, RREQ or RREP was joined anyway; RFC 6997 "
+                          "section 6.1 says it MUST be discarded");
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetDodagCount(),
+                          dodagCountBefore,
+                          "A membership was added for a MOP 4 DIO with no discovery option");
+
+    // Long enough that, before this fix, the ghost membership -- never armed
+    // with an 'L' deadline and exempt from the staleness sweep as every MOP
+    // 4 membership is -- would still be advertising itself.
+    Simulator::Stop(Seconds(60));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(GHOST_INSTANCE, ghostDodagId),
+                          false,
+                          "A ghost MOP 4 membership with no discovery option survived");
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoined(), true, "The node's own base DODAG was disturbed");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief An intermediate router in a P2P-RPL temporary DAG does not route an
+ *        ordinary packet, addressed to that temporary DAG's own DODAGID,
+ *        through the temporary DAG's preferred parent.
+ *
+ * RFC 6997 section 9.1: "The temporary DAG MUST NOT be used to route data
+ * packets. In other words, joining a temporary DAG does not allow a router
+ * to provision routing table entries listing the router's parents in the
+ * temporary DAG as the next hops." RouteOutput()'s search for "some OTHER
+ * DODAG's own DODAGID" -- meant for a non-root membership's own DAO/
+ * DAO-ACK-retry, which a temporary DAG never sends (SendDao() refuses one
+ * outright) -- did not exclude P2P_ROUTE_DISCOVERY memberships, so it
+ * matched the Origin's own address there too and returned a route via
+ * whatever the temporary DAG's preferred parent happened to be, regardless
+ * of whether that was anywhere near the real path. Discovered by
+ * /protocol-test-matrix's angle 3 verification pass.
+ *
+ * Topology: root(0) -- mid(1) -- other(2), other not adjacent to root. other
+ * starts a P2P-RPL discovery for a target nobody answers, so mid joins the
+ * temporary DAG as an intermediate router with other as its preferred
+ * parent there -- a real discovery, not a forged packet. mid's own base
+ * DODAG preferred parent is root. A packet mid sends to other's address (the
+ * temporary DAG's own DODAGID) has to leave towards root, exactly as it
+ * would if the temporary DAG did not exist.
+ */
+class RplTemporaryDagNotUsedForRoutingTestCase : public TestCase
+{
+  public:
+    RplTemporaryDagNotUsedForRoutingTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplTemporaryDagNotUsedForRoutingTestCase::RplTemporaryDagNotUsedForRoutingTestCase()
+    : TestCase("A temporary DAG's own DODAGID does not route packets through it")
+{
+}
+
+void
+RplTemporaryDagNotUsedForRoutingTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(3); // 0 = root, 1 = the node under test, 2 = the discovery's Origin
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    Ptr<SimpleNetDevice> devRoot = DynamicCast<SimpleNetDevice>(devices.Get(0));
+    Ptr<SimpleNetDevice> devOther = DynamicCast<SimpleNetDevice>(devices.Get(2));
+    channel->BlackList(devRoot, devOther);
+    channel->BlackList(devOther, devRoot);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> root = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> mid = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> other = nodes.Get(2)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(mid->IsJoined(), true, "mid never joined the base DODAG");
+    NS_TEST_ASSERT_MSG_EQ(other->IsJoined(), true, "other never joined the base DODAG");
+
+    Ipv6Address otherAddress = other->GetGlobalAddress();
+    NS_TEST_ASSERT_MSG_NE(otherAddress, Ipv6Address::GetAny(), "other has no global address yet");
+    Ipv6Address rootLinkLocal =
+        nodes.Get(0)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    // A target nobody answers, so the discovery never completes and stays
+    // open for the rest of this test -- what matters is that mid joins
+    // other's temporary DAG, not that the discovery succeeds.
+    RplRoutingProtocol::DodagKey key = other->DiscoverP2pRoute(Ipv6Address("2001:9::99"));
+    NS_TEST_ASSERT_MSG_NE(key.dodagId, Ipv6Address::GetAny(), "The discovery did not start");
+    NS_TEST_ASSERT_MSG_EQ(key.dodagId, otherAddress, "The temporary DAG's DODAGID is not other's");
+
+    // Long enough for the P2P mode DIO to reach mid at the default 64 ms
+    // Trickle Imin.
+    Simulator::Stop(Seconds(5));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(mid->IsJoinedTo(key.instanceId, key.dodagId),
+                          true,
+                          "mid never joined other's temporary DAG");
+
+    Ipv6Header header;
+    header.SetDestination(otherAddress);
+    header.SetSource(mid->GetGlobalAddress());
+    header.SetNextHeader(17); // UDP, as an example inner protocol
+
+    Socket::SocketErrno sockerr;
+    Ptr<Ipv6Route> route = mid->RouteOutput(Create<Packet>(), header, nullptr, sockerr);
+
+    NS_TEST_ASSERT_MSG_EQ(route != nullptr, true, "mid has no route to other's address at all");
+    NS_TEST_ASSERT_MSG_EQ(route->GetGateway(),
+                          rootLinkLocal,
+                          "A packet addressed to a temporary DAG's own DODAGID left through that "
+                          "temporary DAG's preferred parent instead of the base DODAG's; RFC "
+                          "6997 section 9.1 says the temporary DAG MUST NOT be used to route "
+                          "data packets");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief A P2P-RPL temporary DAG membership formed before this node has a
+ *        global address still leaves on time at its 'L' deadline.
+ *
+ * RFC 6997 sections 7/9.1 count 'L' "since it joined" / "since it joined it"
+ * -- from membership, not from having completed the Address Vector entry
+ * section 9.4 also requires. HandleP2pRdo() used to call ArmP2pExpiry() only
+ * after building that entry, which needs a global address this node may not
+ * have yet (SLAAC on the base DODAG is asynchronous and unrelated to a
+ * temporary DAG's own Trickle). The early "no global address yet" return
+ * skipped arming entirely, and because SelectPreferredParent()'s staleness
+ * sweep exempts every temporary instance, nothing else was left to retire
+ * the membership -- it stayed joined, Trickle running, until some later DIO
+ * happened to arrive after this node had an address. A neighbour that had
+ * already gone quiet under RFC 6997 section 9.1's own Stop rule (@see
+ * RecordP2pStop()) might never send that later DIO at all, leaving the
+ * membership joined indefinitely. Discovered by /protocol-test-matrix's
+ * angle 4 verification pass.
+ *
+ * One node under test, no base DODAG at all (so GetGlobalAddress() stays
+ * empty throughout), fed a fabricated P2P mode DIO directly.
+ */
+class RplP2pTemporaryInstanceArmsWithoutAddressTestCase : public TestCase
+{
+  public:
+    RplP2pTemporaryInstanceArmsWithoutAddressTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplP2pTemporaryInstanceArmsWithoutAddressTestCase::RplP2pTemporaryInstanceArmsWithoutAddressTestCase()
+    : TestCase("A P2P temporary DAG joined without a global address still expires on time")
+{
+}
+
+void
+RplP2pTemporaryInstanceArmsWithoutAddressTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(1);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.AssignWithoutAddress(devices);
+
+    // Long enough for interface bring-up's own deferred callbacks to settle,
+    // short of anything that could give this node a global address: no
+    // SetRoot() and no neighbour ever sends it a Prefix Information option,
+    // so GetGlobalAddress() stays Ipv6Address::GetAny() for the whole test
+    // regardless of how long this runs -- the precondition candidate C's
+    // fix has to hold under.
+    Simulator::Stop(Seconds(1));
+    Simulator::Run();
+
+    Ptr<Node> node = nodes.Get(0);
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+
+    static constexpr uint8_t INSTANCE = 0x81;
+    Ipv6Address origin("2001:9::1:1");
+    Ipv6Address neighbour("fe80::a");
+
+    RplDioHeader dio;
+    dio.SetInstanceId(INSTANCE);
+    dio.SetVersionNumber(0);
+    dio.SetRank(RPL_MIN_HOPRANKINC);
+    dio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+    dio.SetGrounded(true);
+    dio.SetDodagId(origin);
+    dio.SetDtsn(0);
+    P2pRdoOption rdo;
+    rdo.reply = false;
+    rdo.hopByHop = false;
+    rdo.numRoutes = 0;
+    rdo.lifetime = 0; // 1 second (RFC 6997 section 7's 0x00 encoding)
+    rdo.maxRankOrNh = 3;
+    rdo.target = Ipv6Address("2001:9::1:99"); // not this node
+    rdo.addressVector = {};
+    dio.SetP2pRdo(rdo);
+
+    DeliverRawRplMessage<RplDioHeader>(node,
+                                       1,
+                                       dio,
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       neighbour,
+                                       Ipv6Address(RPL_ALL_NODES_MULTICAST));
+
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(INSTANCE, origin),
+                          true,
+                          "The P2P mode DIO was not joined at all");
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetGlobalAddress(),
+                          Ipv6Address::GetAny(),
+                          "This node has a global address; the precondition this test needs "
+                          "does not hold");
+
+    // Comfortably past the encoded 'L' of 1 second, with this node never
+    // given a global address at any point.
+    Simulator::Stop(Seconds(5));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(INSTANCE, origin),
+                          false,
+                          "A temporary DAG membership joined without a global address never "
+                          "expired at its 'L' deadline");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief An AODV-RPL RREQ-Instance membership formed before this node has a
+ *        global address still leaves on time at its 'L' deadline.
+ *
+ * The AODV-RPL counterpart of
+ * RplP2pTemporaryInstanceArmsWithoutAddressTestCase: HandleAodvRreq() had
+ * the identical gap on the H=0 side -- ArmAodvExpiry() was reached only
+ * after the Address Vector's "no global address yet" branch, which returns
+ * first. RFC 9854 section 4.1 counts 'L' "the time duration that a node is
+ * able to belong to the RREQ-Instance", from joining, the same as RFC
+ * 6997's field. Discovered by /protocol-test-matrix's angle 4 verification
+ * pass.
+ */
+class RplAodvTemporaryInstanceArmsWithoutAddressTestCase : public TestCase
+{
+  public:
+    RplAodvTemporaryInstanceArmsWithoutAddressTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplAodvTemporaryInstanceArmsWithoutAddressTestCase::
+    RplAodvTemporaryInstanceArmsWithoutAddressTestCase()
+    : TestCase("An RREQ-Instance joined without a global address still expires on time")
+{
+}
+
+void
+RplAodvTemporaryInstanceArmsWithoutAddressTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(1);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.AssignWithoutAddress(devices);
+
+    // Same reasoning as the P2P-RPL counterpart above: long enough for
+    // interface bring-up to settle, but this node never gets a global
+    // address regardless, with no root and no neighbour to SLAAC from.
+    Simulator::Stop(Seconds(1));
+    Simulator::Run();
+
+    Ptr<Node> node = nodes.Get(0);
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+
+    static constexpr uint8_t INSTANCE = 0x81; // a local RPLInstanceID
+    Ipv6Address origin("2001:9::1:1");
+    Ipv6Address neighbour("fe80::a");
+
+    RplDioHeader dio;
+    dio.SetInstanceId(INSTANCE);
+    dio.SetVersionNumber(0);
+    dio.SetRank(RPL_MIN_HOPRANKINC);
+    dio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+    dio.SetGrounded(true);
+    dio.SetDodagId(origin);
+    dio.SetDtsn(0);
+    RplDioHeader::RreqOption rreq;
+    rreq.symmetric = true;
+    rreq.hopByHop = false;
+    rreq.compr = 0;
+    rreq.lifetime = 1; // 16 seconds (RFC 9854 section 4.1's 0x01 encoding)
+    rreq.rankLimit = 0;
+    rreq.origSeqNo = 1;
+    rreq.addressVector = {};
+    dio.SetRreq(rreq);
+    RplDioHeader::ArtOption art;
+    art.destSeqNo = 0;
+    art.prefixLength = 0;
+    art.target = Ipv6Address("2001:9::1:99"); // not this node
+    dio.SetArt(art);
+
+    DeliverRawRplMessage<RplDioHeader>(node,
+                                       1,
+                                       dio,
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       neighbour,
+                                       Ipv6Address(RPL_ALL_NODES_MULTICAST));
+
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(INSTANCE, origin),
+                          true,
+                          "The RREQ-DIO was not joined at all");
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetGlobalAddress(),
+                          Ipv6Address::GetAny(),
+                          "This node has a global address; the precondition this test needs "
+                          "does not hold");
+
+    // Comfortably past the encoded 'L' of 16 seconds, with this node never
+    // given a global address at any point.
+    Simulator::Stop(Seconds(20));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(INSTANCE, origin),
+                          false,
+                          "An RREQ-Instance membership joined without a global address never "
+                          "expired at its 'L' deadline");
+
     Simulator::Destroy();
 }
 
@@ -23524,6 +24171,11 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplP2pDiscoverRouteTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pFloodTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pStopSilencesDiosTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pStopDoesNotReachOtherDodagsTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplMop4WithNoDiscoveryOptionRefusedTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplTemporaryDagNotUsedForRoutingTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pTemporaryInstanceArmsWithoutAddressTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplAodvTemporaryInstanceArmsWithoutAddressTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pMaxRankTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pTrickleRuleSuppressionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pDroGeneratedTestCase, TestCase::Duration::QUICK);
