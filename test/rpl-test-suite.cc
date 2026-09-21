@@ -21510,6 +21510,87 @@ RplJoinWithoutDagConfigurationTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief DioIntervalDoublings, AodvDioIntervalDoublings and
+ *        P2pDioIntervalDoublings reject a value that would overflow
+ *        RplTrickleTimer::SetParameters()'s own shift, the same way
+ *        JoinDodag() already clamps the identical field arriving on the
+ *        wire.
+ *
+ * Unlike a value parsed from a DAG Configuration option (@see
+ * RplDagConfigurationExponentOverflowTestCase, right below), these three
+ * attributes had no bound of their own until /protocol-test-matrix's angle 2
+ * measured the consequence directly: `rplHelper.Set("DioIntervalDoublings",
+ * UintegerValue(63))` on a single root node, with nothing else unusual about
+ * the topology, hung the whole simulator at 100% CPU once the first Trickle
+ * doubling collapsed Imax to a negative Time and Simulator::Schedule() kept
+ * re-firing at the same simulated instant forever. 62 reproduced it too; 20
+ * and 21 did not.
+ *
+ * Exercised through SetAttributeFailSafe() rather than Set() followed by
+ * Install(): the non-fail-safe path a Helper's Install() uses calls
+ * NS_FATAL_ERROR() on a rejected value, which aborts the whole test
+ * process rather than failing one test case -- exactly the reason this
+ * angle's own probe had to run as a separate binary, not a TestCase, to
+ * measure the hang in the first place. SetAttributeFailSafe() answers the
+ * same question (is this value accepted) without that risk.
+ */
+class RplDoublingsAttributeBoundedTestCase : public TestCase
+{
+  public:
+    RplDoublingsAttributeBoundedTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplDoublingsAttributeBoundedTestCase::RplDoublingsAttributeBoundedTestCase()
+    : TestCase("DioIntervalDoublings and its AODV-RPL and P2P-RPL counterparts reject an "
+              "out-of-range value")
+{
+}
+
+void
+RplDoublingsAttributeBoundedTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(1);
+    InternetStackHelper internetv6;
+    RplHelper rplHelper;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ptr<RplRoutingProtocol> rpl = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+
+    for (const std::string& name :
+        {"DioIntervalDoublings", "AodvDioIntervalDoublings", "P2pDioIntervalDoublings"})
+    {
+        NS_TEST_ASSERT_MSG_EQ(
+            rpl->SetAttributeFailSafe(name, UintegerValue(RPL_DIO_INTERVAL_EXPONENT_MAX)),
+            true,
+            name << " refused its own documented maximum ("
+                << +RPL_DIO_INTERVAL_EXPONENT_MAX << ")");
+        NS_TEST_ASSERT_MSG_EQ(
+            rpl->SetAttributeFailSafe(name, UintegerValue(RPL_DIO_INTERVAL_EXPONENT_MAX + 1)),
+            false,
+            name << " accepted " << +(RPL_DIO_INTERVAL_EXPONENT_MAX + 1)
+                << ", one past its documented maximum");
+        NS_TEST_ASSERT_MSG_EQ(rpl->SetAttributeFailSafe(name, UintegerValue(62)),
+                              false,
+                              name << " accepted 62, the exact value angle 2's probe measured "
+                                      "hanging the simulator");
+        NS_TEST_ASSERT_MSG_EQ(rpl->SetAttributeFailSafe(name, UintegerValue(63)),
+                              false,
+                              name << " accepted 63, the exact value angle 2's probe measured "
+                                      "hanging the simulator");
+    }
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief A DAG Configuration option's DIOIntervalMin/DIOIntervalDoublings
  *        (RFC 6550 section 6.7.6, each an unconstrained wire byte) do not
  *        crash or hang the simulator when a joining/rejoining DIO carries
@@ -24212,6 +24293,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplDtsnRapidBumpCoalescedTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplParentSwitchRapidBumpCoalescedTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplJoinWithoutDagConfigurationTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplDoublingsAttributeBoundedTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDagConfigurationExponentOverflowTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplStaleAndSwitchCoincideTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplRejoinWithoutDagConfigurationTestCase, TestCase::Duration::QUICK);

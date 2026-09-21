@@ -9942,3 +9942,56 @@ root; mid宛てのother向けパケットのゲートウェイがroot経由で�
 doublings上限62/63でのハング) と角5の残り (H=1でのRREQ積集合誤判定の退行、
 `HasOtherP2pTargets()`のTargetAddr不参照) は実証まで進めていない。角4
 (状態遷移) は起動したが上限に達し未完走。次サイクルで拾う。
+
+## 87. Trickle doublings属性の未クランプ — 単一の属性設定でシミュレータ全体がハングする
+
+§86の角2 (境界値) がプローブで実測した候補を修正した。`RplTrickleTimer::SetParameters()`
+は `m_intervalMax = intervalMin * (int64_t(1) << doublings)` を無条件に計算する。
+`DioIntervalDoublings`/`AodvDioIntervalDoublings`/`P2pDioIntervalDoublings`の3属性は
+いずれも`MakeUintegerChecker<uint8_t>()`に上限が無く、**62か63を設定するだけで
+シミュレータ全体が無限ループに入る**ことをプローブで確認した (自分で追加検証:
+20秒のシミュレーション時間まで走らせると62・63で確実にハング、20・21では正常終了)。
+
+### 87.1 機序
+
+`int64_t(1) << 63`はサインビットに1が立ち負値になる (`1 << 62`もその後の`intervalMin`
+との乗算でオーバーフローし負値になりうる)。`RplTrickleTimer::IntervalEvent()`の
+`m_interval = std::min(m_interval + m_interval, m_intervalMax)`は`m_intervalMax`が
+負なら**最初のdoubling一発で`m_interval`を巨大な負値に潰す**。続く`NewInterval()`が
+`Seconds(負の巨大値)`を`m_transmitTimer.Schedule()`に渡すと、負の遅延は「今すぐ」発火
+すると解釈され、同じ処理が同じ仮想時刻で無限に再入する — CPU 100%、シミュレータ時刻は
+一切進まない。
+
+この経路自体は既知だった。ワイヤ経由 (受信したDAG Configurationオプションの値) は
+`JoinDodag()`が`std::min(dio.GetIntervalDoublings(), RPL_DIO_INTERVAL_EXPONENT_MAX)`で
+既にクランプしており、対応する試験 `RplDagConfigurationExponentOverflowTestCase` もある。
+**属性経由 (root自身の設定値) だけがクランプを欠いていた** — root自身のmembershipは
+`JoinDodag()`を通らず`dodag.dioIntervalDoublings = m_dioIntervalDoublings`を直接代入する
+経路 (`CreateDodagMembership()`等) を通るため。
+
+### 87.2 影響
+
+**悪意あるピア不要。** `rplHelper.Set("DioIntervalDoublings", UintegerValue(63))`という
+単なる設定ミスや、パラメータ掃引スクリプトの入力ミスだけで、そのノードを含む
+シミュレーション全体が復旧不能になる。本セッション中に何度も動かした掃引スクリプト
+(`run-imin-sweep.sh`等) はまさにこの種の属性を機械的に振る形をしており、
+一歩間違えれば掃引全体がハングしていた。
+
+### 87.3 修正
+
+3属性のチェッカーを`MakeUintegerChecker<uint8_t>(0, RPL_DIO_INTERVAL_EXPONENT_MAX)`
+(既存の定数、ワイヤ経路と同じ上限=20) に変更。`P2pDioIntervalDoublings`のdocコメントは
+§85のImin変更前の記述 (「4 doublings (Imax 1.024 s)」) が残っていたため、現在値
+(Imin=128ms、Imax=2.048秒) に合わせて書き直した。
+
+新規試験`RplDoublingsAttributeBoundedTestCase`。`Install()`経由 (`rplHelper.Set()`→
+`ObjectFactory::Create()`) で範囲外値を設定すると`Object::SetAttribute()`が
+`NS_FATAL_ERROR`でプロセス全体を終了させてしまうため、`SetAttributeFailSafe()`を
+直接呼んでbool判定する形にした — 角2自身のプローブが専用バイナリとして走らせる
+必要があったのと同じ理由 (TestCase内で範囲外値をInstall()すると試験系全体が落ちる)。
+3属性それぞれについて上限値(20)が通り、上限+1・62・63が拒否されることを確認。
+チェッカーの上限を外すと確実に落ちることを確認済み (load-bearing)。
+
+### 87.4 検証
+
+`./test.py -s rpl`全PASS。既存試験に影響なし (全既存試験の設定値は最大4)。

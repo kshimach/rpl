@@ -160,10 +160,23 @@ RplRoutingProtocol::GetTypeId()
                           MakeTimeAccessor(&RplRoutingProtocol::m_dioIntervalMin),
                           MakeTimeChecker())
             .AddAttribute("DioIntervalDoublings",
-                          "Number of doublings between Imin and Imax of the DIO Trickle timer.",
+                          "Number of doublings between Imin and Imax of the DIO Trickle timer. "
+                          "Bounded the same way JoinDodag() bounds a wire DAG Configuration "
+                          "option's own value: RplTrickleTimer::SetParameters() computes Imax as "
+                          "intervalMin * (int64_t(1) << doublings) with no bound of its own, and "
+                          "a value at or past 62 overflows that shift into or past the sign bit, "
+                          "producing a negative Imax. IntervalEvent()'s own "
+                          "std::min(interval, intervalMax) then collapses the interval to that "
+                          "negative value on the very first doubling, and Simulator::Schedule() "
+                          "with a negative delay fires immediately, re-entering the same code at "
+                          "the same simulated instant forever -- confirmed by "
+                          "/protocol-test-matrix's angle 2, whose probe measured doublings 62 "
+                          "and 63 hang the whole simulator at 100% CPU while 20 and 21 do not. "
+                          "@see RPL_DIO_INTERVAL_EXPONENT_MAX's own doc comment for the bound's "
+                          "derivation.",
                           UintegerValue(RPL_DIO_INTERVAL_DOUBLINGS),
                           MakeUintegerAccessor(&RplRoutingProtocol::m_dioIntervalDoublings),
-                          MakeUintegerChecker<uint8_t>())
+                          MakeUintegerChecker<uint8_t>(0, RPL_DIO_INTERVAL_EXPONENT_MAX))
             .AddAttribute("DioRedundancy",
                           "Redundancy constant k of the DIO Trickle timer, 0 to never suppress.",
                           UintegerValue(RPL_DIO_REDUNDANCY),
@@ -249,10 +262,14 @@ RplRoutingProtocol::GetTypeId()
                           MakeTimeChecker())
             .AddAttribute("AodvDioIntervalDoublings",
                           "Number of doublings between Imin and Imax of the RREQ-DIO Trickle "
-                          "timer.",
+                          "timer. Bounded at RPL_DIO_INTERVAL_EXPONENT_MAX for the same reason "
+                          "DioIntervalDoublings is (@see its own doc comment): unlike a value "
+                          "arriving on the wire, which JoinDodag() already clamps, this attribute "
+                          "fed a shift-into-the-sign-bit value straight into "
+                          "RplTrickleTimer::SetParameters() with nothing to catch it.",
                           UintegerValue(4),
                           MakeUintegerAccessor(&RplRoutingProtocol::m_aodvDioIntervalDoublings),
-                          MakeUintegerChecker<uint8_t>())
+                          MakeUintegerChecker<uint8_t>(0, RPL_DIO_INTERVAL_EXPONENT_MAX))
             .AddAttribute("AodvDioRedundancy",
                           "Redundancy constant k of the Trickle timer pacing RREQ-/RREP-DIOs, "
                           "or -1 to inherit DioRedundancy the way a local Instance otherwise "
@@ -415,15 +432,19 @@ RplRoutingProtocol::GetTypeId()
                           "Trickle timer. RFC 6997 section 9.2 only says Imax should be 'several "
                           "orders of magnitude higher than Imin', without a specific number -- "
                           "kept modest (matching AODV-RPL's own AodvDioIntervalDoublings) rather "
-                          "than large: this module re-arms a temporary DAG membership's own 'L' "
-                          "deadline on every DIO received from the same preferred parent, so a "
-                          "large Imax lets a slow-growing Trickle interval keep pushing that "
-                          "deadline out for far longer than 'L' names, compounding across each "
-                          "hop of a multi-hop discovery. 4 doublings (Imax 1.024 s) keeps this "
-                          "well clear of the shortest 'L' encoding (1 s) without that effect.",
+                          "than large: a temporary instance's own 'L' bounds its whole lifetime "
+                          "regardless (ArmP2pExpiry() arms it once, from joining), but the "
+                          "farther Imax runs past 'L', the fewer Trickle intervals a multi-hop "
+                          "discovery gets to cross the network in before the flood's own membership "
+                          "starts expiring out from under it -- 4 doublings against the current "
+                          "128 ms Imin default gives Imax 2.048 s, leaving 'L's shortest encoding "
+                          "(1 s) about one interval and its default (16 s) about eight (@see "
+                          "design-constraints.md section 85.4 for the same trade-off on the Imin "
+                          "side). Bounded at RPL_DIO_INTERVAL_EXPONENT_MAX for the reason "
+                          "DioIntervalDoublings is (@see its own doc comment).",
                           UintegerValue(4),
                           MakeUintegerAccessor(&RplRoutingProtocol::m_p2pDioIntervalDoublings),
-                          MakeUintegerChecker<uint8_t>())
+                          MakeUintegerChecker<uint8_t>(0, RPL_DIO_INTERVAL_EXPONENT_MAX))
             .AddAttribute("P2pDioRedundancy",
                           "Redundancy constant k of the P2P mode DIO Trickle timer, as RFC 6997 "
                           "section 9.2 recommends (default 1). Suppression only works as "
