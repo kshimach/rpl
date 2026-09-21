@@ -13851,6 +13851,232 @@ RplAodvTemporaryInstanceArmsWithoutAddressTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief Relaying a P2P-DRO whose Address Vector only fits the Compr it
+ *        actually arrived under does not abort the process.
+ *
+ * P2pRdoSerialize() recomputes Compr fresh from (target, addressVector,
+ * dodagId) via P2pRdoCompr(), which only ever answers 0 or 8 -- this
+ * module's own binary elision heuristic, mirroring
+ * RplDioHeader::ElidedPrefixLength()'s for AODV-RPL. Deserialize(), though,
+ * accepts a received P2P-RDO at any Compr 0..15 a peer chose, sized for
+ * RplP2pMaxAddressVectorEntries() at that finer value (up to 63 entries at
+ * Compr 13 and above). A vector that only fits because of that finer
+ * elision -- entirely legal on the wire, since Deserialize() validated it
+ * against the Compr it actually carried -- can be too large once this
+ * router's own relay recomputes Compr as 0 or 8, and
+ * P2pRdoSerialize()'s own NS_ASSERT_MSG on the resulting mismatch used to
+ * abort the whole process. Discovered as a real crash by
+ * /protocol-test-matrix's angle 3.
+ *
+ * Neither this module's own SetP2pRdo() (bounded only by the loosest
+ * Compr, 63 entries) nor a real discovery (which never produces a Compr
+ * outside {0, 8} in the first place, since every node in it runs this same
+ * module) can construct the packet this test needs -- which is itself part
+ * of what makes the bug easy to miss purely by exercising this module
+ * against itself. The Address Vector option is therefore built as raw
+ * wire bytes, the same way RplDioOptionEdgeTestCase and friends construct
+ * a deliberately non-conforming option elsewhere in this file, standing in
+ * for a peer that elides more finely than this module ever does on
+ * send -- or a forged packet, RFC 6997 section 14's "a rogue router could
+ * ... generate bogus P2P-DRO messages".
+ */
+class RplP2pDroRelayComprMismatchTestCase : public TestCase
+{
+  public:
+    RplP2pDroRelayComprMismatchTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplP2pDroRelayComprMismatchTestCase::RplP2pDroRelayComprMismatchTestCase()
+    : TestCase("Relaying a P2P-DRO sized for a finer Compr than this router's own does not abort")
+{
+}
+
+void
+RplP2pDroRelayComprMismatchTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(1);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.AssignWithoutAddress(devices);
+
+    Ptr<Node> node = nodes.Get(0);
+    // Rooting node's own base DODAG only to give it a global address to
+    // join the (unrelated) temporary DAG with below -- this node never
+    // discovers anything itself, so it is never isOrigin for it, exactly
+    // the relay role this test needs.
+    rplHelper.SetRoot(node, Ipv6Address("2001:1::"), 64);
+    // Long enough for CreateDodagMembership() to actually run: it is not
+    // synchronous with SetRoot() (root's own base DODAG membership is
+    // scheduled, not created inline), the same wait every other root-only
+    // test in this file gives it.
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+    Ipv6Address ownAddress = rpl->GetGlobalAddress();
+    NS_TEST_ASSERT_MSG_NE(ownAddress, Ipv6Address::GetAny(), "node has no global address yet");
+    uint8_t ownBuf[16];
+    ownAddress.Serialize(ownBuf);
+
+    // The temporary DAG's DODAGID: node's own address with the last octet
+    // flipped, so it differs from node's own address (required to join at
+    // all -- ShouldRefuseP2pRdo() refuses a DODAGID that is this node's
+    // own) while sharing every other octet, Compr 13's own elided prefix
+    // included.
+    uint8_t dodagIdBuf[16];
+    std::copy(ownBuf, ownBuf + 16, dodagIdBuf);
+    dodagIdBuf[15] = static_cast<uint8_t>(dodagIdBuf[15] + 1);
+    Ipv6Address dodagId = Ipv6Address::Deserialize(dodagIdBuf);
+
+    Ipv6Address nodeLinkLocal = node->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address peerLinkLocal("fe80::a");
+
+    static constexpr uint8_t INSTANCE = 0x81;
+
+    // Step 1: an ordinary P2P mode DIO join, well-formed in every respect,
+    // naming a Target this node is not (so the check below exercises the
+    // Intermediate Router branch of HandleP2pDro(), not the Origin one).
+    {
+        RplDioHeader dio;
+        dio.SetInstanceId(INSTANCE);
+        dio.SetVersionNumber(0);
+        dio.SetRank(RPL_MIN_HOPRANKINC);
+        dio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+        dio.SetGrounded(true);
+        dio.SetDodagId(dodagId);
+        dio.SetDtsn(0);
+        P2pRdoOption rdo;
+        rdo.reply = false;
+        rdo.hopByHop = false;
+        rdo.numRoutes = 0;
+        rdo.lifetime = 3; // 64 s, comfortably longer than this test needs
+        rdo.maxRankOrNh = 5;
+        rdo.target = dodagId; // a placeholder, not this node
+        rdo.addressVector = {};
+        dio.SetP2pRdo(rdo);
+
+        DeliverRawRplMessage<RplDioHeader>(node,
+                                           1,
+                                           dio,
+                                           static_cast<uint8_t>(RPL_CODE_DIO),
+                                           peerLinkLocal,
+                                           Ipv6Address(RPL_ALL_NODES_MULTICAST));
+    }
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(INSTANCE, dodagId),
+                          true,
+                          "The join DIO was not accepted at all");
+
+    // Step 2: a P2P-DRO whose P2P-RDO option is built as raw wire bytes at
+    // Compr 13 (entrySize 3), 40 Address Vector entries -- within
+    // RplP2pMaxAddressVectorEntries(13) = 63, so Deserialize() accepts it,
+    // but past RplP2pMaxAddressVectorEntries(8) = 30, the bound this
+    // router's own relay recomputes. Every entry reconstructs as dodagId's
+    // own first 13 octets plus 3 wire octets; entry 4 (NH = 5, 1-indexed)
+    // supplies node's own trailing 3 octets, reconstructing node's own
+    // address exactly there and nowhere else -- the one entry that puts
+    // this node at the NH position HandleP2pDro() checks.
+    constexpr uint8_t compr = 13;
+    constexpr uint8_t entrySize = 16 - compr;
+    constexpr uint32_t entries = 40;
+    constexpr uint8_t nh = 5; // 1-indexed; entry (nh - 1) is node's own
+    constexpr uint8_t length = static_cast<uint8_t>(2 + (1 + entries) * entrySize);
+
+    std::vector<uint8_t> rdoBytes;
+    rdoBytes.push_back(RPL_OPTION_P2P_RDO);
+    rdoBytes.push_back(length);
+    rdoBytes.push_back(compr & RPL_P2P_COMPR_MASK); // R=H=0, N=0
+    rdoBytes.push_back(nh & RPL_P2P_MAX_RANK_MASK); // L=0 (1 s, unused past this DRO)
+    rdoBytes.insert(rdoBytes.end(), dodagIdBuf + compr, dodagIdBuf + 16); // TargetAddr, elided
+    for (uint32_t entry = 0; entry < entries; entry++)
+    {
+        if (entry == nh - 1)
+        {
+            rdoBytes.insert(rdoBytes.end(), ownBuf + compr, ownBuf + 16);
+        }
+        else
+        {
+            // Distinct trailing octets per entry, none of which collide
+            // with node's own (checked below) or with each other. The
+            // leading 0xAA keeps this from ever landing on node's own
+            // three trailing octets, which ns-3's own auto-assigned
+            // addresses keep small (its own entry above showed
+            // 0x00, 0x00, 0x01) -- an earlier version of this test used
+            // {0, entry>>8, entry} here, which collided with node's own
+            // address at entry 1 and undercounted the crash this test
+            // means to reach as "the Address Vector names this router
+            // twice" instead.
+            rdoBytes.push_back(0xAA);
+            rdoBytes.push_back(static_cast<uint8_t>(entry >> 8));
+            rdoBytes.push_back(static_cast<uint8_t>(entry));
+        }
+    }
+    NS_TEST_ASSERT_MSG_EQ(rdoBytes.size(), 2u + length, "Built the wrong number of bytes");
+
+    RplP2pDroHeader dro;
+    dro.SetInstanceId(INSTANCE);
+    dro.SetStop(false);
+    dro.SetAckRequested(false);
+    dro.SetSequence(0);
+    dro.SetDodagId(dodagId);
+    // No SetP2pRdo() call: HasP2pRdo() stays false, so Serialize() below
+    // writes the 20-byte base object only, and the hand-built rdoBytes
+    // above are appended raw -- this is exactly what puts the crash beyond
+    // this module's own reach to construct through its own API, per this
+    // test's own class comment.
+    Ptr<Packet> packet = Create<Packet>();
+    packet->AddHeader(dro);
+    packet->AddAtEnd(Create<Packet>(rdoBytes.data(), rdoBytes.size()));
+
+    Icmpv6Header icmpv6Header;
+    icmpv6Header.SetType(ICMPV6_RPL);
+    icmpv6Header.SetCode(static_cast<uint8_t>(RPL_CODE_P2P_DRO));
+    icmpv6Header.CalculatePseudoHeaderChecksum(
+        peerLinkLocal,
+        Ipv6Address(RPL_ALL_NODES_MULTICAST),
+        packet->GetSize() + icmpv6Header.GetSerializedSize(),
+        Icmpv6L4Protocol::GetStaticProtocolNumber());
+    packet->AddHeader(icmpv6Header);
+
+    Ipv6Header ipv6Header;
+    ipv6Header.SetSource(peerLinkLocal);
+    ipv6Header.SetDestination(Ipv6Address(RPL_ALL_NODES_MULTICAST));
+    ipv6Header.SetNextHeader(Icmpv6L4Protocol::GetStaticProtocolNumber());
+    ipv6Header.SetPayloadLength(packet->GetSize());
+    ipv6Header.SetHopLimit(255);
+    packet->AddHeader(ipv6Header);
+
+    Ptr<Ipv6L3Protocol> ipv6l3 = node->GetObject<Ipv6L3Protocol>();
+    Ptr<NetDevice> device = ipv6l3->GetNetDevice(1);
+    ipv6l3->Receive(device, packet, 0x86dd, device->GetAddress(), device->GetAddress(),
+                   NetDevice::PACKET_HOST);
+
+    // Reaching this line at all is most of what this test checks: the
+    // process is still running.
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(INSTANCE, dodagId),
+                          true,
+                          "Processing the oversized P2P-DRO disturbed the temporary DAG "
+                          "membership it should only have refused to relay");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief A P2P mode DIO is only joined if the router's own resulting
  *        DAGRank would stay within the MaxRank, relaxed by one step for the
  *        Target, mirroring AODV-RPL's own RankLimit boundary test.
@@ -24257,6 +24483,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplTemporaryDagNotUsedForRoutingTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pTemporaryInstanceArmsWithoutAddressTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvTemporaryInstanceArmsWithoutAddressTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pDroRelayComprMismatchTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pMaxRankTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pTrickleRuleSuppressionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pDroGeneratedTestCase, TestCase::Duration::QUICK);

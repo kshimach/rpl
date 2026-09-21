@@ -1429,6 +1429,37 @@ RplRoutingProtocol::HandleP2pDro(const RplP2pDroHeader& dro, Ipv6Address from, u
     P2pRdoOption relayedRdo = rdo;
     relayedRdo.maxRankOrNh = static_cast<uint8_t>(rdo.maxRankOrNh - 1);
 
+    // P2pRdoSerialize() recomputes Compr itself, from this router's own
+    // (target, addressVector, dodagId) rather than trusting whatever Compr
+    // the received P2P-DRO travelled under -- necessarily, since Compr is
+    // not carried as an independent decision the way Deserialize() parses
+    // it; it is derived fresh at serialize time (@see P2pRdoCompr()) so
+    // that this router's own relay stays self-consistent. But P2pRdoCompr()
+    // only ever answers 0 or 8 (the same binary heuristic
+    // RplDioHeader::ElidedPrefixLength() uses for AODV-RPL), while
+    // Deserialize() accepts an Address Vector sized for any Compr up to 15
+    // from a peer that elides more finely. A received Address Vector whose
+    // size only fits the finer Compr it actually arrived under -- entirely
+    // legal, since the P2P-RDO Deserialize() itself validated the option
+    // against exactly that peer-supplied Compr -- can be too large for the
+    // 0-or-8 Compr this router's own recompute settles on, and
+    // P2pRdoSerialize()'s own NS_ASSERT_MSG on the mismatch aborts the
+    // whole process, discovered as a real crash by /protocol-test-matrix's
+    // angle 3. Checked here instead: relaying an oversized vector under a
+    // narrower Compr is unsafe to attempt at all, so this router drops it
+    // rather than crash trying.
+    uint8_t relayedCompr =
+        P2pRdoCompr(relayedRdo.target, relayedRdo.addressVector, dro.GetDodagId());
+    if (relayedRdo.addressVector.size() > RplP2pMaxAddressVectorEntries(relayedCompr))
+    {
+        NS_LOG_WARN("Not relaying a P2P-DRO for "
+                    << relayedRdo.target << ": its Address Vector of "
+                    << relayedRdo.addressVector.size()
+                    << " entries does not fit this router's own Compr elision ("
+                    << +relayedCompr << ")");
+        return;
+    }
+
     RplP2pDroHeader relayed;
     relayed.SetInstanceId(dro.GetInstanceId());
     relayed.SetStop(dro.GetStop());

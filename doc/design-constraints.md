@@ -9995,3 +9995,64 @@ doublings上限62/63でのハング) と角5の残り (H=1でのRREQ積集合誤
 ### 87.4 検証
 
 `./test.py -s rpl`全PASS。既存試験に影響なし (全既存試験の設定値は最大4)。
+
+## 88. P2P-DRO中継のCompr再計算不一致 — リモートから1パケットでプロセスを落とせる
+
+§86の角3が実測で確認した候補を修正した。`HandleP2pDro()`の中継 (Intermediate
+Router) 経路が、受信したP2P-DROをそのまま`packet->AddHeader(relayed)`で再直列化
+する際、`P2pRdoSerialize()`が`P2pRdoCompr(target, addressVector, dodagId)`で
+Comprを**受信値を無視して再計算**していた。
+
+### 88.1 機序
+
+`P2pRdoCompr()`はこのモジュール自身の送信専用ヒューリスティックで、target・
+Address Vector・DODAGIDの先頭8オクテットが一致するかだけを見て**0か8の二値**しか
+返さない (AODV-RPL側の`RplDioHeader::ElidedPrefixLength()`と対をなす設計)。
+一方`P2pRdoDeserialize()`は受信したComprフィールドをそのまま信用し、0〜15の
+任意の値に対応する`RplP2pMaxAddressVectorEntries(compr)`で境界検査する
+(Compr 13以上なら最大63エントリ)。
+
+**この二つの非対称が中継で衝突する。** より細かいCompr (9〜15) を使う、この
+モジュールとは別のRFC 6997実装 (あるいは偽造パケット) から、Compr=13・
+31〜63エントリの正当な (受信検査は通る) P2P-DROが届いたとする。中継時に
+Comprを再計算すると0か8にしかならず、`RplP2pMaxAddressVectorEntries(8)=30`。
+エントリ数がそれを超えていれば、`P2pRdoSerialize()`内の
+`NS_ASSERT_MSG(rdo.addressVector.size() <= RplP2pMaxAddressVectorEntries(compr), ...)`
+が発火し**プロセス全体がabort**する。
+
+### 88.2 この脆弱性を自分自身では作れない
+
+このモジュール自身の送信経路 (`P2pRdoCompr`/`ElidedPrefixLength`) は常に0か8
+しか使わないため、**このモジュール同士のシミュレーションでは絶対に発生しない**。
+実際、試験を書く際にも`RplP2pDroHeader::SetP2pRdo()`+`Serialize()`の通常経路
+では31エントリ超のベクタを構築しようとした時点で同じ形のassertに自分自身が
+落ちることを確認した — 攻撃者がこの実装のAPIを経由しては攻撃パケットを作れない
+という事実が、逆に「この実装だけを相手にする限り気づけない」ことの裏返しになって
+いた。試験は生バイト (`Buffer`直書き) でCompr=13のP2P-RDOオプションを構築する形に
+した。
+
+### 88.3 修正
+
+中継直前に`relayedCompr = P2pRdoCompr(...)`を計算し、
+`addressVector.size() > RplP2pMaxAddressVectorEntries(relayedCompr)`なら
+中継せず警告ログを出して`return`する (assertでプロセスを落とす代わりに、
+その1件を中継しないだけで済ませる)。RFC 6997 §9.6は中継をMUSTとするが、
+このCompr不一致自体をRFCは想定していない (規定していない状況への対応であり、
+規定への違反ではない) ため、クラッシュより安全側に倒す判断とした。
+
+### 88.4 検証
+
+新規試験`RplP2pDroRelayComprMismatchTestCase`。単一ノードをroot化して
+グローバルアドレスを得たあと、正規のP2P mode DIOで一時DAGに加入させ、続けて
+Compr=13・40エントリの生バイトP2P-RDOを含むP2P-DROを注入する。修正を外すと
+`NS_ASSERT failed`→`NS_FATAL`→`SIGABRT`で実際にプロセスが落ちることを確認した
+(load-bearing)。
+
+デバッグ過程の副産物: 試験構築時、ルータ (root) の`CreateDodagMembership()`は
+`SetRoot()`と同期ではなくスケジュールされるため、1秒の待ちでは`IsJoined()`が
+falseのままだった (`RplAodvMopAcceptedTestCase`等、他の試験が10秒待つのと同じ
+理由)。また試験内で「他と衝突しないダミーの末尾3バイト」として`{0, entry>>8,
+entry}`を使ったところ、entry=1がノード自身のアドレスの末尾3バイト
+(`{0,0,1}`、ns-3の自動割当アドレスが小さい数字になりがちなため) と衝突し、
+「Address Vectorが自分を2回含む」側のガードに化けて別の分岐に落ちるという
+自己撞着を踏んだ。ダミーの先頭バイトに`0xAA`を挟んで解消した。
