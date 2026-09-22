@@ -12682,6 +12682,106 @@ RplAodvRrepDuplicateRelayedOnceTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief A second discovery started inside REJOIN_REENABLE does not reuse
+ *        the previous discovery's Local RPLInstanceID.
+ *
+ * Every router that served a discovery arms REJOIN_REENABLE against that
+ * exact {instanceId, DODAGID} pair when its own 'L' runs out, because RFC
+ * 9854 section 4.1 requires it: "Once a node leaves an RREQ-Instance, it
+ * MUST NOT rejoin the same RREQ-Instance for at least the time interval
+ * specified by the configuration variable REJOIN_REENABLE." Section 2
+ * keys that bar on the RREQ-InstanceID, which section 4.1 defines as the
+ * ordered pair (Orig_RPLInstanceID, OrigNode-IPaddr) -- so reusing the ID
+ * from the same OrigNode reconstructs the same RREQ-Instance, and every
+ * relay is then obliged to refuse it.
+ *
+ * DiscoverRoute() took the lowest free ID, where "free" meant only "this
+ * node has left it" -- which happens at 'L' (16 s by default), while the
+ * bar the relays hold runs for 15 minutes. A second discovery started
+ * anywhere in between was therefore refused by every relay before it
+ * could join, producing nothing at all, silently, for a window measured
+ * at ~884 s with the defaults. The refusal was correct and in fact
+ * mandatory; the defect was in the allocation. Found by
+ * /protocol-test-matrix's angle 4.
+ *
+ * Note the existing RplAodvHopByHopInstanceReuseTestCase deliberately
+ * waits 950 s -- past the bar -- so it still gets the reuse its own
+ * scenario depends on, and is unaffected.
+ */
+class RplAodvInstanceIdNotReusedInsideRejoinBarTestCase : public TestCase
+{
+  public:
+    RplAodvInstanceIdNotReusedInsideRejoinBarTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplAodvInstanceIdNotReusedInsideRejoinBarTestCase::
+    RplAodvInstanceIdNotReusedInsideRejoinBarTestCase()
+    : TestCase("A discovery inside REJOIN_REENABLE takes a different Local RPLInstanceID")
+{
+}
+
+void
+RplAodvInstanceIdNotReusedInsideRejoinBarTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(1);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    rplHelper.Set("AodvLifetime", UintegerValue(1)); // 'L' = 16 s
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.AssignWithoutAddress(devices);
+
+    Ptr<Node> node = nodes.Get(0);
+    rplHelper.SetRoot(node, Ipv6Address("2001:1::"), 64);
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+
+    RplRoutingProtocol::DodagKey key1 = rpl->DiscoverRoute(Ipv6Address("2001:9::11"), true);
+    NS_TEST_ASSERT_MSG_NE(key1.dodagId, Ipv6Address::GetAny(), "The first discovery did not start");
+
+    // Past the OrigNode's own 'L' (16 s), so its membership is gone and
+    // AodvInstanceExpired() has armed the bar, but far short of
+    // REJOIN_REENABLE (15 min by default), so the bar is still live --
+    // which is precisely the window the relays are obliged to refuse in.
+    Simulator::Stop(Seconds(30));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(key1.instanceId, key1.dodagId),
+                          false,
+                          "The first discovery's own membership never expired at 'L'");
+
+    RplRoutingProtocol::DodagKey key2 = rpl->DiscoverRoute(Ipv6Address("2001:9::22"), true);
+    NS_TEST_ASSERT_MSG_NE(key2.dodagId,
+                          Ipv6Address::GetAny(),
+                          "The second discovery did not start at all");
+    NS_TEST_ASSERT_MSG_EQ(key2.dodagId, key1.dodagId, "OrigNode's own address should not change");
+    NS_TEST_ASSERT_MSG_NE(key2.instanceId,
+                          key1.instanceId,
+                          "The second discovery reused the first one's Local RPLInstanceID while "
+                          "REJOIN_REENABLE is still live against that exact RREQ-InstanceID: RFC "
+                          "9854 section 4.1 obliges every relay that served the first discovery "
+                          "to refuse it, so this discovery would reach nobody at all");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief A stepping DODAG Version Number does not restart an RREQ-Instance's
  *        'L' deadline.
  *
@@ -26014,6 +26114,8 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplAodvRrepInstanceRankLimitTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRrepInstanceAddressVectorFullTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRrepDuplicateRelayedOnceTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplAodvInstanceIdNotReusedInsideRejoinBarTestCase,
+                TestCase::Duration::QUICK);
     AddTestCase(new RplAodvVersionBumpDoesNotExtendLifetimeTestCase,
                 TestCase::Duration::QUICK);
     AddTestCase(new RplP2pNonzeroVersionRefusedTestCase, TestCase::Duration::QUICK);

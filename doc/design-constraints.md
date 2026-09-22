@@ -10554,3 +10554,89 @@ enough to have new versions"と明言しており、RFC 9854のRREQ-Instanceも
 
 `./ns3 build`clean、`test-runner --suite=rpl`(160件、全PASS)・
 `./test.py -s rpl`PASS。
+
+## 95. AODV-RPLのID割当がREJOIN_REENABLEを見ず、再探索を~884秒間まるごと潰していた
+
+角4の5件目。独立verifierが実プローブでCONFIRMED、gap掃引による定量測定まで
+実施した。
+
+### 95.1 機序 — 拒否する側は正しく、割り当てる側が誤っていた
+
+`DiscoverRoute()`のID探索は「空き」を`IsJoinedTo()`だけで判定していた:
+
+```cpp
+if (!IsJoinedTo(local, GetGlobalAddress())) { instanceId = local; break; }
+```
+
+しかし前回の探索に参加した**すべての中継**は、自分の`L`が切れた時点で
+その`{instanceId, DODAGID}`ペアに対してREJOIN_REENABLEを張る。
+RFC 9854 §4.1:
+"Once a node leaves an RREQ-Instance, it MUST NOT rejoin the same
+RREQ-Instance for at least the time interval specified by the
+configuration variable REJOIN_REENABLE."
+そして§2はこのバーを**RREQ-InstanceID**に紐付け、§4.1はそれを
+ordered pair (Orig_RPLInstanceID, OrigNode-IPaddr) と定義する。
+dodagIdは常にOrigNode自身のアドレスなので、**IDを再利用すると同じ
+RREQ-Instanceを再構成したことになり、中継は拒否する義務を負う**。
+
+つまり中継側の拒否は正しいどころか**必須**であり、欠陥は割当側にあった。
+OrigNodeの自メンバーシップは`L`(既定16秒)で消えるのに中継のバーは
+15分続くため、その間に始めた2回目の探索は**全中継で加入前に落とされ、
+何も起きないまま終わる**。
+
+verifierの実測(2ノード、gap掃引):
+
+| 1回目の'L'満了からの間隔 | 中継が2回目を処理したか |
+|---|---|
+| 1秒 / 30秒 / 400秒 / 800秒 / 870秒 | NO |
+| 880秒 | YES(ただし残り約4秒のみ) |
+| 890秒 / 900秒 | YES |
+
+完全に失われる窓は`REJOIN_REENABLE - L` = 900 - 16 = **約884秒**
+(Phase 1報告の「約900秒」を実測で精緻化)。ログでは中継側に
+"Refusing instance 128 at ...: left too recently to rejoin"が
+Trickleのコピーごとに並ぶ。
+
+### 95.2 修正
+
+候補走査に`m_aodvRejoinBlocked`の参照を追加し、バーが生きているIDを飛ばす。
+新規の状態も新規の属性も不要 — このmapはOrigNode自身の
+`AodvInstanceExpired()`が自分のキーに対して既に張っている。
+
+全IDがバー内の場合は探索を拒否せず、**最も早く解放されるID**を選んで
+警告ログを出す。バー内の中継には拒否されるが「劣化して進む」ほうが
+「何も始めない」より良いという判断。
+
+**残存リスク(隠さず記録)**: OrigNode自身のバーは中継のバーよりわずかに
+早く切れる — 中継は後から加入するので離脱も後になる。verifierの2ホップ実測で
+スキューは0.114秒。多ホップでは伝搬遅延分だけ広がるが、15分のバーに対しては
+1秒未満のオーダー。約884秒の確実な失敗窓がこの縁ケースまで縮む、という
+改善であって完全な保証ではない。任意のマージンを発明するより、事実を
+記録する側を選んだ。
+
+### 95.3 既存試験への影響は起きなかった
+
+計画段階では`RplAodvHopByHopInstanceReuseTestCase`(§89.1の`targetsSeeded`
+修正を守る試験)が`key2.instanceId == key1.instanceId`を自分の前提として
+アサートしているため、本修正で壊れると予測していた。属性で逃がす案まで
+用意したが、**実際には壊れなかった**。
+
+理由: 同試験は950秒待つ設計で、これは**本節のバグ自体への回避策**として
+書かれたもの(§89.1の記録どおり、20秒待ちの初期版が2回目の探索を
+拒否されて気づいた)。950秒は900秒のバーを越えているので、2回目の時点で
+バーは満了済み。本修正のチェックはそのまま通し、再利用は従来どおり成立する。
+
+結果として試験の書き換えも属性追加も不要で、§89.1のカバレッジは無傷。
+バグへの回避策が、そのバグの修正に対する前方互換性を偶然与えていた形。
+
+### 95.4 検証
+
+新規試験`RplAodvInstanceIdNotReusedInsideRejoinBarTestCase`。
+1回目の探索の`L`(16秒)を越え、REJOIN_REENABLE(既定15分)の内側である
+30秒時点で2回目を開始し、異なるinstanceIdが割り当てられることを検証。
+
+バー参照を外すと同じIDが再利用されて確実に落ちることを確認済み
+(load-bearing)。
+
+`./ns3 build`clean、`test-runner --suite=rpl`(161件、全PASS)・
+`./test.py -s rpl`PASS。

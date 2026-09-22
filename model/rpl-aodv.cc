@@ -130,13 +130,36 @@ RplRoutingProtocol::DiscoverRoute(Ipv6Address target, bool hopByHop)
     // A Local RPLInstanceID, which is only unique per DODAGID (RFC 6550
     // section 5.1) -- and every RREQ-Instance this node originates shares
     // one DODAGID, this node's own address, so the ID has to be unique
-    // among them. Scanning for the first free one rather than counting up
-    // and wrapping: a discovery that has already ended has freed its ID, and
-    // reusing the lowest free one keeps the numbers small and predictable.
-    // The 'D' flag stays clear throughout; CreateLocalDodag() enforces that
-    // for control messages regardless.
+    // among them. The 'D' flag stays clear throughout; CreateLocalDodag()
+    // enforces that for control messages regardless.
+    //
+    // "Free" is not just "this node has left it". Every router that served
+    // the previous discovery armed REJOIN_REENABLE against this exact
+    // {instanceId, DODAGID} pair when its own 'L' ran out, and RFC 9854
+    // section 4.1 binds them to it: "Once a node leaves an RREQ-Instance,
+    // it MUST NOT rejoin the same RREQ-Instance for at least the time
+    // interval specified by the configuration variable REJOIN_REENABLE."
+    // Section 2 keys that bar on the RREQ-InstanceID, which section 4.1
+    // defines as the ordered pair (Orig_RPLInstanceID, OrigNode-IPaddr) --
+    // exactly what reusing the ID reconstructs. So the neighbours' refusal
+    // is not merely correct, it is mandatory: taking the lowest free ID
+    // again within the bar meant every relay dropped the new discovery's
+    // RREQ-DIO before joining, and the discovery produced nothing at all
+    // for the rest of the window (measured at ~884 s with the defaults).
+    // The defect was on this side, not theirs. Found by
+    // /protocol-test-matrix's angle 4.
+    //
+    // m_aodvRejoinBlocked holds this node's own copy of that bar, armed by
+    // AodvInstanceExpired() for its own membership. It runs slightly ahead
+    // of the relays' (they join, and so leave, a little later), so this is
+    // a close lower bound rather than a guarantee -- @see
+    // design-constraints.md for the residual skew, which is bounded by
+    // propagation delay and so is sub-second against a 15-minute bar.
     uint8_t instanceId = 0;
     bool found = false;
+    Time earliestFree = Time::Max();
+    uint8_t earliestFreeId = 0;
+    bool anyBarred = false;
     for (uint8_t candidate = 0; candidate <= RPL_AODV_PREFIX_LENGTH_MASK; candidate++)
     {
         uint8_t local = static_cast<uint8_t>(RPL_LOCAL_INSTANCE_FLAG | candidate);
@@ -145,12 +168,41 @@ RplRoutingProtocol::DiscoverRoute(Ipv6Address target, bool hopByHop)
             // Would collide with the 'D' flag's bit; not a usable Local ID.
             continue;
         }
-        if (!IsJoinedTo(local, GetGlobalAddress()))
+        if (IsJoinedTo(local, GetGlobalAddress()))
         {
-            instanceId = local;
-            found = true;
-            break;
+            continue;
         }
+        auto blocked = m_aodvRejoinBlocked.find(DodagKey{local, GetGlobalAddress()});
+        if (blocked != m_aodvRejoinBlocked.end() && Simulator::Now() < blocked->second)
+        {
+            // Left recently enough that the relays that served it are still
+            // barred from rejoining. Remember the one that frees up soonest
+            // in case every ID turns out to be in this state.
+            anyBarred = true;
+            if (blocked->second < earliestFree)
+            {
+                earliestFree = blocked->second;
+                earliestFreeId = local;
+            }
+            continue;
+        }
+        instanceId = local;
+        found = true;
+        break;
+    }
+    if (!found && anyBarred)
+    {
+        // Every usable ID is still inside its own rejoin bar. Going ahead
+        // with the one that frees up soonest is the least-bad option: the
+        // discovery is degraded (relays still inside the bar will refuse
+        // it) rather than refused outright, which is what returning here
+        // would make of it.
+        instanceId = earliestFreeId;
+        found = true;
+        NS_LOG_WARN("Every Local RPLInstanceID is still inside its own REJOIN_REENABLE bar; "
+                    "reusing "
+                    << +instanceId << ", which frees up at " << earliestFree.As(Time::S)
+                    << " -- relays still barred will refuse this discovery");
     }
     if (!found)
     {
