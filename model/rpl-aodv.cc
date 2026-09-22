@@ -159,8 +159,10 @@ RplRoutingProtocol::DiscoverRoute(Ipv6Address target, bool hopByHop)
     }
 
     // RFC 9854 section 6.1: "it MUST increase its own Sequence Number to
-    // avoid conflicts with previously established routes".
-    m_aodvSeqNo++;
+    // avoid conflicts with previously established routes". RFC 6550 section
+    // 7.2's own wrap (127 -> 0, not 127 -> 128), which section 6.1 binds
+    // this counter to, the same way every other counter here is incremented.
+    m_aodvSeqNo = RplSequenceIncrement(m_aodvSeqNo);
 
     DodagKey key = CreateLocalDodag(instanceId, RPL_MOP_P2P_ROUTE_DISCOVERY);
     if (key.dodagId.IsAny())
@@ -1243,7 +1245,7 @@ RplRoutingProtocol::StartAodvRrepInstance(const DodagMembership& rreqDodag, Doda
     // applied to the TargNode originating this instance: it is what the ART
     // option carries as Dest SeqNo, and what tells a stale route from this
     // one at the far end.
-    m_aodvSeqNo++;
+    m_aodvSeqNo = RplSequenceIncrement(m_aodvSeqNo);
 
     rrepDodag.aodv.isRrepInstance = true;
     rrepDodag.aodv.pairedInstanceId = rreqKey.instanceId;
@@ -1348,6 +1350,25 @@ RplRoutingProtocol::SendAodvRrep(DodagMembership& dodag, DodagKey key)
     // zero and ignored"), since HandleAodvRreq() never populates it then.
     option.addressVector = dodag.aodv.addressVector;
     rrep.SetRrep(option);
+
+    // This TargNode's own Sequence Number, advanced before it is emitted --
+    // the same rule StartAodvRrepInstance() applies to the asymmetric case,
+    // which is where this counter is otherwise moved. RFC 9854 section 6.1
+    // binds it to every node ("Each node maintains a Sequence Number"), and
+    // section 6.4.3 makes the emitted value the freshness this route is
+    // judged by downstream: "A route entry with the same source and
+    // destination address and the same RPLInstanceID, but a stale Sequence
+    // Number, MUST be deleted."
+    //
+    // Left un-advanced, a TargNode answered every discovery it ever served
+    // with the identical Dest SeqNo, so two discoveries under a reused
+    // RREQ-InstanceID were indistinguishable in freshness. A relay whose
+    // path changed between them then hit StoreHopByHopRoute()'s
+    // equal-Sequence-Number pin -- same seqNo, different next hop -- and
+    // discarded the second discovery's RREP outright, leaving the OrigNode
+    // with no reply and the relay pointing down the old, broken path.
+    // Found by /protocol-test-matrix's angle 4.
+    m_aodvSeqNo = RplSequenceIncrement(m_aodvSeqNo);
 
     // The ART option of an RREP names the OrigNode, not the target: it is
     // what tells each router on the way back whether it is the OrigNode

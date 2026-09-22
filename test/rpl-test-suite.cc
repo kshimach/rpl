@@ -12682,6 +12682,211 @@ RplAodvRrepDuplicateRelayedOnceTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief A TargNode answering a symmetric route discovery advances its own
+ *        Sequence Number, so successive discoveries are distinguishable.
+ *
+ * RFC 9854 section 6.1: "Each node maintains a Sequence Number; the
+ * operation is specified in Section 7.2 of [RFC6550]." Section 6.4.3 makes
+ * the emitted value load-bearing downstream: "The Sequence Number
+ * represents the freshness of the route entry and is copied from the Dest
+ * SeqNo field of the ART option of the RREP-DIO. A route entry with the
+ * same source and destination address and the same RPLInstanceID, but a
+ * stale Sequence Number, MUST be deleted."
+ *
+ * SendAodvRrep() -- the symmetric reply path -- read the counter without
+ * ever advancing it, while StartAodvRrepInstance() (the asymmetric path)
+ * did advance it. A TargNode therefore answered every discovery it ever
+ * served with the identical Dest SeqNo. Two discoveries under a reused
+ * RREQ-InstanceID were then indistinguishable in freshness, and a relay
+ * whose path had changed between them hit StoreHopByHopRoute()'s
+ * equal-Sequence-Number pin (same seqNo, different next hop) and discarded
+ * the second discovery's RREP, leaving the OrigNode unanswered. Found by
+ * /protocol-test-matrix's angle 4.
+ *
+ * Two fabricated RREQ-DIOs, under two different RREQ-InstanceIDs so no 'L'
+ * deadline or REJOIN_REENABLE wait is involved, both naming the node under
+ * test as TargNode. The RREP-DIOs it unicasts back are captured at the
+ * peer. The expectation is taken from the spec rather than from any
+ * particular value: the second Dest SeqNo must be *newer* than the first
+ * by RFC 6550 section 7.2's own comparison, which is what section 6.4.3's
+ * "stale" is defined against.
+ */
+class RplAodvSymmetricRrepAdvancesSeqNoTestCase : public TestCase
+{
+  public:
+    RplAodvSymmetricRrepAdvancesSeqNoTestCase();
+
+  private:
+    void DoRun() override;
+
+    /// @brief Record the Dest SeqNo of each RREP-DIO seen at the monitor.
+    /// @param socket the monitoring socket
+    void CaptureRrep(Ptr<Socket> socket);
+
+    std::vector<uint8_t> m_destSeqNos; //!< Dest SeqNo of each RREP-DIO, in arrival order
+};
+
+RplAodvSymmetricRrepAdvancesSeqNoTestCase::RplAodvSymmetricRrepAdvancesSeqNoTestCase()
+    : TestCase("A TargNode's symmetric RREP advances its own Sequence Number")
+{
+}
+
+void
+RplAodvSymmetricRrepAdvancesSeqNoTestCase::CaptureRrep(Ptr<Socket> socket)
+{
+    Address sender;
+    Ptr<Packet> packet = socket->RecvFrom(sender);
+    if (!packet)
+    {
+        return;
+    }
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ipv6Header);
+    Icmpv6Header icmpv6Header;
+    packet->RemoveHeader(icmpv6Header);
+    if (icmpv6Header.GetType() != ICMPV6_RPL || icmpv6Header.GetCode() != RPL_CODE_DIO)
+    {
+        return;
+    }
+    RplDioHeader dio;
+    packet->RemoveHeader(dio);
+    if (!dio.HasRrep() || !dio.HasArt())
+    {
+        return;
+    }
+    m_destSeqNos.push_back(dio.GetArt().destSeqNo);
+}
+
+void
+RplAodvSymmetricRrepAdvancesSeqNoTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2); // 0 = the TargNode under test and base root, 1 = the peer it answers through
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    interfaces.SetForwarding(0, true);
+    interfaces.SetForwarding(1, true);
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    Ptr<Node> node = nodes.Get(0);
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> peer = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(peer->IsJoined(), true, "The peer never joined the base DODAG");
+    Ipv6Address peerGlobal = peer->GetGlobalAddress();
+    Ipv6Address ownGlobal = rpl->GetGlobalAddress();
+    NS_TEST_ASSERT_MSG_NE(ownGlobal, Ipv6Address::GetAny(), "The node has no global address yet");
+
+    Ipv6Address nodeLinkLocal = node->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address peerLinkLocal =
+        nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    Ipv6Address origNode("2001:9::1"); // fabricated OrigNode, no real node behind it
+
+    Ptr<Socket> monitor = Socket::CreateSocket(nodes.Get(1), Ipv6RawSocketFactory::GetTypeId());
+    monitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    monitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    monitor->BindToNetDevice(nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+    monitor->SetRecvCallback(
+        MakeCallback(&RplAodvSymmetricRrepAdvancesSeqNoTestCase::CaptureRrep, this));
+
+    // Two discoveries, distinguished only by their RREQ-InstanceID, so that
+    // neither an 'L' deadline nor REJOIN_REENABLE has to be waited out to
+    // get a second answer out of the same TargNode.
+    auto deliverRreq = [&](uint8_t instanceId) {
+        RplDioHeader rreqDio;
+        rreqDio.SetInstanceId(instanceId);
+        rreqDio.SetVersionNumber(0);
+        rreqDio.SetRank(RPL_MIN_HOPRANKINC);
+        rreqDio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+        rreqDio.SetDodagId(origNode);
+        rreqDio.SetDtsn(0);
+        rreqDio.SetDagConfiguration(0,
+                                    20,
+                                    RPL_DIO_REDUNDANCY,
+                                    RPL_MAX_RANKINC,
+                                    RPL_MIN_HOPRANKINC,
+                                    RPL_OCP_OF0,
+                                    RPL_DEFAULT_LIFETIME,
+                                    RPL_DEFAULT_LIFETIME_UNIT);
+        RplDioHeader::RreqOption rreq;
+        rreq.symmetric = true; // the symmetric reply path this test is about
+        rreq.hopByHop = false;
+        rreq.compr = 0;
+        rreq.lifetime = 0;
+        rreq.rankLimit = 0;
+        rreq.origSeqNo = 1;
+        rreq.addressVector = {peerGlobal};
+        rreqDio.SetRreq(rreq);
+        RplDioHeader::ArtOption art;
+        art.destSeqNo = 0; // section 4.3's "no known information" encoding
+        art.prefixLength = 0;
+        art.target = ownGlobal; // names the node under test as TargNode
+        rreqDio.SetArt(art);
+        DeliverRawRplMessage<RplDioHeader>(node,
+                                           1,
+                                           rreqDio,
+                                           static_cast<uint8_t>(RPL_CODE_DIO),
+                                           peerLinkLocal,
+                                           nodeLinkLocal);
+    };
+
+    deliverRreq(0x81);
+    Simulator::Stop(Seconds(1));
+    Simulator::Run();
+    deliverRreq(0x82);
+    Simulator::Stop(Seconds(1));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(m_destSeqNos.size(),
+                          2,
+                          "Expected exactly one RREP-DIO back per discovery");
+    // Checked before indexing: an assertion failure does not stop this
+    // function, so a short vector would be read out of range below.
+    if (m_destSeqNos.size() < 2)
+    {
+        monitor->Close();
+        Simulator::Destroy();
+        return;
+    }
+
+    NS_TEST_ASSERT_MSG_NE(m_destSeqNos[0],
+                          0,
+                          "Dest SeqNo 0 is RFC 9854 section 4.3's reserved \"no known information "
+                          "about the Sequence Number of TargNode\" encoding, \"not used "
+                          "otherwise\" -- a TargNode answering with its own Sequence Number must "
+                          "never emit it");
+    NS_TEST_ASSERT_MSG_EQ(RplSequenceNewer(m_destSeqNos[1], m_destSeqNos[0]),
+                          true,
+                          "The second discovery's Dest SeqNo is not newer than the first's: a "
+                          "TargNode that never advances its Sequence Number leaves two "
+                          "discoveries indistinguishable in freshness, so RFC 9854 section "
+                          "6.4.3's \"stale Sequence Number\" rule cannot tell them apart and "
+                          "StoreHopByHopRoute()'s equal-Sequence-Number pin refuses the second "
+                          "one's route");
+
+    monitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief An RREP-DIO this router drops without handling does not consume the
  *        dedup that a later, genuinely relayable RREP-DIO needs.
  *
@@ -25304,6 +25509,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplAodvRrepInstanceRankLimitTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRrepInstanceAddressVectorFullTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRrepDuplicateRelayedOnceTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplAodvSymmetricRrepAdvancesSeqNoTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRrepDropDoesNotConsumeDedupTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvMultiTargNodeRrepsBothHandledTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRoutesInPrintedTablesTestCase, TestCase::Duration::QUICK);

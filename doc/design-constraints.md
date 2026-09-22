@@ -10308,3 +10308,89 @@ verifierの指摘どおりで、本節の新規試験2件がその空白を埋�
 
 `./ns3 build`clean、`test-runner --suite=rpl`(156件、全PASS)・
 `./test.py -s rpl`PASS。
+
+## 92. 対称RREPがTargNode自身のSequence Numberを進めていなかった
+
+角4の候補2件目。§91と同じ監査で検出し、独立verifierが実プローブで
+CONFIRMED(単一変数の対照実験まで実施 — Dest SeqNoを1つ違えるだけで
+結果が反転することを確認)。
+
+### 92.1 機序
+
+`m_aodvSeqNo`(RFC 9854 §6.1のSequence Number)を進める箇所はモジュール全体で
+2つしかなかった: `DiscoverRoute()`(OrigNodeとして探索を開始するとき)と
+`StartAodvRrepInstance()`(**非対称**のTargNodeとして応答するとき)。
+**対称**の応答経路`SendAodvRrep()`は`art.destSeqNo = m_aodvSeqNo;`と
+読むだけで進めていなかった。
+
+RFC 9854 §6.1は
+"Each node maintains a Sequence Number; the operation is specified in
+Section 7.2 of [RFC6550]."
+と主語を**ノード一般**に置いており、§6.4.3は送出値が下流で持つ意味を規定する:
+"The Sequence Number represents the freshness of the route entry and is
+copied from the Dest SeqNo field of the ART option of the RREP-DIO. A
+route entry with the same source and destination address and the same
+RPLInstanceID, but a stale Sequence Number, MUST be deleted."
+
+進めないと、あるTargNodeは**自分が応答したすべての探索に同じDest SeqNo**を
+返す。RREQ-InstanceIDが再利用された2回の探索は鮮度で区別できなくなり、
+間で経路が変わった中継は`StoreHopByHopRoute()`の
+`pinNextHop`(同一Sequence Numberで次ホップだけ違う更新を拒否する)に
+引っかかって**2回目のRREPを破棄**する。OrigNodeは応答を得られず、
+中継は壊れた旧経路を指したまま残る。
+
+verifierの実測(5ノード、H=1、instanceId再利用):
+TargNodeは1回目・2回目とも`DestSeqNo 0`を送出し、中継Xで
+"next hop ... disagrees with the ... already held at the same Sequence
+Number 0"が発火してRREPが消滅、OrigNode側に完了ログが出ない。
+Dest SeqNoを1つ進めた対照では中継が成功し経路が移動した。
+
+### 92.2 修正
+
+`SendAodvRrep()`でART option構築の直前に`m_aodvSeqNo`を進める
+(非対称側と同じpre-increment)。併せて既存の2箇所の素の`++`を
+`RplSequenceIncrement()`に置き換えた — 他の6箇所のカウンタ
+(dtsn・pathSequence・daoSequence・version)はすべてこのヘルパー経由で
+あり、AODVのSequence Numberだけが漏れていた。RFC 6550 §7.2 rule 2の
+127→0の折り返し(素の`++`では127→128になる)。
+
+### 92.3 初期値についてのverifier指摘の訂正
+
+verifierは「Dest SeqNo=0はRFC 9854 §4.3が
+"Zero is used if there is no known information about the Sequence Number
+of TargNode and not used otherwise"と予約しているので、初期値を
+RFC 6550 §7.2 rule 1の推奨値240に変えないとこの違反が残る。増分の修正と
+初期値の修正は独立でない」と報告した。**これは誤り**で、増分を
+**読み取りより前**に置く(既存の非対称側と同じpre-increment)限り、
+0は二度と送出されない — 本節の修正だけで予約値違反は解消する。
+実際、新規試験は`m_destSeqNos[0] != 0`を直接検証しており、修正を戻すと
+このアサートも同時に落ちる。
+
+初期値0のままにした理由: RFC 6550 §7.2 rule 1はSHOULDであり、
+このモジュールの**7つあるカウンタすべてが0初期化**で揃っている。
+AODVのものだけを240に変えると一貫性を失ううえ、上記のとおり機能的効果は
+ゼロ。モジュール全体の既知の逸脱として記録し、直すなら全カウンタ一括で
+別途扱う。verifier自身の網羅列挙(256通りの保持値×gap 1..40)でも、
+素の`++`とRFC準拠の折り返しで`RplSequenceNewer()`の判定が食い違う
+ケースは**存在しなかった**。
+
+### 92.4 検証
+
+新規試験`RplAodvSymmetricRrepAdvancesSeqNoTestCase`。被験ノードを
+TargNodeとして名指す偽造RREQ-DIOを2つの異なるRREQ-InstanceIDで届け
+('L'期限もREJOIN_REENABLEも待たずに2回答えさせられる)、返ってくる
+RREP-DIOをピア上のモニタで捕捉してDest SeqNoを読む。
+
+期待値は具体値でなく**仕様上の性質**で固定した: (a) 予約値0を送出しない
+(§4.3)、(b) 2回目が1回目より`RplSequenceNewer()`の意味で新しい
+(§6.4.3の"stale"が定義される比較そのもの)。実装の具体値を覗いていない。
+
+`SendAodvRrep()`の増分を外すと両アサートとも落ちることを確認済み
+(load-bearing)。
+
+verifierの指摘どおり、**この送出値を観測する試験はこれまでゼロだった** —
+既存の`destSeqNo`関連アサート約30箇所はすべて試験自身が捏造した値の
+直列化ラウンドトリップで、実ノードが何を送るかは誰も見ていなかった。
+
+`./ns3 build`clean、`test-runner --suite=rpl`(157件、全PASS)・
+`./test.py -s rpl`PASS。

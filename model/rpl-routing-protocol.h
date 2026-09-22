@@ -2877,9 +2877,23 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     DodagKey m_baseDodagKey{0, Ipv6Address::GetAny()};
 
     /// This node's own Sequence Number (RFC 9854 section 6.1, the RFC 6550
-    /// section 7.2 lollipop counter): incremented at the start of each route
-    /// discovery this node originates, so that routes an earlier one left
-    /// behind can be told apart from the current one's.
+    /// section 7.2 lollipop counter). Section 6.1 gives it to every node
+    /// ("Each node maintains a Sequence Number"), and this one is advanced
+    /// every time this node originates something whose freshness a peer
+    /// judges by it: a route discovery of its own (DiscoverRoute()), and an
+    /// RREP answering someone else's, symmetric (SendAodvRrep()) or
+    /// asymmetric (StartAodvRrepInstance()) alike. Always advanced before
+    /// the value is emitted, so the reserved "no known information about
+    /// the Sequence Number of TargNode" encoding of zero (section 4.3,
+    /// "not used otherwise") never goes on the wire.
+    ///
+    /// Initialised to 0 rather than to RFC 6550 section 7.2 rule 1's
+    /// recommended 240, in common with every other sequence counter in this
+    /// module (dtsn, pathSequence, daoSequence, version). A known
+    /// conformance deviation with no functional consequence, since nothing
+    /// is emitted before the first increment and RplSequenceCompare()
+    /// orders the resulting values correctly either way. @see
+    /// design-constraints.md.
     uint8_t m_aodvSeqNo{0};
     /// Imin of the Trickle timer pacing RREQ-DIOs. Separate from
     /// DioIntervalMin because a route discovery has to finish inside its own
