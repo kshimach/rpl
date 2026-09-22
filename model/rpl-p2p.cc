@@ -62,8 +62,44 @@ RplRoutingProtocol::DiscoverP2pRoute(Ipv6Address target, bool hopByHop)
     // their local instances at this same node's global address and
     // IsJoinedTo() already resolves by the (instanceId, dodagId) pair
     // regardless of which protocol owns the membership.
+    // "Free" is not just "this node has left it". RFC 6997 section 6.1 bars
+    // reuse twice over, and both bars outlast this node's own membership:
+    //
+    //   "The Origin SHOULD NOT reuse a RPLInstanceID for a route discovery
+    //    if some routers might still maintain membership in the DAG that
+    //    the Origin had initiated for the previous route discovery using
+    //    this RPLInstanceID. ... it is usually sufficient that the Origin
+    //    wait for twice the duration indicated by the L field inside the
+    //    P2P-RDO used for the previous route discovery"
+    //
+    //   "When initiating a new route discovery to a particular Target, the
+    //    Origin MUST NOT reuse the RPLInstanceID used in a previous route
+    //    discovery to this Target if the state created during the previous
+    //    route discovery might still exist in some routers. ... it is
+    //    sufficient that the Origin lets a time duration equal to "X+2*t"
+    //    seconds pass since the initiation of the previous route discovery"
+    //
+    // where X is the lifetime of the route state (PathLifetime * the
+    // lifetime unit) and t the 'L' duration. With the defaults that is 16 s
+    // against 1832 s: this node leaves its own temporary DAG more than a
+    // hundred times sooner than the routes it established expire.
+    //
+    // Reusing inside the MUST NOT window is what section 9.6 itself names as
+    // the failure -- a router still holding the previous route for this
+    // Target, under this same {RPLInstanceID, DODAGID}, "MUST discard the
+    // P2P-DRO message with no further processing" when the new one's next
+    // hop differs. The second discovery's reply then dies at that router:
+    // the Origin keeps its stale route, believes it still has one, and
+    // blackholes traffic for the rest of PathLifetime. Found by
+    // /protocol-test-matrix's angle 4.
+    Time membershipBar = Seconds(2 * RplP2pLifetimeSeconds(m_p2pLifetime));
+    Time routeBar = Seconds(m_pathLifetime * m_lifetimeUnit) + membershipBar;
+
     uint8_t instanceId = 0;
     bool found = false;
+    Time earliestFree = Time::Max();
+    uint8_t earliestFreeId = 0;
+    bool anyBarred = false;
     for (uint8_t candidate = 0; candidate <= RPL_AODV_PREFIX_LENGTH_MASK; candidate++)
     {
         uint8_t local = static_cast<uint8_t>(RPL_LOCAL_INSTANCE_FLAG | candidate);
@@ -71,12 +107,45 @@ RplRoutingProtocol::DiscoverP2pRoute(Ipv6Address target, bool hopByHop)
         {
             continue;
         }
-        if (!IsJoinedTo(local, GetGlobalAddress()))
+        if (IsJoinedTo(local, GetGlobalAddress()))
         {
-            instanceId = local;
-            found = true;
-            break;
+            continue;
         }
+        auto used = m_p2pInstanceUse.find(local);
+        if (used != m_p2pInstanceUse.end())
+        {
+            // The MUST NOT bar applies only to a repeat discovery for the
+            // same Target, which is how section 6.1 scopes it and how
+            // m_hopByHopRoutes/m_p2pRoutes are keyed; the SHOULD NOT bar
+            // applies whatever the Target.
+            Time freeAt = used->second.started +
+                          (used->second.target == target ? routeBar : membershipBar);
+            if (Simulator::Now() < freeAt)
+            {
+                anyBarred = true;
+                if (freeAt < earliestFree)
+                {
+                    earliestFree = freeAt;
+                    earliestFreeId = local;
+                }
+                continue;
+            }
+        }
+        instanceId = local;
+        found = true;
+        break;
+    }
+    if (!found && anyBarred)
+    {
+        // Every usable ID is still barred. Going ahead with the one that
+        // frees up soonest degrades this discovery (a router still holding
+        // the older state may discard its P2P-DRO) rather than refusing to
+        // start one at all, the same choice DiscoverRoute() makes.
+        instanceId = earliestFreeId;
+        found = true;
+        NS_LOG_WARN("Every Local RPLInstanceID is still inside its own RFC 6997 section 6.1 reuse "
+                    "bar; reusing "
+                    << +instanceId << ", which frees up at " << earliestFree.As(Time::S));
     }
     if (!found)
     {
@@ -84,6 +153,7 @@ RplRoutingProtocol::DiscoverP2pRoute(Ipv6Address target, bool hopByHop)
                                                            << ": no free Local RPLInstanceID");
         return empty;
     }
+    m_p2pInstanceUse[instanceId] = P2pInstanceUse{target, Simulator::Now()};
 
     DodagKey key = CreateLocalDodag(instanceId, RPL_MOP_P2P_ROUTE_DISCOVERY);
     if (key.dodagId.IsAny())

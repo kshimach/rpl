@@ -2944,6 +2944,27 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     /// finds itself an ordinary member of its own discovery.
     std::map<DodagKey, Time> m_aodvRejoinBlocked;
 
+    /// What the last P2P-RPL discovery this node originated under a given
+    /// Local RPLInstanceID was, so DiscoverP2pRoute() can honour RFC 6997
+    /// section 6.1's two reuse rules. AODV-RPL needs no equivalent: its own
+    /// m_aodvRejoinBlocked above already records the same thing for the same
+    /// key, armed when the membership expires.
+    struct P2pInstanceUse
+    {
+        Ipv6Address target; //!< the Target that discovery was looking for
+        Time started;       //!< when it was initiated
+    };
+
+    /// Keyed by Local RPLInstanceID. RFC 6997 section 6.1 bars reuse twice
+    /// over: a SHOULD NOT until "twice the duration indicated by the L
+    /// field" has passed (routers may still hold membership in the previous
+    /// temporary DAG), and, when the new discovery seeks the same Target, a
+    /// MUST NOT until "X+2*t" where X is the route lifetime (routers may
+    /// still hold the route it established, which section 9.6 then makes
+    /// them discard the new discovery's P2P-DRO over). @see
+    /// DiscoverP2pRoute() and design-constraints.md.
+    std::map<uint8_t, P2pInstanceUse> m_p2pInstanceUse;
+
     /// A route an AODV-RPL discovery found, held at the OrigNode.
     struct AodvRoute
     {

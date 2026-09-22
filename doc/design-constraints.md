@@ -10640,3 +10640,104 @@ Trickleのコピーごとに並ぶ。
 
 `./ns3 build`clean、`test-runner --suite=rpl`(161件、全PASS)・
 `./test.py -s rpl`PASS。
+
+## 96. P2P-RPLのID割当がRFC 6997 §6.1の再利用禁止を実装していなかった
+
+角4の6件目(最後)。独立verifierが実プローブでCONFIRMEDし、
+**症状はPhase 1の記述より悪い**と判定した。
+
+### 96.1 機序
+
+`DiscoverP2pRoute()`のID探索は`IsJoinedTo()`だけを見ていた。しかし
+RFC 6997 §6.1は再利用を**二重に**縛っており、どちらの縛りも
+Origin自身の一時DAG membership(既定16秒)よりはるかに長い:
+
+- SHOULD NOT: 「前回の探索で作った一時DAGにまだ加入しているルータが
+  いるかもしれない間」は再利用しない。目安は`2*t`(Lの2倍、既定32秒)
+- MUST NOT: 「**同じTarget**への新しい探索を始めるとき、前回の探索が
+  作った状態がどこかのルータにまだ残っているかもしれない間」は再利用
+  しない。目安は`X+2*t`(Xは経路の寿命 = PathLifetime × LifetimeUnit、
+  既定1800秒 → 合計1832秒)
+
+既定値では**16秒 対 1832秒** — このノードは自分が張った経路が切れるより
+100倍以上早く一時DAGを抜ける。その差の間に同じIDで再探索すると、
+RFC 6997 §9.6自身が名指ししている失敗に突き当たる:
+
+"If the router already maintains a Hop-by-hop state listing the Target as
+the destination and carrying the same RPLInstanceID and DODAGID fields as
+the received P2P-DRO, and the next-hop information in the state does not
+match the next hop indicated in the received P2P-DRO, the router MUST
+discard the P2P-DRO message with no further processing."
+
+しかも§9.6はこの状況が起きる場合として
+"When a Hop-by-hop Route between the Origin and the Target, previously
+established using the same RPLInstanceID and DODAGID as the route
+currently being established, still exists and at least partially overlaps
+the route currently being established"
+を**明示的に列挙**している — RFCは§6.1のMUST NOTの理由としてこれを
+書いているのであって、実装が踏んだのはまさにその想定どおりの穴だった。
+
+### 96.2 症状 — 「静かに失敗」より悪い
+
+verifierの実測(5ノード、H=1、1回目の経路を故意に切って2回目に別経路を
+取らせる):
+
+- 2回目のP2P-DROは中継で
+  "conflicts with the next hop ... already held"となり破棄される
+- **Origin自身の`StoreHopByHopRoute()`は一度も走らない**ため、Originは
+  1回目の古いエントリを保持したまま。`GetHopByHopRoute()`はtrueを返し、
+  アプリから見ると経路は「ある」
+- 結果は**データプレーンのブラックホール**: `Send()`は64を返すが
+  1通も届かない。中継が到達不能なノードへ転送し続けるため、残りの
+  PathLifetime(最大1800秒)継続する
+- エラー経路もトレースソースも無い。既存の2つのトレース
+  (`RankErrorConfirmed`/`DiscoveryTargetReached`)はどちらも失敗を
+  報せない — 後者はTargetへの到達自体は起きているので「成功」を報告する
+
+対照実験(`PathLifetime=1`にして経路状態を先に失効させた場合)では
+同じIDを再利用しても正常に動作した。**唯一の変数が「前回の状態が
+まだ生きているか」**であることの確認になっている。
+
+### 96.3 修正
+
+`m_p2pInstanceUse`(instanceId → {最後に探しTarget, 開始時刻})を新設し、
+候補走査で2つの窓を判定する — 同じTargetなら`X+2*t`、異なるTargetなら
+`2*t`。新規**属性**は不要: どちらの長さも既存の`PathLifetime`・
+`LifetimeUnit`・`P2pLifetime`から算出できる。
+
+全IDが窓の内側なら、AODV側(§95)と同じく最も早く解放されるIDを選んで
+警告を出す(探索を拒否するより劣化して進むほうがまし)。
+
+AODV側との非対称性: あちらは`m_aodvRejoinBlocked`という同等の記録が
+REJOIN_REENABLEのために既に存在したので新規状態が要らなかった。
+P2P-RPLにはREJOIN_REENABLEに相当する規定が無い(§309付近の既存コメント
+のとおり)ため、ここだけ新規のbookkeepingが要る。
+
+### 96.4 検証
+
+新規試験`RplP2pInstanceIdNotReusedWhileStateLivesTestCase`。
+一時DAGの'L'(16秒)を越えた40秒時点で、(a) 同じTargetへの再探索、
+(b) 別Targetへの探索、の2つを行い、いずれも前の探索と異なるinstanceIdが
+割り当てられることを検証(MUST NOTとSHOULD NOTの両方)。
+
+窓の判定を外すと同じIDが再利用されて確実に落ちることを確認済み
+(load-bearing)。
+
+`./ns3 build`clean、`test-runner --suite=rpl`(162件、全PASS)・
+`./test.py -s rpl`PASS。
+
+### 96.5 角4の総括
+
+`/protocol-test-matrix`の角4(シーケンス状態遷移)をモジュール全体に対して
+初めて完走させた結果、Phase 1で5候補、Phase 2の独立検証で**5件すべて
+CONFIRMED**、さらに検証中に1件(§93)が追加で見つかり、計6件を§91〜§96で
+修正した。
+
+6件のうち4件(§92・§93・§95・§96)が**「解放済みローカルRPLInstanceIDの
+再利用」と「それが張った派生状態の長い寿命」の不一致**という同一の
+根本原因を共有していた。既に§83・§89でこの系統を2度直していたにも
+かかわらず、別の現れ方がまだ4つ残っていたことになる。角4がdiff範囲でなく
+モジュール全体を対象にしたからこそ届いた領域で、diffスコープの角1〜3では
+原理的に捕まえられなかった。
+
+試験は154件から162件へ。各修正は個別にload-bearing検証済み。

@@ -12682,6 +12682,125 @@ RplAodvRrepDuplicateRelayedOnceTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief A repeat P2P-RPL discovery to the same Target does not reuse the
+ *        previous one's Local RPLInstanceID while its routes are still live.
+ *
+ * RFC 6997 section 6.1 bars reuse twice over, and both bars far outlast
+ * the Origin's own membership in the temporary DAG:
+ *
+ *     The Origin SHOULD NOT reuse a RPLInstanceID for a route discovery
+ *     if some routers might still maintain membership in the DAG that the
+ *     Origin had initiated for the previous route discovery using this
+ *     RPLInstanceID. ... it is usually sufficient that the Origin wait for
+ *     twice the duration indicated by the L field
+ *
+ *     When initiating a new route discovery to a particular Target, the
+ *     Origin MUST NOT reuse the RPLInstanceID used in a previous route
+ *     discovery to this Target if the state created during the previous
+ *     route discovery might still exist in some routers. ... it is
+ *     sufficient that the Origin lets a time duration equal to "X+2*t"
+ *     seconds pass since the initiation of the previous route discovery
+ *
+ * With the defaults that is 16 s of membership against 1832 s of route
+ * state. DiscoverP2pRoute() took the lowest ID this node had merely left,
+ * so a repeat discovery inside that window met its own predecessor's
+ * still-live routes under the same {RPLInstanceID, DODAGID} -- which
+ * section 9.6 then has a router "MUST discard the P2P-DRO message with no
+ * further processing" over, whenever the new route's next hop differs.
+ * The reply died at that router and the Origin kept a stale route it
+ * believed was good, blackholing traffic. Found by
+ * /protocol-test-matrix's angle 4.
+ *
+ * Both bars are checked: a repeat to the same Target (the MUST NOT), and
+ * a discovery to a different Target inside twice 'L' (the SHOULD NOT).
+ */
+class RplP2pInstanceIdNotReusedWhileStateLivesTestCase : public TestCase
+{
+  public:
+    RplP2pInstanceIdNotReusedWhileStateLivesTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplP2pInstanceIdNotReusedWhileStateLivesTestCase::
+    RplP2pInstanceIdNotReusedWhileStateLivesTestCase()
+    : TestCase("A repeat P2P-RPL discovery takes a different Local RPLInstanceID")
+{
+}
+
+void
+RplP2pInstanceIdNotReusedWhileStateLivesTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(1);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.AssignWithoutAddress(devices);
+
+    Ptr<Node> node = nodes.Get(0);
+    rplHelper.SetRoot(node, Ipv6Address("2001:1::"), 64);
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+
+    Ipv6Address target("2001:9::11");
+    Ipv6Address otherTarget("2001:9::22");
+
+    RplRoutingProtocol::DodagKey key1 = rpl->DiscoverP2pRoute(target, true);
+    NS_TEST_ASSERT_MSG_NE(key1.dodagId, Ipv6Address::GetAny(), "The first discovery did not start");
+
+    // Past the temporary DAG's own 'L' (16 s at the default P2pLifetime of
+    // 2), so this node has left it and the old allocator would call the ID
+    // free, but nowhere near the route state's own lifetime.
+    Simulator::Stop(Seconds(40));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(key1.instanceId, key1.dodagId),
+                          false,
+                          "The first discovery's own membership never expired at 'L'");
+
+    // The MUST NOT: same Target, inside X+2*t.
+    RplRoutingProtocol::DodagKey key2 = rpl->DiscoverP2pRoute(target, true);
+    NS_TEST_ASSERT_MSG_NE(key2.dodagId,
+                          Ipv6Address::GetAny(),
+                          "The repeat discovery did not start at all");
+    NS_TEST_ASSERT_MSG_NE(key2.instanceId,
+                          key1.instanceId,
+                          "A repeat discovery to the same Target reused the previous one's Local "
+                          "RPLInstanceID while the routes it established are still live: RFC "
+                          "6997 section 9.6 has a router holding that state discard the new "
+                          "discovery's P2P-DRO, so the reply never reaches the Origin");
+
+    // The SHOULD NOT: a different Target, still inside twice 'L' of both
+    // discoveries above, so neither of their IDs may be taken either.
+    RplRoutingProtocol::DodagKey key3 = rpl->DiscoverP2pRoute(otherTarget, true);
+    NS_TEST_ASSERT_MSG_NE(key3.dodagId,
+                          Ipv6Address::GetAny(),
+                          "The third discovery did not start at all");
+    NS_TEST_ASSERT_MSG_NE(key3.instanceId,
+                          key2.instanceId,
+                          "A discovery started within twice 'L' of the previous one reused its "
+                          "Local RPLInstanceID, which RFC 6997 section 6.1 bars while routers "
+                          "may still hold membership in that temporary DAG");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief A second discovery started inside REJOIN_REENABLE does not reuse
  *        the previous discovery's Local RPLInstanceID.
  *
@@ -26114,6 +26233,8 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplAodvRrepInstanceRankLimitTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRrepInstanceAddressVectorFullTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRrepDuplicateRelayedOnceTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pInstanceIdNotReusedWhileStateLivesTestCase,
+                TestCase::Duration::QUICK);
     AddTestCase(new RplAodvInstanceIdNotReusedInsideRejoinBarTestCase,
                 TestCase::Duration::QUICK);
     AddTestCase(new RplAodvVersionBumpDoesNotExtendLifetimeTestCase,
