@@ -1424,6 +1424,14 @@ RplRoutingProtocol::HandleAodvRrep(const RplDioHeader& dio, Ipv6Address from, ui
     }
     DodagMembership& dodag = it->second;
 
+    // RFC 9854 section 4.2: "TargNode sets one of its IPv6 addresses in the
+    // DODAGID field of the RREP-DIO message", so this names which TargNode
+    // is answering -- the one thing that tells two TargNodes' replies to the
+    // same RREQ-Instance apart. Read from the DIO rather than from
+    // dodag.aodv.target, which holds only the first ART target this
+    // membership ever saw (@see its own doc comment).
+    Ipv6Address targNode = dio.GetDodagId();
+
     // RFC 9854 section 6.4: "a router that already belongs to the
     // RREP-Instance SHOULD drop the RREP-DIO". This module never forms an
     // RREP-Instance DODAG for a symmetric route (section 6.3.1), so there is
@@ -1433,30 +1441,44 @@ RplRoutingProtocol::HandleAodvRrep(const RplDioHeader& dio, Ipv6Address from, ui
     // intermediate hop -- harmless on its own since the Address Vector is
     // fixed-length so it does not amplify, but pure waste, and at the
     // OrigNode it just overwrote m_aodvRoutes[target] with identical data.
-    if (dodag.aodv.rrepHandled)
+    //
+    // Per TargNode, not per RREQ-Instance: section 6.2.2 has one
+    // RREQ-Instance reach several TargNodes, each of which answers with its
+    // own RREP-Instance (its own DODAGID). A single flag for the whole
+    // RREQ-Instance dropped the second TargNode's reply as a repeat of the
+    // first's, so the OrigNode never learned that route at all. @see
+    // rrepHandled's own doc comment and design-constraints.md.
+    if (dodag.aodv.rrepHandled.find(targNode) != dodag.aodv.rrepHandled.end())
     {
-        NS_LOG_LOGIC("Already handled an RREP for RREQ-Instance "
-                    << +rreqInstanceId << " at " << origNode << ", dropping a repeat");
+        NS_LOG_LOGIC("Already handled an RREP from TargNode "
+                    << targNode << " for RREQ-Instance " << +rreqInstanceId << " at " << origNode
+                    << ", dropping a repeat");
         return;
     }
-    dodag.aodv.rrepHandled = true;
 
     // RFC 9854 sections 6.2.3/6.4.3: an H=1 route entry records only each
     // router's own next hop, unlike H=0's whole path, so every router the
     // RREP passes through -- OrigNode included -- stores its own downward
     // entry toward TargNode here, pointing at from: one hop closer to
     // TargNode than this router is, since the RREP travels that direction
-    // back from wherever it originated. dodag.aodv.target already names
-    // TargNode, set from the RREQ-Instance's own ART option this same
-    // membership recorded (DiscoverRoute() at the OrigNode,
-    // HandleAodvRreq() everywhere else). destSeqNo is TargNode's own
+    // back from wherever it originated. destSeqNo is TargNode's own
     // Sequence Number, the freshness this specific (downward) direction is
     // judged by, the same way Orig SeqNo judges the upward one.
+    //
+    // The destination is targNode, the RREP-DIO's own DODAGID: section
+    // 6.4.3 lists "TargNode Address as destination" among the entry's items
+    // and says outright that "the destination address is learned from the
+    // DODAGID". It used to be dodag.aodv.target -- the first ART target
+    // this membership ever saw -- which names a different node as soon as
+    // one RREQ-Instance carries several ART options (section 6.2.2). Since
+    // m_hopByHopRoutes is keyed by destination alone, a second TargNode's
+    // RREP did not merely get mislabelled: it overwrote the first
+    // TargNode's own entry with a next hop toward somewhere else.
     if (rrep.hopByHop)
     {
         if (!StoreHopByHopRoute(rreqInstanceId,
                                origNode,
-                               dodag.aodv.target,
+                               targNode,
                                from,
                                Seconds(m_pathLifetime * m_lifetimeUnit),
                                true,
@@ -1464,7 +1486,7 @@ RplRoutingProtocol::HandleAodvRrep(const RplDioHeader& dio, Ipv6Address from, ui
         {
             NS_LOG_LOGIC("Discarding an RREP establishing a Hop-by-hop Route that conflicts "
                         "with or is staler than one already held for "
-                        << dodag.aodv.target);
+                        << targNode);
             return;
         }
     }
@@ -1476,8 +1498,12 @@ RplRoutingProtocol::HandleAodvRrep(const RplDioHeader& dio, Ipv6Address from, ui
     {
         if (rrep.hopByHop)
         {
-            NS_LOG_INFO("Hop-by-hop Route discovery to " << dodag.aodv.target
-                                                          << " completed, next hop " << from);
+            // Handled: the downward entry above is this OrigNode's whole
+            // share of an H=1 route. @see rrepHandled's own doc comment for
+            // why this is recorded here rather than on the way in.
+            dodag.aodv.rrepHandled.insert(targNode);
+            NS_LOG_INFO("Hop-by-hop Route discovery to " << targNode << " completed, next hop "
+                                                          << from);
             return;
         }
 
@@ -1501,6 +1527,7 @@ RplRoutingProtocol::HandleAodvRrep(const RplDioHeader& dio, Ipv6Address from, ui
         Ipv6Address target = route.hops.back();
         m_aodvRoutes[target] = route;
 
+        dodag.aodv.rrepHandled.insert(targNode);
         NS_LOG_INFO("Route discovery to " << target << " completed over " << route.hops.size()
                                           << " hop(s), Dest SeqNo " << +route.destSeqNo);
         return;
@@ -1549,7 +1576,9 @@ RplRoutingProtocol::HandleAodvRrep(const RplDioHeader& dio, Ipv6Address from, ui
         nextHop = ownIndex >= 1 ? hops[ownIndex - 1] : origNode;
     }
 
-    NS_LOG_INFO("Relaying an RREP for " << origNode << " onward via " << nextHop);
+    dodag.aodv.rrepHandled.insert(targNode);
+    NS_LOG_INFO("Relaying an RREP for " << origNode << " from TargNode " << targNode
+                                        << " onward via " << nextHop);
     SendAodvRrepTo(dodag, dio, nextHop);
 }
 

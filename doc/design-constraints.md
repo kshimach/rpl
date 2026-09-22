@@ -10233,3 +10233,78 @@ Address Vectorという非常に稀な入力が要る)、専用試験は追加�
 
 `./ns3 build`clean、`test-runner --suite=rpl`(154件、全PASS)・
 `./test.py -s rpl`PASS。既存試験に回帰なし。
+
+## 91. `HandleAodvRrep()`のRREP重複判定 — 処理していないRREPで判定を消費し、複数TargNodeを取りこぼす
+
+`/protocol-test-matrix`の角4(シーケンス状態遷移)をモジュール全体に対して
+初めて完走させ、5候補を検出。各候補を独立したverifierが実プローブで検証し
+**5件すべてCONFIRMED**、うち1件の検証中にさらに1件(§93で扱う`mayMove`)を
+発見した。本節はそのうちの1件目。
+
+### 91.1 3つの欠陥が同じ関数に同居していた
+
+**(A) 重複判定を、処理していないRREPで消費していた。**
+`dodag.aodv.rrepHandled`は関数入口(全早期returnより手前)で立てられていた。
+ところがこの関数には、RREPを**何も処理せずに**捨てるreturnが4つある —
+経路が競合/陳腐化、OrigNodeでAddress Vectorが空、上り経路が未記録、
+Address Vectorが自分を通らない。いずれかを踏むと、フラグだけが立ち、
+以降そのRREQ-Instance宛の**正当なRREPが永久に握りつぶされる**。
+
+RFC 9854 §6.4の原文は
+"Upon receiving an RREP-DIO, a router that already belongs to the
+RREP-Instance SHOULD drop the RREP-DIO. Otherwise, the router performs
+the steps in the following subsections."
+— 述語は「既にRREP-Instanceに属している」であり、§6.4.1のチェックで捨てた
+ルータはそもそも加入していない。「見た」と「処理した」を取り違えていた。
+
+**(B) 重複判定の粒度がRREQ-Instance単位だった。**
+RFC 9854 §6.2.2は1つのRREQ-Instanceで複数TargNodeを探す形を規定し、本実装は
+その受信側(複数ART option・targets交差)を実装済み。各TargNodeは§4.2に従い
+**自分のアドレスをDODAGIDに入れた**RREP-DIOで答えるので、2つの返信は
+RREQ-InstanceIDを共有する**別々のRREP-Instance**。インスタンス単位の1フラグは
+2つ目のTargNodeの返信を1つ目の重複として捨て、OrigNodeはそのTargNodeへの
+経路を一切得られなかった。
+
+**(C) 下り経路の宛先がDODAGIDでなく「最初に見たARTターゲット」だった。**
+RFC 9854 §6.4.3は経路エントリの要素として"TargNode Address as destination"を
+挙げ、さらに"the destination address is learned from the DODAGID"と明言する。
+実装は`dodag.aodv.target`(このmembershipが最初に見たART option)を渡していた
+— ヘッダのdocコメント自身が当該フィールドを"the first ART target ever seen
+for this instance; logging/RREP-Instance use only"と書いており、この用途向け
+でないことを実装側が既に把握していた。`m_hopByHopRoutes`は**宛先のみをキー**
+とするため、2つ目のTargNodeのエントリは誤ったラベルが付くだけでなく、
+1つ目のTargNodeのエントリを別方向の次ホップで**上書き**していた。
+
+### 91.2 修正
+
+- (A) `rrepHandled`への記録を、実際に処理を終えた3箇所へ移動 —
+  OrigNodeのH=1完了、OrigNodeのH=0経路格納、中継の送出直前
+- (B) `bool rrepHandled` → `std::set<Ipv6Address> rrepHandled`。キーは
+  RREP-DIO自身のDODAGID(=答えているTargNode)
+- (C) `StoreHopByHopRoute()`の宛先引数を`dodag.aodv.target`→`dio.GetDodagId()`
+
+### 91.3 検証
+
+新規試験2件。
+
+- `RplAodvRrepDropDoesNotConsumeDedupTestCase` — 自分を通らない
+  Address Vectorを持つRREPを先に届け、続けて正当なRREPを届ける。
+  (A)を戻すと中継数が1→0になり確実に落ちることを確認(load-bearing)
+- `RplAodvMultiTargNodeRrepsBothHandledTestCase` — H=1で2つのART optionを
+  持つRREQ-Instanceに、DODAGIDの異なる2つのRREPが別々の隣接から届く。
+  中継数2件と、各TargNodeのDODAGIDで引ける下り経路の次ホップを検証。
+  (B)(C)いずれを戻しても落ちることを個別に確認(load-bearing)
+
+(C)だけを戻した場合も中継数が1に落ちる: 2件目のTargNodeの経路が1件目の
+宛先スロットに衝突し、`StoreHopByHopRoute()`の`pinNextHop`(同一Sequence
+Numberで次ホップだけ違う更新を拒否する)に弾かれてRREP自体が破棄される
+ため。これは角4が別途検出した候補(§92で扱う、対称RREPがDest SeqNoを
+進めない件)の機序と複合しており、両者が実際に絡むことの実地確認になった。
+
+既存の`RplAodvRrepDuplicateRelayedOnceTestCase`は無変更でPASS。ただし
+同試験はbyte-identicalな重複しか注入しないため、**重複判定の粒度((B))に
+対してはload-bearingでない** — 正しく絞ったキーでも通ってしまう。
+verifierの指摘どおりで、本節の新規試験2件がその空白を埋める。
+
+`./ns3 build`clean、`test-runner --suite=rpl`(156件、全PASS)・
+`./test.py -s rpl`PASS。

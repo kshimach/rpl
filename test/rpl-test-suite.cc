@@ -12682,6 +12682,471 @@ RplAodvRrepDuplicateRelayedOnceTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief An RREP-DIO this router drops without handling does not consume the
+ *        dedup that a later, genuinely relayable RREP-DIO needs.
+ *
+ * RFC 9854 section 6.4: "Upon receiving an RREP-DIO, a router that already
+ * belongs to the RREP-Instance SHOULD drop the RREP-DIO.  Otherwise, the
+ * router performs the steps in the following subsections." The predicate is
+ * having joined the RREP-Instance -- i.e. having actually done something
+ * with an RREP -- so a router that discarded one at section 6.4.1's own
+ * checks has not become a member and must still act on the next one.
+ *
+ * HandleAodvRrep() used to record the dedup on the way in, before the four
+ * returns that discard an RREP without consuming it (a conflicting or
+ * staler Hop-by-hop Route, an empty Address Vector at the OrigNode, no
+ * upward route recorded, and the Address Vector check exercised here). One
+ * unusable RREP therefore left the whole RREQ-Instance permanently deaf:
+ * every later copy was dropped as a repeat of an RREP this router had never
+ * handled, and the OrigNode's route was never established.
+ *
+ * Same two-node fixture as RplAodvRrepDuplicateRelayedOnceTestCase. The
+ * first RREP-DIO carries an Address Vector that does not run through the
+ * node under test, which section 6.4.4 has it drop; the second is the
+ * genuine one and must still be relayed.
+ */
+class RplAodvRrepDropDoesNotConsumeDedupTestCase : public TestCase
+{
+  public:
+    RplAodvRrepDropDoesNotConsumeDedupTestCase();
+
+  private:
+    void DoRun() override;
+
+    /// @brief Count a DIO seen at the monitor.
+    /// @param socket the monitoring socket
+    void CountDio(Ptr<Socket> socket);
+
+    uint32_t m_dioCount{0}; //!< DIOs seen at the monitor
+};
+
+RplAodvRrepDropDoesNotConsumeDedupTestCase::RplAodvRrepDropDoesNotConsumeDedupTestCase()
+    : TestCase("A dropped RREP-DIO does not block the next, relayable one")
+{
+}
+
+void
+RplAodvRrepDropDoesNotConsumeDedupTestCase::CountDio(Ptr<Socket> socket)
+{
+    Address sender;
+    Ptr<Packet> packet = socket->RecvFrom(sender);
+    if (!packet)
+    {
+        return;
+    }
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ipv6Header);
+    Icmpv6Header icmpv6Header;
+    packet->RemoveHeader(icmpv6Header);
+    if (icmpv6Header.GetType() == ICMPV6_RPL && icmpv6Header.GetCode() == RPL_CODE_DIO)
+    {
+        m_dioCount++;
+    }
+}
+
+void
+RplAodvRrepDropDoesNotConsumeDedupTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2); // 0 = the node under test, 1 = a real peer/next hop
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    interfaces.SetForwarding(0, true);
+    interfaces.SetForwarding(1, true);
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    Ptr<Node> node = nodes.Get(0);
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> peer = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(peer->IsJoined(), true, "The peer never joined the base DODAG");
+    Ipv6Address peerGlobal = peer->GetGlobalAddress();
+    NS_TEST_ASSERT_MSG_NE(peerGlobal, Ipv6Address::GetAny(), "The peer has no global address yet");
+
+    Ipv6Address nodeLinkLocal = node->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address peerLinkLocal =
+        nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    static constexpr uint8_t RREQ_INSTANCE = 0x81;
+    Ipv6Address origNode("2001:9::1");
+    Ipv6Address targNode("2001:9::99");
+
+    RplDioHeader rreqDio;
+    rreqDio.SetInstanceId(RREQ_INSTANCE);
+    rreqDio.SetVersionNumber(0);
+    rreqDio.SetRank(RPL_MIN_HOPRANKINC);
+    rreqDio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+    rreqDio.SetDodagId(origNode);
+    rreqDio.SetDtsn(0);
+    rreqDio.SetDagConfiguration(0,
+                                20,
+                                RPL_DIO_REDUNDANCY,
+                                RPL_MAX_RANKINC,
+                                RPL_MIN_HOPRANKINC,
+                                RPL_OCP_OF0,
+                                RPL_DEFAULT_LIFETIME,
+                                RPL_DEFAULT_LIFETIME_UNIT);
+    RplDioHeader::RreqOption rreq;
+    rreq.symmetric = true;
+    rreq.hopByHop = false;
+    rreq.compr = 0;
+    rreq.lifetime = 0;
+    rreq.rankLimit = 0;
+    rreq.origSeqNo = 1;
+    rreq.addressVector = {peerGlobal};
+    rreqDio.SetRreq(rreq);
+    RplDioHeader::ArtOption rreqArt;
+    rreqArt.destSeqNo = 0;
+    rreqArt.prefixLength = 0;
+    rreqArt.target = targNode;
+    rreqDio.SetArt(rreqArt);
+    DeliverRawRplMessage<RplDioHeader>(node,
+                                       1,
+                                       rreqDio,
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       peerLinkLocal,
+                                       nodeLinkLocal);
+
+    std::vector<Ipv6Address> addressVector;
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetAodvAddressVector(RREQ_INSTANCE, origNode, addressVector),
+                          true,
+                          "Did not join the fabricated RREQ-Instance");
+    NS_TEST_ASSERT_MSG_EQ(addressVector.size(), 2, "Wrong Address Vector size after joining");
+
+    Ptr<Socket> monitor = Socket::CreateSocket(nodes.Get(1), Ipv6RawSocketFactory::GetTypeId());
+    monitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    monitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    monitor->BindToNetDevice(nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+    monitor->SetRecvCallback(
+        MakeCallback(&RplAodvRrepDropDoesNotConsumeDedupTestCase::CountDio, this));
+
+    auto buildRrep = [&](const std::vector<Ipv6Address>& vector) {
+        RplDioHeader rrepDio;
+        rrepDio.SetInstanceId(RREQ_INSTANCE); // Delta 0
+        rrepDio.SetVersionNumber(0);
+        rrepDio.SetRank(RPL_MIN_HOPRANKINC);
+        rrepDio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+        rrepDio.SetDodagId(targNode);
+        rrepDio.SetDtsn(0);
+        RplDioHeader::RrepOption rrep;
+        rrep.gratuitous = false;
+        rrep.hopByHop = false;
+        rrep.compr = 0;
+        rrep.lifetime = 0;
+        rrep.rankLimit = 0;
+        rrep.delta = 0;
+        rrep.addressVector = vector;
+        rrepDio.SetRrep(rrep);
+        RplDioHeader::ArtOption rrepArt;
+        rrepArt.destSeqNo = 1;
+        rrepArt.prefixLength = 0;
+        rrepArt.target = origNode;
+        rrepDio.SetArt(rrepArt);
+        return rrepDio;
+    };
+
+    Ipv6Address fakeDownstream("fe80::66");
+
+    // Copy 1: an Address Vector that does not run through this node at all,
+    // which section 6.4.4's own "does not run through this node" check
+    // discards. Nothing is stored and nothing is relayed -- so nothing has
+    // been "handled" for the dedup to record.
+    DeliverRawRplMessage<RplDioHeader>(node,
+                                       1,
+                                       buildRrep({peerGlobal}),
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       fakeDownstream,
+                                       nodeLinkLocal);
+
+    // Copy 2: the genuine RREP for the same RREP-Instance, carrying the
+    // Address Vector this node is actually on.
+    DeliverRawRplMessage<RplDioHeader>(node,
+                                       1,
+                                       buildRrep(addressVector),
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       fakeDownstream,
+                                       nodeLinkLocal);
+
+    Simulator::Stop(Seconds(1));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(m_dioCount,
+                          1,
+                          "The genuine RREP-DIO was not relayed: the earlier, discarded copy "
+                          "consumed the dedup that RFC 9854 section 6.4 scopes to an RREP this "
+                          "router has actually handled");
+
+    monitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief Two TargNodes answering one RREQ-Instance are both relayed, each
+ *        with its own downward Hop-by-hop Route keyed by its own DODAGID.
+ *
+ * RFC 9854 section 6.2.2 has one RREQ-Instance seek several TargNodes at
+ * once ("If the OrigNode tries to reach multiple TargNodes in a single
+ * RREQ-Instance..."), and this module implements the receive side of it.
+ * Each TargNode answers with its own RREP-DIO, and section 4.2 has it set
+ * "one of its IPv6 addresses in the DODAGID field of the RREP-DIO message",
+ * so the two replies are two different RREP-Instances sharing one
+ * RREQ-InstanceID.
+ *
+ * Two separate defects met here, both found by /protocol-test-matrix's
+ * angle 4:
+ *
+ * - The dedup of section 6.4 was one flag for the whole RREQ-Instance, so
+ *   the second TargNode's RREP was dropped as a repeat of the first's and
+ *   the OrigNode never learned that route.
+ * - The downward route's destination came from dodag.aodv.target -- the
+ *   first ART target this membership ever saw -- rather than from the
+ *   RREP-DIO's DODAGID, which section 6.4.3 names outright ("the
+ *   destination address is learned from the DODAGID", listing "TargNode
+ *   Address as destination" among the entry's items). Since
+ *   m_hopByHopRoutes is keyed by destination alone, the second TargNode's
+ *   entry did not merely carry the wrong label, it overwrote the first
+ *   TargNode's with a next hop pointing elsewhere.
+ *
+ * H=1, so the downward entries are observable directly. The two RREPs
+ * arrive from different neighbours, so each entry's next hop identifies
+ * which reply established it.
+ */
+class RplAodvMultiTargNodeRrepsBothHandledTestCase : public TestCase
+{
+  public:
+    RplAodvMultiTargNodeRrepsBothHandledTestCase();
+
+  private:
+    void DoRun() override;
+
+    /// @brief Count a DIO seen at the monitor.
+    /// @param socket the monitoring socket
+    void CountDio(Ptr<Socket> socket);
+
+    uint32_t m_dioCount{0}; //!< DIOs seen at the monitor
+};
+
+RplAodvMultiTargNodeRrepsBothHandledTestCase::RplAodvMultiTargNodeRrepsBothHandledTestCase()
+    : TestCase("Two TargNodes' RREPs on one RREQ-Instance are both relayed and both stored")
+{
+}
+
+void
+RplAodvMultiTargNodeRrepsBothHandledTestCase::CountDio(Ptr<Socket> socket)
+{
+    Address sender;
+    Ptr<Packet> packet = socket->RecvFrom(sender);
+    if (!packet)
+    {
+        return;
+    }
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ipv6Header);
+    Icmpv6Header icmpv6Header;
+    packet->RemoveHeader(icmpv6Header);
+    if (icmpv6Header.GetType() == ICMPV6_RPL && icmpv6Header.GetCode() == RPL_CODE_DIO)
+    {
+        m_dioCount++;
+    }
+}
+
+void
+RplAodvMultiTargNodeRrepsBothHandledTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2); // 0 = the node under test, 1 = a real peer/next hop
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    interfaces.SetForwarding(0, true);
+    interfaces.SetForwarding(1, true);
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    Ptr<Node> node = nodes.Get(0);
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> peer = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(peer->IsJoined(), true, "The peer never joined the base DODAG");
+
+    Ipv6Address nodeLinkLocal = node->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address peerLinkLocal =
+        nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    static constexpr uint8_t RREQ_INSTANCE = 0x81;
+    Ipv6Address origNode("2001:9::1");
+    Ipv6Address targNode1("2001:9::11");
+    Ipv6Address targNode2("2001:9::22");
+
+    // An H=1 RREQ-DIO naming two TargNodes, the section 6.2.2 shape. H=1
+    // means no Address Vector (section 4.1: "In hop-by-hop mode (H=1), this
+    // field MUST be set to zero and ignored"); the upward route this records
+    // is what the RREP relay below needs (section 6.4.4's "local route
+    // entry").
+    RplDioHeader rreqDio;
+    rreqDio.SetInstanceId(RREQ_INSTANCE);
+    rreqDio.SetVersionNumber(0);
+    rreqDio.SetRank(RPL_MIN_HOPRANKINC);
+    rreqDio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+    rreqDio.SetDodagId(origNode);
+    rreqDio.SetDtsn(0);
+    rreqDio.SetDagConfiguration(0,
+                                20,
+                                RPL_DIO_REDUNDANCY,
+                                RPL_MAX_RANKINC,
+                                RPL_MIN_HOPRANKINC,
+                                RPL_OCP_OF0,
+                                RPL_DEFAULT_LIFETIME,
+                                RPL_DEFAULT_LIFETIME_UNIT);
+    RplDioHeader::RreqOption rreq;
+    rreq.symmetric = true;
+    rreq.hopByHop = true;
+    rreq.compr = 0;
+    rreq.lifetime = 0;
+    rreq.rankLimit = 0;
+    rreq.origSeqNo = 1;
+    rreq.addressVector = {};
+    rreqDio.SetRreq(rreq);
+    RplDioHeader::ArtOption art1;
+    art1.destSeqNo = 0;
+    art1.prefixLength = 0;
+    art1.target = targNode1;
+    rreqDio.SetArt(art1);
+    RplDioHeader::ArtOption art2;
+    art2.destSeqNo = 0;
+    art2.prefixLength = 0;
+    art2.target = targNode2;
+    rreqDio.AddArt(art2);
+    DeliverRawRplMessage<RplDioHeader>(node,
+                                       1,
+                                       rreqDio,
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       peerLinkLocal,
+                                       nodeLinkLocal);
+
+    std::vector<Ipv6Address> targets;
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetAodvTargets(RREQ_INSTANCE, origNode, targets),
+                          true,
+                          "Did not join the fabricated multi-target RREQ-Instance");
+    NS_TEST_ASSERT_MSG_EQ(targets.size(),
+                          2,
+                          "Both ART options should have been recorded as outstanding targets");
+
+    Ptr<Socket> monitor = Socket::CreateSocket(nodes.Get(1), Ipv6RawSocketFactory::GetTypeId());
+    monitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    monitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    monitor->BindToNetDevice(nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+    monitor->SetRecvCallback(
+        MakeCallback(&RplAodvMultiTargNodeRrepsBothHandledTestCase::CountDio, this));
+
+    auto buildRrep = [&](Ipv6Address targNode) {
+        RplDioHeader rrepDio;
+        rrepDio.SetInstanceId(RREQ_INSTANCE); // Delta 0
+        rrepDio.SetVersionNumber(0);
+        rrepDio.SetRank(RPL_MIN_HOPRANKINC);
+        rrepDio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+        // Section 4.2: the answering TargNode's own address.
+        rrepDio.SetDodagId(targNode);
+        rrepDio.SetDtsn(0);
+        RplDioHeader::RrepOption rrep;
+        rrep.gratuitous = false;
+        rrep.hopByHop = true;
+        rrep.compr = 0;
+        rrep.lifetime = 0;
+        rrep.rankLimit = 0;
+        rrep.delta = 0;
+        rrep.addressVector = {};
+        rrepDio.SetRrep(rrep);
+        // Section 6.4.2: an RREP's ART option names the OrigNode.
+        RplDioHeader::ArtOption rrepArt;
+        rrepArt.destSeqNo = 1;
+        rrepArt.prefixLength = 0;
+        rrepArt.target = origNode;
+        rrepDio.SetArt(rrepArt);
+        return rrepDio;
+    };
+
+    // Distinct senders, so each stored downward route's next hop says which
+    // TargNode's reply established it.
+    Ipv6Address towardTarg1("fe80::66");
+    Ipv6Address towardTarg2("fe80::77");
+
+    DeliverRawRplMessage<RplDioHeader>(node,
+                                       1,
+                                       buildRrep(targNode1),
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       towardTarg1,
+                                       nodeLinkLocal);
+    DeliverRawRplMessage<RplDioHeader>(node,
+                                       1,
+                                       buildRrep(targNode2),
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       towardTarg2,
+                                       nodeLinkLocal);
+
+    Simulator::Stop(Seconds(1));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(m_dioCount,
+                          2,
+                          "Both TargNodes' RREP-DIOs should have been relayed onward: they are "
+                          "two different RREP-Instances (different DODAGIDs) sharing one "
+                          "RREQ-InstanceID, not a repeat of one another");
+
+    Ipv6Address nextHop;
+    uint8_t storedInstance = 0;
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetHopByHopRoute(targNode1, nextHop, storedInstance),
+                          true,
+                          "No downward Hop-by-hop Route stored for the first TargNode");
+    NS_TEST_ASSERT_MSG_EQ(nextHop,
+                          towardTarg1,
+                          "The first TargNode's downward route points the wrong way");
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetHopByHopRoute(targNode2, nextHop, storedInstance),
+                          true,
+                          "No downward Hop-by-hop Route stored for the second TargNode: its "
+                          "entry should be keyed by its own DODAGID (RFC 9854 section 6.4.3), "
+                          "not by the first ART target this membership happened to see");
+    NS_TEST_ASSERT_MSG_EQ(nextHop,
+                          towardTarg2,
+                          "The second TargNode's downward route points the wrong way");
+
+    monitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief An AODV-RPL route the OrigNode discovered shows up in both
  *        PrintRoutingTable() and PrintRoutingTableJson(), and only there --
  *        not at the TargNode, which keeps no per-hop state of its own for a
@@ -24839,6 +25304,8 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplAodvRrepInstanceRankLimitTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRrepInstanceAddressVectorFullTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRrepDuplicateRelayedOnceTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplAodvRrepDropDoesNotConsumeDedupTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplAodvMultiTargNodeRrepsBothHandledTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRoutesInPrintedTablesTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pRoutesInPrintedTablesTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pDiscoverRouteTestCase, TestCase::Duration::QUICK);

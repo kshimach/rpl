@@ -1163,10 +1163,29 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
             /// RFC 9854 section 6.4: "a router that already belongs to the
             /// RREP-Instance SHOULD drop the RREP-DIO". A symmetric route
             /// never forms an RREP-Instance DODAG to check membership
-            /// against (section 6.3.1), so this stands in for it -- set the
-            /// first time this RREQ-Instance's RREP is handled here, either
-            /// consumed (OrigNode) or relayed onward (intermediate router).
-            bool rrepHandled{false};
+            /// against (section 6.3.1), so this stands in for it.
+            ///
+            /// Keyed by the RREP-DIO's own DODAGID -- the TargNode address
+            /// (section 4.2: "TargNode sets one of its IPv6 addresses in the
+            /// DODAGID field of the RREP-DIO message") -- rather than being
+            /// one flag for the whole RREQ-Instance, because one
+            /// RREQ-Instance can legitimately be answered by several
+            /// TargNodes (section 6.2.2's multi-target discovery, whose
+            /// receive side this module implements via targets/GetArts()).
+            /// Each TargNode's reply is its own RREP-Instance, so dropping
+            /// the second one as "already handled" loses that TargNode's
+            /// route entirely. Found by /protocol-test-matrix's angle 4.
+            ///
+            /// Recorded only once an RREP has actually been handled --
+            /// consumed at the OrigNode, or relayed onward at an
+            /// intermediate router. An earlier version set it before the
+            /// function's own failure returns (a conflicting route entry,
+            /// an Address Vector that does not run through this node, no
+            /// upward route recorded), so a single unusable RREP left the
+            /// instance permanently deaf: every later, genuinely relayable
+            /// copy was dropped as a repeat of an RREP this router had in
+            /// fact never handled.
+            std::set<Ipv6Address> rrepHandled;
             /// When the 'L' field's deadline takes this node out of the
             /// instance (RFC 9854 section 4.1). Never armed for the
             /// unlimited encoding.
