@@ -10394,3 +10394,72 @@ verifierの指摘どおり、**この送出値を観測する試験はこれま�
 
 `./ns3 build`clean、`test-runner --suite=rpl`(157件、全PASS)・
 `./test.py -s rpl`PASS。
+
+## 93. `mayMove`が「消えた隣接」を競合相手として守り、上り経路を古いまま固定していた
+
+角4の3件目。§92の候補を検証していたverifierが、その過程で**別の経路**として
+発見したもの(同じ「解放済みinstanceIdの再利用 + 長寿命な派生状態」系だが、
+別関数・別症状)。実測で確認済み。
+
+### 93.1 機序
+
+`HandleAodvRreq()`の`mayMove`は、届いたRREQ-DIOがこのルータの上り
+Hop-by-hop Route(OrigNode方向)を現在のpreferred parentへ張り替えてよいかを
+決める。判定はランク比較のみだった:
+
+```cpp
+mayMove = storedRank != RPL_INFINITE_RANK && chosenRank < storedRank;
+```
+
+既に保持している隣接が**消えている**場合、その隣接はどのparent setにも
+居ないので`storedRank = RPL_INFINITE_RANK`となり、`mayMove`は**false**。
+結果、ルータは到達できなくなったノードを指したままの上り経路を
+PathLifetime(既定30分)のあいだ保持し続け、TargNodeのRREPはその穴へ
+ユニキャストされて消える。
+
+守っている相手がそもそも競合でないのが問題の本質。ローカル
+RPLInstanceIDは自分の`L`(既定16秒)で解放されるのに、それが張った経路は
+PathLifetime(30分)残るため、**同じOrigNodeからの2回目の探索が1回目の
+残骸に日常的に出くわす**。
+
+### 93.2 修正
+
+受信したOrig SeqNoが保存エントリのSequence Numberより新しければ、
+ランク比較によらず`mayMove = true`とする。
+
+```cpp
+bool fromLaterDiscovery = RplSequenceNewer(rreq.origSeqNo, storedSeqNo);
+mayMove = fromLaterDiscovery ||
+          (storedRank != RPL_INFINITE_RANK && chosenRank < storedRank);
+```
+
+根拠: RFC 9854 §6.1はOrigNodeに探索ごとの
+"it MUST increase its own Sequence Number"を課しており、これが2つの探索を
+区別できる唯一の手掛かり。§6.2.3は古いSequence Numberの経路エントリを
+"MUST be deleted"としており、**守る**のでなく**捨てる**のが規定の側。
+
+保存エントリのSequence Numberを読むため、`FindHopByHopRoute()`の
+instance指定オーバーロードに任意のout-param(`uint8_t* seqNo = nullptr`)を
+追加した。既存の呼び出し元は無変更。
+
+なお`StoreHopByHopRoute()`自体は既に`rreq.origSeqNo`と`pinNextHop=false`を
+受け取っており鮮度判定は正しかった — 問題は呼ぶ前に`mayMove`で
+門前払いしていたこと。
+
+### 93.3 検証
+
+新規試験`RplAodvLaterDiscoveryMovesStaleUpwardRouteTestCase`。単一ノードに、
+同一RREQ-InstanceIDのH=1 RREQ-DIOを2つの別隣接から届ける。1回目の`L`を
+挟み(1回目の隣接は二度と現れない=消滅した親)、2回目のOrig SeqNoを進める。
+上り経路の次ホップが2番目の隣接へ移ることを検証。
+
+`fromLaterDiscovery`条件を外すと、上り経路が消えた隣接のまま残り確実に
+落ちることを確認済み(load-bearing)。
+
+試験ではREJOIN_REENABLEを`Seconds(1)`に短縮している。既定15分では2回目の
+RREQ-DIOが`mayMove`に到達する前に拒否されるため。0にせず非ゼロを保った
+のは、§35.4が記録している「近隣のTrickleで即再加入してインスタンスが
+死なない」問題を防ぐ機構を殺さないため。
+
+`./ns3 build`clean、`test-runner --suite=rpl`(158件、全PASS)・
+`./test.py -s rpl`PASS。

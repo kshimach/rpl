@@ -841,9 +841,32 @@ RplRoutingProtocol::HandleAodvRreq(const RplDioHeader& dio,
         // sameRoute check (already correct) does the actual store/overwrite.
         bool mayMove = true;
         Ipv6Address storedNextHop;
-        if (FindHopByHopRoute(key.instanceId, key.dodagId, key.dodagId, storedNextHop) &&
+        uint8_t storedSeqNo = 0;
+        if (FindHopByHopRoute(key.instanceId, key.dodagId, key.dodagId, storedNextHop,
+                             &storedSeqNo) &&
             storedNextHop != dodag.preferredParent)
         {
+            // A newer Orig SeqNo means this RREQ belongs to a *later*
+            // discovery than the entry already held, so that entry is not a
+            // competing next hop for the current discovery at all -- it is
+            // leftover state from a finished one. RFC 9854 section 6.1 has
+            // the OrigNode "MUST increase its own Sequence Number" for each
+            // discovery it starts, which is exactly what makes this
+            // distinguishable, and section 6.2.3 has a route entry with "a
+            // stale Sequence Number, MUST be deleted" rather than defended.
+            //
+            // Without this the rank comparison below decided it, and a
+            // neighbour that has since vanished is in no parent set, so it
+            // scores RPL_INFINITE_RANK and mayMove worked out false: the
+            // router kept pointing its upward route at a node it could no
+            // longer reach, for the whole PathLifetime, and the TargNode's
+            // RREP was then unicast into that hole. A Local RPLInstanceID
+            // is freed at its own 'L' long before the route it left behind
+            // expires (16 s against 30 min at the defaults), so a second
+            // discovery from the same OrigNode meets the first one's entry
+            // routinely. Found by /protocol-test-matrix's angle 4.
+            bool fromLaterDiscovery = RplSequenceNewer(rreq.origSeqNo, storedSeqNo);
+
             auto stored = dodag.parents.find(storedNextHop);
             auto chosen = dodag.parents.find(dodag.preferredParent);
             uint16_t storedRank = stored == dodag.parents.end()
@@ -852,7 +875,8 @@ RplRoutingProtocol::HandleAodvRreq(const RplDioHeader& dio,
             uint16_t chosenRank = chosen == dodag.parents.end()
                                       ? RPL_INFINITE_RANK
                                       : RankViaParent(dodag, chosen->second);
-            mayMove = storedRank != RPL_INFINITE_RANK && chosenRank < storedRank;
+            mayMove = fromLaterDiscovery ||
+                      (storedRank != RPL_INFINITE_RANK && chosenRank < storedRank);
             if (!mayMove)
             {
                 NS_LOG_LOGIC("Keeping the upward Hop-by-hop Route to "

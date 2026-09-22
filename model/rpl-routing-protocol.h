@@ -2025,12 +2025,17 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      * @param dodagId the OrigNode/Origin the route's Instance belongs to
      * @param destination the destination to route to
      * @param [out] nextHop the next hop's address (global)
+     * @param [out] seqNo optional: the Sequence Number the entry was stored
+     *              with, which is what says which discovery left it behind
+     *              when a Local RPLInstanceID has been reused (@see
+     *              HandleAodvRreq()'s own mayMove)
      * @return true if a live route matching all three was found
      */
     bool FindHopByHopRoute(uint8_t instanceId,
                            Ipv6Address dodagId,
                            Ipv6Address destination,
-                           Ipv6Address& nextHop) const;
+                           Ipv6Address& nextHop,
+                           uint8_t* seqNo = nullptr) const;
 
     /**
      * @brief Establish or refresh a Hop-by-hop Route (H=1), rejecting a

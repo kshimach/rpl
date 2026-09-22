@@ -3390,7 +3390,8 @@ bool
 RplRoutingProtocol::FindHopByHopRoute(uint8_t instanceId,
                                       Ipv6Address dodagId,
                                       Ipv6Address destination,
-                                      Ipv6Address& nextHop) const
+                                      Ipv6Address& nextHop,
+                                      uint8_t* seqNo) const
 {
     auto it = m_hopByHopRoutes.find(destination);
     if (it == m_hopByHopRoutes.end() || it->second.expire <= Simulator::Now() ||
@@ -3399,6 +3400,10 @@ RplRoutingProtocol::FindHopByHopRoute(uint8_t instanceId,
         return false;
     }
     nextHop = it->second.nextHop;
+    if (seqNo)
+    {
+        *seqNo = it->second.seqNo;
+    }
     return true;
 }
 

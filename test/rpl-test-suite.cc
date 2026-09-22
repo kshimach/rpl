@@ -12682,6 +12682,186 @@ RplAodvRrepDuplicateRelayedOnceTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief A later discovery's RREQ moves the upward Hop-by-hop Route off a
+ *        neighbour an earlier discovery left behind, even when that
+ *        neighbour is gone.
+ *
+ * HandleAodvRreq()'s mayMove decides whether an incoming RREQ-DIO may
+ * repoint this router's upward H=1 route (towards OrigNode) at its current
+ * preferred parent. It compared ranks only: the neighbour already held had
+ * to be a live parent that the new one beats. A neighbour that has since
+ * vanished is in no parent set at all, so it scored RPL_INFINITE_RANK and
+ * the move was refused -- the router kept pointing at a node it could no
+ * longer reach for the whole PathLifetime, and the TargNode's RREP was
+ * then unicast into that hole.
+ *
+ * The entry being defended is not a competitor at all in that case: a
+ * Local RPLInstanceID is freed at its own 'L' deadline (16 s by default)
+ * long before the route it left behind expires (30 min), so a second
+ * discovery from the same OrigNode routinely meets the first one's stale
+ * entry under the very same {instanceId, dodagId}. RFC 9854 section 6.1
+ * has the OrigNode "MUST increase its own Sequence Number" for each
+ * discovery, which is what tells the two apart, and section 6.2.3 has an
+ * entry with "a stale Sequence Number, MUST be deleted" rather than
+ * defended. Found by /protocol-test-matrix's angle 4.
+ *
+ * One node under test, fed two fabricated H=1 RREQ-DIOs for the same
+ * RREQ-InstanceID from two different neighbours, with the first
+ * discovery's 'L' allowed to expire in between (REJOIN_REENABLE shortened
+ * so the second is not refused outright -- that bar is a separate
+ * mechanism, @see RplAodvHopByHopInstanceReuseTestCase). The first
+ * neighbour never reappears, exactly the vanished-parent case.
+ */
+class RplAodvLaterDiscoveryMovesStaleUpwardRouteTestCase : public TestCase
+{
+  public:
+    RplAodvLaterDiscoveryMovesStaleUpwardRouteTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplAodvLaterDiscoveryMovesStaleUpwardRouteTestCase::
+    RplAodvLaterDiscoveryMovesStaleUpwardRouteTestCase()
+    : TestCase("A later discovery moves the upward route off a vanished neighbour")
+{
+}
+
+void
+RplAodvLaterDiscoveryMovesStaleUpwardRouteTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(1);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    rplHelper.Set("AodvLifetime", UintegerValue(1)); // 'L' = 16 s
+    // The rejoin bar (RFC 9854 section 4.1's REJOIN_REENABLE) would refuse
+    // the second RREQ-DIO outright for 15 minutes by default, well before
+    // mayMove is ever consulted. Shortened rather than removed: keeping it
+    // non-zero preserves the mechanism it exists for (a node surrounded by
+    // neighbours still Trickling the old DIO rejoining at once, so the
+    // instance never dies).
+    rplHelper.Set("AodvRejoinReenable", TimeValue(Seconds(1)));
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.AssignWithoutAddress(devices);
+
+    Ptr<Node> node = nodes.Get(0);
+    rplHelper.SetRoot(node, Ipv6Address("2001:1::"), 64);
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+    Ipv6Address nodeLinkLocal = node->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    static constexpr uint8_t INSTANCE = 0x81;
+    Ipv6Address origNode("2001:9::1");
+    Ipv6Address targNode("2001:9::99");
+    Ipv6Address firstNeighbour("fe80::a");  // vanishes after the first discovery
+    Ipv6Address secondNeighbour("fe80::b"); // carries the second one
+
+    auto buildRreq = [&](uint8_t origSeqNo) {
+        RplDioHeader dio;
+        dio.SetInstanceId(INSTANCE);
+        dio.SetVersionNumber(0);
+        dio.SetRank(RPL_MIN_HOPRANKINC);
+        dio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+        dio.SetDodagId(origNode);
+        dio.SetDtsn(0);
+        dio.SetDagConfiguration(0,
+                                20,
+                                RPL_DIO_REDUNDANCY,
+                                RPL_MAX_RANKINC,
+                                RPL_MIN_HOPRANKINC,
+                                RPL_OCP_OF0,
+                                RPL_DEFAULT_LIFETIME,
+                                RPL_DEFAULT_LIFETIME_UNIT);
+        RplDioHeader::RreqOption rreq;
+        rreq.symmetric = true;
+        rreq.hopByHop = true; // the upward entry this test is about
+        rreq.compr = 0;
+        rreq.lifetime = 1; // 'L' = 16 s, so the first membership expires
+        rreq.rankLimit = 0;
+        rreq.origSeqNo = origSeqNo;
+        rreq.addressVector = {};
+        dio.SetRreq(rreq);
+        RplDioHeader::ArtOption art;
+        art.destSeqNo = 0;
+        art.prefixLength = 0;
+        art.target = targNode;
+        dio.SetArt(art);
+        return dio;
+    };
+
+    // Discovery 1, via the neighbour that later vanishes.
+    DeliverRawRplMessage<RplDioHeader>(node,
+                                       1,
+                                       buildRreq(1),
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       firstNeighbour,
+                                       Ipv6Address(RPL_ALL_NODES_MULTICAST));
+
+    Ipv6Address nextHop;
+    uint8_t storedInstance = 0;
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetHopByHopRoute(origNode, nextHop, storedInstance),
+                          true,
+                          "The first discovery did not record an upward Hop-by-hop Route");
+    NS_TEST_ASSERT_MSG_EQ(nextHop, firstNeighbour, "The upward route points the wrong way");
+
+    // Past the first discovery's own 'L' (16 s) and the shortened rejoin
+    // bar, but nowhere near the route's PathLifetime (30 min), so the stale
+    // entry the second discovery has to displace is still there.
+    Simulator::Stop(Seconds(30));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(INSTANCE, origNode),
+                          false,
+                          "The first discovery's membership outlived its own 'L'");
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetHopByHopRoute(origNode, nextHop, storedInstance),
+                          true,
+                          "The upward route should outlive the discovery that created it");
+    NS_TEST_ASSERT_MSG_EQ(nextHop,
+                          firstNeighbour,
+                          "Test construction error: the stale entry this test means to displace "
+                          "is not the one held");
+
+    // Discovery 2: same RREQ-InstanceID, newer Orig SeqNo, arriving from a
+    // different neighbour. The first neighbour never reappears, so it is in
+    // no parent set and scores RPL_INFINITE_RANK.
+    DeliverRawRplMessage<RplDioHeader>(node,
+                                       1,
+                                       buildRreq(2),
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       secondNeighbour,
+                                       Ipv6Address(RPL_ALL_NODES_MULTICAST));
+
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(INSTANCE, origNode),
+                          true,
+                          "The second discovery was not joined at all");
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetHopByHopRoute(origNode, nextHop, storedInstance),
+                          true,
+                          "The second discovery left no upward Hop-by-hop Route");
+    NS_TEST_ASSERT_MSG_EQ(nextHop,
+                          secondNeighbour,
+                          "The upward route still points at the neighbour the *previous* "
+                          "discovery used, which has since vanished: a newer Orig SeqNo means "
+                          "the entry held belongs to a finished discovery (RFC 9854 section "
+                          "6.1/6.2.3), not to a competing next hop this one has to beat on rank");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief A TargNode answering a symmetric route discovery advances its own
  *        Sequence Number, so successive discoveries are distinguishable.
  *
@@ -25509,6 +25689,8 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplAodvRrepInstanceRankLimitTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRrepInstanceAddressVectorFullTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRrepDuplicateRelayedOnceTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplAodvLaterDiscoveryMovesStaleUpwardRouteTestCase,
+                TestCase::Duration::QUICK);
     AddTestCase(new RplAodvSymmetricRrepAdvancesSeqNoTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRrepDropDoesNotConsumeDedupTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvMultiTargNodeRrepsBothHandledTestCase, TestCase::Duration::QUICK);
