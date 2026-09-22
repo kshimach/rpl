@@ -1850,8 +1850,55 @@ RplRoutingProtocol::HandleDio(const RplDioHeader& dio,
     {
         JoinDodag(dio, interface);
     }
+    else if (dio.GetVersionNumber() != existing->version &&
+             existing->mop == RPL_MOP_P2P_ROUTE_DISCOVERY)
+    {
+        // Adopted so this node re-emits what the rest of the discovery is
+        // using (@see SendDio()), and nothing else: no migration, and no
+        // "stale version" refusal either, since dropping a copy of a
+        // route-discovery DIO over a field that carries no meaning here
+        // could lose the discovery outright. Only ever moved forward, by
+        // the same lollipop comparison the migration below uses.
+        if (RplSequenceNewer(dio.GetVersionNumber(), existing->version))
+        {
+            existing->version = dio.GetVersionNumber();
+        }
+    }
     else if (dio.GetVersionNumber() != existing->version)
     {
+        // A route-discovery instance (MOP 4, both AODV-RPL's RREQ/
+        // RREP-Instance and P2P-RPL's temporary DAG) is deliberately exempt
+        // from the migration below. RFC 6997 section 6.1 says why in as many
+        // words -- "The temporary DAG used for P2P-RPL route discovery does
+        // not exist long enough to have new versions" -- and RFC 9854's
+        // RREQ-Instance is the same shape, a one-shot DAG bounded by its own
+        // 'L' field rather than repaired across Versions.
+        //
+        // Running the leave-and-rejoin on one is actively harmful: it
+        // destroys the DodagMembership, and with it the aodv.expiry Timer
+        // that 'L' is counted on, so ArmAodvExpiry()'s own "already running"
+        // guard sees a freshly-constructed Timer and schedules a full fresh
+        // deadline. A peer whose Version keeps stepping faster than 'L'
+        // therefore holds the membership open indefinitely -- exactly the
+        // "memory and network resources are likely to be consumed
+        // unnecessarily" that RFC 9854 section 4.1 gives 'L' to bound -- and
+        // AodvInstanceExpired() never runs, so REJOIN_REENABLE never engages
+        // either. The discovery state the rejoin wipes (targetsSeeded,
+        // rrepHandled, the Address Vector) is re-seeded from scratch on every
+        // such DIO on top of that.
+        //
+        // Refusing a nonzero Version outright, the way ShouldRefuseP2pRdo()
+        // does for P2P-RPL's own base-object rules, is deliberately NOT what
+        // this does for AODV-RPL: RFC 9854 places no constraint at all on the
+        // field (unlike RFC 6997 section 6.1's "MUST be set to zero"), and
+        // RFC 6550 section 8.2.2.1 lets a root "increment the
+        // DODAGVersionNumber that they advertise" whenever it likes -- an
+        // AODV-RPL OrigNode is the root of its own RREQ-Instance, so a
+        // conforming peer may legitimately send one. The Version is still
+        // adopted and re-emitted below; only the migration is skipped, so
+        // this node stays in step with the peer without resetting the
+        // discovery. Found by /protocol-test-matrix's angle 4.
+        //
         // The DODAGVersionNumber is a lollipop counter (RFC 6550 section
         // 7.1), so which of two Versions is the newer one is decided by the
         // comparison of section 7.2 rule 3, not by a plain `>`. The two

@@ -12682,6 +12682,331 @@ RplAodvRrepDuplicateRelayedOnceTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief A stepping DODAG Version Number does not restart an RREQ-Instance's
+ *        'L' deadline.
+ *
+ * HandleDio()'s DODAG Version migration (leave-and-rejoin) ran for every
+ * DODAG including MOP 4. On a route-discovery instance that is actively
+ * harmful: LeaveDodag() destroys the DodagMembership, and with it the
+ * aodv.expiry Timer 'L' is counted on, so ArmAodvExpiry()'s "already
+ * running" guard then sees a freshly-constructed Timer and schedules a
+ * full fresh deadline. A peer whose Version steps faster than 'L' holds
+ * the membership open indefinitely, which is exactly the "memory and
+ * network resources are likely to be consumed unnecessarily" that RFC
+ * 9854 section 4.1 gives 'L' to bound:
+ *
+ *     L ... 2-bit unsigned integer determining the time duration that a
+ *     node is able to belong to the RREQ-Instance ... Once the time is
+ *     reached, a node SHOULD leave the RREQ-Instance and stop sending or
+ *     receiving any more DIOs for the RREQ-Instance; otherwise, memory
+ *     and network resources are likely to be consumed unnecessarily.
+ *
+ * "Once the time is reached" anchors the deadline to a point in time, not
+ * to a lease each DIO renews -- which is what ArmAodvExpiry()'s own guard
+ * already implements for an ordinary repeat flood.
+ *
+ * Note this needs no hostile peer: RFC 9854 places no constraint on the
+ * field at all (unlike RFC 6997 section 6.1's "MUST be set to zero" for
+ * P2P-RPL), and RFC 6550 section 8.2.2.1 lets a root "increment the
+ * DODAGVersionNumber that they advertise" whenever it likes, an AODV-RPL
+ * OrigNode being the root of its own RREQ-Instance. Found by
+ * /protocol-test-matrix's angle 4.
+ *
+ * A/B in one run: two RREQ-Instances fed identical DIO streams except that
+ * one steps its Version Number. Both must leave at the same deadline.
+ */
+class RplAodvVersionBumpDoesNotExtendLifetimeTestCase : public TestCase
+{
+  public:
+    RplAodvVersionBumpDoesNotExtendLifetimeTestCase();
+
+  private:
+    void DoRun() override;
+
+    /// @brief Record whether each instance is still joined, at 1 Hz.
+    /// @param rpl the routing protocol under test
+    /// @param controlOrig the control instance's OrigNode
+    /// @param steppingOrig the Version-stepping instance's OrigNode
+    void Sample(Ptr<RplRoutingProtocol> rpl, Ipv6Address controlOrig, Ipv6Address steppingOrig);
+
+    Time m_controlLeft{Seconds(0)};  //!< when the control instance stopped being joined
+    Time m_steppingLeft{Seconds(0)}; //!< when the Version-stepping one did
+};
+
+RplAodvVersionBumpDoesNotExtendLifetimeTestCase::
+    RplAodvVersionBumpDoesNotExtendLifetimeTestCase()
+    : TestCase("A stepping DODAG Version Number does not extend an RREQ-Instance's 'L'")
+{
+}
+
+void
+RplAodvVersionBumpDoesNotExtendLifetimeTestCase::Sample(Ptr<RplRoutingProtocol> rpl,
+                                                        Ipv6Address controlOrig,
+                                                        Ipv6Address steppingOrig)
+{
+    static constexpr uint8_t CONTROL_INSTANCE = 0x81;
+    static constexpr uint8_t STEPPING_INSTANCE = 0x82;
+    if (m_controlLeft.IsZero() && !rpl->IsJoinedTo(CONTROL_INSTANCE, controlOrig))
+    {
+        m_controlLeft = Simulator::Now();
+    }
+    if (m_steppingLeft.IsZero() && !rpl->IsJoinedTo(STEPPING_INSTANCE, steppingOrig))
+    {
+        m_steppingLeft = Simulator::Now();
+    }
+}
+
+void
+RplAodvVersionBumpDoesNotExtendLifetimeTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(1);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.AssignWithoutAddress(devices);
+
+    Ptr<Node> node = nodes.Get(0);
+    rplHelper.SetRoot(node, Ipv6Address("2001:1::"), 64);
+    Simulator::Stop(Seconds(2));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+    Ipv6Address nodeLinkLocal = node->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    static constexpr uint8_t CONTROL_INSTANCE = 0x81;
+    static constexpr uint8_t STEPPING_INSTANCE = 0x82;
+    Ipv6Address controlOrig("2001:9::1");
+    Ipv6Address steppingOrig("2001:9::2");
+    Ipv6Address targNode("2001:9::99");
+    Ipv6Address neighbour("fe80::a");
+
+    auto buildRreq = [&](uint8_t instanceId, Ipv6Address origNode, uint8_t version) {
+        RplDioHeader dio;
+        dio.SetInstanceId(instanceId);
+        dio.SetVersionNumber(version);
+        dio.SetRank(RPL_MIN_HOPRANKINC);
+        dio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+        dio.SetDodagId(origNode);
+        dio.SetDtsn(0);
+        dio.SetDagConfiguration(0,
+                                20,
+                                RPL_DIO_REDUNDANCY,
+                                RPL_MAX_RANKINC,
+                                RPL_MIN_HOPRANKINC,
+                                RPL_OCP_OF0,
+                                RPL_DEFAULT_LIFETIME,
+                                RPL_DEFAULT_LIFETIME_UNIT);
+        RplDioHeader::RreqOption rreq;
+        rreq.symmetric = true;
+        rreq.hopByHop = true;
+        rreq.compr = 0;
+        rreq.lifetime = 1; // 'L' = 16 s
+        rreq.rankLimit = 0;
+        rreq.origSeqNo = 1;
+        rreq.addressVector = {};
+        dio.SetRreq(rreq);
+        RplDioHeader::ArtOption art;
+        art.destSeqNo = 0;
+        art.prefixLength = 0;
+        art.target = targNode;
+        dio.SetArt(art);
+        return dio;
+    };
+
+    // Ten deliveries 4 s apart from t=4 s, well inside 'L' = 16 s, to both
+    // instances. Identical in every respect but the Version Number: the
+    // control pins it at 0, the other steps it 0, 1, 2, ...
+    for (uint32_t i = 0; i < 10; i++)
+    {
+        Time when = Seconds(4 + 4 * i);
+        Simulator::Schedule(when,
+                            &DeliverRawRplMessage<RplDioHeader>,
+                            node,
+                            1,
+                            buildRreq(CONTROL_INSTANCE, controlOrig, 0),
+                            static_cast<uint8_t>(RPL_CODE_DIO),
+                            neighbour,
+                            Ipv6Address(RPL_ALL_NODES_MULTICAST));
+        Simulator::Schedule(when + MilliSeconds(1),
+                            &DeliverRawRplMessage<RplDioHeader>,
+                            node,
+                            1,
+                            buildRreq(STEPPING_INSTANCE,
+                                      steppingOrig,
+                                      static_cast<uint8_t>(i)),
+                            static_cast<uint8_t>(RPL_CODE_DIO),
+                            neighbour,
+                            Ipv6Address(RPL_ALL_NODES_MULTICAST));
+    }
+
+    for (uint32_t i = 0; i < 120; i++)
+    {
+        Simulator::Schedule(Seconds(4) + Seconds(i) + MilliSeconds(500),
+                            &RplAodvVersionBumpDoesNotExtendLifetimeTestCase::Sample,
+                            this,
+                            rpl,
+                            controlOrig,
+                            steppingOrig);
+    }
+
+    Simulator::Stop(Seconds(130));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_NE(m_controlLeft,
+                          Seconds(0),
+                          "The control RREQ-Instance never reached its 'L' deadline at all");
+    NS_TEST_ASSERT_MSG_NE(m_steppingLeft,
+                          Seconds(0),
+                          "The Version-stepping RREQ-Instance never reached its 'L' deadline: a "
+                          "peer stepping the DODAG Version Number faster than 'L' held the "
+                          "membership open indefinitely");
+    // Both joined within a millisecond of each other and both carry the same
+    // 'L', so the deadlines should coincide to well inside the 1 s sampling
+    // period. Compared rather than pinned to an absolute time, so this does
+    // not depend on exactly when the first DIO landed.
+    NS_TEST_ASSERT_MSG_EQ(m_steppingLeft <= m_controlLeft + Seconds(2),
+                          true,
+                          "The Version-stepping RREQ-Instance outlived the control one: the "
+                          "leave-and-rejoin migration destroyed the membership's expiry Timer, "
+                          "so ArmAodvExpiry() re-armed a full fresh 'L' on every Version bump");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief A P2P mode DIO carrying a nonzero Version Number is refused.
+ *
+ * RFC 6997 section 6.1 fixes the field outright -- "Version Number: This
+ * field MUST be set to zero. The temporary DAG used for P2P-RPL route
+ * discovery does not exist long enough to have new versions" -- and then
+ * says what to do about a violation: "A received P2P mode DIO MUST be
+ * discarded if it does not follow the above-listed rules regarding the
+ * RPLInstanceID, Version Number, G flag, MOP, and Prf fields inside the
+ * Base object."
+ *
+ * ShouldRefuseP2pRdo() has implemented this since the audit that hardened
+ * the five base-object fields, but nothing exercised it: an audit pass
+ * over the suite found that deleting the check would not have failed a
+ * single test. This closes that gap rather than fixing a defect -- the
+ * AODV-RPL sibling's own Version Number handling (@see
+ * RplAodvVersionBumpDoesNotExtendLifetimeTestCase) is deliberately
+ * different, because RFC 9854 has no equivalent rule, so the two are worth
+ * pinning side by side.
+ */
+class RplP2pNonzeroVersionRefusedTestCase : public TestCase
+{
+  public:
+    RplP2pNonzeroVersionRefusedTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplP2pNonzeroVersionRefusedTestCase::RplP2pNonzeroVersionRefusedTestCase()
+    : TestCase("A P2P mode DIO whose Version Number is nonzero is discarded")
+{
+}
+
+void
+RplP2pNonzeroVersionRefusedTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(1);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.AssignWithoutAddress(devices);
+
+    Ptr<Node> node = nodes.Get(0);
+    rplHelper.SetRoot(node, Ipv6Address("2001:1::"), 64);
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+    Ipv6Address neighbour("fe80::a");
+
+    auto buildP2pDio = [&](uint8_t instanceId, Ipv6Address origin, uint8_t version) {
+        RplDioHeader dio;
+        dio.SetInstanceId(instanceId);
+        dio.SetVersionNumber(version);
+        dio.SetRank(RPL_MIN_HOPRANKINC);
+        dio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+        dio.SetGrounded(true);
+        dio.SetDodagId(origin);
+        dio.SetDtsn(0);
+        dio.SetDagConfiguration(4,
+                                6,
+                                0,
+                                0,
+                                RPL_MIN_HOPRANKINC,
+                                RPL_OCP_OF0,
+                                RPL_DEFAULT_LIFETIME,
+                                RPL_DEFAULT_LIFETIME_UNIT);
+        P2pRdoOption rdo;
+        rdo.reply = false;
+        rdo.hopByHop = false;
+        rdo.numRoutes = 0;
+        rdo.lifetime = 2;
+        rdo.maxRankOrNh = 5;
+        rdo.target = Ipv6Address("2001:9::99");
+        rdo.addressVector = {};
+        dio.SetP2pRdo(rdo);
+        return dio;
+    };
+
+    // Version 0: the conforming case, joined as a control so a failure of
+    // the nonzero case below cannot be explained by the fixture itself.
+    Ipv6Address conformingOrigin("2001:9::1");
+    DeliverRawRplMessage<RplDioHeader>(node,
+                                       1,
+                                       buildP2pDio(0x81, conformingOrigin, 0),
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       neighbour,
+                                       Ipv6Address(RPL_ALL_NODES_MULTICAST));
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(0x81, conformingOrigin),
+                          true,
+                          "A conforming P2P mode DIO (Version 0) was not joined");
+
+    // Version 1: must be discarded outright, no membership formed.
+    Ipv6Address offendingOrigin("2001:9::2");
+    DeliverRawRplMessage<RplDioHeader>(node,
+                                       1,
+                                       buildP2pDio(0x82, offendingOrigin, 1),
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       neighbour,
+                                       Ipv6Address(RPL_ALL_NODES_MULTICAST));
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(0x82, offendingOrigin),
+                          false,
+                          "A P2P mode DIO whose Version Number is nonzero was joined: RFC 6997 "
+                          "section 6.1 has it discarded");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief A later discovery's RREQ moves the upward Hop-by-hop Route off a
  *        neighbour an earlier discovery left behind, even when that
  *        neighbour is gone.
@@ -25689,6 +26014,9 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplAodvRrepInstanceRankLimitTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRrepInstanceAddressVectorFullTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRrepDuplicateRelayedOnceTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplAodvVersionBumpDoesNotExtendLifetimeTestCase,
+                TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pNonzeroVersionRefusedTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvLaterDiscoveryMovesStaleUpwardRouteTestCase,
                 TestCase::Duration::QUICK);
     AddTestCase(new RplAodvSymmetricRrepAdvancesSeqNoTestCase, TestCase::Duration::QUICK);

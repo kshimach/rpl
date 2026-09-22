@@ -10463,3 +10463,94 @@ RREQ-DIOが`mayMove`に到達する前に拒否されるため。0にせず非�
 
 `./ns3 build`clean、`test-runner --suite=rpl`(158件、全PASS)・
 `./test.py -s rpl`PASS。
+
+## 94. MOP=4のDODAG Version移行が'L'期限を毎回リセットしていた
+
+角4の4件目。独立verifierが実プローブでCONFIRMED、かつ
+**Phase 1の想定より深刻**と評価した。
+
+### 94.1 機序
+
+`HandleDio()`のDODAG Version移行(leave-and-rejoin)はMOPを問わず走る。
+route-discoveryインスタンス(MOP 4 — AODV-RPLのRREQ/RREP-Instanceと
+P2P-RPLの一時DAG)でこれが走ると:
+
+1. `LeaveDodag()`が`DodagMembership`を破棄。`aodv.expiry`は
+   `Timer::CANCEL_ON_DESTROY`なのでmap eraseと同時に消える
+2. `JoinDodag()`が真っさらなmembershipを作る
+3. `ArmAodvExpiry()`の`if (dodag.aodv.expiry.IsRunning()) return;`ガードが
+   **未武装のTimer**を見るので、**満額の'L'を再武装**する
+
+つまりVersionを'L'より短い間隔で刻むピアがいる限り、membershipは
+**永久に期限に達しない**。RFC 9854 §4.1が'L'に与えた役割そのもの
+("Once the time is reached, a node SHOULD leave the RREQ-Instance ...
+otherwise, memory and network resources are likely to be consumed
+unnecessarily")が無効化される。"Once the time is reached"は
+**時点**を指しており、DIOごとに更新されるリースではない —
+`ArmAodvExpiry()`のガード自身が通常の重複floodに対しては既に
+そう実装していた。
+
+`AodvInstanceExpired()`が走らないので`m_aodvRejoinBlocked`も張られず、
+REJOIN_REENABLEも連鎖的に効かなくなる。加えて移行のたびに
+`targetsSeeded`・`rrepHandled`・Address Vectorが初期化され、重複抑制も
+毎回やり直しになる。
+
+verifierの実測(同一DIO列でVersionのみ変える対照実験):
+membership寿命が16.0秒→52.0秒(3.25倍)、送出DIO数が62→198(3.19倍)。
+
+### 94.2 「悪意あるピア不要」— Phase 1の想定の訂正
+
+Phase 1はこれを「非準拠または悪意あるピアが要る」と位置づけたが、
+verifierは仕様を突き合わせてこれを**過小評価**と判定した:
+
+- RFC 9854はVersion Numberに**規範的記述を一切持たない**
+  (verifierによるrfc9854.txt全文grep: "version"の出現は4箇所のみで、
+  いずれもRFC 6550のRank定義の引用か参考文献のソフトウェア版数)
+- RFC 6550 §8.2.2.1は
+  "DODAG roots MAY increment the DODAGVersionNumber that they advertise"
+  と明示的に許可し、その契機は"implementation dependent"で
+  "application-level detection of lost connectivity"を例示している
+- AODV-RPLのOrigNodeは自分のRREQ-InstanceのDODAG rootそのもの
+- RFC 9854 §6.3.3は同一instanceIdの再利用を明示的に許可している
+
+したがって「探索が失敗したので同じinstanceIdで再試行し、区別のために
+Versionを進める」という**完全に準拠したピア**が、この症状を引き起こす。
+悪意の有無を問わない**相互運用上の危険**であり、攻撃面にとどまらない。
+意図的に使えば、未認証・オフパス・16秒に1パケットで任意数の被害ノードの
+membershipを無期限に開かせ、1パケットあたり約60 DIOの増幅を伴う
+リソース枯渇の一次要因になる。
+
+### 94.3 修正
+
+MOP 4ではVersion変化でleave-and-rejoinを行わない。Versionは
+(前進方向のみ)**採用して再送出**するだけに留め、状態と'L'期限は保持する。
+
+根拠: RFC 6997 §6.1が一時DAGの性質を
+"The temporary DAG used for P2P-RPL route discovery does not exist long
+enough to have new versions"と明言しており、RFC 9854のRREQ-Instanceも
+'L'で有界な同形の一回限りのDAG。Versionを跨いで修復する対象ではない。
+
+**P2Pと同じ「非ゼロを拒否」にしなかった理由**: RFC 6997 §6.1は
+"MUST be set to zero"を明記するが、RFC 9854には対応する規定が無く
+(94.2)、準拠ピアが正当に非ゼロを送りうる。拒否すると正当なDIOを
+落としてしまう。またMOP 4では「古いVersion」も拒否しない —
+意味を持たないフィールドで探索用DIOのコピーを落とすと探索自体を
+失いかねないため。
+
+### 94.4 検証
+
+新規試験2件。
+
+- `RplAodvVersionBumpDoesNotExtendLifetimeTestCase` — 1ノードに2つの
+  RREQ-Instanceへ同一のDIO列を流し、片方だけVersionを刻む。両者の
+  離脱時刻が(1秒のサンプリング周期内で)一致することを検証。絶対時刻に
+  依存しない相対比較。MOP 4の免除を外すと、Version側だけ生き残り
+  確実に落ちることを確認(load-bearing)
+- `RplP2pNonzeroVersionRefusedTestCase` — P2P側の既存ガード
+  (`rpl-p2p.cc`のVersion非ゼロ拒否)の**回帰保護の空白を埋める**もの。
+  verifierが「このガードを消してもどの試験も落ちない」と指摘したため
+  追加した。欠陥の修正ではない。ガードを無効化すると落ちることを
+  確認済み(load-bearing)
+
+`./ns3 build`clean、`test-runner --suite=rpl`(160件、全PASS)・
+`./test.py -s rpl`PASS。
