@@ -26,7 +26,7 @@ them under identical conditions.
 
 ## Status
 
-144 unit test cases (`./test.py -s rpl`), all passing. Multi-hop scenarios
+162 unit test cases (`./test.py -s rpl`), all passing. Multi-hop scenarios
 with a full IEEE 802.15.4 + 6LoWPAN stack (`rpl-6lowpan-simple`) and a
 100-node system-test harness (`rpl-large-scale-system-test`, in `scratch/`
 of the parent tree) are used for end-to-end validation; see

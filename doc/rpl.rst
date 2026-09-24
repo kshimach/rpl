@@ -311,7 +311,7 @@ Examples
 Tests
 ~~~~~
 
-The comprehensive test suite (``test/rpl-test-suite.cc``) comprises **144 test cases**:
+The comprehensive test suite (``test/rpl-test-suite.cc``) comprises **162 test cases**:
 
 * Serialization and deserialization round trips for all control messages, options,
   SRH, RPI, P2P-RDO, DRO, DRO-ACK, and AODV-RPL options.
@@ -333,7 +333,7 @@ The comprehensive test suite (``test/rpl-test-suite.cc``) comprises **144 test c
 Validation
 ----------
 
-The test suite is formally verified via ``./test.py -s rpl`` (all 144 unit test cases
+The test suite is formally verified via ``./test.py -s rpl`` (all 162 unit test cases
 executing cleanly). Multi-hop topologies with full IEEE 802.15.4 and 6LoWPAN stacks
 demonstrate 100% end-to-end bidirectional ping delivery, correct ETX accumulation, and
 stable operation across lossy radio channels.
