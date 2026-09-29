@@ -11283,3 +11283,35 @@ load-bearing検証: `RecordP2pStop()`呼び出しを一時的にコメントア�
 元に戻して再度PASSを確認した。
 
 `./test.py -s rpl`: 164件(新規1件)全件PASS。
+
+## 102. §73.5の「専用テストを持たない修正」— OriginのTarget未検証への回帰試験を追加
+
+§73.4/§73.5には計7件、「コードは既に直っているが専用テストが無い」修正が
+記録されている(`HandleP2pDro()`のisOriginブランチで`rdo.target !=
+dodag.p2p.target`を見るガードもその1つ)。RFC 6997 §14は次のように述べる:
+
+> a rogue router could...generate bogus P2P-DRO messages carrying bad
+> routes
+
+P2P-DROには認証が一切無い。Targetの一致は、Originが自分で独立に知っている
+唯一の検証材料であり、これが無いとこの発見を盗み聞きしただけの近隣ノードが
+任意の宛先への経路を`m_hopByHopRoutes`に植え付けられる。
+
+### 試験
+
+`RplP2pOriginRejectsMismatchedTargetTestCase` (test/rpl-test-suite.cc)。
+単一ノードが`DiscoverP2pRoute()`で自分自身をOriginにし、(1) 別のTargetを
+名乗る偽造P2P-DROを注入 → 経路が記録されないことを確認、(2) 正しい
+Targetを名乗るP2P-DRO(Sequence Numberは変えて、Sequence側の重複排除が
+たまたま素通りさせた可能性を排除)を注入 → 今度は経路が記録されることを
+確認。(2)を入れているのは、(1)の拒否が本当にTarget不一致によるものであって、
+発見の仕組み自体が何であれ拒否するような無関係な理由でないことを示すため。
+
+load-bearing検証: ガードを`if (false && rdo.target != dodag.p2p.target)`
+で無効化 → FAIL(経路が記録されてしまう)を確認、元に戻して再度PASSを
+確認した。
+
+`./test.py -s rpl`: 165件(新規1件)全件PASS。README.md/doc/rpl.rstの
+試験数表記も164→165に更新した。
+
+§73.4/§73.5の残り6件については引き続き専用テスト無し。

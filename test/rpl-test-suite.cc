@@ -16118,6 +16118,133 @@ RplP2pDroOffRouteStopTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief The Origin discards a P2P-DRO naming a Target it never asked about.
+ *
+ * RFC 6997 section 14: "a rogue router could...generate bogus P2P-DRO
+ * messages carrying bad routes." Nothing in a P2P-DRO is authenticated, and
+ * the Target field is the one thing about it the Origin independently
+ * knows, so HandleP2pDro()'s isOrigin branch checks `rdo.target !=
+ * dodag.p2p.target` before storing anything (@see design-constraints.md
+ * section 73.5, which recorded this fix without a dedicated test). A
+ * single-node test: the node is its own Origin (DiscoverP2pRoute()), fed a
+ * P2P-DRO naming a different Target than it asked about, then a
+ * correctly-targeted one under a different Sequence Number -- proving the
+ * first was refused specifically because of the Target mismatch, not some
+ * unrelated reason (e.g. Sequence Number dedup) that would have refused the
+ * second one too.
+ */
+class RplP2pOriginRejectsMismatchedTargetTestCase : public TestCase
+{
+  public:
+    RplP2pOriginRejectsMismatchedTargetTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplP2pOriginRejectsMismatchedTargetTestCase::RplP2pOriginRejectsMismatchedTargetTestCase()
+    : TestCase("The Origin discards a P2P-DRO naming a Target it never asked about "
+              "(RFC 6997 section 14)")
+{
+}
+
+void
+RplP2pOriginRejectsMismatchedTargetTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(1);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.AssignWithoutAddress(devices);
+
+    Ptr<Node> node = nodes.Get(0);
+    rplHelper.SetRoot(node, Ipv6Address("2001:1::"), 64);
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> orig = node->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(orig->GetGlobalAddress().IsAny(),
+                          false,
+                          "node has no global address yet");
+
+    Ipv6Address realTarget("2001:9::1");
+    Ipv6Address wrongTarget("2001:9::2");
+    Ipv6Address peerLinkLocal("fe80::a");
+
+    RplRoutingProtocol::DodagKey key = orig->DiscoverP2pRoute(realTarget, true);
+    NS_TEST_ASSERT_MSG_NE(key.dodagId, Ipv6Address::GetAny(), "The discovery did not start");
+
+    auto buildDro = [&](Ipv6Address target, uint8_t sequence) {
+        RplP2pDroHeader dro;
+        dro.SetInstanceId(key.instanceId);
+        dro.SetStop(false);
+        dro.SetAckRequested(false);
+        dro.SetSequence(sequence);
+        dro.SetDodagId(key.dodagId);
+        P2pRdoOption rdo;
+        rdo.reply = false;
+        rdo.hopByHop = true;
+        rdo.numRoutes = 0;
+        rdo.lifetime = 3;
+        rdo.maxRankOrNh = 0;
+        rdo.target = target;
+        rdo.addressVector = {}; // a direct neighbour: nextHop == target
+        dro.SetP2pRdo(rdo);
+        return dro;
+    };
+
+    // Step 1: a P2P-DRO naming a Target this discovery never asked about.
+    DeliverRawRplMessage<RplP2pDroHeader>(node,
+                                          1,
+                                          buildDro(wrongTarget, 0),
+                                          static_cast<uint8_t>(RPL_CODE_P2P_DRO),
+                                          peerLinkLocal,
+                                          Ipv6Address(RPL_ALL_NODES_MULTICAST));
+
+    Ipv6Address nextHop;
+    uint8_t foundInstance = 0;
+    NS_TEST_ASSERT_MSG_EQ(orig->GetHopByHopRoute(wrongTarget, nextHop, foundInstance),
+                          false,
+                          "A P2P-DRO naming a Target this discovery never asked about was "
+                          "accepted -- a neighbour that merely overheard the discovery could "
+                          "plant an arbitrary route this way (RFC 6997 section 14)");
+    NS_TEST_ASSERT_MSG_EQ(orig->GetHopByHopRoute(realTarget, nextHop, foundInstance),
+                          false,
+                          "No P2P-DRO for the real Target was sent yet, but a route exists");
+
+    // Step 2: the same discovery, answered correctly (a different Sequence
+    // Number, so a Sequence-based dedup could not be what let this one
+    // through). If this is also refused, step 1's refusal proved nothing
+    // about the Target check specifically.
+    DeliverRawRplMessage<RplP2pDroHeader>(node,
+                                          1,
+                                          buildDro(realTarget, 1),
+                                          static_cast<uint8_t>(RPL_CODE_P2P_DRO),
+                                          peerLinkLocal,
+                                          Ipv6Address(RPL_ALL_NODES_MULTICAST));
+
+    NS_TEST_ASSERT_MSG_EQ(orig->GetHopByHopRoute(realTarget, nextHop, foundInstance),
+                          true,
+                          "A correctly-targeted P2P-DRO was refused too -- the discovery "
+                          "itself, not the Target check, is what rejected step 1");
+    NS_TEST_ASSERT_MSG_EQ(nextHop, realTarget, "The recorded next hop is wrong");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief A P2P mode DIO is only joined if the router's own resulting
  *        DAGRank would stay within the MaxRank, relaxed by one step for the
  *        Target, mirroring AODV-RPL's own RankLimit boundary test.
@@ -26541,6 +26668,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplP2pDroRelayComprMismatchTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pDroRelayComprMismatchStopTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pDroOffRouteStopTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pOriginRejectsMismatchedTargetTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pMaxRankTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pTrickleRuleSuppressionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pDroGeneratedTestCase, TestCase::Duration::QUICK);
