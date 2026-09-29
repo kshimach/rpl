@@ -8474,10 +8474,17 @@ method" を免罪符として使っていたのも誤りで、この文は**候�
 §72.4 の「`P2pDroRetry()` は完全に無変更で済んでいる」という記述の
 両方が偽になっていた。
 
-**別件として記録**: `HandleP2pDro()` が NH 位置以外のルータで
-`stopped` を触らないこと自体が、上記 §5 の "including those not
-listed in the route" に対する乖離。これは §72 以前からある挙動で、
-'N' とは独立。未修正。
+**別件として記録したが、現在のコードでは既に解消している (2026-09-29
+確認)**: 当時は `HandleP2pDro()` が NH 位置以外のルータで `stopped` を
+触らないこと自体が、上記 §5 の "including those not listed in the route"
+に対する乖離だと記録した。現在の「自分の番でない」分岐
+(`rdo.maxRankOrNh` の範囲外／NH 位置不一致) を読むと、`return` の前に
+`RecordP2pStop(dodag, dro.GetStop())` を呼んでおり、経路上に無いルータ
+でも Stop は記録される — §90.2 がこの分岐を「既に正しい形」として、
+そこに合わせる形で他の 4 箇所の早期 return を直した経緯があるため、
+本節が指摘した時点より後、§90 より前のどこかで解消されたとみられるが、
+どの節での修正かは特定できていない。専用の回帰試験は無いため、
+§101 で追加した(RplP2pDroOffRouteStopTestCase)。
 
 ### 73.4 ライフサイクルの穴 3 件 (Angle 3・Angle 5)
 
@@ -11255,3 +11262,24 @@ load-bearing検証: `GetGlobalAddressOnInterface()`への切り替えを
 
 `./test.py -s rpl`: 163件(新規1件)全件PASS。既存の`RplP2pFloodTestCase`
 含め、単一インタフェースのシナリオは無変更で通る。
+
+## 101. §73.3の「未修正」項目に専用の回帰試験を追加
+
+§73.3で「未修正」と記録し、100.0で現在のコードでは既に解消済みと確認した
+項目 — `HandleP2pDro()`の「自分の番でない」分岐がRFC 6997 §8の「経路上に
+無いルータを含む全受信ルータ」にStopを及ぼすか — に、専用の回帰試験
+`RplP2pDroOffRouteStopTestCase`を追加した。
+
+構成は§90.3の`RplP2pDroRelayComprMismatchStopTestCase`とほぼ同じ
+(単一ノード、`DeliverRawRplMessage()`による直接注入)だが、Comprミス
+マッチの生バイト構成は不要 — 通常の`P2pRdoOption`で`maxRankOrNh=1`・
+`addressVector`に無関係な1エントリを入れるだけで「自分の番でない」
+分岐に入る。手順は同型: (1) 悪いRankで加入、(2) Stop付き・自分の番でない
+P2P-DROを注入、(3) 良いRankの新規DIOを注入、(4) Rankが変化しないこと
+(=Stopが効いている)を確認。
+
+load-bearing検証: `RecordP2pStop()`呼び出しを一時的にコメントアウトした
+ところ、Rankが更新されてしまい(256、期待値512)FAILすることを確認、
+元に戻して再度PASSを確認した。
+
+`./test.py -s rpl`: 164件(新規1件)全件PASS。

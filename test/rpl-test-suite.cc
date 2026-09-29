@@ -15963,6 +15963,161 @@ RplP2pDroRelayComprMismatchStopTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief A router never named at the Address Vector's NH position still
+ *        records a P2P-DRO's Stop flag.
+ *
+ * RFC 6997 section 8: "All the routers receiving such a P2P-DRO, **including
+ * those not listed in the route** carried inside a P2P-RDO" -- the audience
+ * for Stop is every router that hears the P2P-DRO at all, not only the
+ * handful actually named along the winning path. `HandleP2pDro()`'s "not
+ * this router's turn to relay" branch (`rdo.maxRankOrNh` out of range, or
+ * naming some other router) calls `RecordP2pStop()` before returning, ahead
+ * of design-constraints.md section 73.3's own record of this branch's
+ * shape (that section's separate note about it being unfixed predates
+ * whatever later change put the call there; this test is the regression
+ * coverage that note found lacking).
+ */
+class RplP2pDroOffRouteStopTestCase : public TestCase
+{
+  public:
+    RplP2pDroOffRouteStopTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplP2pDroOffRouteStopTestCase::RplP2pDroOffRouteStopTestCase()
+    : TestCase("A router not named in a P2P-DRO's route still records its Stop flag "
+              "(RFC 6997 section 8)")
+{
+}
+
+void
+RplP2pDroOffRouteStopTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(1);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.AssignWithoutAddress(devices);
+
+    Ptr<Node> node = nodes.Get(0);
+    rplHelper.SetRoot(node, Ipv6Address("2001:1::"), 64);
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+    Ipv6Address ownAddress = rpl->GetGlobalAddress();
+    NS_TEST_ASSERT_MSG_NE(ownAddress, Ipv6Address::GetAny(), "node has no global address yet");
+
+    Ipv6Address dodagId("2001:2::1"); // an unrelated temporary DAG identity
+    Ipv6Address peerLinkLocal("fe80::a");
+    Ipv6Address betterLinkLocal("fe80::b");
+    static constexpr uint8_t INSTANCE = 0x81;
+    const uint16_t worseRank = static_cast<uint16_t>(3 * RPL_MIN_HOPRANKINC);
+    const uint16_t betterRank = RPL_MIN_HOPRANKINC;
+
+    auto buildJoinDio = [&](uint16_t rank) {
+        RplDioHeader dio;
+        dio.SetInstanceId(INSTANCE);
+        dio.SetVersionNumber(0);
+        dio.SetRank(rank);
+        dio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+        dio.SetGrounded(true);
+        dio.SetDodagId(dodagId);
+        dio.SetDtsn(0);
+        P2pRdoOption rdo;
+        rdo.reply = false;
+        rdo.hopByHop = false;
+        rdo.numRoutes = 0;
+        rdo.lifetime = 3;
+        rdo.maxRankOrNh = 5;
+        rdo.target = dodagId; // a placeholder, not this node
+        rdo.addressVector = {};
+        dio.SetP2pRdo(rdo);
+        return dio;
+    };
+
+    // Step 1: an ordinary join at a deliberately worse Rank.
+    DeliverRawRplMessage<RplDioHeader>(node,
+                                       1,
+                                       buildJoinDio(worseRank),
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       peerLinkLocal,
+                                       Ipv6Address(RPL_ALL_NODES_MULTICAST));
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(INSTANCE, dodagId),
+                          true,
+                          "The join DIO was not accepted at all");
+    uint16_t rankAfterJoin = rpl->GetRankIn(INSTANCE, dodagId);
+
+    // Step 2: an ordinary P2P-DRO for this same temporary DAG, Stop set,
+    // with an Address Vector that names some other router at NH -- never
+    // this node's turn to relay, the branch RFC 6997 section 8 says must
+    // still bind. A single unrelated entry plus maxRankOrNh=1 keeps the
+    // vector trivially valid while unambiguously not this node's own
+    // address.
+    RplP2pDroHeader dro;
+    dro.SetInstanceId(INSTANCE);
+    dro.SetStop(true); // the crux of this test
+    dro.SetAckRequested(false);
+    dro.SetSequence(0);
+    dro.SetDodagId(dodagId);
+    P2pRdoOption rdo;
+    rdo.reply = false;
+    rdo.hopByHop = false;
+    rdo.numRoutes = 0;
+    rdo.lifetime = 0;
+    rdo.maxRankOrNh = 1; // Address[1], not this node
+    rdo.target = Ipv6Address("2001:9::1"); // unrelated to anything real
+    rdo.addressVector = {Ipv6Address("2001:9::2")}; // some other router, not ownAddress
+    dro.SetP2pRdo(rdo);
+
+    DeliverRawRplMessage<RplP2pDroHeader>(node,
+                                          1,
+                                          dro,
+                                          static_cast<uint8_t>(RPL_CODE_P2P_DRO),
+                                          peerLinkLocal,
+                                          Ipv6Address(RPL_ALL_NODES_MULTICAST));
+
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(INSTANCE, dodagId),
+                          true,
+                          "Processing the off-route P2P-DRO disturbed the temporary DAG "
+                          "membership it should only have declined to relay");
+
+    // Step 3: a much-better-Rank join DIO for the same temporary DAG, from
+    // a new neighbour. If step 2's Stop was recorded despite this node
+    // never being named at NH, ShouldRefuseP2pRdo() refuses this DIO
+    // outright and the Rank stays exactly what step 1 left it at.
+    DeliverRawRplMessage<RplDioHeader>(node,
+                                       1,
+                                       buildJoinDio(betterRank),
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       betterLinkLocal,
+                                       Ipv6Address(RPL_ALL_NODES_MULTICAST));
+
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetRankIn(INSTANCE, dodagId),
+                          rankAfterJoin,
+                          "A DIO reached SelectPreferredParent() after Stop should have "
+                          "silenced this temporary DAG entirely -- the off-route P2P-DRO "
+                          "must not have recorded Stop for a router RFC 6997 section 8 still "
+                          "obligates");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief A P2P mode DIO is only joined if the router's own resulting
  *        DAGRank would stay within the MaxRank, relaxed by one step for the
  *        Target, mirroring AODV-RPL's own RankLimit boundary test.
@@ -26385,6 +26540,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplAodvTemporaryInstanceArmsWithoutAddressTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pDroRelayComprMismatchTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pDroRelayComprMismatchStopTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pDroOffRouteStopTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pMaxRankTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pTrickleRuleSuppressionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pDroGeneratedTestCase, TestCase::Duration::QUICK);
