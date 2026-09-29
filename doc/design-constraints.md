@@ -6,11 +6,16 @@
 
 ## 1. 動作モード
 
-- **非 storing mode (MOP=1) のみサポート**。storing mode (MOP=2) は実装しない。
+- **当初は非 storing mode (MOP=1) のみサポート**。storing mode (MOP=2) は
+  実装しない方針だった。
 - 理由: 要件として非 storing mode を明示指定されたため。
 - 影響: 下り経路情報 (Transit Information) は root のみが保持する。中間ノードは
   トポロジテーブルを持たず、送信元ルーティング (Source Routing Header, RFC 6554) で
   下り方向のパケットを転送する。
+- **訂正 (§54)**: この節は後に storing mode (MOP=2、multicast 無し) を
+  実装したことで古くなった。RplHelper の `Mop` 属性で選択でき、両モードを
+  同一ネットワークで比較できる (README.md 参照)。この節は non-storing mode
+  時点の影響のみを記す当時の記録として残す。
 
 ## 2. IPv6 拡張ヘッダーを送信元で挿入できない (解消済み: コアフック追加)
 
