@@ -11,9 +11,9 @@ this file's own and do not match the Japanese original.
 
 The module's own policy throughout has been: **do not modify ns-3 core**
 unless there is no other way to meet a hard requirement (an accurate wire
-format, a correct protocol behaviour). Sections 2 and 15 are the two places
-that policy was overridden, each behind a minimal, generically-useful core
-hook rather than an RPL-specific change.
+format, a correct protocol behaviour). Sections 2 and 15 add minimal,
+generically-useful core hooks rather than RPL-specific changes; section 10
+lists the core bugs fixed along the way.
 
 ## 1. Scope
 
@@ -112,13 +112,15 @@ targets LLNs, where a node normally has exactly one multi-hop radio
 interface; the test suite represents multi-hop topologies with `BlackList()`
 on a single shared `SimpleChannel` instead.
 
-## 10. Four ns-3 core bugs found along the way
+## 10. ns-3 core bugs found along the way
 
 Switching to a real RH3 implementation and a real RFC 6553 RPL Option
 exercised IPv6 extension-header code paths that had, in practice, never run
-before. Three of the four are not RPL-specific — they reproduce with plain
-RFC 2460 RH0 routing headers over 6LoWPAN, or after any Hop-by-Hop header —
-and were fixed in `src/sixlowpan` / `src/internet`, not in this module.
+before. Three of the first four are not RPL-specific — they reproduce with
+plain RFC 2460 RH0 routing headers over 6LoWPAN, or after any Hop-by-Hop
+header — and were fixed in `src/sixlowpan` / `src/internet`, not in this
+module. The fifth is in `src/lr-wpan` and affects any dense 802.15.4
+simulation.
 
 1. **6LoWPAN NHC compression corrupts Routing Header addresses.**
    `SixLowPanNetDevice::CompressLowPanNhc()`/`DecompressLowPanNhc()` read and
@@ -158,6 +160,23 @@ and were fixed in `src/sixlowpan` / `src/internet`, not in this module.
    without updating the IPv6 header's Next Header field to match. Fixed by
    preserving the discarded prefix (`packet->CreateFragment(0, offset)`) and
    re-attaching it after the Routing Header rewrite.
+5. **The lr-wpan PHY can stick in `BUSY_RX` forever.**
+   `LrWpanPhy::PlmeSetTRXStateRequest()` sets `m_isRxCanceled` when TX_ON is
+   forced during a reception (e.g. to send an ACK), and only the cancelled
+   packet's own `EndRx()` clears it. If another packet becomes
+   `m_currentRxPacket` in `EndPreamble()` before that `EndRx()` arrives, the
+   cancelled packet's `EndRx()` no longer matches and the flag survives. The
+   next packet lost to interference then reads the stale flag as "the state
+   was already changed by the cancellation," skips the return to RX_ON, and
+   leaves the PHY in `BUSY_RX` with no way out: every later signal is
+   ignored and every CCA reports busy, so the node can never transmit again.
+   The more crowded the channel, the more likely both preconditions are, so
+   the number of dead radios grows with density and time — in a 100-node,
+   200 m random topology, 14–32 of them within 6,000 s, with the DODAG
+   shedding nodes behind them. Still present upstream. Fix: clear
+   `m_isRxCanceled` whenever `EndPreamble()` starts tracking a new packet
+   (two lines). Verified on four seeds with the fix removed (radios stick,
+   nodes drop out) and restored (none stick, all 100 nodes stay joined).
 
 ## 11. Hop-by-Hop option double dispatch
 
@@ -305,7 +324,9 @@ advertised it propagates to the whole DODAG.
 * **Only ETX and LQL are implemented** among RFC 6551's routing metrics;
   Node Energy, Hop Count metric object, Link Throughput, Link Latency, and
   Link Color are not.
-* **Unbounded rank growth under dense topologies.** Root's periodic Global
-  Repair (`GlobalRepairInterval`, DODAGVersionNumber increment) exists, but
-  a node that has hit `DAGMaxRankIncrease` and gone infinite-rank can fail
-  to recover under some dense-topology conditions; not fully root-caused.
+* **Results measured over lr-wpan before the fix in section 10 item 5** may
+  include nodes whose radio had silently died. The node loss previously
+  attributed to unbounded rank growth in dense topologies, and Global
+  Repair's apparent ineffectiveness, were both that bug: with it fixed, a
+  100-node topology keeps every node joined and each Global Repair reaches
+  all 99 non-root nodes.

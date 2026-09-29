@@ -69,7 +69,7 @@ Wi-SUN FAN 1.1 standardizes (Non-Storing, MRHOF, ETX).
   features, explicit scope/limitations, class design, every attribute, and
   the test/validation summary.
 * [`DESIGN_CONSTRAINTS.md`](DESIGN_CONSTRAINTS.md) — an English summary of
-  the ns-3-core-level constraints this module works around (and the four
+  the ns-3-core-level constraints this module works around (and the five
   independent ns-3 core bugs it uncovered along the way).
 * [`doc/design-constraints.md`](doc/design-constraints.md) — the full,
   ongoing design-decision record (Japanese), the source the summary above
