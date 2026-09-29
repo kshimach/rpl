@@ -498,7 +498,7 @@ RplRoutingProtocol::HandleP2pRdo(const RplDioHeader& dio, Ipv6Address from, uint
     // RFC 6997 section 9.4's route diversity, kept ahead of every guard
     // below for the same reason the alternate collection is: the copies
     // those guards discard are exactly the ones carrying a different route.
-    RecordP2pCandidateRoute(dodag, rdo, from);
+    RecordP2pCandidateRoute(dodag, rdo, from, interface);
 
     // RFC 6997 section 7's 'N': the Origin asked for more than one route, so
     // a copy of the DIO this node would otherwise drop below -- as a repeat,
@@ -515,7 +515,7 @@ RplRoutingProtocol::HandleP2pRdo(const RplDioHeader& dio, Ipv6Address from, uint
     uint8_t asked = rdo.hopByHop ? 0 : rdo.numRoutes;
     if (dodag.p2p.isTarget && asked > 0)
     {
-        RecordP2pAlternateRoute(dodag, rdo, asked);
+        RecordP2pAlternateRoute(dodag, rdo, asked, interface);
     }
 
     if (dodag.p2p.isTarget && !HasOtherP2pTargets(dodag))
@@ -589,7 +589,7 @@ RplRoutingProtocol::HandleP2pRdo(const RplDioHeader& dio, Ipv6Address from, uint
     // IPv6 address of the receiving interface...to the route in the Address
     // vector." A global address, since the vector becomes a Source Route
     // later.
-    Ipv6Address ownAddress = GetGlobalAddressIn(dodag);
+    Ipv6Address ownAddress = GetGlobalAddressOnInterface(dodag, interface);
     if (ownAddress.IsAny())
     {
         NS_LOG_LOGIC("No global address to put in the Address Vector yet");
@@ -974,7 +974,8 @@ RplRoutingProtocol::PruneP2pCandidateRoutes(DodagMembership& dodag)
 void
 RplRoutingProtocol::RecordP2pCandidateRoute(DodagMembership& dodag,
                                             const P2pRdoOption& rdo,
-                                            Ipv6Address from)
+                                            Ipv6Address from,
+                                            uint32_t interface)
 {
     NS_LOG_FUNCTION(this << from << rdo.addressVector.size());
 
@@ -1009,7 +1010,7 @@ RplRoutingProtocol::RecordP2pCandidateRoute(DodagMembership& dodag,
         return;
     }
 
-    Ipv6Address ownAddress = GetGlobalAddressIn(dodag);
+    Ipv6Address ownAddress = GetGlobalAddressOnInterface(dodag, interface);
     if (ownAddress.IsAny())
     {
         return;
@@ -1060,11 +1061,12 @@ RplRoutingProtocol::RecordP2pCandidateRoute(DodagMembership& dodag,
 void
 RplRoutingProtocol::RecordP2pAlternateRoute(DodagMembership& dodag,
                                             const P2pRdoOption& rdo,
-                                            uint8_t asked)
+                                            uint8_t asked,
+                                            uint32_t interface)
 {
     NS_LOG_FUNCTION(this << rdo.addressVector.size());
 
-    Ipv6Address ownAddress = GetGlobalAddressIn(dodag);
+    Ipv6Address ownAddress = GetGlobalAddressOnInterface(dodag, interface);
     if (ownAddress.IsAny())
     {
         return;

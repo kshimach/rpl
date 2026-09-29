@@ -14615,6 +14615,133 @@ RplP2pFloodTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief RFC 6997 section 9.4: "the intermediate router MUST add a unicast
+ *        IPv6 address of the receiving interface...to the route in the
+ *        Address vector." A multi-interface relay must use the address of
+ *        whichever interface the P2P mode DIO actually arrived on, not
+ *        whichever of its interfaces happens to enumerate first.
+ *
+ * The relay gets a second interface carrying its own distinct global
+ * address, entirely unconnected to the P2P discovery's own channel and
+ * numbered *before* the interface the discovery actually runs over (RPL
+ * enumerates interfaces by index, and GetGlobalAddressIn()'s bug was to
+ * scan every interface for a match rather than the one the packet came in
+ * on). If the relay's Address Vector entry is the low-numbered interface's
+ * address, the bug is present; if it is the receiving interface's, RFC
+ * 6997 section 9.4 is honoured.
+ */
+class RplP2pAddressVectorUsesReceivingInterfaceTestCase : public TestCase
+{
+  public:
+    RplP2pAddressVectorUsesReceivingInterfaceTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplP2pAddressVectorUsesReceivingInterfaceTestCase::
+    RplP2pAddressVectorUsesReceivingInterfaceTestCase()
+    : TestCase("A multi-interface relay's Address Vector entry is the receiving "
+              "interface's address (RFC 6997 section 9.4)")
+{
+}
+
+void
+RplP2pAddressVectorUsesReceivingInterfaceTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(3); // 0 = Origin, 1 = relay (Target), 2 = the side interface's peer
+
+    // Installed *before* the main interface below, so it is interface 1 and
+    // the main one is interface 2 -- the enumeration order
+    // GetGlobalAddressIn()'s bug depends on.
+    Ptr<SimpleChannel> sideChannel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer sideDevices =
+        simpleNetDevice.Install(NodeContainer(nodes.Get(1), nodes.Get(2)), sideChannel);
+
+    Ptr<SimpleChannel> mainChannel = CreateObject<SimpleChannel>();
+    NetDeviceContainer mainDevices =
+        simpleNetDevice.Install(NodeContainer(nodes.Get(0), nodes.Get(1)), mainChannel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper sideIpv6;
+    sideIpv6.SetBase(Ipv6Address("2001:9::"), Ipv6Prefix(64));
+    Ipv6InterfaceContainer sideInterfaces = sideIpv6.Assign(sideDevices);
+    sideInterfaces.SetForwarding(0, true);
+    sideInterfaces.SetForwarding(1, true);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer mainInterfaces = ipv6.AssignWithoutAddress(mainDevices);
+    for (uint32_t i = 0; i < mainDevices.GetN(); i++)
+    {
+        mainInterfaces.SetForwarding(i, true);
+    }
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    // The base DODAG over the main interface, and DAD clearing the relay's
+    // side-interface static address, both need simulated time.
+    Simulator::Stop(Seconds(250));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> orig = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> relay = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(relay->IsJoined(), true, "The relay never joined the base DODAG");
+
+    // Read both addresses straight from the interface containers, not via
+    // relay->GetGlobalAddress() -- that scans every interface in the same
+    // enumeration order the bug under test depends on, so it would just
+    // reproduce whichever answer happens to come first instead of naming
+    // the specific interface each address actually belongs to.
+    Ipv6Address relayMainAddress = mainInterfaces.GetAddress(1, 1); // node 1 = relay; index 1: GUA
+    Ipv6Address relaySideAddress = sideInterfaces.GetAddress(0, 1); // node 0 = relay; index 1: GUA
+    NS_TEST_ASSERT_MSG_NE(relayMainAddress,
+                          Ipv6Address::GetAny(),
+                          "The relay has no address on its main interface");
+    NS_TEST_ASSERT_MSG_NE(relaySideAddress,
+                          Ipv6Address::GetAny(),
+                          "The relay has no address on its side interface");
+    NS_TEST_ASSERT_MSG_NE(relayMainAddress,
+                          relaySideAddress,
+                          "The two interfaces need distinct addresses for this test to mean "
+                          "anything");
+
+    Ipv6Address targAddress = relayMainAddress;
+    RplRoutingProtocol::DodagKey key = orig->DiscoverP2pRoute(targAddress);
+    NS_TEST_ASSERT_MSG_NE(key.dodagId, Ipv6Address::GetAny(), "The discovery did not start");
+
+    Simulator::Stop(Seconds(2));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(relay->IsJoinedTo(key.instanceId, key.dodagId),
+                          true,
+                          "The relay (the Target) never heard the P2P mode DIO");
+
+    std::vector<Ipv6Address> addressVector;
+    NS_TEST_ASSERT_MSG_EQ(relay->GetP2pAddressVector(key.instanceId, key.dodagId, addressVector),
+                          true,
+                          "The relay recorded no Address Vector at all");
+    NS_TEST_ASSERT_MSG_EQ(addressVector.size(),
+                          1,
+                          "The relay's Address Vector is the wrong length");
+    NS_TEST_ASSERT_MSG_EQ(addressVector[0],
+                          relayMainAddress,
+                          "The relay put its side interface's address in the Address Vector "
+                          "instead of the one the P2P mode DIO actually arrived on");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief A P2P-DRO carrying 'S' stops the routers it passes sending any
  *        more P2P mode DIOs for that temporary DAG.
  *
@@ -26249,6 +26376,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplP2pRoutesInPrintedTablesTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pDiscoverRouteTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pFloodTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pAddressVectorUsesReceivingInterfaceTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pStopSilencesDiosTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pStopDoesNotReachOtherDodagsTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplMop4WithNoDiscoveryOptionRefusedTestCase, TestCase::Duration::QUICK);

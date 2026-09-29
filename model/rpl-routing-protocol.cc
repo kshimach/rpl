@@ -1033,6 +1033,31 @@ RplRoutingProtocol::GetGlobalAddressIn(const DodagMembership& dodag) const
     return Ipv6Address::GetAny();
 }
 
+Ipv6Address
+RplRoutingProtocol::GetGlobalAddressOnInterface(const DodagMembership& dodag,
+                                                uint32_t interface) const
+{
+    for (uint32_t j = 0; j < m_ipv6->GetNAddresses(interface); j++)
+    {
+        Ipv6InterfaceAddress iaddr = m_ipv6->GetAddress(interface, j);
+        if (iaddr.GetScope() != Ipv6InterfaceAddress::GLOBAL ||
+            iaddr.GetState() == Ipv6InterfaceAddress::TENTATIVE)
+        {
+            continue;
+        }
+        if (!dodag.hasPrefixInfo)
+        {
+            return iaddr.GetAddress();
+        }
+        Ipv6Prefix prefix(dodag.prefixLength);
+        if (prefix.IsMatch(iaddr.GetAddress(), dodag.prefix))
+        {
+            return iaddr.GetAddress();
+        }
+    }
+    return Ipv6Address::GetAny();
+}
+
 void
 RplRoutingProtocol::HandleDadSuccess(const Ipv6Address& address)
 {

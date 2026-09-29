@@ -1804,10 +1804,13 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      * @param dodag the temporary DAG membership
      * @param rdo the arriving DIO's P2P-RDO
      * @param from the neighbour it came from, a link-local address
+     * @param interface the interface the DIO arrived on, for
+     *        GetGlobalAddressOnInterface() (RFC 6997 section 9.4)
      */
     void RecordP2pCandidateRoute(DodagMembership& dodag,
                                  const P2pRdoOption& rdo,
-                                 Ipv6Address from);
+                                 Ipv6Address from,
+                                 uint32_t interface);
 
     /**
      * @brief Drop candidate routes whose neighbour is no longer a usable
@@ -1845,8 +1848,14 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      *
      * @param dodag the temporary DAG membership, at this Target
      * @param rdo the arriving DIO's P2P-RDO
+     * @param asked how many alternates to keep (RFC 6997 section 7's 'N')
+     * @param interface the interface the DIO arrived on, for
+     *        GetGlobalAddressOnInterface() (RFC 6997 section 9.4)
      */
-    void RecordP2pAlternateRoute(DodagMembership& dodag, const P2pRdoOption& rdo, uint8_t asked);
+    void RecordP2pAlternateRoute(DodagMembership& dodag,
+                                 const P2pRdoOption& rdo,
+                                 uint8_t asked,
+                                 uint32_t interface);
 
     /**
      * @brief Send this Target's batch of P2P-DROs once the collection
@@ -2641,6 +2650,27 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      *         GetGlobalAddress() if the DODAG carries no prefix at all
      */
     Ipv6Address GetGlobalAddressIn(const DodagMembership& dodag) const;
+
+    /**
+     * @brief Like GetGlobalAddressIn(), but restricted to one interface.
+     *
+     * RFC 6997 section 9.4: "the intermediate router MUST add a unicast
+     * IPv6 address of **the receiving interface**...to the route in the
+     * Address vector" -- a per-packet requirement GetGlobalAddressIn()
+     * cannot satisfy, since it picks whichever interface's address happens
+     * to match the DODAG's prefix first, not necessarily the one a given
+     * P2P mode DIO actually arrived on. Identical to GetGlobalAddressIn()
+     * on a single-interface node; only a multi-interface one can tell the
+     * two apart.
+     *
+     * @param dodag the DODAG membership to find this node's address on
+     * @param interface the interface the DIO being processed arrived on
+     * @return the global address on that interface matching the DODAG's
+     *         prefix, :: if none is assigned (including while still
+     *         TENTATIVE); falls back to any global address on that
+     *         interface if the DODAG carries no prefix at all
+     */
+    Ipv6Address GetGlobalAddressOnInterface(const DodagMembership& dodag, uint32_t interface) const;
 
     /**
      * @brief Build the link-local address that shares an interface identifier

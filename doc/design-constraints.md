@@ -8568,7 +8568,7 @@ listed in the route" に対する乖離。これは §72 以前からある挙�
   インタフェースを走査して最初に prefix が一致したものを返し、
   `HandleP2pRdo()` が受け取っている `interface` 引数を使っていない。
   §72 以前からある挙動で primary 経路も同じ形。マルチインタフェース
-  ノードでのみ顕在化する。'N' とは独立の別件として未修正。
+  ノードでのみ顕在化する。'N' とは独立の別件として未修正。(§100で修正済み)
 - **'N' を経由ルータが書き換えられる** (Angle 3)。中継は受信値を
   素通しするので、フラッド上の任意のルータが 'N' を 0b11 にすると
   Target は 4 通ぶんのバッチを組む。ただしパディング廃止 (§73.2) に
@@ -11199,3 +11199,59 @@ G-RREP歯止め-13.4%(-13%)、F-all完全準拠1.28倍(1.25倍)。結論に変�
 微増する(137.4→141.4KB)。P2P-RPL自身のACK機構が持つコスト/信頼性の
 トレードオフであり、AODV-RPLとの比較(8.4節の主題)とは別の論点のため
 本節では立ち入らない。
+
+## 100. P2P-RPLのAddress Vectorが受信インターフェースでなく任意のインターフェースのアドレスを使っていた (RFC 6997 §7、§73の再訪)
+
+§73で「マルチインタフェースノードでのみ顕在化する、'N'とは独立の別件として
+未修正」と記録していたバグに着手した。
+
+### 100.1 RFC本文と実装のずれ
+
+RFC 6997 §7: "the intermediate router **MUST** add a unicast IPv6 address of
+**the receiving interface**...to the route in the Address vector."
+
+`HandleP2pRdo()`・`RecordP2pCandidateRoute()`・`RecordP2pAlternateRoute()`の
+3箇所とも、実際に載せていたのは`GetGlobalAddressIn(dodag)`の戻り値だった。
+この関数はノードの全インタフェースを番号順に走査し、DODAGのプレフィックス
+(またはプレフィックス情報が無ければ任意のグローバルアドレス)に最初に
+一致したものを返す — DIOが実際に届いたインタフェースは一切見ていない。
+単一インタフェースのノードでは番号順の走査結果と受信インタフェースが
+常に一致するため顕在化せず、複数インタフェースを持つノードでだけ、
+低い番号のインタフェースのアドレスが誤って載る。
+
+### 100.2 修正
+
+新規`GetGlobalAddressOnInterface(dodag, interface)`を追加した —
+`GetGlobalAddressIn()`と同じプレフィックス一致・フォールバックロジックだが、
+走査を指定した1インタフェースに限定する。`HandleP2pRdo()`は自分の
+`interface`引数をそのまま渡すだけで済んだ。`RecordP2pCandidateRoute()`・
+`RecordP2pAlternateRoute()`は`interface`引数を持っていなかったため、
+呼び出し元(`HandleP2pRdo()`、両方とも`interface`を持つ)から素通しする
+形でシグネチャに追加した。
+
+`GetGlobalAddressIn()`自体は変更していない — DAO関連の4呼び出し箇所
+(`SendDao()`・`SendNoPathDao()`・`HandleDao()`の自己判定)は、いずれも
+「このDODAGでの自分のアドレス」を問うものであって「どのインタフェースで
+受信したか」とは無関係であり、単一のグローバルアドレスで正しい。
+
+### 100.3 テスト
+
+新規`RplP2pAddressVectorUsesReceivingInterfaceTestCase`
+(`test/rpl-test-suite.cc`)。中継ノードに2つのインタフェースを持たせる —
+P2P探索とは無関係な「サイド」チャネル(先にインストールし、低い番号の
+インタフェースにする)と、Origin・Targetがいる「メイン」チャネル。
+サイド側には`Ipv6AddressHelper`で手動の固定プレフィックス(プレフィックス
+情報を持たないため、修正前は`GetGlobalAddressIn()`がフォールバックで
+「任意のグローバルアドレス」を返す経路)、メイン側にはRPLのSLAAC経由の
+アドレスを与える。期待値はテスト自身が`GetGlobalAddress()`のような
+全インタフェース走査ヘルパーで求めず、両インタフェースコンテナから
+直接読む — そうしないと期待値の計算自体が同じバグの影響を受ける
+(実際、最初に書いたテストはこれで自己矛盾していた)。
+
+load-bearing検証: `GetGlobalAddressOnInterface()`への切り替えを
+一時的に`GetGlobalAddressIn()`へ戻したところ、新規テストは
+「サイドインタフェースのアドレスが載っている」という、まさにバグの
+症状通りの理由でFAILすることを確認、元に戻して再度PASSを確認した。
+
+`./test.py -s rpl`: 163件(新規1件)全件PASS。既存の`RplP2pFloodTestCase`
+含め、単一インタフェースのシナリオは無変更で通る。
