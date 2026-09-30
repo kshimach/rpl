@@ -11661,3 +11661,30 @@ MUST NOT送る」を両立させるには、ウィンドウをメンバーシッ
 警告は0回だった)。多ホップでは、'L'の終わり際に出たDROは先に加入した上流の中継では
 既にメンバーシップが切れていて捨てられることが多い(§9.6のMUST discard)ため、効果は
 限られる。これは推論で、実測していない。
+
+## 112. TargNodeのRREP-Instanceを、OrigNodeでなくRREQ-Instanceごとに1本にする(§110 AODV-RPL 3)
+
+`StartAodvRrepInstance()`は「既にRREP-Instanceを建てているか」を`FindAodvRrepInstance(origNode)`、
+つまりOrigNodeだけで判定していた。同じOrigNodeからの2本目の非対称探索は、
+`HandleAodvRreq()`が既にisTargetを立てた後で拒否され、以後のコピーも§6.2.6の繰り返し判定で
+捨てられて、'L'満了まで一度も応答されなかった(§110、20シードで0/20)。旧コメントの
+「RFC 9854は2本目を想定していない」は、§6.1("OrigNode can maintain different RPL Instances
+to discover routes ... to the same targets")と§6.3.3("between the same pair of OrigNode and
+TargNode, there can be multiple AODV-RPL route discovery instances ... they MUST pair the
+RREQ-Instance and the RREP-Instance")に反していた。§6.3.2の"the TargNode MUST build a DODAG in
+the RREP-Instance corresponding to the RREQ-DIO"は、RREQ-DIOごとの対応を述べる。
+
+修正: 照合キーをRREQ-Instance、つまり(Orig_RPLInstanceID, OrigNode)にする(§2がこれを
+"uniquely identifies the RREQ-Instance"と定義する)。`FindAodvRrepInstance()`の引数に
+`rreqInstanceId`を加え、`aodv.pairedInstanceId`と照合する。公開関数のシグネチャ変更で、
+既存の試験2か所(`rreqKey.instanceId`を渡す)を更新した。同じRREQ-Instanceへの再参加による
+二重応答は、従来どおりこのガードが防ぐ。
+
+試験: `RplRrepInstancePerRreqInstanceTestCase`(175件になった)。1ノードをTargNodeにして、同じ
+OrigNodeから別のRREQ-InstanceIDの非対称RREQ-DIOを2通届け、それぞれに別のRREP-Instanceが
+建つこと。load-bearing検証: OrigNodeだけの照合に戻すと、2本目がどちらも最初のRREP-Instanceを
+指してFAILすることを確認した。
+
+未修正: OrigNode側は探索先1つにつき経路1本(`m_aodvRoutes[target]`)なので、並行探索の
+経路はOrigNodeで上書きし合う。§110の指摘のうち、フラグだけ残って以後応答しない構造
+(グローバルアドレス無し、Delta枯渇)は、標準構成で踏めないので手を入れていない。

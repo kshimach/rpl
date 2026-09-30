@@ -702,20 +702,26 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     bool IsAodvSymmetric(uint8_t instanceId, Ipv6Address dodagId) const;
 
     /**
-     * @brief Find the RREP-Instance this node holds for a given OrigNode.
+     * @brief Find the RREP-Instance this node holds for a given RREQ-Instance.
      *
      * An asymmetric discovery's RREP-Instance is keyed by the TargNode's
      * address, not the OrigNode's, and its RPLInstanceID is the
      * RREQ-InstanceID plus a Delta chosen at the TargNode (RFC 9854 section
      * 6.3.3) -- so neither half of its key can be predicted from the
-     * RREQ-Instance alone. This looks it up by the one thing a caller does
-     * know.
+     * RREQ-Instance alone. This looks it up by the RREQ-Instance it is
+     * paired with, (Orig_RPLInstanceID, OrigNode), which RFC 9854 section 2
+     * defines as what "uniquely identifies the RREQ-Instance". The OrigNode
+     * alone is not enough: one OrigNode can run several discoveries to the
+     * same TargNode at once (section 6.1, section 6.3.3).
      *
      * @param origNode the OrigNode the discovery is for
+     * @param rreqInstanceId the RREQ-InstanceID the discovery runs under
      * @param [out] key the RREP-Instance's key, untouched if none is found
      * @return true if this node holds such an RREP-Instance
      */
-    bool FindAodvRrepInstance(Ipv6Address origNode, DodagKey& key) const;
+    bool FindAodvRrepInstance(Ipv6Address origNode,
+                              uint8_t rreqInstanceId,
+                              DodagKey& key) const;
 
     // P2P-RPL (RFC 6997). Implemented in model/rpl-p2p.cc, not
     // model/rpl-routing-protocol.cc, the same split rpl-aodv.cc keeps for

@@ -9885,7 +9885,7 @@ RplAodvAsymmetricRrepInstanceTestCase::DoRun()
 
     // The second DODAG: rooted at the TargNode, not at the OrigNode.
     RplRoutingProtocol::DodagKey rrepKey;
-    NS_TEST_ASSERT_MSG_EQ(targ->FindAodvRrepInstance(origAddress, rrepKey),
+    NS_TEST_ASSERT_MSG_EQ(targ->FindAodvRrepInstance(origAddress, rreqKey.instanceId, rrepKey),
                           true,
                           "The TargNode never rooted an RREP-Instance for the asymmetric route");
     NS_TEST_ASSERT_MSG_EQ(rrepKey.dodagId,
@@ -10025,7 +10025,7 @@ RplAodvAsymmetricRrepFloodTestCase::DoRun()
 
     // The RREP-Instance the TargNode rooted, found by the OrigNode it names.
     RplRoutingProtocol::DodagKey rrepKey;
-    NS_TEST_ASSERT_MSG_EQ(targ->FindAodvRrepInstance(origAddress, rrepKey),
+    NS_TEST_ASSERT_MSG_EQ(targ->FindAodvRrepInstance(origAddress, rreqKey.instanceId, rrepKey),
                           true,
                           "The TargNode never rooted an RREP-Instance");
 
@@ -21913,6 +21913,129 @@ RplRrepInstanceAvoidsRejoinBarTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief A TargNode answers two asymmetric discoveries from the same
+ *        OrigNode that run at once.
+ *
+ * RFC 9854 section 6.3.3: "between the same pair of OrigNode and TargNode,
+ * there can be multiple AODV-RPL route discovery instances. So that OrigNode
+ * and TargNode can avoid any mismatch, they MUST pair the RREQ-Instance and
+ * the RREP-Instance in the same route discovery by using the RPLInstanceID."
+ * StartAodvRrepInstance() looked for an existing RREP-Instance by OrigNode
+ * alone, so the second discovery was refused after HandleAodvRreq() had
+ * already marked the node the TargNode, and no copy of it was ever answered
+ * (design-constraints.md section 110). One node as the TargNode, two
+ * hand-built asymmetric RREQ-DIOs from one OrigNode under different
+ * RREQ-InstanceIDs.
+ */
+class RplRrepInstancePerRreqInstanceTestCase : public TestCase
+{
+  public:
+    RplRrepInstancePerRreqInstanceTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplRrepInstancePerRreqInstanceTestCase::RplRrepInstancePerRreqInstanceTestCase()
+    : TestCase("A TargNode roots one RREP-Instance per RREQ-Instance, not one per OrigNode "
+              "(RFC 9854 section 6.3.3)")
+{
+}
+
+void
+RplRrepInstancePerRreqInstanceTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(1);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.SetBase(Ipv6Address("2001:1::"), Ipv6Prefix(64));
+    Ipv6InterfaceContainer interfaces = ipv6.Assign(devices);
+    interfaces.SetForwarding(0, true);
+
+    Ptr<Node> node = nodes.Get(0);
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+
+    Simulator::Stop(Seconds(5)); // let DAD clear the static address
+    Simulator::Run();
+
+    Ipv6Address self = interfaces.GetAddress(0, 1);
+    NS_TEST_ASSERT_MSG_NE(self, Ipv6Address::GetAny(), "no global address yet");
+    Ipv6Address origNode("2001:5::1");
+    Ipv6Address neighbour("fe80::a");
+    static constexpr uint8_t FIRST = 0x80;
+    static constexpr uint8_t SECOND = 0x81;
+
+    auto deliver = [&](uint8_t rreqInstance) {
+        RplDioHeader dio;
+        dio.SetInstanceId(rreqInstance);
+        dio.SetVersionNumber(0);
+        dio.SetRank(RPL_MIN_HOPRANKINC);
+        dio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+        dio.SetGrounded(true);
+        dio.SetDodagId(origNode);
+        dio.SetDtsn(0);
+        dio.SetDagConfiguration(0,
+                                20,
+                                RPL_DIO_REDUNDANCY,
+                                RPL_MAX_RANKINC,
+                                RPL_MIN_HOPRANKINC,
+                                RPL_OCP_OF0,
+                                RPL_DEFAULT_LIFETIME,
+                                RPL_DEFAULT_LIFETIME_UNIT);
+        RplDioHeader::RreqOption rreq;
+        rreq.symmetric = false; // an RREP-Instance, not a unicast RREP
+        rreq.hopByHop = false;
+        rreq.compr = 0;
+        rreq.lifetime = 1; // 16 s
+        rreq.rankLimit = 0;
+        rreq.origSeqNo = 1;
+        dio.SetRreq(rreq);
+        RplDioHeader::ArtOption art;
+        art.destSeqNo = 0;
+        art.prefixLength = 0;
+        art.target = self;
+        dio.SetArt(art);
+        DeliverRawRplMessage<RplDioHeader>(node,
+                                           1,
+                                           dio,
+                                           static_cast<uint8_t>(RPL_CODE_DIO),
+                                           neighbour,
+                                           Ipv6Address(RPL_ALL_NODES_MULTICAST));
+    };
+
+    deliver(FIRST);
+    deliver(SECOND); // the same OrigNode, a second discovery running at once
+
+    RplRoutingProtocol::DodagKey firstRrep;
+    RplRoutingProtocol::DodagKey secondRrep;
+    NS_TEST_ASSERT_MSG_EQ(rpl->FindAodvRrepInstance(origNode, FIRST, firstRrep),
+                          true,
+                          "No RREP-Instance for the first discovery");
+    NS_TEST_ASSERT_MSG_EQ(rpl->FindAodvRrepInstance(origNode, SECOND, secondRrep),
+                          true,
+                          "The TargNode rooted no RREP-Instance for a second discovery from the "
+                          "same OrigNode: it answers one discovery per OrigNode");
+    NS_TEST_ASSERT_MSG_NE(firstRrep.instanceId,
+                          secondRrep.instanceId,
+                          "Two discoveries share one RREP-InstanceID");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Follow a node all the way around the state machine: joined, then
  *        cut off from its only parent until it gives up on the DODAG, then
  *        reconnected and joined again.
@@ -27931,6 +28054,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplDisContinuesAfterDiscoveryJoinTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplRreqWithoutArtDroppedTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplRrepInstanceAvoidsRejoinBarTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplRrepInstancePerRreqInstanceTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplInterfaceRestartTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplRootReaddressTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplParentFreshnessTestCase, TestCase::Duration::QUICK);
