@@ -314,6 +314,23 @@ RplRoutingProtocol::HasOtherP2pTargets(const DodagMembership& dodag) const
     return false;
 }
 
+Ipv6Address
+RplRoutingProtocol::MatchedP2pTargetAddress(const DodagMembership& dodag) const
+{
+    if (IsOwnAddress(dodag.p2p.target))
+    {
+        return dodag.p2p.target;
+    }
+    for (const auto& target : dodag.p2p.additionalTargets)
+    {
+        if (IsOwnAddress(target))
+        {
+            return target;
+        }
+    }
+    return Ipv6Address::GetAny();
+}
+
 bool
 RplRoutingProtocol::ShouldRefuseP2pRdo(const RplDioHeader& dio, Ipv6Address from) const
 {
@@ -518,7 +535,16 @@ RplRoutingProtocol::HandleP2pRdo(const RplDioHeader& dio, Ipv6Address from, uint
         RecordP2pAlternateRoute(dodag, rdo, asked, interface);
     }
 
-    if (dodag.p2p.isTarget && !HasOtherP2pTargets(dodag))
+    // !addressVector.empty() rather than isTarget alone: the address-vector
+    // build below can itself return without setting anything, when this
+    // copy's own receiving interface has no global address yet (@see that
+    // return). isTarget latches immediately on a match and never un-sets, so
+    // without this a Target whose first matching copy arrived on such an
+    // interface would latch "already the Target" here on every later copy --
+    // including one arriving on a different interface that does have an
+    // address -- and never reply for the rest of the discovery. Found by
+    // /protocol-test-matrix's angle 4.
+    if (dodag.p2p.isTarget && !dodag.p2p.addressVector.empty() && !HasOtherP2pTargets(dodag))
     {
         NS_LOG_LOGIC("Already the Target of temporary DAG " << +key.instanceId
                                                              << ", ignoring a repeat");
@@ -816,7 +842,6 @@ RplRoutingProtocol::SendP2pDroRoute(DodagMembership& dodag,
                          << trackAck);
 
     NS_ASSERT_MSG(!route.empty(), "The Target is not in its own Address Vector");
-    Ipv6Address ownAddress = route.back();
 
     RplP2pDroHeader dro;
     dro.SetInstanceId(dodag.instanceId);
@@ -852,7 +877,15 @@ RplRoutingProtocol::SendP2pDroRoute(DodagMembership& dodag,
     // "the NH field is set to n = (Option Length - 2 - (16 - Compr)) /
     // (16 - Compr)", which is exactly this vector's own entry count.
     rdo.maxRankOrNh = static_cast<uint8_t>(rdo.addressVector.size());
-    rdo.target = ownAddress;
+    // Not route.back() (this Target's own address on whichever interface the
+    // triggering DIO happened to arrive on): RFC 6997 section 8.2 requires
+    // "a unicast global or unique-local IPv6 address of the Target
+    // generating the P2P-DRO", and on a multi-interface Target route.back()
+    // need not even be one of this node's own Target addresses, only its
+    // receiving interface's (@see MatchedP2pTargetAddress()). Found by
+    // /protocol-test-matrix's angle 4 as a regression from section 100's own
+    // interface-scoping fix.
+    rdo.target = MatchedP2pTargetAddress(dodag);
     dro.SetP2pRdo(rdo);
 
     Ptr<Packet> packet = Create<Packet>();

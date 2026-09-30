@@ -11320,3 +11320,91 @@ load-bearing検証: ガードを`if (false && rdo.target != dodag.p2p.target)`
 試験数表記も164→165に更新した。
 
 §73.4/§73.5の残り6件については引き続き専用テスト無し。
+
+## 103. 複数インタフェースのTargetがP2P-DROを返せない(§100の修正が起こした退行、および同根の2件)
+
+角4の再走(P2P-RPL担当)が見つけた。§100で`HandleP2pRdo()`のAddress Vector用アドレスを
+受信インタフェース限定にした結果、Targetの返信経路に2つの穴が開いていた。
+
+1. **P2P-DROのTargetAddrがAddress Vectorの末尾(=受信インタフェースのアドレス)になっていた。**
+   `SendP2pDroRoute()`は`rdo.target = route.back()`を送っていた。RFC 6997 §8.2は
+   "this field MUST contain a unicast global or unique-local IPv6 address of the Target
+   generating the P2P-DRO"と定める。受信インタフェースがTargetアドレスを持つものと
+   違うと、OriginのTarget照合(§102)がこの返信を捨てる。
+   修正: `MatchedP2pTargetAddress()`を追加し、自ノードのアドレスに一致した主TargetAddr
+   または RPL Target option のうち実際に一致した方を返す。当初`dodag.p2p.target`を
+   そのまま使ったが、RPL Target optionだけで一致するTarget(`RplP2pMultiTargetTestCase`)
+   が主Targetを名乗ってしまい既存試験が落ちたので、この形にした。
+2. **最初の一致DIOが、グローバルアドレスの無いインタフェースに届くと、以後一度も返信しない。**
+   `isTarget`は一致した時点で立ち、Address Vectorが空のまま「アドレス無し」で
+   returnする。その後の「Already the Target」ガードが`isTarget`だけを見ていたため、
+   アドレスのあるインタフェースに届いた次のコピーまで捨てていた。
+   修正: ガードを`isTarget && !addressVector.empty() && !HasOtherP2pTargets()`にした。
+
+試験(2件、167件になった):
+- `RplP2pTargetOnOtherInterfaceTestCase`: Targetアドレスが主インタフェース、DIOが副
+  インタフェースに届く。捕捉したP2P-DROのTargetAddrが主インタフェースのアドレスであること。
+- `RplP2pTargetRetriesOnAddresslessInterfaceTestCase`: 最初のコピーをアドレス無しの
+  インタフェース、次のコピーを主インタフェースに届け、後者でAddress Vectorが入ること。
+
+load-bearing検証: 1は`rdo.target = route.back()`に戻すと`actual=2001:9::...`でFAIL、
+2はガードから`!addressVector.empty()`を外すとFAILすることを確認した。2は当初
+`addressVector[0]`の索引でセグメンテーションフォルトになり、失敗ではなくクラッシュだった。
+アサーションは失敗しても戻らないので、索引の前に空チェックを入れた。
+
+試験の作り方で踏んだ点(次に同じ形の試験を書くときのために):
+- 送信ノード自身のraw socketは、自分が送ったマルチキャストを受け取らない。観測ノードを
+  別に置く。
+- 観測ノードはRPLを動かす。`StartInterface()`がRPLのマルチキャストグループへの参加を
+  しており、参加していないインタフェースはそのグループ宛を受け取らない。
+- IPv6のインタフェース番号は`Ipv6AddressHelper::Assign()`を呼んだ順で付く。デバイスを
+  作った順ではない。
+- インタフェースを上げるには`Assign()`か`AssignWithoutAddress()`が要る。どちらも
+  呼ばないインタフェースはRPLが始まらない。
+- `GetP2pAddressVector()`は、メンバーシップがあればAddress Vectorが空でも`true`を返す。
+
+## 104. 角4(シーケンス状態遷移)の再走で見つかった未修正の指摘
+
+`/protocol-test-matrix`の角4を、RPLコア、AODV-RPL、P2P-RPLの3担当で再走した。
+§103のほかは未修正。RPLコア分は別コンテキストの検証(Phase 2)まで済み、全件
+CONFIRMED。AODV-RPL分とP2P-RPL分は監査側の実測のみで、独立検証は未実施。
+
+### RPLコア(検証済み)
+1. **Path Sequenceが離脱・Version移行のたびに0へ戻る**(`pathSequence`は
+   `DodagMembership`の中)。rootは再参加後のDAOを「古い」と捨て、下り配送が
+   非storingで約29分、storingで最大約58分止まる(実測)。RFC 6550 §7.1は
+   Path SequenceをDODAG単位の値とする。既存の`RplParentLossRejoinTestCase`は
+   2ノード構成で、この欠陥を踏まない。
+2. **Lが同じVersionへの再参加で忘れられる**(`:2343`のerase、`:2175`)。RFC 6550
+   §8.2.2.4 rule 3(MUST)と、"loophole"を名指しする l.4005-4008に反する。離脱と
+   再参加を繰り返すとRankがINFINITE_RANKまで上がりうる(実測: 256 -> 1408、
+   循環で512 -> 2304)。同根で、離脱後に旧Version(v4)へ再参加できる(rule 6違反)。
+3. **`LeaveDodag()`のbase昇格がMOP 4を除外していない**(`:2369`)。§32.2の不変条件を
+   `:842`と`:2152`だけが守っている。昇格した一時インスタンスがDISを止め、期限切れ後に
+   baseスロットが宙に浮く。`IsJoined()`が偽になり、`scratch`のハーネスで約4%のrunに
+   偽のTC-NET-01/03 FAILが出る。昇格中は一時DAGがデータの経路にも使われる
+   (RFC 6997 §9.1違反)。
+4. **参加のきっかけのDIO自身が`ConsistencyHit()`で数えられる**(`:2096`)。k=1では各中継の
+   最初のDIOが必ず抑制される。直列5ノードでbase RPLの収束が13 s -> 67 s、AODV-RPLの
+   RREQ到達が0.39 s -> 3.7 s。25ノード格子では差が有意でない。
+5. **比較不能なVersion(差17以上)の優先親DIOを丸ごと捨てる**(`:1938`)。回復は
+   陳腐化判定頼みで実測44-50分。`GlobalRepairInterval`を有効にした場合だけ起きる。
+
+### AODV-RPL(監査側の実測、未検証)
+1. TargNodeのRREP-Instance ID割当がREJOIN_REENABLEを見ない(§95のRREQ側修正の移行漏れ)。
+   25ノード格子で、既に使ったキーの再利用探索が5件とも未完了。
+2. 同じノードが関わる並行探索がH=1で互いを壊す(宛先1つにつきHop-by-hop経路1件、
+   RREPごとにSeqNoを進める)。
+3. 同じOrigNode->TargNodeの2本目の並行探索が、非対称では永久に応答されない
+   (`FindAodvRrepInstance()`がOrigNodeだけで照合)。
+4. REJOIN_REENABLEが'L'満了のときしか張られない。親を失っての離脱では即再参加する。
+5. ARTの無いRREQ-DIO 1通で、期限の無いメンバーシップが永久に残る(`:615`)。
+6. Dest SeqNo 0(予約値)を128回ごとに送出する。§92.3の「0は二度と送出されない」は誤り。
+
+### P2P-RPL(監査側の実測、未検証。§103の分を除く)
+1. Stopの記録が'L'満了とともに消え、遅れて届いたDIOで再参加・再フラッドする(100シード中
+   38シード)。
+2. P2PとAODVのID割当が互いの再利用禁止を見ない。
+3. 一時DAGへの加入がノード全体のDISタイマーを取り消し、'L'満了後も再開しない。
+4. 収集ウィンドウのクランプを「既定値では到達不能」とするコメントと§78.6が誤り
+   (挙動は正しい)。

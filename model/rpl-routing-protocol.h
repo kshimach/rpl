@@ -1646,6 +1646,31 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     bool HasOtherP2pTargets(const DodagMembership& dodag) const;
 
     /**
+     * @brief Which of this node's own addresses is the Target a P2P-DRO
+     *        this node generates should identify itself as.
+     *
+     * RFC 6997 section 8.2: "When the P2P-RDO is included in a P2P-DRO,
+     * this field MUST contain a unicast global or unique-local IPv6
+     * address of the Target generating the P2P-DRO" -- a specific one of
+     * this node's own addresses, not whichever address happened to be
+     * appended to the Address vector (@see SendP2pDroRoute(), which used
+     * to send that instead: on a multi-interface Target it need not even
+     * be one of this node's Target addresses at all, only its receiving
+     * interface's). In a multi-Target discovery (RFC 6997 section 9.4),
+     * this node may have matched via the primary TargetAddr
+     * (dodag.p2p.target) or via one of the RPL Target options recorded
+     * in dodag.p2p.additionalTargets (@see MatchesP2pTarget()); this
+     * returns whichever one is actually this node's own address, so a
+     * Target matched only through an RPL Target option still identifies
+     * itself correctly rather than as the (different) primary Target.
+     *
+     * @param dodag the temporary DAG membership to check
+     * @return this node's own matched Target address, or GetAny() if
+     *         called when dodag.p2p.isTarget is not (or no longer) true
+     */
+    Ipv6Address MatchedP2pTargetAddress(const DodagMembership& dodag) const;
+
+    /**
      * @brief Act on an RREP-DIO travelling back towards the OrigNode.
      *
      * Never joined as a DODAG: on a symmetric route "the DODAG in

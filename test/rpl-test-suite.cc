@@ -14742,6 +14742,333 @@ RplP2pAddressVectorUsesReceivingInterfaceTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief A multi-interface Target's P2P-DRO names itself correctly even
+ *        when the triggering DIO arrived on an interface other than the
+ *        one holding its Target address.
+ *
+ * RFC 6997 section 8.2: "When the P2P-RDO is included in a P2P-DRO, this
+ * field MUST contain a unicast global or unique-local IPv6 address of the
+ * Target generating the P2P-DRO." SendP2pDroRoute() used to send
+ * route.back() instead -- this node's own Address Vector entry, which
+ * section 100's own fix scoped to the *receiving* interface. On a
+ * multi-interface Target those are not the same address, and the Origin's
+ * own section 102 TargetAddr check then discards the reply outright.
+ * Found by /protocol-test-matrix's angle 4 as a regression from section
+ * 100's own fix.
+ */
+class RplP2pTargetOnOtherInterfaceTestCase : public TestCase
+{
+  public:
+    RplP2pTargetOnOtherInterfaceTestCase();
+
+  private:
+    void DoRun() override;
+
+    /// @brief Capture a P2P-DRO seen at the monitor.
+    /// @param socket the monitoring socket
+    void CaptureDro(Ptr<Socket> socket);
+
+    bool m_seenDro{false};      //!< a P2P-DRO was seen
+    RplP2pDroHeader m_captured; //!< the first one seen
+};
+
+RplP2pTargetOnOtherInterfaceTestCase::RplP2pTargetOnOtherInterfaceTestCase()
+    : TestCase("A multi-interface Target's P2P-DRO names itself, not its receiving "
+              "interface's address (RFC 6997 section 8.2)")
+{
+}
+
+void
+RplP2pTargetOnOtherInterfaceTestCase::CaptureDro(Ptr<Socket> socket)
+{
+    Address sender;
+    Ptr<Packet> packet = socket->RecvFrom(sender);
+    if (!packet)
+    {
+        return;
+    }
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ipv6Header);
+    Icmpv6Header icmpv6Header;
+    packet->RemoveHeader(icmpv6Header);
+    if (icmpv6Header.GetType() != ICMPV6_RPL || icmpv6Header.GetCode() != RPL_CODE_P2P_DRO)
+    {
+        return;
+    }
+    if (m_seenDro)
+    {
+        return;
+    }
+    m_seenDro = true;
+    packet->RemoveHeader(m_captured);
+}
+
+void
+RplP2pTargetOnOtherInterfaceTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2); // 0 = monitor, 1 = the multi-interface Target under test
+
+    // The monitor shares the main channel with the Target, so it can
+    // actually observe the Target's multicast P2P-DRO -- a raw socket does
+    // not see a node's own locally-originated multicast looped back to
+    // itself, so a single-node version of this test would see nothing sent
+    // at all regardless of which address ends up in it.
+    Ptr<SimpleChannel> mainChannel = CreateObject<SimpleChannel>();
+    Ptr<SimpleChannel> sideChannel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer mainDevices = simpleNetDevice.Install(nodes, mainChannel);
+    NetDeviceContainer sideDevices =
+        simpleNetDevice.Install(NodeContainer(nodes.Get(1)), sideChannel);
+
+    // The monitor (node 0) also runs RPL, unrooted -- it never forms a DODAG
+    // of its own, but StartInterface() is what actually joins the RPL
+    // multicast group on its interface, and a raw socket sees nothing sent
+    // to a group its own interface never joined at the IPv6 layer.
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper mainIpv6;
+    mainIpv6.SetBase(Ipv6Address("2001:1::"), Ipv6Prefix(64));
+    Ipv6InterfaceContainer mainInterfaces = mainIpv6.Assign(mainDevices);
+    for (uint32_t i = 0; i < mainDevices.GetN(); i++)
+    {
+        mainInterfaces.SetForwarding(i, true);
+    }
+    Ipv6AddressHelper sideIpv6;
+    sideIpv6.SetBase(Ipv6Address("2001:9::"), Ipv6Prefix(64));
+    Ipv6InterfaceContainer sideInterfaces = sideIpv6.Assign(sideDevices);
+    sideInterfaces.SetForwarding(0, true);
+
+    Simulator::Stop(Seconds(5)); // let DAD clear both static addresses
+    Simulator::Run();
+
+    Ptr<Node> node = nodes.Get(1);
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+
+    Ipv6Address mainAddress = mainInterfaces.GetAddress(1, 1); // node 1's GUA on main
+    Ipv6Address sideAddress = sideInterfaces.GetAddress(0, 1); // node 1's GUA on side
+    NS_TEST_ASSERT_MSG_NE(mainAddress, Ipv6Address::GetAny(), "no main address yet");
+    NS_TEST_ASSERT_MSG_NE(sideAddress, Ipv6Address::GetAny(), "no side address yet");
+    NS_TEST_ASSERT_MSG_NE(mainAddress,
+                          sideAddress,
+                          "The two interfaces need distinct addresses for this test to mean "
+                          "anything");
+
+    Ptr<Socket> monitor = Socket::CreateSocket(nodes.Get(0), Ipv6RawSocketFactory::GetTypeId());
+    monitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    monitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    monitor->BindToNetDevice(mainDevices.Get(0));
+    monitor->SetRecvCallback(MakeCallback(&RplP2pTargetOnOtherInterfaceTestCase::CaptureDro, this));
+
+    Ipv6Address origin("2001:1::1");  // an unrelated placeholder DODAGID
+    Ipv6Address neighbour("fe80::a"); // the neighbour the DIO is heard from
+    static constexpr uint8_t INSTANCE = 0x81;
+    // Interface 0 is loopback; 1 and 2 are mainDevices/sideDevices, in
+    // installation order.
+    static constexpr uint32_t SIDE_INTERFACE = 2;
+
+    RplDioHeader dio;
+    dio.SetInstanceId(INSTANCE);
+    dio.SetVersionNumber(0);
+    dio.SetRank(RPL_MIN_HOPRANKINC);
+    dio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+    dio.SetGrounded(true);
+    dio.SetDodagId(origin);
+    dio.SetDtsn(0);
+    P2pRdoOption rdo;
+    rdo.reply = true;
+    rdo.hopByHop = false;
+    rdo.numRoutes = 0;
+    rdo.lifetime = 3;
+    rdo.maxRankOrNh = 5;
+    rdo.target = mainAddress; // this node's own address -- but on the OTHER interface
+    rdo.addressVector = {};
+    dio.SetP2pRdo(rdo);
+
+    // Delivered on the side interface: this node's Target address
+    // (mainAddress) belongs to a different interface than the one this DIO
+    // arrives on.
+    DeliverRawRplMessage<RplDioHeader>(node,
+                                       SIDE_INTERFACE,
+                                       dio,
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       neighbour,
+                                       Ipv6Address(RPL_ALL_NODES_MULTICAST));
+
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsP2pTarget(INSTANCE, origin),
+                          true,
+                          "The node did not recognise itself as the Target");
+
+    Simulator::Stop(MilliSeconds(10));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(m_seenDro, true, "No P2P-DRO was ever sent");
+    NS_TEST_ASSERT_MSG_EQ(m_captured.HasP2pRdo(), true, "No P2P-RDO");
+    NS_TEST_ASSERT_MSG_EQ(m_captured.GetP2pRdo().target,
+                          mainAddress,
+                          "The P2P-DRO named the receiving (side) interface's address instead "
+                          "of the Target address the Origin actually asked about -- the "
+                          "Origin's own section 102 check would discard this reply");
+
+    monitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief A Target whose first matching DIO arrives on an interface with no
+ *        global address yet still replies once a later copy arrives on an
+ *        interface that has one.
+ *
+ * HandleP2pRdo() latches isTarget as soon as a DIO's Target matches this
+ * node, before checking whether the receiving interface has a global
+ * address to put in the Address Vector -- if it does not yet, the function
+ * returns without recording a route. Before this fix, the "already the
+ * Target, ignoring a repeat" guard fired on isTarget alone, so a later copy
+ * of the same discovery arriving on a *different*, address-bearing
+ * interface was silently dropped too, and this Target never replied for
+ * the rest of the discovery. Found by /protocol-test-matrix's angle 4.
+ */
+class RplP2pTargetRetriesOnAddresslessInterfaceTestCase : public TestCase
+{
+  public:
+    RplP2pTargetRetriesOnAddresslessInterfaceTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplP2pTargetRetriesOnAddresslessInterfaceTestCase::
+    RplP2pTargetRetriesOnAddresslessInterfaceTestCase()
+    : TestCase("A Target retries on a later DIO copy if its first arrived on an "
+              "interface with no global address yet")
+{
+}
+
+void
+RplP2pTargetRetriesOnAddresslessInterfaceTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(1);
+
+    Ptr<SimpleChannel> mainChannel = CreateObject<SimpleChannel>();
+    Ptr<SimpleChannel> sideChannel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer mainDevices = simpleNetDevice.Install(nodes, mainChannel);
+    NetDeviceContainer sideDevices = simpleNetDevice.Install(nodes, sideChannel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    // Interface numbering follows Ipv6AddressHelper call order, not device
+    // installation order -- main has to be assigned first to land on
+    // interface 1, matching MAIN_INTERFACE/SIDE_INTERFACE below.
+    Ipv6AddressHelper mainIpv6;
+    mainIpv6.SetBase(Ipv6Address("2001:1::"), Ipv6Prefix(64));
+    Ipv6InterfaceContainer mainInterfaces = mainIpv6.Assign(mainDevices);
+    mainInterfaces.SetForwarding(0, true);
+
+    // Brought up with only a link-local address -- no global address yet,
+    // as if SLAAC on it had not completed. AssignWithoutAddress() (unlike
+    // simply never touching this interface) still calls SetUp(), which is
+    // what makes RplRoutingProtocol::NotifyInterfaceUp() actually fire and
+    // start RPL on it at all.
+    Ipv6AddressHelper sideIpv6;
+    sideIpv6.AssignWithoutAddress(sideDevices);
+
+    Simulator::Stop(Seconds(5)); // let DAD clear the static address
+    Simulator::Run();
+
+    Ptr<Node> node = nodes.Get(0);
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+
+    Ipv6Address mainAddress = mainInterfaces.GetAddress(0, 1); // GUA
+    NS_TEST_ASSERT_MSG_NE(mainAddress, Ipv6Address::GetAny(), "no main address yet");
+
+    Ipv6Address origin("2001:1::1");
+    Ipv6Address neighbour("fe80::a");
+    static constexpr uint8_t INSTANCE = 0x81;
+    // Interface 0 is loopback; 1 and 2 are mainDevices/sideDevices.
+    static constexpr uint32_t MAIN_INTERFACE = 1;
+    static constexpr uint32_t SIDE_INTERFACE = 2;
+
+    auto buildDio = [&]() {
+        RplDioHeader dio;
+        dio.SetInstanceId(INSTANCE);
+        dio.SetVersionNumber(0);
+        dio.SetRank(RPL_MIN_HOPRANKINC);
+        dio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+        dio.SetGrounded(true);
+        dio.SetDodagId(origin);
+        dio.SetDtsn(0);
+        P2pRdoOption rdo;
+        rdo.reply = true;
+        rdo.hopByHop = false;
+        rdo.numRoutes = 0;
+        rdo.lifetime = 3;
+        rdo.maxRankOrNh = 5;
+        rdo.target = mainAddress;
+        rdo.addressVector = {};
+        dio.SetP2pRdo(rdo);
+        return dio;
+    };
+
+    // Step 1: arrives on the side interface, which has no global address.
+    DeliverRawRplMessage<RplDioHeader>(node,
+                                       SIDE_INTERFACE,
+                                       buildDio(),
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       neighbour,
+                                       Ipv6Address(RPL_ALL_NODES_MULTICAST));
+
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsP2pTarget(INSTANCE, origin),
+                          true,
+                          "The node did not recognise itself as the Target");
+    std::vector<Ipv6Address> addressVector;
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetP2pAddressVector(INSTANCE, origin, addressVector),
+                          true,
+                          "The node did not join the temporary DAG at all");
+    NS_TEST_ASSERT_MSG_EQ(addressVector.empty(),
+                          true,
+                          "An Address Vector was recorded despite no global address being "
+                          "available on the receiving interface");
+
+    // Step 2: a later copy of the same discovery arrives on the main
+    // interface, which does have a global address.
+    DeliverRawRplMessage<RplDioHeader>(node,
+                                       MAIN_INTERFACE,
+                                       buildDio(),
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       neighbour,
+                                       Ipv6Address(RPL_ALL_NODES_MULTICAST));
+
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetP2pAddressVector(INSTANCE, origin, addressVector),
+                          true,
+                          "The Target never recorded an Address Vector on a later copy that "
+                          "arrived on an interface with a usable address -- the 'already the "
+                          "Target' guard must be blocking the retry");
+    NS_TEST_ASSERT_MSG_EQ(addressVector.size(), 1, "The Address Vector is the wrong length");
+    if (addressVector.empty())
+    {
+        Simulator::Destroy();
+        return;
+    }
+    NS_TEST_ASSERT_MSG_EQ(addressVector[0], mainAddress, "The recorded address is wrong");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief A P2P-DRO carrying 'S' stops the routers it passes sending any
  *        more P2P mode DIOs for that temporary DAG.
  *
@@ -26659,6 +26986,8 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplP2pDiscoverRouteTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pFloodTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pAddressVectorUsesReceivingInterfaceTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pTargetOnOtherInterfaceTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pTargetRetriesOnAddresslessInterfaceTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pStopSilencesDiosTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pStopDoesNotReachOtherDodagsTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplMop4WithNoDiscoveryOptionRefusedTestCase, TestCase::Duration::QUICK);
