@@ -2268,16 +2268,25 @@ RplRoutingProtocol::JoinDodag(const RplDioHeader& dio, uint32_t interface)
         }
     }
 
-    m_disTimer.Cancel();
-    // Cleared here too, not only in DisTimerExpire() (@see
-    // m_disRefreshPending's own doc comment): a successful join cancels
-    // m_disTimer through this completely different path, bypassing
-    // DisTimerExpire() entirely, so without this a pending flag armed by
-    // an earlier best.IsAny() and then cancelled by this same join (e.g.
-    // rejoining via one neighbour right after losing another) would stay
-    // stuck true forever, silently blocking every future trigger from
-    // ever arming another one.
-    m_disRefreshPending = false;
+    // Only a join that can be the base DODAG ends the search for one. A
+    // route-discovery instance is scoped to somebody else's discovery and
+    // leaves this node with no base DODAG at all: cancelling here left
+    // DisTimerExpire() nothing to re-arm it from, and this node then sent no
+    // DIS for the rest of its life (or until an unsolicited DIO happened to
+    // arrive), well past the instance's own 'L'.
+    if (dodag.mop != RPL_MOP_P2P_ROUTE_DISCOVERY)
+    {
+        m_disTimer.Cancel();
+        // Cleared here too, not only in DisTimerExpire() (@see
+        // m_disRefreshPending's own doc comment): a successful join cancels
+        // m_disTimer through this completely different path, bypassing
+        // DisTimerExpire() entirely, so without this a pending flag armed by
+        // an earlier best.IsAny() and then cancelled by this same join (e.g.
+        // rejoining via one neighbour right after losing another) would stay
+        // stuck true forever, silently blocking every future trigger from
+        // ever arming another one.
+        m_disRefreshPending = false;
+    }
 
     // A freshly constructed DodagMembership's Timer-bearing members start
     // out with no function bound at all (unlike the old scalar members,
@@ -2398,10 +2407,23 @@ RplRoutingProtocol::LeaveDodag(DodagKey key, bool poison)
         // exactly the key JoinDodag() is about to reinsert, so the base
         // identity survives the migration unchanged, which is the whole
         // point of not poisoning on the way out.
-        m_hasBaseDodag = !m_dodags.empty();
-        if (m_hasBaseDodag)
+        //
+        // Never a route-discovery instance, the same rule JoinDodag() and
+        // CreateDodagMembership() apply when the slot is first filled: it is
+        // transient, so promoting one strands every base-scoped accessor when
+        // its 'L' expires, reports an unjoined node as joined until then, and
+        // (RFC 6997 section 9.1: "The temporary DAG MUST NOT be used to route
+        // data packets") lets RouteOutput() forward data through it. With
+        // only those left, the node has no base DODAG.
+        m_hasBaseDodag = false;
+        for (const auto& [survivorKey, survivor] : m_dodags)
         {
-            m_baseDodagKey = m_dodags.begin()->first;
+            if (survivor.mop != RPL_MOP_P2P_ROUTE_DISCOVERY)
+            {
+                m_hasBaseDodag = true;
+                m_baseDodagKey = survivorKey;
+                break;
+            }
         }
     }
 }

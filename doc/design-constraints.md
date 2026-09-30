@@ -11468,3 +11468,44 @@ Version入口の拒否を外すとv4に参加してFAILすることを確認し�
 
 未修正: ここで直したのは再参加後のLだけ。§104のP2P/AODV側の`REJOIN_REENABLE`、
 DAOSequenceの巻き戻り、Trickleのconsistent判定は別項目。
+
+## 107. base DODAGの昇格が経路探索インスタンスを選び、DISが止まる(§104 RPLコア3、P2P-RPL3)
+
+`LeaveDodag()`のbase昇格は`m_dodags.begin()`の生き残りを選び、MOPを見ていなかった。
+`CreateDodagMembership()`と`JoinDodag()`は§32.2の不変条件(経路探索インスタンスはbaseに
+ならない)を守っていたが、3つ目の入口が抜けていた。`rpl-aodv.cc`のコメントは
+その不変条件を述べていたが、実装が従っていなかった。これは§104で既に検証済みで、
+コミット4b237d4のメッセージが同じ害("would strand every base-scoped accessor")を書いている。
+
+害(検証側の実測):
+- 昇格したMOP 4インスタンスが`IsJoined()`を真にし、`GetDodagId()`が探索の
+  DODAGIDを返す。期限切れ('L')後にbaseスロットは存在しないキーを指したまま残り、
+  実際にはbaseのメンバーなのに`IsJoined()`が偽のままになる。
+- `RouteOutput()`の最後のフォールバックがbaseの優先親経由になるので、データが
+  一時DAGの親へ向かう(RFC 6997 §9.1: "The temporary DAG MUST NOT be used to
+  route data packets"に反する)。
+- `scratch`のハーネスで、120 run中5 run(約4%)に偽のTC-NET-01/03 FAILが出る。
+- 昇格したときは`DisTimerExpire()`が`IsJoined()`を見て再スケジュールせず、DISが止まる。
+
+別経路で同じ症状: `JoinDodag()`は種類を問わず`m_disTimer.Cancel()`していた。baseの
+無いノードが経路探索DIOを1通聞くだけで、DISが二度と出なくなる(P2P-RPL担当の実測で、
+DIS 30秒周期のノードが(100, 500]秒に13回 -> 0回)。
+
+修正:
+1. 昇格は経路探索インスタンスを飛ばす。生き残りがそれだけなら`m_hasBaseDodag`を偽にする。
+2. `JoinDodag()`のDIS timerのcancelと`m_disRefreshPending`の解除を、経路探索インスタンスの
+   参加では行わない。
+
+試験(171件になった):
+- `RplBaseDodagNotPromotedFromDiscoveryTestCase`: baseとP2Pの一時DAGに参加し、baseの唯一の
+  親がpoisonした後、`IsJoined()`が偽であること。
+- `RplDisContinuesAfterDiscoveryJoinTestCase`: baseの無いノードが一時DAGに参加した後の
+  100秒に、観測ノードがそのノードのDISを2回以上見ること。
+
+load-bearing検証: 昇格の絞り込みを外すと`IsJoined()`が真でFAIL、DISのcancelを無条件に
+戻すとDISが0回でFAILすることを確認した。
+
+未修正: 昇格していた間の`RouteOutput()`の経路は、baseが正しく偽になるので通らなくなった
+が、そのフォールバック自体に`RPL_MOP_P2P_ROUTE_DISCOVERY`の判定を入れてはいない。
+§104のAODV-RPL担当が報告した「MOP 4のメンバーシップにも`LeaveDodag(key, true)`が走り、
+poisonのDIOとDISを出す」点も、別項目として残る。

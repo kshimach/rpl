@@ -21255,6 +21255,259 @@ RplRejoinKeepsRankCeilingTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief Losing the base DODAG never promotes a route-discovery instance to
+ *        be the base DODAG.
+ *
+ * RFC 6997 section 9.1: "The temporary DAG MUST NOT be used to route data
+ * packets", and a route-discovery instance is scoped to somebody else's
+ * discovery. JoinDodag() and CreateDodagMembership() already keep it out of
+ * the base slot; LeaveDodag()'s promotion of a survivor did not, so a node
+ * that lost its base DODAG while holding one reported itself joined to
+ * it, and RouteOutput() sent data through it (design-constraints.md section
+ * 104). One node, hand-built DIOs: join the base DODAG, join a P2P-RPL
+ * temporary DAG, then lose the base DODAG's only parent.
+ */
+class RplBaseDodagNotPromotedFromDiscoveryTestCase : public TestCase
+{
+  public:
+    RplBaseDodagNotPromotedFromDiscoveryTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplBaseDodagNotPromotedFromDiscoveryTestCase::RplBaseDodagNotPromotedFromDiscoveryTestCase()
+    : TestCase("Losing the base DODAG does not promote a route-discovery instance in its place")
+{
+}
+
+void
+RplBaseDodagNotPromotedFromDiscoveryTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(1);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.AssignWithoutAddress(devices);
+
+    Ptr<Node> node = nodes.Get(0);
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+
+    Simulator::Stop(Seconds(1));
+    Simulator::Run();
+
+    Ipv6Address baseId("2001:1::1");
+    Ipv6Address discoveryId("2001:2::1");
+    Ipv6Address parent("fe80::a");
+    static constexpr uint8_t BASE_INSTANCE = 0;
+    static constexpr uint8_t DISCOVERY_INSTANCE = 0x81;
+
+    auto deliver = [&](const RplDioHeader& dio) {
+        DeliverRawRplMessage<RplDioHeader>(node,
+                                           1,
+                                           dio,
+                                           static_cast<uint8_t>(RPL_CODE_DIO),
+                                           parent,
+                                           Ipv6Address(RPL_ALL_NODES_MULTICAST));
+    };
+    auto baseDio = [&](uint16_t rank) {
+        RplDioHeader dio;
+        dio.SetInstanceId(BASE_INSTANCE);
+        dio.SetVersionNumber(0);
+        dio.SetRank(rank);
+        dio.SetMop(RPL_MOP_NON_STORING);
+        dio.SetGrounded(true);
+        dio.SetDodagId(baseId);
+        dio.SetDtsn(0);
+        dio.SetDagConfiguration(4,
+                                6,
+                                0,
+                                0,
+                                RPL_MIN_HOPRANKINC,
+                                RPL_OCP_OF0,
+                                RPL_DEFAULT_LIFETIME,
+                                RPL_DEFAULT_LIFETIME_UNIT);
+        return dio;
+    };
+
+    deliver(baseDio(RPL_MIN_HOPRANKINC));
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoined(), true, "The node never joined the base DODAG");
+
+    RplDioHeader discovery;
+    discovery.SetInstanceId(DISCOVERY_INSTANCE);
+    discovery.SetVersionNumber(0);
+    discovery.SetRank(RPL_MIN_HOPRANKINC);
+    discovery.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+    discovery.SetGrounded(true);
+    discovery.SetDodagId(discoveryId);
+    discovery.SetDtsn(0);
+    P2pRdoOption rdo;
+    rdo.reply = false;
+    rdo.hopByHop = false;
+    rdo.numRoutes = 0;
+    rdo.lifetime = 3;
+    rdo.maxRankOrNh = 5;
+    rdo.target = Ipv6Address("2001:9::99"); // not this node
+    rdo.addressVector = {};
+    discovery.SetP2pRdo(rdo);
+    deliver(discovery);
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(DISCOVERY_INSTANCE, discoveryId),
+                          true,
+                          "The node did not join the temporary DAG");
+
+    deliver(baseDio(RPL_INFINITE_RANK));
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(BASE_INSTANCE, baseId),
+                          false,
+                          "The base DODAG was not left");
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoined(),
+                          false,
+                          "A route-discovery instance was promoted to the base DODAG: the node "
+                          "reports itself joined with no base DODAG");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief Joining a route-discovery instance does not stop an unjoined node
+ *        from soliciting a base DODAG.
+ *
+ * JoinDodag() cancelled the node-wide DIS timer for every join. A
+ * route-discovery instance leaves the node with no base DODAG, and
+ * DisTimerExpire() only re-arms itself, so nothing ever fired again
+ * (design-constraints.md section 104). A DUT with no base DODAG hears a
+ * P2P-RPL DIO; a second node observes whether the DUT keeps sending DIS.
+ */
+class RplDisContinuesAfterDiscoveryJoinTestCase : public TestCase
+{
+  public:
+    RplDisContinuesAfterDiscoveryJoinTestCase();
+
+  private:
+    void DoRun() override;
+
+    /// @brief Record a DIS sent by the node under test.
+    /// @param socket the monitoring socket
+    void CaptureDis(Ptr<Socket> socket);
+
+    Ipv6Address m_dutLinkLocal;    //!< link-local address of the node under test
+    std::vector<Time> m_dutDisTimes; //!< when the node under test sent a DIS
+};
+
+RplDisContinuesAfterDiscoveryJoinTestCase::RplDisContinuesAfterDiscoveryJoinTestCase()
+    : TestCase("An unjoined node keeps sending DIS after joining a route-discovery instance")
+{
+}
+
+void
+RplDisContinuesAfterDiscoveryJoinTestCase::CaptureDis(Ptr<Socket> socket)
+{
+    Address sender;
+    Ptr<Packet> packet = socket->RecvFrom(sender);
+    if (!packet)
+    {
+        return;
+    }
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ipv6Header);
+    Icmpv6Header icmpv6Header;
+    packet->RemoveHeader(icmpv6Header);
+    if (icmpv6Header.GetType() == ICMPV6_RPL && icmpv6Header.GetCode() == RPL_CODE_DIS &&
+        ipv6Header.GetSource() == m_dutLinkLocal)
+    {
+        m_dutDisTimes.push_back(Simulator::Now());
+    }
+}
+
+void
+RplDisContinuesAfterDiscoveryJoinTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2); // 0 = monitor, 1 = node under test
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.AssignWithoutAddress(devices);
+
+    Ptr<Node> dut = nodes.Get(1);
+    m_dutLinkLocal = dut->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    // The monitor runs RPL too, unrooted: StartInterface() is what joins the
+    // RPL multicast group on its interface.
+    Ptr<Socket> monitor = Socket::CreateSocket(nodes.Get(0), Ipv6RawSocketFactory::GetTypeId());
+    monitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    monitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    monitor->BindToNetDevice(devices.Get(0));
+    monitor->SetRecvCallback(
+        MakeCallback(&RplDisContinuesAfterDiscoveryJoinTestCase::CaptureDis, this));
+
+    Simulator::Stop(Seconds(2));
+    Simulator::Run();
+
+    Ipv6Address discoveryId("2001:2::1");
+    RplDioHeader discovery;
+    discovery.SetInstanceId(0x81);
+    discovery.SetVersionNumber(0);
+    discovery.SetRank(RPL_MIN_HOPRANKINC);
+    discovery.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+    discovery.SetGrounded(true);
+    discovery.SetDodagId(discoveryId);
+    discovery.SetDtsn(0);
+    P2pRdoOption rdo;
+    rdo.reply = false;
+    rdo.hopByHop = false;
+    rdo.numRoutes = 0;
+    rdo.lifetime = 3;
+    rdo.maxRankOrNh = 5;
+    rdo.target = Ipv6Address("2001:9::99"); // not this node
+    rdo.addressVector = {};
+    discovery.SetP2pRdo(rdo);
+    DeliverRawRplMessage<RplDioHeader>(dut,
+                                       1,
+                                       discovery,
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       Ipv6Address("fe80::a"),
+                                       Ipv6Address(RPL_ALL_NODES_MULTICAST));
+    NS_TEST_ASSERT_MSG_EQ(dut->GetObject<RplRoutingProtocol>()->IsJoinedTo(0x81, discoveryId),
+                          true,
+                          "The node did not join the route-discovery instance");
+    m_dutDisTimes.clear();
+
+    Simulator::Stop(Seconds(100));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_GT_OR_EQ(m_dutDisTimes.size(),
+                                2,
+                                "The node stopped soliciting a base DODAG once it joined a "
+                                "route-discovery instance that leaves it with none");
+
+    monitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Follow a node all the way around the state machine: joined, then
  *        cut off from its only parent until it gives up on the DODAG, then
  *        reconnected and joined again.
@@ -27268,6 +27521,8 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplParentLossRejoinTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplPathSequenceSurvivesRejoinTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplRejoinKeepsRankCeilingTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplBaseDodagNotPromotedFromDiscoveryTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplDisContinuesAfterDiscoveryJoinTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplInterfaceRestartTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplRootReaddressTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplParentFreshnessTestCase, TestCase::Duration::QUICK);
