@@ -1292,8 +1292,19 @@ RplRoutingProtocol::StartAodvRrepInstance(const DodagMembership& rreqDodag, Doda
     // 5.1 requires it clear in control messages), which would leave the
     // instance running under an ID one bit off from the one Delta describes,
     // and every receiver's own instanceId - delta would then miss.
+    //
+    // An RREP-Instance this node has recently left is skipped too, the same
+    // REJOIN_REENABLE bar the relays apply to it (@see
+    // ShouldRefuseAodvRrep()) and DiscoverRoute() applies to its own
+    // RREQ-InstanceID (section 95). Choosing by IsJoinedTo() alone reused the
+    // {ID, this node} of an instance that had just expired, which every relay
+    // still inside the bar then refused: the discovery never completed
+    // (design-constraints.md section 104).
     uint8_t rrepInstanceId = 0;
     bool found = false;
+    Time earliestFree = Time::Max();
+    uint8_t earliestFreeId = 0;
+    bool anyBarred = false;
     for (uint8_t delta = 0; delta <= (RPL_AODV_DELTA_MASK >> RPL_AODV_DELTA_SHIFT); delta++)
     {
         uint8_t candidate = static_cast<uint8_t>(rreqKey.instanceId + delta);
@@ -1301,12 +1312,34 @@ RplRoutingProtocol::StartAodvRrepInstance(const DodagMembership& rreqDodag, Doda
         {
             continue;
         }
-        if (!IsJoinedTo(candidate, ownAddress))
+        if (IsJoinedTo(candidate, ownAddress))
         {
-            rrepInstanceId = candidate;
-            found = true;
-            break;
+            continue;
         }
+        auto blocked = m_aodvRejoinBlocked.find(DodagKey{candidate, ownAddress});
+        if (blocked != m_aodvRejoinBlocked.end() && Simulator::Now() < blocked->second)
+        {
+            anyBarred = true;
+            if (blocked->second < earliestFree)
+            {
+                earliestFree = blocked->second;
+                earliestFreeId = candidate;
+            }
+            continue;
+        }
+        rrepInstanceId = candidate;
+        found = true;
+        break;
+    }
+    if (!found && anyBarred)
+    {
+        // Every Delta is inside its bar: degrade this discovery (relays still
+        // barred refuse it) rather than refuse to answer at all.
+        rrepInstanceId = earliestFreeId;
+        found = true;
+        NS_LOG_WARN("Every RREP-InstanceID for RREQ-Instance "
+                    << +rreqKey.instanceId << " is still inside its REJOIN_REENABLE bar; reusing "
+                    << +rrepInstanceId << ", which frees up at " << earliestFree.As(Time::S));
     }
     if (!found)
     {

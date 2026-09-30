@@ -11529,3 +11529,32 @@ RFCは"the message"を捨てると書いている。§6.3で直した「'L'が�
 試験: `RplRreqWithoutArtDroppedTestCase`(172件になった)。ARTの有無だけが違う2通のRREQ-DIO。
 無い方は参加せず、メンバーシップも残らないこと、ある方は参加すること。
 load-bearing検証: 検査を外すと参加してFAILすることを確認した。
+
+## 109. TargNodeのRREP-InstanceID選択がREJOIN_REENABLEを見ていなかった(§104 AODV-RPL1)
+
+中継側は`ShouldRefuseAodvRrep()`でRREP-InstanceにもREJOIN_REENABLEのbarを適用し、OrigNodeの
+RREQ-InstanceID選択は§95でbarを避けるようになっていた。`StartAodvRrepInstance()`の
+Delta選択だけが`IsJoinedTo()`で空きを見ており、直前に期限切れになったRREP-Instanceの
+`{ID, TargNode}`を選び直した。中継はbarの中でそれを拒否するので、非対称の探索が完了しない。
+§95の移行漏れ(角5)である。RFC 9854 §6.3.3はactiveなRREP-InstanceのIDの再利用だけを
+MUST NOTとしているので、barの適用は実装が中継側で選んだ規則に、TargNodeを揃えたものである。
+
+監査側の実測: 25ノード格子の非対称で、145 sの第2ラウンドに既に使われたRREP-Instanceキーを
+再利用した探索が5件、5件とも未完了(再利用でない探索は21件中20件が完了)。
+`AodvRejoinReenable=20s`にすると26件すべて完了した。多対一の通信では、2番目以降の
+OrigNodeの最初の探索がこの形になる。
+
+修正: Delta選択でbarの中のIDを飛ばす。全Deltaがbarの中なら、最も早く空くものを使う
+(探索を劣化させても、応答自体はしない、よりは良い)。`DiscoverRoute()`と同じ形。
+
+試験: `RplRrepInstanceAvoidsRejoinBarTestCase`(173件になった)。1ノードをTargNodeにして、
+非対称のRREQ-DIOを2通、別のOrigNodeから同じRREQ-InstanceIDで届ける。1通目のRREP-Instance
+が期限切れになった後、2通目ではDelta 1のIDを使うこと。load-bearing検証: barの判定を
+外すとDelta 0を再利用してFAILすることを確認した。
+
+### §104の対応状況(この時点)
+- RPLコア: 1 -> §105、2 -> §106、3 -> §107。4(Trickleのconsistent判定)と5(比較不能な
+  Version)は既定値に触れるため保留(利用者の判断待ち)。
+- AODV-RPL: 1 -> §109、5 -> §108。2, 3, 4, 6は未対応。
+- P2P-RPL: 3 -> §107(DIS timer)。1, 2, 4は未対応。§103は別途修正済み。
+- AODV-RPLとP2P-RPLの指摘のうち、独立した検証を経たのは今回試験で再現できたものだけである。

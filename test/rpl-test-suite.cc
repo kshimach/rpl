@@ -21621,6 +21621,132 @@ RplRreqWithoutArtDroppedTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief A TargNode does not reuse an RREP-InstanceID it has just left.
+ *
+ * Every relay applies REJOIN_REENABLE to an RREP-Instance
+ * (ShouldRefuseAodvRrep()), and DiscoverRoute() already steers the OrigNode's
+ * own RREQ-InstanceID away from one still inside the bar (section 95).
+ * StartAodvRrepInstance() chose its Delta by IsJoinedTo() alone, so a second
+ * asymmetric discovery reaching the same TargNode after the first instance
+ * expired rooted {ID, TargNode} again, and every relay refused it
+ * (design-constraints.md section 104). One node as the TargNode, two
+ * hand-built asymmetric RREQ-DIOs from different OrigNodes that use the same
+ * RREQ-InstanceID.
+ */
+class RplRrepInstanceAvoidsRejoinBarTestCase : public TestCase
+{
+  public:
+    RplRrepInstanceAvoidsRejoinBarTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplRrepInstanceAvoidsRejoinBarTestCase::RplRrepInstanceAvoidsRejoinBarTestCase()
+    : TestCase("A TargNode's RREP-InstanceID choice skips one still inside REJOIN_REENABLE")
+{
+}
+
+void
+RplRrepInstanceAvoidsRejoinBarTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(1);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.SetBase(Ipv6Address("2001:1::"), Ipv6Prefix(64));
+    Ipv6InterfaceContainer interfaces = ipv6.Assign(devices);
+    interfaces.SetForwarding(0, true);
+
+    Ptr<Node> node = nodes.Get(0);
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+
+    Simulator::Stop(Seconds(5)); // let DAD clear the static address
+    Simulator::Run();
+
+    Ipv6Address self = interfaces.GetAddress(0, 1);
+    NS_TEST_ASSERT_MSG_NE(self, Ipv6Address::GetAny(), "no global address yet");
+    Ipv6Address neighbour("fe80::a");
+    static constexpr uint8_t RREQ_INSTANCE = 0x80;
+
+    auto deliver = [&](Ipv6Address origNode) {
+        RplDioHeader dio;
+        dio.SetInstanceId(RREQ_INSTANCE);
+        dio.SetVersionNumber(0);
+        dio.SetRank(RPL_MIN_HOPRANKINC);
+        dio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+        dio.SetGrounded(true);
+        dio.SetDodagId(origNode);
+        dio.SetDtsn(0);
+        dio.SetDagConfiguration(0,
+                                20,
+                                RPL_DIO_REDUNDANCY,
+                                RPL_MAX_RANKINC,
+                                RPL_MIN_HOPRANKINC,
+                                RPL_OCP_OF0,
+                                RPL_DEFAULT_LIFETIME,
+                                RPL_DEFAULT_LIFETIME_UNIT);
+        RplDioHeader::RreqOption rreq;
+        rreq.symmetric = false; // an RREP-Instance, not a unicast RREP
+        rreq.hopByHop = false;
+        rreq.compr = 0;
+        rreq.lifetime = 1; // 16 s
+        rreq.rankLimit = 0;
+        rreq.origSeqNo = 1;
+        dio.SetRreq(rreq);
+        RplDioHeader::ArtOption art;
+        art.destSeqNo = 0;
+        art.prefixLength = 0;
+        art.target = self;
+        dio.SetArt(art);
+        DeliverRawRplMessage<RplDioHeader>(node,
+                                           1,
+                                           dio,
+                                           static_cast<uint8_t>(RPL_CODE_DIO),
+                                           neighbour,
+                                           Ipv6Address(RPL_ALL_NODES_MULTICAST));
+    };
+
+    // First discovery: the TargNode roots the RREP-Instance at Delta 0.
+    deliver(Ipv6Address("2001:5::1"));
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(RREQ_INSTANCE, self),
+                          true,
+                          "The TargNode did not root an RREP-Instance at Delta 0");
+
+    // Both instances run out their 'L' (16 s); the TargNode's own bar on
+    // the RREP-Instance is armed then and lasts REJOIN_REENABLE.
+    Simulator::Stop(Seconds(20));
+    Simulator::Run();
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(RREQ_INSTANCE, self),
+                          false,
+                          "The first RREP-Instance did not expire");
+
+    // Second discovery, a different OrigNode reusing the RREQ-InstanceID.
+    deliver(Ipv6Address("2001:5::2"));
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(RREQ_INSTANCE, self),
+                          false,
+                          "The TargNode reused the RREP-InstanceID it had just left, which "
+                          "every relay still inside REJOIN_REENABLE would refuse");
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(RREQ_INSTANCE + 1, self),
+                          true,
+                          "The TargNode rooted no RREP-Instance for the second discovery");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Follow a node all the way around the state machine: joined, then
  *        cut off from its only parent until it gives up on the DODAG, then
  *        reconnected and joined again.
@@ -27637,6 +27763,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplBaseDodagNotPromotedFromDiscoveryTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDisContinuesAfterDiscoveryJoinTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplRreqWithoutArtDroppedTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplRrepInstanceAvoidsRejoinBarTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplInterfaceRestartTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplRootReaddressTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplParentFreshnessTestCase, TestCase::Duration::QUICK);
