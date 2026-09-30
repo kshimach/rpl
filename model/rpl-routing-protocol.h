@@ -768,6 +768,17 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     bool IsP2pTarget(uint8_t instanceId, Ipv6Address dodagId) const;
 
     /**
+     * @brief Get the Path Sequence this node currently advertises for a
+     *        DODAG it is a member of. Exposed for tests.
+     *
+     * @param instanceId the RPLInstanceID of the DODAG
+     * @param dodagId the DODAGID
+     * @param [out] pathSequence the counter's current value
+     * @return true if this node is a member of that DODAG
+     */
+    bool GetPathSequence(uint8_t instanceId, Ipv6Address dodagId, uint8_t& pathSequence) const;
+
+    /**
      * @brief Get the source route a P2P-RPL discovery found to a target.
      *
      * The P2P-RPL counterpart of GetAodvRoute(): every hop from the Origin
@@ -2931,6 +2942,16 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      * moved once constructed.
      */
     std::map<DodagKey, DodagMembership> m_dodags;
+    /// The Path Sequence this node last advertised in each DODAG it has left,
+    /// restored if it rejoins. RFC 6550 section 7.1 makes Path Sequence
+    /// "globally significant in a DODAG": it is the freshness of this node's
+    /// route as the root holds it, so it has to outlive this node's own
+    /// membership. Kept in the membership alone, a leave and rejoin (or a
+    /// DODAG Version migration) restarted it at 0, and the root then discarded
+    /// every DAO as "older" than the value it still held until that entry's
+    /// PathLifetime ran out. Not kept for route-discovery instances, which
+    /// send no DAOs.
+    std::map<DodagKey, uint8_t> m_retainedPathSequence;
 
     bool m_hasBaseDodag{false}; //!< whether m_baseDodagKey currently names a real entry
     //!< key of the base DODAG, meaningful only if m_hasBaseDodag
@@ -2950,9 +2971,11 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     /// Initialised to 0 rather than to RFC 6550 section 7.2 rule 1's
     /// recommended 240, in common with every other sequence counter in this
     /// module (dtsn, pathSequence, daoSequence, version). A known
-    /// conformance deviation with no functional consequence, since nothing
-    /// is emitted before the first increment and RplSequenceCompare()
-    /// orders the resulting values correctly either way. @see
+    /// conformance deviation with no functional consequence for this
+    /// counter, since nothing is emitted before the first increment and
+    /// RplSequenceCompare() orders the resulting values correctly either way.
+    /// (Not true of pathSequence once it restarts at 0 against a root that
+    /// holds a larger value: @see m_retainedPathSequence.) @see
     /// design-constraints.md.
     uint8_t m_aodvSeqNo{0};
     /// Imin of the Trickle timer pacing RREQ-DIOs. Separate from

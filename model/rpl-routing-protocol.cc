@@ -2149,6 +2149,11 @@ RplRoutingProtocol::JoinDodag(const RplDioHeader& dio, uint32_t interface)
     // the value directly inside the map node, no temporary involved.
     DodagMembership& dodag = m_dodags[key];
 
+    if (auto retained = m_retainedPathSequence.find(key); retained != m_retainedPathSequence.end())
+    {
+        dodag.pathSequence = retained->second;
+    }
+
     if (!m_hasBaseDodag && dio.GetMop() != RPL_MOP_P2P_ROUTE_DISCOVERY)
     {
         // Never let a route-discovery instance become the base DODAG, for
@@ -2340,6 +2345,10 @@ RplRoutingProtocol::LeaveDodag(DodagKey key, bool poison)
     dodag.globalRepairEvent.Cancel();
     dodag.p2p.droRetryEvent.Cancel();
     dodag.p2p.droCollectEvent.Cancel();
+    if (dodag.mop != RPL_MOP_P2P_ROUTE_DISCOVERY)
+    {
+        m_retainedPathSequence[key] = dodag.pathSequence;
+    }
     m_dodags.erase(it);
 
     if (poison && m_hasBaseDodag && m_baseDodagKey == key)
@@ -5144,6 +5153,20 @@ RplRoutingProtocol::GetPreferredParent() const
 {
     const DodagMembership* dodag = GetBaseDodag();
     return dodag ? dodag->preferredParent : Ipv6Address::GetAny();
+}
+
+bool
+RplRoutingProtocol::GetPathSequence(uint8_t instanceId,
+                                    Ipv6Address dodagId,
+                                    uint8_t& pathSequence) const
+{
+    auto it = m_dodags.find(DodagKey{instanceId, dodagId});
+    if (it == m_dodags.end())
+    {
+        return false;
+    }
+    pathSequence = it->second.pathSequence;
+    return true;
 }
 
 bool

@@ -21013,6 +21013,123 @@ RplDioRejectionTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief A node's Path Sequence survives leaving a DODAG and rejoining it.
+ *
+ * RFC 6550 section 7.1: "The Path Sequence is globally significant in a
+ * DODAG and indicates the freshness of the route to the associated target.
+ * An older (lesser) value received from an originating router indicates
+ * that the originating router holds stale routing states". The root keeps
+ * the value it last accepted from this node, so a node that comes back with
+ * a counter restarted at 0 has every DAO discarded as "older" until that
+ * entry expires (design-constraints.md section 104). One node, fed
+ * hand-built DIOs: join, lose the only parent to a poisoning DIO, rejoin,
+ * and require the new value to be newer than the last one advertised before
+ * the leave.
+ */
+class RplPathSequenceSurvivesRejoinTestCase : public TestCase
+{
+  public:
+    RplPathSequenceSurvivesRejoinTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplPathSequenceSurvivesRejoinTestCase::RplPathSequenceSurvivesRejoinTestCase()
+    : TestCase("A node's Path Sequence is newer after leaving a DODAG and rejoining it "
+              "(RFC 6550 section 7.1)")
+{
+}
+
+void
+RplPathSequenceSurvivesRejoinTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(1);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.AssignWithoutAddress(devices);
+
+    Ptr<Node> node = nodes.Get(0);
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+
+    Simulator::Stop(Seconds(1));
+    Simulator::Run();
+
+    Ipv6Address dodagId("2001:1::1");
+    Ipv6Address parent("fe80::a");
+    static constexpr uint8_t INSTANCE = 0;
+
+    auto buildDio = [&](uint16_t rank) {
+        RplDioHeader dio;
+        dio.SetInstanceId(INSTANCE);
+        dio.SetVersionNumber(0);
+        dio.SetRank(rank);
+        dio.SetMop(RPL_MOP_NON_STORING);
+        dio.SetGrounded(true);
+        dio.SetDodagId(dodagId);
+        dio.SetDtsn(0);
+        dio.SetDagConfiguration(4,
+                                6,
+                                0,
+                                0,
+                                RPL_MIN_HOPRANKINC,
+                                RPL_OCP_OF0,
+                                RPL_DEFAULT_LIFETIME,
+                                RPL_DEFAULT_LIFETIME_UNIT);
+        return dio;
+    };
+    auto deliver = [&](uint16_t rank) {
+        DeliverRawRplMessage<RplDioHeader>(node,
+                                           1,
+                                           buildDio(rank),
+                                           static_cast<uint8_t>(RPL_CODE_DIO),
+                                           parent,
+                                           Ipv6Address(RPL_ALL_NODES_MULTICAST));
+    };
+
+    deliver(RPL_MIN_HOPRANKINC);
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(INSTANCE, dodagId), true, "The node never joined");
+    uint8_t beforeLeave = 0;
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetPathSequence(INSTANCE, dodagId, beforeLeave),
+                          true,
+                          "No Path Sequence for a DODAG the node has joined");
+
+    deliver(RPL_INFINITE_RANK);
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(INSTANCE, dodagId),
+                          false,
+                          "Losing the only parent to a poisoning DIO did not leave the DODAG");
+
+    deliver(RPL_MIN_HOPRANKINC);
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(INSTANCE, dodagId), true, "The node did not rejoin");
+    uint8_t afterRejoin = 0;
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetPathSequence(INSTANCE, dodagId, afterRejoin),
+                          true,
+                          "No Path Sequence after rejoining");
+
+    NS_TEST_ASSERT_MSG_EQ(static_cast<int>(RplSequenceCompare(afterRejoin, beforeLeave)),
+                          static_cast<int>(RplSequenceOrder::GREATER),
+                          "The Path Sequence after rejoining (" << +afterRejoin
+                              << ") is not newer than the one advertised before leaving ("
+                              << +beforeLeave
+                              << "): the root would discard this node's DAOs as stale");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Follow a node all the way around the state machine: joined, then
  *        cut off from its only parent until it gives up on the DODAG, then
  *        reconnected and joined again.
@@ -27024,6 +27141,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplP2pRelayRouteDiversityTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDioRejectionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplParentLossRejoinTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplPathSequenceSurvivesRejoinTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplInterfaceRestartTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplRootReaddressTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplParentFreshnessTestCase, TestCase::Duration::QUICK);

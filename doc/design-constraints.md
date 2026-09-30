@@ -11408,3 +11408,26 @@ CONFIRMED。AODV-RPL分とP2P-RPL分は監査側の実測のみで、独立検�
 3. 一時DAGへの加入がノード全体のDISタイマーを取り消し、'L'満了後も再開しない。
 4. 収集ウィンドウのクランプを「既定値では到達不能」とするコメントと§78.6が誤り
    (挙動は正しい)。
+
+## 105. Path Sequenceを離脱・再参加・Version移行をまたいで保持する(§104 RPLコア1)
+
+`pathSequence`は`DodagMembership`の中にあり、`LeaveDodag()`のeraseと`JoinDodag()`の
+新規構築で0に戻っていた。rootは最後に受理した値を保持しているので、再参加後の
+DAOは「古い」と判定されて捨てられ、そのエントリのPathLifetimeが切れるまで
+下り配送が止まる(§104に実測)。RFC 6550 §7.1は"The Path Sequence is globally
+significant in a DODAG"と定める。ノード自身のメンバーシップより長く生きる値である。
+
+修正: `m_retainedPathSequence`を`{instanceId, dodagId}`ごとに持ち、`LeaveDodag()`で
+保存、`JoinDodag()`で復元する。経路探索インスタンス(MOP 4)はDAOを送らないので
+対象外。DODAG Version移行(`LeaveDodag`直後の`JoinDodag`)も同じ経路で保持される。
+親を変えたときの増分(§9.5)は従来どおり効くので、再参加後の最初のDAOは保持値より
+新しくなる。
+
+試験: `RplPathSequenceSurvivesRejoinTestCase`(168件になった)。1ノードに手組みのDIOを
+与え、参加、唯一の親のpoisonで離脱、再参加の後、Path Sequenceが離脱前より新しいこと。
+テスト用に`GetPathSequence()`を追加した。load-bearing検証: 復元を外すと再参加後が1、
+離脱前が1で「新しくない」としてFAILすることを確認した。
+
+未確認: 多ノード(root、中継2、子)でのrootの下り配送の回復は、この試験では見ていない。
+§104の実測シナリオは別コンテキストの検証が持っている。`daoSequence`も同様に0へ戻る
+ため、離脱前のDAOへの遅れたDAO-ACKが再参加後のDAOに一致しうる(未実測、未修正)。
