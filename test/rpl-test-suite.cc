@@ -21508,6 +21508,119 @@ RplDisContinuesAfterDiscoveryJoinTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief An RREQ-DIO with no ART option is dropped whole, not joined.
+ *
+ * RFC 9854 section 4.3: "An RREQ-DIO message MUST carry at least one ART
+ * option ... Otherwise, the message MUST be dropped." HandleAodvRreq() used
+ * to ignore only the AODV-RPL content, after HandleDio() had already joined
+ * the instance and before 'L' was armed, so one option-less DIO left a
+ * membership that never expired (design-constraints.md section 104). One
+ * node, two hand-built RREQ-DIOs that differ only in the ART option.
+ */
+class RplRreqWithoutArtDroppedTestCase : public TestCase
+{
+  public:
+    RplRreqWithoutArtDroppedTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplRreqWithoutArtDroppedTestCase::RplRreqWithoutArtDroppedTestCase()
+    : TestCase("An RREQ-DIO with no ART option is dropped without joining "
+              "(RFC 9854 section 4.3)")
+{
+}
+
+void
+RplRreqWithoutArtDroppedTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(1);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.AssignWithoutAddress(devices);
+
+    Ptr<Node> node = nodes.Get(0);
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+
+    Simulator::Stop(Seconds(1));
+    Simulator::Run();
+
+    Ipv6Address origNode("2001:1::1");
+    Ipv6Address neighbour("fe80::a");
+    static constexpr uint8_t INSTANCE = 0x81;
+
+    auto deliver = [&](uint8_t instance, bool withArt) {
+        RplDioHeader dio;
+        dio.SetInstanceId(instance);
+        dio.SetVersionNumber(0);
+        dio.SetRank(RPL_MIN_HOPRANKINC);
+        dio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+        dio.SetGrounded(true);
+        dio.SetDodagId(origNode);
+        dio.SetDtsn(0);
+        dio.SetDagConfiguration(0,
+                                20,
+                                RPL_DIO_REDUNDANCY,
+                                RPL_MAX_RANKINC,
+                                RPL_MIN_HOPRANKINC,
+                                RPL_OCP_OF0,
+                                RPL_DEFAULT_LIFETIME,
+                                RPL_DEFAULT_LIFETIME_UNIT);
+        RplDioHeader::RreqOption rreq;
+        rreq.symmetric = true;
+        rreq.hopByHop = false;
+        rreq.compr = 0;
+        rreq.lifetime = 1;
+        rreq.rankLimit = 0;
+        rreq.origSeqNo = 1;
+        dio.SetRreq(rreq);
+        if (withArt)
+        {
+            RplDioHeader::ArtOption art;
+            art.destSeqNo = 0;
+            art.prefixLength = 0;
+            art.target = Ipv6Address("2001:9::99"); // not this node
+            dio.SetArt(art);
+        }
+        DeliverRawRplMessage<RplDioHeader>(node,
+                                           1,
+                                           dio,
+                                           static_cast<uint8_t>(RPL_CODE_DIO),
+                                           neighbour,
+                                           Ipv6Address(RPL_ALL_NODES_MULTICAST));
+    };
+
+    deliver(INSTANCE, false);
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(INSTANCE, origNode),
+                          false,
+                          "An RREQ-DIO with no ART option was joined: nothing arms its 'L', so "
+                          "the membership never expires");
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetDodagCount(), 0, "The option-less RREQ-DIO left a membership");
+
+    // The same DIO with an ART option is a valid RREQ-DIO.
+    deliver(INSTANCE + 1, true);
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(INSTANCE + 1, origNode),
+                          true,
+                          "A well-formed RREQ-DIO was refused too");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Follow a node all the way around the state machine: joined, then
  *        cut off from its only parent until it gives up on the DODAG, then
  *        reconnected and joined again.
@@ -27523,6 +27636,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplRejoinKeepsRankCeilingTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplBaseDodagNotPromotedFromDiscoveryTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDisContinuesAfterDiscoveryJoinTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplRreqWithoutArtDroppedTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplInterfaceRestartTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplRootReaddressTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplParentFreshnessTestCase, TestCase::Duration::QUICK);

@@ -11509,3 +11509,23 @@ load-bearing検証: 昇格の絞り込みを外すと`IsJoined()`が真でFAIL�
 が、そのフォールバック自体に`RPL_MOP_P2P_ROUTE_DISCOVERY`の判定を入れてはいない。
 §104のAODV-RPL担当が報告した「MOP 4のメンバーシップにも`LeaveDodag(key, true)`が走り、
 poisonのDIOとDISを出す」点も、別項目として残る。
+
+## 108. ARTの無いRREQ-DIO 1通が、期限の無いメンバーシップを残す(§104 AODV-RPL5)
+
+RFC 9854 §4.3: "An RREQ-DIO message MUST carry at least one ART option ... Otherwise,
+the message MUST be dropped." `HandleAodvRreq()`は、`HandleDio()`が既にインスタンスへ
+参加した後で、AODV-RPLとしての内容だけを無視してreturnしていた。'L'を張る
+`ArmAodvExpiry()`はそのreturnより後にあり、`ShouldRefuseAodvRreq()`にはART検査が無い。
+結果、ARTを省いたRREQ-DIO 1通で、期限のないMOP 4メンバーシップが残り、オプションの
+無いMOP 4 DIOを送り続けた(監査側の実測: L=16 sを載せた1通で、+3600 s時点でも参加中、
+その1時間にSendDioが14072回。ARTありの対照は+17 sで離脱)。旧コメントの「DIO自体は
+有効で、AODV-RPLの中身だけが使えない」という読みが、参加後に捨てる形を生んでいた。
+RFCは"the message"を捨てると書いている。§6.3で直した「'L'が張られない穴」と同じ種類の
+漏れである。
+
+修正: ART検査を`ShouldRefuseAodvRreq()`の先頭に移し、参加より前にDIOごと捨てる。
+`HandleAodvRreq()`側の検査は、別の経路から到達した場合のために残した。
+
+試験: `RplRreqWithoutArtDroppedTestCase`(172件になった)。ARTの有無だけが違う2通のRREQ-DIO。
+無い方は参加せず、メンバーシップも残らないこと、ある方は参加すること。
+load-bearing検証: 検査を外すと参加してFAILすることを確認した。

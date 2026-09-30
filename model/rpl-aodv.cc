@@ -386,6 +386,19 @@ RplRoutingProtocol::ShouldRefuseAodvRreq(const RplDioHeader& dio, Ipv6Address fr
     const RplDioHeader::RreqOption& rreq = dio.GetRreq();
     DodagKey key{dio.GetInstanceId(), dio.GetDodagId()};
 
+    // RFC 9854 section 4.3: "An RREQ-DIO message MUST carry at least one ART
+    // option ... Otherwise, the message MUST be dropped." The whole message,
+    // so before anything is joined: joining and then ignoring the content
+    // left a membership whose 'L' was never armed (ArmAodvExpiry() runs
+    // after this check in HandleAodvRreq()), one that then sent option-less
+    // MOP 4 DIOs for the rest of the simulation (design-constraints.md
+    // section 104).
+    if (!dio.HasArt())
+    {
+        NS_LOG_WARN("Dropping an RREQ-DIO with no ART option");
+        return true;
+    }
+
     // The two checks an RREQ-Instance and an RREP-Instance need alike: the
     // rejoin bar, and this node's own instance heard back.
     if (ShouldRefuseAodvInstance(key, from))
@@ -607,11 +620,9 @@ RplRoutingProtocol::HandleAodvRreq(const RplDioHeader& dio,
 
     const RplDioHeader::RreqOption& rreq = dio.GetRreq();
 
-    // RFC 9854 section 4.3: "An RREQ-DIO message MUST carry at least one ART
-    // option ... Otherwise, the message MUST be dropped." Enforced here
-    // rather than in ShouldRefuseAodvRreq() because the membership is
-    // already formed by now -- the DIO was a valid DIO, it is only its
-    // AODV-RPL content that is unusable, so the DODAG side of it stands.
+    // RFC 9854 section 4.3's ART requirement is enforced in
+    // ShouldRefuseAodvRreq(), before the join; kept here for a caller that
+    // reaches this function some other way.
     if (!dio.HasArt())
     {
         NS_LOG_WARN("Ignoring the AODV-RPL content of an RREQ-DIO with no ART option");
