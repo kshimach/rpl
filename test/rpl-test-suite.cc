@@ -15069,6 +15069,172 @@ RplP2pTargetRetriesOnAddresslessInterfaceTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief A Target whose collection window would outlast the temporary DAG's
+ *        'L' shortens it instead of never answering.
+ *
+ * RFC 6997 section 9.5: "all P2P-DRO transmissions and retransmissions MUST
+ * take place while the Target is still a part of the temporary DAG ... A
+ * Target MUST NOT transmit a P2P-DRO if it no longer belongs to this DAG"
+ * and "the Target MUST select one or more discovered routes and send one or
+ * more P2P-DRO messages". HandleP2pRdo() clamps the window to half of what
+ * is left of 'L'. It was documented as unreachable at the defaults, so no
+ * test reached it, but it is reachable: once ArmP2pExpiry() arms 'L' only on
+ * joining, a reply cycle that starts late in the DAG's life sees only the
+ * remainder (design-constraints.md section 111). Here a single Target hears
+ * its first DIO on an interface with no global address, so it joins and arms
+ * 'L' but cannot reply, and hears the second 0.9 s later on the main
+ * interface, with 'L' = 1 s and the default 256 ms window.
+ */
+class RplP2pCollectWindowClampTestCase : public TestCase
+{
+  public:
+    RplP2pCollectWindowClampTestCase();
+
+  private:
+    void DoRun() override;
+
+    /// @brief Record when a P2P-DRO reaches the monitor.
+    /// @param socket the monitoring socket
+    void CaptureDro(Ptr<Socket> socket);
+
+    std::vector<Time> m_droTimes; //!< when each P2P-DRO reached the monitor
+};
+
+RplP2pCollectWindowClampTestCase::RplP2pCollectWindowClampTestCase()
+    : TestCase("A collection window longer than what is left of 'L' is clamped, not lost "
+              "(RFC 6997 section 9.5)")
+{
+}
+
+void
+RplP2pCollectWindowClampTestCase::CaptureDro(Ptr<Socket> socket)
+{
+    Address sender;
+    Ptr<Packet> packet = socket->RecvFrom(sender);
+    if (!packet)
+    {
+        return;
+    }
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ipv6Header);
+    Icmpv6Header icmpv6Header;
+    packet->RemoveHeader(icmpv6Header);
+    if (icmpv6Header.GetType() == ICMPV6_RPL && icmpv6Header.GetCode() == RPL_CODE_P2P_DRO)
+    {
+        m_droTimes.push_back(Simulator::Now());
+    }
+}
+
+void
+RplP2pCollectWindowClampTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2); // 0 = monitor, 1 = the Target
+
+    Ptr<SimpleChannel> mainChannel = CreateObject<SimpleChannel>();
+    Ptr<SimpleChannel> sideChannel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer mainDevices = simpleNetDevice.Install(nodes, mainChannel);
+    NetDeviceContainer sideDevices =
+        simpleNetDevice.Install(NodeContainer(nodes.Get(1)), sideChannel);
+
+    // The monitor runs RPL too, unrooted, only because StartInterface() is
+    // what joins the RPL multicast group on its interface.
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    // Interface numbering follows Ipv6AddressHelper call order: main first.
+    Ipv6AddressHelper mainIpv6;
+    mainIpv6.SetBase(Ipv6Address("2001:1::"), Ipv6Prefix(64));
+    Ipv6InterfaceContainer mainInterfaces = mainIpv6.Assign(mainDevices);
+    for (uint32_t i = 0; i < mainDevices.GetN(); i++)
+    {
+        mainInterfaces.SetForwarding(i, true);
+    }
+    // Up, link-local only: no global address on the side interface.
+    Ipv6AddressHelper sideIpv6;
+    sideIpv6.AssignWithoutAddress(sideDevices);
+
+    Simulator::Stop(Seconds(5)); // let DAD clear the static address
+    Simulator::Run();
+
+    Ptr<Node> target = nodes.Get(1);
+    Ptr<RplRoutingProtocol> rpl = target->GetObject<RplRoutingProtocol>();
+    Ipv6Address targetAddress = mainInterfaces.GetAddress(1, 1);
+    NS_TEST_ASSERT_MSG_NE(targetAddress, Ipv6Address::GetAny(), "no global address yet");
+
+    Ptr<Socket> monitor = Socket::CreateSocket(nodes.Get(0), Ipv6RawSocketFactory::GetTypeId());
+    monitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    monitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    monitor->BindToNetDevice(mainDevices.Get(0));
+    monitor->SetRecvCallback(
+        MakeCallback(&RplP2pCollectWindowClampTestCase::CaptureDro, this));
+
+    Ipv6Address origin("2001:7::1");
+    Ipv6Address neighbour("fe80::a");
+    static constexpr uint8_t INSTANCE = 0x81;
+    static constexpr uint32_t MAIN_INTERFACE = 1;
+    static constexpr uint32_t SIDE_INTERFACE = 2;
+
+    auto deliver = [&](uint32_t interface) {
+        RplDioHeader dio;
+        dio.SetInstanceId(INSTANCE);
+        dio.SetVersionNumber(0);
+        dio.SetRank(RPL_MIN_HOPRANKINC);
+        dio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+        dio.SetGrounded(true);
+        dio.SetDodagId(origin);
+        dio.SetDtsn(0);
+        P2pRdoOption rdo;
+        rdo.reply = true;
+        rdo.hopByHop = false;
+        rdo.numRoutes = 1; // a nonzero 'N' is what arms the collection window
+        rdo.lifetime = 0;  // 'L' = 1 s
+        rdo.maxRankOrNh = 5;
+        rdo.target = targetAddress;
+        rdo.addressVector = {};
+        dio.SetP2pRdo(rdo);
+        DeliverRawRplMessage<RplDioHeader>(target,
+                                           interface,
+                                           dio,
+                                           static_cast<uint8_t>(RPL_CODE_DIO),
+                                           neighbour,
+                                           Ipv6Address(RPL_ALL_NODES_MULTICAST));
+    };
+
+    const Time joined = Simulator::Now();
+    deliver(SIDE_INTERFACE);
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(INSTANCE, origin),
+                          true,
+                          "The Target did not join the temporary DAG");
+    Simulator::Schedule(MilliSeconds(900), [&]() { deliver(MAIN_INTERFACE); });
+
+    Simulator::Stop(MilliSeconds(1200));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(m_droTimes.empty(),
+                          false,
+                          "The Target never answered: with 'L' about to end, the collection "
+                          "window ran past it and the reply was lost");
+    if (m_droTimes.empty())
+    {
+        Simulator::Destroy();
+        return;
+    }
+    NS_TEST_ASSERT_MSG_LT(m_droTimes.front() - joined,
+                          Seconds(1),
+                          "The P2P-DRO left after the temporary DAG's 'L' had ended");
+
+    monitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief A P2P-DRO carrying 'S' stops the routers it passes sending any
  *        more P2P mode DIOs for that temporary DAG.
  *
@@ -27722,6 +27888,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplP2pAddressVectorUsesReceivingInterfaceTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pTargetOnOtherInterfaceTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pTargetRetriesOnAddresslessInterfaceTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pCollectWindowClampTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pStopSilencesDiosTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pStopDoesNotReachOtherDodagsTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplMop4WithNoDiscoveryOptionRefusedTestCase, TestCase::Duration::QUICK);

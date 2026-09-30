@@ -496,7 +496,7 @@ RplRoutingProtocol::GetTypeId()
                           "single-route discovery is unaffected by it. RFC 6997 sets no such "
                           "timer of its own -- it says only that the Target selects 'one or more "
                           "discovered routes', leaving how it comes to have more than one "
-                          "entirely open. The default is four times P2pDioIntervalMin's own 64ms "
+                          "entirely open. The default is twice P2pDioIntervalMin's own 128ms "
                           "default, long enough for a neighbour or two to re-flood on an early "
                           "Trickle interval, and short against even the shortest 'L' (1 s).",
                           TimeValue(MilliSeconds(256)),
@@ -542,7 +542,7 @@ RplRoutingProtocol::GetTypeId()
                           "no numeric default of its own ('configurable...based on the "
                           "characteristics of individual deployments'); this module's default is "
                           "chosen on the same order as the P2P mode DIO's own Imax "
-                          "(P2pDioIntervalMin=64ms, P2pDioIntervalDoublings=4 -> ~1.024s), rather "
+                          "(P2pDioIntervalMin=128ms, P2pDioIntervalDoublings=4 -> ~2.048s), rather "
                           "than reusing DaoAckTimeout's 5s -- P2P-RPL's 'L' (16s by default) "
                           "would lose most of its budget to a single wait at that timescale.",
                           TimeValue(Seconds(1)),

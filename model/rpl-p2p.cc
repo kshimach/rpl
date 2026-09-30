@@ -761,17 +761,21 @@ RplRoutingProtocol::HandleP2pRdo(const RplDioHeader& dio, Ipv6Address from, uint
                 // just means the Target silently never answers at all,
                 // which is worse than answering early with whatever it has.
                 //
-                // ArmP2pExpiry() ran earlier in this same call, so what
-                // GetDelayLeft() reports here is always the full 'L' rather
-                // than any partially elapsed remainder -- the comparison is
-                // effectively "is the configured window at least as long as
-                // 'L' itself". NOT reachable at the defaults: 256 ms is
-                // below even the shortest 'L' of 1 s. It takes a caller
-                // configuring a window of a second or more, which this
-                // module's own tests do. (An earlier version of this
-                // comment, and of design-constraints.md section 73.4,
-                // claimed the default reached it; that was arithmetically
-                // wrong and the /protocol-test-matrix audit caught it.)
+                // GetDelayLeft() is what is left of 'L' counted from when
+                // this router joined: ArmP2pExpiry() arms it once and a
+                // later call returns early (the IsRunning() check), so a
+                // DIO that starts a reply cycle late in the temporary DAG's
+                // life sees only the remainder. Reachable at the defaults:
+                // a multi-Target discovery whose preferred parent's DIO
+                // changes the Address Vector, or a single Target whose
+                // first matching DIO reached an interface with no global
+                // address (@see HandleP2pRdo()'s Address Vector build), in
+                // either case arriving within P2pDroCollectWindow of 'L'.
+                // Without the clamp the second case sends nothing at all.
+                // (Earlier versions of this comment, and of
+                // design-constraints.md sections 73.4 and 78.6, called it
+                // unreachable at the defaults; that stopped being true when
+                // ArmP2pExpiry() became arm-once, @see section 111.)
                 Time window = m_p2pDroCollectWindow;
                 Time remaining = dodag.p2p.expiry.GetDelayLeft();
                 if (window >= remaining)
