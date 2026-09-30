@@ -2952,6 +2952,25 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     /// PathLifetime ran out. Not kept for route-discovery instances, which
     /// send no DAOs.
     std::map<DodagKey, uint8_t> m_retainedPathSequence;
+    /// What this node remembers of a DODAG it has left: the newest Version it
+    /// was a member of and its L (lowest Rank advertised) in that Version.
+    struct RetainedRank
+    {
+        uint8_t version;    //!< the DODAG Version the node was last a member of
+        uint16_t lowestRank; //!< L, RFC 6550 section 8.2.2.4 rule 3, in that Version
+    };
+    /// Kept across a leave, by DODAG. RFC 6550 section 8.2.2.4 rule 4 and its
+    /// closing paragraph: a node that rejoins a DODAG Version it has been a
+    /// member of "must continue to observe the rule that it may not advertise
+    /// a Rank higher than L+DAGMaxRankIncrease at any point in the life of the
+    /// DODAG Version. This rule must be observed so as not to create a
+    /// loophole that would allow the node to effectively increment its Rank
+    /// all the way to INFINITE_RANK", and section 8.2.2.1 rule 6 forbids being
+    /// a member of a previous Version once a newer one was advertised. A
+    /// membership erased on leaving forgot both, so a lost poison DIO let a
+    /// node and its children climb the Rank without bound. Not kept for
+    /// route-discovery instances.
+    std::map<DodagKey, RetainedRank> m_retainedRank;
 
     bool m_hasBaseDodag{false}; //!< whether m_baseDodagKey currently names a real entry
     //!< key of the base DODAG, meaningful only if m_hasBaseDodag

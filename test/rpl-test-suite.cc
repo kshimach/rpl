@@ -21130,6 +21130,131 @@ RplPathSequenceSurvivesRejoinTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief Leaving a DODAG does not let a node escape the Rank ceiling of the
+ *        DODAG Version it was in, nor rejoin an older Version.
+ *
+ * RFC 6550 section 8.2.2.4 rule 3 (MUST): a node "MUST NOT advertise an
+ * effective Rank higher than L + DAGMaxRankIncrease" within a DODAG
+ * Version, and the closing paragraph of that section extends it to a node
+ * that rejoins the same Version ("This rule must be observed so as not to
+ * create a loophole that would allow the node to effectively increment its
+ * Rank all the way to INFINITE_RANK"). Section 8.2.2.1 rule 6: "Once a node
+ * has advertised a DODAG Version by sending a DIO, it MUST NOT be a member
+ * of a previous DODAG Version of the same DODAG." One node, fed hand-built
+ * DIOs (design-constraints.md section 104).
+ */
+class RplRejoinKeepsRankCeilingTestCase : public TestCase
+{
+  public:
+    RplRejoinKeepsRankCeilingTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplRejoinKeepsRankCeilingTestCase::RplRejoinKeepsRankCeilingTestCase()
+    : TestCase("A rejoin keeps the DODAG Version's Rank ceiling and refuses an older Version "
+              "(RFC 6550 section 8.2.2)")
+{
+}
+
+void
+RplRejoinKeepsRankCeilingTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(1);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.AssignWithoutAddress(devices);
+
+    Ptr<Node> node = nodes.Get(0);
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+
+    Simulator::Stop(Seconds(1));
+    Simulator::Run();
+
+    Ipv6Address dodagId("2001:1::1");
+    Ipv6Address p1("fe80::a");
+    Ipv6Address p2("fe80::b");
+    Ipv6Address p3("fe80::c");
+    static constexpr uint8_t INSTANCE = 0;
+    static constexpr uint16_t MAX_RANK_INCREASE = 512;
+
+    auto deliver = [&](Ipv6Address from, uint8_t version, uint16_t rank) {
+        RplDioHeader dio;
+        dio.SetInstanceId(INSTANCE);
+        dio.SetVersionNumber(version);
+        dio.SetRank(rank);
+        dio.SetMop(RPL_MOP_NON_STORING);
+        dio.SetGrounded(true);
+        dio.SetDodagId(dodagId);
+        dio.SetDtsn(0);
+        dio.SetDagConfiguration(4,
+                                6,
+                                0,
+                                MAX_RANK_INCREASE,
+                                RPL_MIN_HOPRANKINC,
+                                RPL_OCP_OF0,
+                                RPL_DEFAULT_LIFETIME,
+                                RPL_DEFAULT_LIFETIME_UNIT);
+        DeliverRawRplMessage<RplDioHeader>(node,
+                                           1,
+                                           dio,
+                                           static_cast<uint8_t>(RPL_CODE_DIO),
+                                           from,
+                                           Ipv6Address(RPL_ALL_NODES_MULTICAST));
+    };
+
+    // Version 5: join through p1 at a low Rank, which sets L.
+    deliver(p1, 5, RPL_MIN_HOPRANKINC);
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(INSTANCE, dodagId), true, "The node never joined");
+    uint16_t firstRank = rpl->GetRankIn(INSTANCE, dodagId);
+    NS_TEST_ASSERT_MSG_NE(firstRank, RPL_INFINITE_RANK, "The first join gave no Rank");
+
+    // p1's poisoning DIO takes the node out of the DODAG, and with it the
+    // membership that recorded L.
+    deliver(p1, 5, RPL_INFINITE_RANK);
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(INSTANCE, dodagId), false, "The node did not leave");
+
+    // The same Version through a far worse parent: the Rank it would get
+    // exceeds L + DAGMaxRankIncrease, so it has to advertise INFINITE_RANK.
+    deliver(p2, 5, static_cast<uint16_t>(firstRank + MAX_RANK_INCREASE + 4 * RPL_MIN_HOPRANKINC));
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(INSTANCE, dodagId), true, "The node did not rejoin");
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetRankIn(INSTANCE, dodagId),
+                          RPL_INFINITE_RANK,
+                          "A rejoin of the same Version advertised a Rank above L + "
+                          "DAGMaxRankIncrease: L was forgotten when the node left");
+
+    // Leave again, then hear only an older Version.
+    deliver(p2, 5, RPL_INFINITE_RANK);
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(INSTANCE, dodagId), false, "The node did not leave");
+    deliver(p3, 4, RPL_MIN_HOPRANKINC);
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(INSTANCE, dodagId),
+                          false,
+                          "The node joined DODAG Version 4 after having been in Version 5");
+
+    // A newer Version is a fresh start with no ceiling.
+    deliver(p3, 6, RPL_MIN_HOPRANKINC);
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(INSTANCE, dodagId),
+                          true,
+                          "The node refused a newer DODAG Version");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Follow a node all the way around the state machine: joined, then
  *        cut off from its only parent until it gives up on the DODAG, then
  *        reconnected and joined again.
@@ -27142,6 +27267,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplDioRejectionTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplParentLossRejoinTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplPathSequenceSurvivesRejoinTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplRejoinKeepsRankCeilingTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplInterfaceRestartTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplRootReaddressTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplParentFreshnessTestCase, TestCase::Duration::QUICK);

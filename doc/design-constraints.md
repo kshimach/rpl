@@ -11431,3 +11431,40 @@ significant in a DODAG"と定める。ノード自身のメンバーシップよ
 未確認: 多ノード(root、中継2、子)でのrootの下り配送の回復は、この試験では見ていない。
 §104の実測シナリオは別コンテキストの検証が持っている。`daoSequence`も同様に0へ戻る
 ため、離脱前のDAOへの遅れたDAO-ACKが再参加後のDAOに一致しうる(未実測、未修正)。
+
+## 106. 離脱後の再参加でL(Rank上限)とDODAG Versionの履歴を保持する(§104 RPLコア2)
+
+`lowestRankThisVersion`(L)と`version`は`DodagMembership`の中にあり、`LeaveDodag()`の
+eraseで一緒に消えていた。RFC 6550 §8.2.2.4 rule 3(MUST)は、Version内で"MUST NOT
+advertise an effective Rank higher than L + DAGMaxRankIncrease"と定め、末尾の段落は
+同じVersionに再参加するノードにも同じ規則を課して、"loophole that would allow the
+node to effectively increment its Rank all the way to INFINITE_RANK"を名指しする。
+§8.2.2.1 rule 6は、新しいVersionをDIOで広告した後に古いVersionのメンバーになることを
+MUST NOTとする。
+
+実測(検証側): v5でrank 256(L=256)で参加、poisonで離脱、同じv5でrank 1280の親から
+rank 1408で再参加した(L+DAGMaxRankIncrease=1280を超える)。poisonが失われる状況で
+子と交互に再参加すると、Rankが512, 768, ... 2304と上がり続けた。離脱後にv4のDIOで
+v4へ再参加もできた。§8.2.2.4 rule 3の記述と§73/§58の記録に、この経路を扱った箇所は
+無い(`JoinDodag()`のコメント「Lは参加ごとに新しく始まる」は、同じVersionへの再参加を
+含めて読んでいた)。
+
+修正: `m_retainedRank`に`{version, L}`を`{instanceId, dodagId}`ごとに保存し、
+`LeaveDodag()`で書き、`JoinDodag()`でVersionが一致するときだけLを復元する。
+`HandleDio()`の新規参加の入口で、保存したVersionより厳密に古いVersionのDIOを捨てる。
+新しいVersion、比較不能なVersionは新規の始まりとして受ける(Version移行の
+`LeaveDodag`直後の`JoinDodag`もこの規則で自然に扱われる)。経路探索インスタンスは対象外。
+保存は期限なしにした。§8.2.2.1の"implementation-specific local timer"の後は忘れて
+よいが、忘れる必要も無く、新しいVersionを聞くまで持つだけで足りる。
+
+試験: `RplRejoinKeepsRankCeilingTestCase`(169件になった)。v5で低いRankで参加、poisonで
+離脱、v5でL+DAGMaxRankIncreaseを超えるRankの親から再参加してINFINITE_RANKになること、
+離脱後のv4のDIOで参加しないこと、v6には参加すること。
+
+load-bearing検証(2つの修正それぞれ): Lの復元を外すと再参加後のRankが1408でFAIL、
+Version入口の拒否を外すとv4に参加してFAILすることを確認した。復元に`cp`を使うと、
+同じ秒のうちの再ビルドがmtimeの粒度で拾われないことがあり、先に`touch`してから
+ビルドする。
+
+未修正: ここで直したのは再参加後のLだけ。§104のP2P/AODV側の`REJOIN_REENABLE`、
+DAOSequenceの巻き戻り、Trickleのconsistent判定は別項目。

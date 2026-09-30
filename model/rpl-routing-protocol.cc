@@ -1873,6 +1873,22 @@ RplRoutingProtocol::HandleDio(const RplDioHeader& dio,
 
     if (!existing)
     {
+        // RFC 6550 section 8.2.2.1 rule 6: "Once a node has advertised a
+        // DODAG Version by sending a DIO, it MUST NOT be a member of a
+        // previous DODAG Version of the same DODAG." Only a strictly older
+        // Version is refused: a newer or an incomparable one is a fresh
+        // start (@see RplSequenceCompare()).
+        auto retained = m_retainedRank.find(dioKey);
+        if (retained != m_retainedRank.end() &&
+            RplSequenceCompare(dio.GetVersionNumber(), retained->second.version) ==
+                RplSequenceOrder::LESS)
+        {
+            NS_LOG_LOGIC("Ignoring a DIO for version " << +dio.GetVersionNumber()
+                                                       << ", older than the version "
+                                                       << +retained->second.version
+                                                       << " this node already left");
+            return;
+        }
         JoinDodag(dio, interface);
     }
     else if (dio.GetVersionNumber() != existing->version &&
@@ -2176,8 +2192,14 @@ RplRoutingProtocol::JoinDodag(const RplDioHeader& dio, uint32_t interface)
     dodag.rank = RPL_INFINITE_RANK; // until a parent is picked
     dodag.pathEtx = 0;
     // RFC 6550 section 8.2.2.4 rule 3: L starts fresh for every DODAG
-    // Version, this join included.
+    // Version -- but not for one this node was already a member of, which
+    // rule 4 makes it keep observing (@see m_retainedRank).
     dodag.lowestRankThisVersion = RPL_INFINITE_RANK;
+    if (auto retained = m_retainedRank.find(key);
+        retained != m_retainedRank.end() && retained->second.version == dodag.version)
+    {
+        dodag.lowestRankThisVersion = retained->second.lowestRank;
+    }
 
     if (dio.HasDagConfiguration())
     {
@@ -2348,6 +2370,7 @@ RplRoutingProtocol::LeaveDodag(DodagKey key, bool poison)
     if (dodag.mop != RPL_MOP_P2P_ROUTE_DISCOVERY)
     {
         m_retainedPathSequence[key] = dodag.pathSequence;
+        m_retainedRank[key] = RetainedRank{dodag.version, dodag.lowestRankThisVersion};
     }
     m_dodags.erase(it);
 
