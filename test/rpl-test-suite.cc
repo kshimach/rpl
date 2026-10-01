@@ -13827,6 +13827,202 @@ RplAodvRrepDropDoesNotConsumeDedupTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief An H=1 RREP is relayed over any live route to its OrigNode, not
+ *        only the one its own RREQ-Instance recorded.
+ *
+ * RFC 9854 section 6.4.4: "If the intermediate router has a route to
+ * OrigNode, it uses that route to unicast the RREP-DIO to OrigNode." The
+ * Hop-by-hop table holds one entry per destination, so a second discovery
+ * that has this router relay a reply towards the same node replaces the
+ * upward entry D1 recorded with a downward one under D2's instance, and the
+ * relay used to drop D1's RREP for want of an exact match
+ * (design-constraints.md section 110). One router under test, hand-built
+ * messages: D1 (O to a far TargNode) and D2 (P to O) RREQs, D2's RREP back
+ * through the router, then D1's RREP.
+ */
+class RplAodvRrepRelayedOverAnyRouteTestCase : public TestCase
+{
+  public:
+    RplAodvRrepRelayedOverAnyRouteTestCase();
+
+  private:
+    void DoRun() override;
+
+    /// @brief Count a unicast DIO seen at the monitor.
+    /// @param socket the monitoring socket
+    void CountUnicastDio(Ptr<Socket> socket);
+
+    uint32_t m_unicastDios{0}; //!< unicast DIOs seen at the monitor
+};
+
+RplAodvRrepRelayedOverAnyRouteTestCase::RplAodvRrepRelayedOverAnyRouteTestCase()
+    : TestCase("An H=1 RREP is relayed over any live route to its OrigNode "
+              "(RFC 9854 section 6.4.4)")
+{
+}
+
+void
+RplAodvRrepRelayedOverAnyRouteTestCase::CountUnicastDio(Ptr<Socket> socket)
+{
+    Address sender;
+    Ptr<Packet> packet = socket->RecvFrom(sender);
+    if (!packet)
+    {
+        return;
+    }
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ipv6Header);
+    Icmpv6Header icmpv6Header;
+    packet->RemoveHeader(icmpv6Header);
+    if (icmpv6Header.GetType() == ICMPV6_RPL && icmpv6Header.GetCode() == RPL_CODE_DIO &&
+        !ipv6Header.GetDestination().IsMulticast())
+    {
+        m_unicastDios++;
+    }
+}
+
+void
+RplAodvRrepRelayedOverAnyRouteTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2); // 0 = the router under test, 1 = its one real neighbour
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    interfaces.SetForwarding(0, true);
+    interfaces.SetForwarding(1, true);
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    Ptr<Node> node = nodes.Get(0);
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> peer = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(peer->IsJoined(), true, "The peer never joined the base DODAG");
+
+    Ipv6Address nodeLinkLocal = node->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address peerLinkLocal =
+        nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    Ptr<Socket> monitor = Socket::CreateSocket(nodes.Get(1), Ipv6RawSocketFactory::GetTypeId());
+    monitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    monitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    monitor->BindToNetDevice(nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+    monitor->SetRecvCallback(
+        MakeCallback(&RplAodvRrepRelayedOverAnyRouteTestCase::CountUnicastDio, this));
+
+    static constexpr uint8_t D1 = 0x80;
+    static constexpr uint8_t D2 = 0x81;
+    Ipv6Address origD1("2001:9::1"); // O
+    Ipv6Address targD1("2001:9::99");
+    Ipv6Address origD2("2001:9::2"); // P, whose discovery targets O
+
+    auto deliverRreq = [&](uint8_t instance, Ipv6Address orig, Ipv6Address targ) {
+        RplDioHeader dio;
+        dio.SetInstanceId(instance);
+        dio.SetVersionNumber(0);
+        dio.SetRank(RPL_MIN_HOPRANKINC);
+        dio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+        dio.SetDodagId(orig);
+        dio.SetDtsn(0);
+        dio.SetDagConfiguration(0,
+                                20,
+                                RPL_DIO_REDUNDANCY,
+                                RPL_MAX_RANKINC,
+                                RPL_MIN_HOPRANKINC,
+                                RPL_OCP_OF0,
+                                RPL_DEFAULT_LIFETIME,
+                                RPL_DEFAULT_LIFETIME_UNIT);
+        RplDioHeader::RreqOption rreq;
+        rreq.symmetric = true;
+        rreq.hopByHop = true;
+        rreq.compr = 0;
+        rreq.lifetime = 2; // 64 s
+        rreq.rankLimit = 0;
+        rreq.origSeqNo = 1;
+        dio.SetRreq(rreq);
+        RplDioHeader::ArtOption art;
+        art.destSeqNo = 0;
+        art.prefixLength = 0;
+        art.target = targ;
+        dio.SetArt(art);
+        DeliverRawRplMessage<RplDioHeader>(node,
+                                           1,
+                                           dio,
+                                           static_cast<uint8_t>(RPL_CODE_DIO),
+                                           peerLinkLocal,
+                                           nodeLinkLocal);
+    };
+    auto deliverRrep = [&](uint8_t instance, Ipv6Address targ, Ipv6Address orig) {
+        RplDioHeader dio;
+        dio.SetInstanceId(instance); // Delta 0
+        dio.SetVersionNumber(0);
+        dio.SetRank(RPL_MIN_HOPRANKINC);
+        dio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+        dio.SetDodagId(targ);
+        dio.SetDtsn(0);
+        RplDioHeader::RrepOption rrep;
+        rrep.gratuitous = false;
+        rrep.hopByHop = true;
+        rrep.compr = 0;
+        rrep.lifetime = 2;
+        rrep.rankLimit = 0;
+        rrep.delta = 0;
+        dio.SetRrep(rrep);
+        RplDioHeader::ArtOption art;
+        art.destSeqNo = 1;
+        art.prefixLength = 0;
+        art.target = orig;
+        dio.SetArt(art);
+        DeliverRawRplMessage<RplDioHeader>(node,
+                                           1,
+                                           dio,
+                                           static_cast<uint8_t>(RPL_CODE_DIO),
+                                           peerLinkLocal,
+                                           nodeLinkLocal);
+    };
+
+    deliverRreq(D1, origD1, targD1);
+    deliverRreq(D2, origD2, origD1);
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(D1, origD1) && rpl->IsJoinedTo(D2, origD2),
+                          true,
+                          "The router did not join both RREQ-Instances");
+
+    // D2's RREP passes through, replacing the entry for O that D1 recorded.
+    deliverRrep(D2, origD1, origD2);
+    Simulator::Stop(Seconds(1));
+    Simulator::Run();
+    NS_TEST_ASSERT_MSG_GT_OR_EQ(m_unicastDios, 1, "D2's own RREP was not relayed either");
+    const uint32_t afterD2 = m_unicastDios;
+
+    deliverRrep(D1, targD1, origD1);
+    Simulator::Stop(Seconds(1));
+    Simulator::Run();
+    NS_TEST_ASSERT_MSG_EQ(m_unicastDios,
+                          afterD2 + 1,
+                          "D1's RREP was dropped although the router still held a route to "
+                          "its OrigNode, under D2's instance");
+
+    monitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Two TargNodes answering one RREQ-Instance are both relayed, each
  *        with its own downward Hop-by-hop Route keyed by its own DODAGID.
  *
@@ -28055,6 +28251,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplRreqWithoutArtDroppedTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplRrepInstanceAvoidsRejoinBarTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplRrepInstancePerRreqInstanceTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplAodvRrepRelayedOverAnyRouteTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplInterfaceRestartTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplRootReaddressTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplParentFreshnessTestCase, TestCase::Duration::QUICK);

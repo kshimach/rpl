@@ -1689,11 +1689,28 @@ RplRoutingProtocol::HandleAodvRrep(const RplDioHeader& dio, Ipv6Address from, ui
         // RFC 9854 section 6.4.4: "the local route entry" -- this node's
         // own upward Hop-by-hop Route toward OrigNode, recorded by
         // HandleAodvRreq() when the original RREQ-DIO passed through here.
+        //
+        // Any live route to OrigNode will do, not only the one this
+        // RREQ-Instance recorded: the same section says "If the intermediate
+        // router has a route to OrigNode, it uses that route to unicast the
+        // RREP-DIO to OrigNode", and m_hopByHopRoutes holds one entry per
+        // destination, so a concurrent discovery that has this node relay a
+        // reply towards the same node (as its TargNode) replaces the upward
+        // entry with a downward one under another instance. Requiring an
+        // exact match then dropped the RREP of a discovery that was
+        // otherwise proceeding normally (design-constraints.md section 110:
+        // D1 failed in 48 of 100 runs, 1 of 100 with this fallback).
         if (!FindHopByHopRoute(rreqInstanceId, origNode, origNode, nextHop))
         {
-            NS_LOG_LOGIC("Dropping an RREP for " << origNode
-                        << ": no upward Hop-by-hop Route recorded for it");
-            return;
+            uint8_t otherInstanceId = 0;
+            if (!FindHopByHopRoute(origNode, nextHop, otherInstanceId))
+            {
+                NS_LOG_LOGIC("Dropping an RREP for " << origNode
+                            << ": no Hop-by-hop Route to it at all");
+                return;
+            }
+            NS_LOG_LOGIC("Relaying an RREP for " << origNode << " over the route to it held under "
+                        << "Instance " << +otherInstanceId << ", not " << +rreqInstanceId);
         }
     }
     else

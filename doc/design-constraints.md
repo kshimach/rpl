@@ -11688,3 +11688,32 @@ OrigNodeから別のRREQ-InstanceIDの非対称RREQ-DIOを2通届け、それぞ
 未修正: OrigNode側は探索先1つにつき経路1本(`m_aodvRoutes[target]`)なので、並行探索の
 経路はOrigNodeで上書きし合う。§110の指摘のうち、フラグだけ残って以後応答しない構造
 (グローバルアドレス無し、Delta枯渇)は、標準構成で踏めないので手を入れていない。
+
+## 113. H=1のRREP中継で、OrigNodeへの経路を完全一致でなく任意のものとして探す(§110 AODV-RPL 2)
+
+RFC 9854 §6.4.4: "If the intermediate router has a route to OrigNode, it uses that route to
+unicast the RREP-DIO to OrigNode. Otherwise, in the case of a symmetric route, the RREP-DIO
+message is unicast to the Next Hop according to the Address Vector (H=0) or the local route entry
+(H=1)." 中継は`FindHopByHopRoute(rreqInstanceId, origNode, origNode, ...)`、つまり
+(インスタンス, DODAGID)が完全に一致する上りエントリだけを探し、無ければRREPを捨てていた。
+`m_hopByHopRoutes`は宛先1つにつき1エントリなので、同じ中継が別の探索のTargNode向けの
+RREPを中継すると、その下りエントリが別インスタンスのまま上りエントリを置き換え、元の探索の
+RREPが「上りが無い」として捨てられた。§49.1が§6.4.4の第1文を「他プロトコルの経路」と限定して
+使わなかったのは、原文に無い読み込み(§110)。
+
+修正: 完全一致が無ければ、宛先OrigNodeへの生きた経路を、インスタンスを問わず探して使う。
+RFCの文言どおりである。上書きそのもの(宛先1つにつき1エントリ)は直していない。
+
+試験: `RplAodvRrepRelayedOverAnyRouteTestCase`(176件になった)。1台の中継に、D1(OからTargNodeへ)と
+D2(PからOへ)のRREQ、D2のRREP(Oへの下りエントリがD1の上りエントリを置き換える)、
+D1のRREPを順に与え、D1のRREPが中継されること。load-bearing検証: 任意の経路を探す分岐を外すと、
+D1のRREPが中継されずFAILする(中継されたunicast DIOが1で、期待は2)ことを確認した。
+
+スケール確認: ハーネスのscenario 3(AODV)、H=1、20シードで、修正あり・なしとも300試行中174成功で
+同一。このシナリオでは「上りが無い」破棄がそもそも起きないため、差が出ないのは想定どおり。
+検証側のscratchの構成(25ノード格子、O-X-TとPの並行探索)での48件→1件は、本修正と同じ変更の
+実測で、ここでは再現していない。効果は、同じ中継が2つの探索に関わる並行探索に限られる。
+
+未修正: §110の切り分けのとおり、並行探索では上書きと、RREPごとのSeqNo増加によるstale拒否が
+残る(SeqNo増加を外すと26、stale判定をインスタンス単位にすると26)。stale拒否はRFCの字義
+では義務(§6.2.1)なので手を入れていない。
