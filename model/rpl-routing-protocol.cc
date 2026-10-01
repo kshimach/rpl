@@ -2376,6 +2376,22 @@ RplRoutingProtocol::LeaveDodag(DodagKey key, bool poison)
     dodag.globalRepairEvent.Cancel();
     dodag.p2p.droRetryEvent.Cancel();
     dodag.p2p.droCollectEvent.Cancel();
+    if (!dodag.aodv.target.IsAny())
+    {
+        // RFC 9854 section 4.1: "Once a node leaves an RREQ-Instance, it MUST
+        // NOT rejoin the same RREQ-Instance for at least the time interval
+        // specified by the configuration variable REJOIN_REENABLE." The
+        // sentence is not limited to leaving at the 'L' deadline. Armed here,
+        // on every way out of an AODV-RPL instance, rather than only in
+        // AodvInstanceExpired(): a node that lost its last parent used to
+        // rejoin within seconds (348 of 348 non-'L' leaves in ten harness
+        // runs, design-constraints.md section 110), restart its own 'L', and
+        // go on advertising an instance whose OrigNode had long moved on. The
+        // bars of the nodes along a route also no longer end up to one 'L'
+        // apart, which DiscoverRoute()'s choice of RREQ-InstanceID assumes
+        // they do not.
+        m_aodvRejoinBlocked[key] = Simulator::Now() + m_aodvRejoinReenable;
+    }
     if (dodag.mop != RPL_MOP_P2P_ROUTE_DISCOVERY)
     {
         m_retainedPathSequence[key] = dodag.pathSequence;

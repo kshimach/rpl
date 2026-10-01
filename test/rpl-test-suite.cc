@@ -21983,6 +21983,127 @@ RplRreqWithoutArtDroppedTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief A node that leaves an RREQ-Instance because it lost its last parent
+ *        does not rejoin it at once.
+ *
+ * RFC 9854 section 4.1: "Once a node leaves an RREQ-Instance, it MUST NOT
+ * rejoin the same RREQ-Instance for at least the time interval specified by
+ * the configuration variable REJOIN_REENABLE." The sentence does not limit
+ * itself to leaving at the 'L' deadline, but only AodvInstanceExpired() armed
+ * the bar, so a node that lost its parent rejoined within seconds and
+ * restarted its own 'L' (design-constraints.md section 110). One node as the
+ * TargNode: join, a worse Rank from its only parent, the same RREQ-DIO again.
+ */
+class RplAodvRejoinBarOnParentLossTestCase : public TestCase
+{
+  public:
+    RplAodvRejoinBarOnParentLossTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplAodvRejoinBarOnParentLossTestCase::RplAodvRejoinBarOnParentLossTestCase()
+    : TestCase("A node that left an RREQ-Instance on losing its parent does not rejoin it "
+              "(RFC 9854 section 4.1)")
+{
+}
+
+void
+RplAodvRejoinBarOnParentLossTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(1);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.SetBase(Ipv6Address("2001:1::"), Ipv6Prefix(64));
+    Ipv6InterfaceContainer interfaces = ipv6.Assign(devices);
+    interfaces.SetForwarding(0, true);
+
+    Ptr<Node> node = nodes.Get(0);
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+
+    Simulator::Stop(Seconds(5)); // let DAD clear the static address
+    Simulator::Run();
+
+    Ipv6Address self = interfaces.GetAddress(0, 1);
+    NS_TEST_ASSERT_MSG_NE(self, Ipv6Address::GetAny(), "no global address yet");
+    Ipv6Address origNode("2001:5::1");
+    Ipv6Address parent("fe80::a");
+    static constexpr uint8_t INSTANCE = 0x80;
+
+    auto deliver = [&](uint16_t rank) {
+        RplDioHeader dio;
+        dio.SetInstanceId(INSTANCE);
+        dio.SetVersionNumber(0);
+        dio.SetRank(rank);
+        dio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+        dio.SetGrounded(true);
+        dio.SetDodagId(origNode);
+        dio.SetDtsn(0);
+        dio.SetDagConfiguration(0,
+                                20,
+                                RPL_DIO_REDUNDANCY,
+                                RPL_MAX_RANKINC,
+                                RPL_MIN_HOPRANKINC,
+                                RPL_OCP_OF0,
+                                RPL_DEFAULT_LIFETIME,
+                                RPL_DEFAULT_LIFETIME_UNIT);
+        RplDioHeader::RreqOption rreq;
+        rreq.symmetric = true;
+        rreq.hopByHop = true;
+        rreq.compr = 0;
+        rreq.lifetime = 2; // 64 s, well beyond this test
+        rreq.rankLimit = 0;
+        rreq.origSeqNo = 1;
+        dio.SetRreq(rreq);
+        RplDioHeader::ArtOption art;
+        art.destSeqNo = 0;
+        art.prefixLength = 0;
+        art.target = self;
+        dio.SetArt(art);
+        DeliverRawRplMessage<RplDioHeader>(node,
+                                           1,
+                                           dio,
+                                           static_cast<uint8_t>(RPL_CODE_DIO),
+                                           parent,
+                                           Ipv6Address(RPL_ALL_NODES_MULTICAST));
+    };
+
+    deliver(RPL_MIN_HOPRANKINC);
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(INSTANCE, origNode), true, "The node never joined");
+
+    // The only parent advertises a Rank at or above this node's own: it can
+    // no longer be a parent, and the node leaves.
+    deliver(static_cast<uint16_t>(4 * RPL_MIN_HOPRANKINC));
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(INSTANCE, origNode),
+                          false,
+                          "The node did not leave when its only parent stopped being one");
+
+    Simulator::Stop(Seconds(1));
+    Simulator::Run();
+    deliver(RPL_MIN_HOPRANKINC);
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(INSTANCE, origNode),
+                          false,
+                          "The node rejoined the RREQ-Instance it had just left, inside "
+                          "REJOIN_REENABLE");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief A TargNode does not reuse an RREP-InstanceID it has just left.
  *
  * Every relay applies REJOIN_REENABLE to an RREP-Instance
@@ -28250,6 +28371,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplDisContinuesAfterDiscoveryJoinTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplRreqWithoutArtDroppedTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplRrepInstanceAvoidsRejoinBarTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplAodvRejoinBarOnParentLossTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplRrepInstancePerRreqInstanceTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRrepRelayedOverAnyRouteTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplInterfaceRestartTestCase, TestCase::Duration::QUICK);

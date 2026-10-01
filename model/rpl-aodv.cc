@@ -331,10 +331,8 @@ RplRoutingProtocol::AodvInstanceExpired(DodagKey key)
 
     NS_LOG_INFO("RREQ-Instance " << +key.instanceId << " at " << key.dodagId
                                  << " reached its 'L' deadline, leaving it");
-    // RFC 9854 section 4.1: "Once a node leaves an RREQ-Instance, it MUST
-    // NOT rejoin the same RREQ-Instance for at least the time interval
-    // specified by the configuration variable REJOIN_REENABLE."
-    m_aodvRejoinBlocked[key] = Simulator::Now() + m_aodvRejoinReenable;
+    // The REJOIN_REENABLE bar (RFC 9854 section 4.1) is armed by
+    // LeaveDodag() itself, on every way out of an AODV-RPL instance.
     // poison = false. AODV-RPL has no notion of poisoning: RFC 9854 section
     // 4.1 says only that a node "SHOULD leave the RREQ-Instance and stop
     // sending or receiving any more DIOs" for it. The poisoning path would
