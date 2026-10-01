@@ -241,6 +241,22 @@ RplRoutingProtocol::DiscoverRoute(Ipv6Address target, bool hopByHop)
     // this rather than from target directly, so it has to be seeded here
     // too, not just at a relay that learns it from an incoming RREQ-DIO.
     dodag.aodv.targets = {target};
+    // RFC 9854 section 4.3: the Sequence Number of the last route this node
+    // stored to the TargNode, or 0 when it holds none.
+    {
+        uint8_t knownSeqNo = 0;
+        auto stored = m_aodvRoutes.find(target);
+        auto hopByHop = m_hopByHopRoutes.find(target);
+        if (stored != m_aodvRoutes.end() && stored->second.expire > Simulator::Now())
+        {
+            knownSeqNo = stored->second.destSeqNo;
+        }
+        else if (hopByHop != m_hopByHopRoutes.end() && hopByHop->second.expire > Simulator::Now())
+        {
+            knownSeqNo = hopByHop->second.seqNo;
+        }
+        dodag.aodv.targetSeqNos[target] = knownSeqNo;
+    }
     dodag.aodv.isOrigin = true;
     dodag.aodv.isTarget = false;
     // Empty at the OrigNode: "The Origin and Target addresses MUST NOT be
@@ -733,6 +749,7 @@ RplRoutingProtocol::HandleAodvRreq(const RplDioHeader& dio,
     for (const auto& art : dio.GetArts())
     {
         incomingTargets.push_back(art.target);
+        dodag.aodv.targetSeqNos[art.target] = art.destSeqNo;
     }
     // "Is this the first RREQ-DIO this router has processed for the
     // instance?" -- aodvAlreadyProcessed, computed above, is that question
@@ -1371,7 +1388,7 @@ RplRoutingProtocol::StartAodvRrepInstance(const DodagMembership& rreqDodag, Doda
     // applied to the TargNode originating this instance: it is what the ART
     // option carries as Dest SeqNo, and what tells a stale route from this
     // one at the far end.
-    m_aodvSeqNo = RplSequenceIncrement(m_aodvSeqNo);
+    AdvanceAodvSeqNoForRrep();
 
     rrepDodag.aodv.isRrepInstance = true;
     rrepDodag.aodv.pairedInstanceId = rreqKey.instanceId;
@@ -1494,7 +1511,7 @@ RplRoutingProtocol::SendAodvRrep(DodagMembership& dodag, DodagKey key)
     // discarded the second discovery's RREP outright, leaving the OrigNode
     // with no reply and the relay pointing down the old, broken path.
     // Found by /protocol-test-matrix's angle 4.
-    m_aodvSeqNo = RplSequenceIncrement(m_aodvSeqNo);
+    AdvanceAodvSeqNoForRrep();
 
     // The ART option of an RREP names the OrigNode, not the target: it is
     // what tells each router on the way back whether it is the OrigNode
@@ -2089,6 +2106,16 @@ RplRoutingProtocol::IsAodvSymmetric(uint8_t instanceId, Ipv6Address dodagId) con
 {
     auto it = m_dodags.find(DodagKey{instanceId, dodagId});
     return it != m_dodags.end() && it->second.aodv.symmetric;
+}
+
+void
+RplRoutingProtocol::AdvanceAodvSeqNoForRrep()
+{
+    m_aodvSeqNo = RplSequenceIncrement(m_aodvSeqNo);
+    if (m_aodvSeqNo == 0)
+    {
+        m_aodvSeqNo = RplSequenceIncrement(m_aodvSeqNo);
+    }
 }
 
 bool

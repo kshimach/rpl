@@ -13611,6 +13611,487 @@ RplAodvSymmetricRrepAdvancesSeqNoTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief A TargNode never puts the reserved Dest SeqNo 0 in an RREP.
+ *
+ * RFC 9854 section 4.3: "Zero is used if there is no known information about
+ * the Sequence Number of TargNode and not used otherwise." An answering
+ * TargNode always knows its own, and RFC 6550 section 7.2 rule 2 wraps the
+ * counter 127 -> 0, so one RREP in 128 carried the reserved value
+ * (design-constraints.md section 110; section 92.3 claimed it never could).
+ * The node under test answers 131 discoveries, each from a different
+ * OrigNode so none waits on an 'L' deadline or REJOIN_REENABLE.
+ */
+class RplAodvRrepNeverCarriesReservedSeqNoTestCase : public TestCase
+{
+  public:
+    RplAodvRrepNeverCarriesReservedSeqNoTestCase();
+
+  private:
+    void DoRun() override;
+
+    /// @brief Record what a DIO seen at the monitor carries.
+    /// @param socket the monitoring socket
+    void Capture(Ptr<Socket> socket);
+
+    std::vector<uint8_t> m_destSeqNos; //!< Dest SeqNo of each RREP-DIO seen
+};
+
+RplAodvRrepNeverCarriesReservedSeqNoTestCase::RplAodvRrepNeverCarriesReservedSeqNoTestCase()
+    : TestCase("A TargNode never emits the reserved Dest SeqNo 0 in an RREP (RFC 9854 section 4.3)")
+{
+}
+
+void
+RplAodvRrepNeverCarriesReservedSeqNoTestCase::Capture(Ptr<Socket> socket)
+{
+    Address sender;
+    Ptr<Packet> packet = socket->RecvFrom(sender);
+    if (!packet)
+    {
+        return;
+    }
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ipv6Header);
+    Icmpv6Header icmpv6Header;
+    packet->RemoveHeader(icmpv6Header);
+    if (icmpv6Header.GetType() != ICMPV6_RPL || icmpv6Header.GetCode() != RPL_CODE_DIO)
+    {
+        return;
+    }
+    RplDioHeader dio;
+    packet->RemoveHeader(dio);
+    if (dio.HasRrep() && dio.HasArt())
+    {
+        m_destSeqNos.push_back(dio.GetArt().destSeqNo);
+    }
+}
+
+void
+RplAodvRrepNeverCarriesReservedSeqNoTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2); // 0 = the node under test and base root, 1 = its peer
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    interfaces.SetForwarding(0, true);
+    interfaces.SetForwarding(1, true);
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    Ptr<Node> node = nodes.Get(0);
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> peer = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(peer->IsJoined(), true, "The peer never joined the base DODAG");
+    Ipv6Address peerGlobal = peer->GetGlobalAddress();
+    Ipv6Address ownGlobal = rpl->GetGlobalAddress();
+    NS_TEST_ASSERT_MSG_NE(ownGlobal, Ipv6Address::GetAny(), "The node has no global address yet");
+    Ipv6Address nodeLinkLocal = node->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address peerLinkLocal =
+        nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    Ptr<Socket> monitor = Socket::CreateSocket(nodes.Get(1), Ipv6RawSocketFactory::GetTypeId());
+    monitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    monitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    monitor->BindToNetDevice(nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+    monitor->SetRecvCallback(MakeCallback(&RplAodvRrepNeverCarriesReservedSeqNoTestCase::Capture, this));
+    for (uint32_t i = 0; i < 131; i++)
+    {
+        RplDioHeader rreqDio;
+        rreqDio.SetInstanceId(0x81);
+        rreqDio.SetVersionNumber(0);
+        rreqDio.SetRank(RPL_MIN_HOPRANKINC);
+        rreqDio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+        std::ostringstream origin;
+        origin << "2001:9::" << std::hex << (i + 1); // a distinct OrigNode per discovery
+        rreqDio.SetDodagId(Ipv6Address(origin.str().c_str()));
+        rreqDio.SetDtsn(0);
+        rreqDio.SetDagConfiguration(0,
+                                    20,
+                                    RPL_DIO_REDUNDANCY,
+                                    RPL_MAX_RANKINC,
+                                    RPL_MIN_HOPRANKINC,
+                                    RPL_OCP_OF0,
+                                    RPL_DEFAULT_LIFETIME,
+                                    RPL_DEFAULT_LIFETIME_UNIT);
+        RplDioHeader::RreqOption rreq;
+        rreq.symmetric = true;
+        rreq.hopByHop = false;
+        rreq.compr = 0;
+        rreq.lifetime = 0;
+        rreq.rankLimit = 0;
+        rreq.origSeqNo = 1;
+        rreq.addressVector = {peerGlobal};
+        rreqDio.SetRreq(rreq);
+        RplDioHeader::ArtOption art;
+        art.destSeqNo = 0;
+        art.prefixLength = 0;
+        art.target = ownGlobal;
+        rreqDio.SetArt(art);
+        DeliverRawRplMessage<RplDioHeader>(node,
+                                           1,
+                                           rreqDio,
+                                           static_cast<uint8_t>(RPL_CODE_DIO),
+                                           peerLinkLocal,
+                                           nodeLinkLocal);
+        Simulator::Stop(MilliSeconds(50));
+        Simulator::Run();
+    }
+
+    NS_TEST_ASSERT_MSG_EQ(m_destSeqNos.size(), 131, "Expected one RREP-DIO per discovery");
+    uint32_t zeros = 0;
+    for (uint8_t seqNo : m_destSeqNos)
+    {
+        zeros += seqNo == 0 ? 1 : 0;
+    }
+    NS_TEST_ASSERT_MSG_EQ(zeros,
+                          0,
+                          "An RREP carried Dest SeqNo 0, the reserved \"no known information\" "
+                          "encoding: the counter wrapped 127 -> 0 and was emitted as it was");
+
+    monitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief A relay re-emits the Dest SeqNo its RREQ-DIO arrived with.
+ *
+ * RFC 9854 section 4.3: in an RREQ-DIO a nonzero Dest SeqNo "is the Sequence
+ * Number for the last route that OrigNode stored to the TargNode".
+ * SendDio() rebuilt every outgoing ART with 0, so what the OrigNode knew was
+ * lost after one hop and the Gratuitous RREP rule of section 7 ("Dest SeqNo
+ * ... at least as large as the Sequence Number in the RREQ-DIO") could not
+ * see it (design-constraints.md section 110). One relay, an RREQ-DIO
+ * carrying Dest SeqNo 7 for a TargNode that is not the relay.
+ */
+class RplAodvRelayKeepsReceivedDestSeqNoTestCase : public TestCase
+{
+  public:
+    RplAodvRelayKeepsReceivedDestSeqNoTestCase();
+
+  private:
+    void DoRun() override;
+
+    /// @brief Record what a DIO seen at the monitor carries.
+    /// @param socket the monitoring socket
+    void Capture(Ptr<Socket> socket);
+
+    std::vector<uint8_t> m_destSeqNos; //!< Dest SeqNo of each RREQ-DIO seen
+};
+
+RplAodvRelayKeepsReceivedDestSeqNoTestCase::RplAodvRelayKeepsReceivedDestSeqNoTestCase()
+    : TestCase("A relay re-emits the Dest SeqNo its RREQ-DIO carried, not 0 (RFC 9854 section 4.3)")
+{
+}
+
+void
+RplAodvRelayKeepsReceivedDestSeqNoTestCase::Capture(Ptr<Socket> socket)
+{
+    Address sender;
+    Ptr<Packet> packet = socket->RecvFrom(sender);
+    if (!packet)
+    {
+        return;
+    }
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ipv6Header);
+    Icmpv6Header icmpv6Header;
+    packet->RemoveHeader(icmpv6Header);
+    if (icmpv6Header.GetType() != ICMPV6_RPL || icmpv6Header.GetCode() != RPL_CODE_DIO)
+    {
+        return;
+    }
+    RplDioHeader dio;
+    packet->RemoveHeader(dio);
+    if (dio.HasRreq() && dio.HasArt())
+    {
+        m_destSeqNos.push_back(dio.GetArt().destSeqNo);
+    }
+}
+
+void
+RplAodvRelayKeepsReceivedDestSeqNoTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2); // 0 = the node under test and base root, 1 = its peer
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    interfaces.SetForwarding(0, true);
+    interfaces.SetForwarding(1, true);
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    Ptr<Node> node = nodes.Get(0);
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> peer = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(peer->IsJoined(), true, "The peer never joined the base DODAG");
+    Ipv6Address peerGlobal = peer->GetGlobalAddress();
+    Ipv6Address ownGlobal = rpl->GetGlobalAddress();
+    NS_TEST_ASSERT_MSG_NE(ownGlobal, Ipv6Address::GetAny(), "The node has no global address yet");
+    Ipv6Address nodeLinkLocal = node->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address peerLinkLocal =
+        nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    Ptr<Socket> monitor = Socket::CreateSocket(nodes.Get(1), Ipv6RawSocketFactory::GetTypeId());
+    monitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    monitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    monitor->BindToNetDevice(nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+    monitor->SetRecvCallback(MakeCallback(&RplAodvRelayKeepsReceivedDestSeqNoTestCase::Capture, this));
+    RplDioHeader rreqDio;
+    rreqDio.SetInstanceId(0x81);
+    rreqDio.SetVersionNumber(0);
+    rreqDio.SetRank(RPL_MIN_HOPRANKINC);
+    rreqDio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+    rreqDio.SetDodagId(Ipv6Address("2001:9::1"));
+    rreqDio.SetDtsn(0);
+    // Imin 2^7 = 128 ms, so the relay's own Trickle re-emits within the test.
+    rreqDio.SetDagConfiguration(4,
+                                7,
+                                RPL_DIO_REDUNDANCY,
+                                RPL_MAX_RANKINC,
+                                RPL_MIN_HOPRANKINC,
+                                RPL_OCP_OF0,
+                                RPL_DEFAULT_LIFETIME,
+                                RPL_DEFAULT_LIFETIME_UNIT);
+    RplDioHeader::RreqOption rreq;
+    rreq.symmetric = true;
+    rreq.hopByHop = false;
+    rreq.compr = 0;
+    rreq.lifetime = 1; // 16 s, longer than this test
+    rreq.rankLimit = 0;
+    rreq.origSeqNo = 1;
+    rreq.addressVector = {peerGlobal};
+    rreqDio.SetRreq(rreq);
+    RplDioHeader::ArtOption art;
+    art.destSeqNo = 7;
+    art.prefixLength = 0;
+    art.target = Ipv6Address("2001:9::99"); // not this node: it only relays
+    rreqDio.SetArt(art);
+    DeliverRawRplMessage<RplDioHeader>(node,
+                                       1,
+                                       rreqDio,
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       peerLinkLocal,
+                                       nodeLinkLocal);
+    Simulator::Stop(Seconds(3));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(m_destSeqNos.empty(), false, "The relay never re-emitted the RREQ-DIO");
+    for (uint8_t seqNo : m_destSeqNos)
+    {
+        NS_TEST_ASSERT_MSG_EQ(+seqNo,
+                              7,
+                              "The relayed RREQ-DIO's Dest SeqNo is not the one it arrived with");
+    }
+
+    monitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief An OrigNode's RREQ carries the Sequence Number of the route it
+ *        already holds to the TargNode.
+ *
+ * RFC 9854 section 4.3: in an RREQ-DIO a nonzero Dest SeqNo "is the Sequence
+ * Number for the last route that OrigNode stored to the TargNode ... Zero is
+ * used if there is no known information about the Sequence Number of
+ * TargNode and not used otherwise." DiscoverRoute() always sent 0, so the
+ * rule of section 7 that an intermediate router answers with a Gratuitous
+ * RREP only if its cached route is at least as new as what the OrigNode
+ * already knows had nothing to compare against
+ * (design-constraints.md section 110). One OrigNode: a first discovery whose
+ * RREP (Dest SeqNo 5) is injected, then a second discovery whose RREQ-DIO is
+ * observed.
+ */
+class RplAodvRreqCarriesKnownDestSeqNoTestCase : public TestCase
+{
+  public:
+    RplAodvRreqCarriesKnownDestSeqNoTestCase();
+
+  private:
+    void DoRun() override;
+
+    /// @brief Record what a DIO seen at the monitor carries.
+    /// @param socket the monitoring socket
+    void Capture(Ptr<Socket> socket);
+
+    std::vector<std::pair<uint8_t, uint8_t>> m_seen; //!< (RPLInstanceID, Dest SeqNo) per RREQ-DIO
+};
+
+RplAodvRreqCarriesKnownDestSeqNoTestCase::RplAodvRreqCarriesKnownDestSeqNoTestCase()
+    : TestCase("An OrigNode's RREQ carries the Dest SeqNo of the route it already holds (RFC 9854 section 4.3)")
+{
+}
+
+void
+RplAodvRreqCarriesKnownDestSeqNoTestCase::Capture(Ptr<Socket> socket)
+{
+    Address sender;
+    Ptr<Packet> packet = socket->RecvFrom(sender);
+    if (!packet)
+    {
+        return;
+    }
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ipv6Header);
+    Icmpv6Header icmpv6Header;
+    packet->RemoveHeader(icmpv6Header);
+    if (icmpv6Header.GetType() != ICMPV6_RPL || icmpv6Header.GetCode() != RPL_CODE_DIO)
+    {
+        return;
+    }
+    RplDioHeader dio;
+    packet->RemoveHeader(dio);
+    if (dio.HasRreq() && dio.HasArt())
+    {
+        m_seen.emplace_back(dio.GetInstanceId(), dio.GetArt().destSeqNo);
+    }
+}
+
+void
+RplAodvRreqCarriesKnownDestSeqNoTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2); // 0 = the node under test and base root, 1 = its peer
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    interfaces.SetForwarding(0, true);
+    interfaces.SetForwarding(1, true);
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    Ptr<Node> node = nodes.Get(0);
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> peer = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(peer->IsJoined(), true, "The peer never joined the base DODAG");
+    Ipv6Address peerGlobal = peer->GetGlobalAddress();
+    Ipv6Address ownGlobal = rpl->GetGlobalAddress();
+    NS_TEST_ASSERT_MSG_NE(ownGlobal, Ipv6Address::GetAny(), "The node has no global address yet");
+    Ipv6Address nodeLinkLocal = node->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address peerLinkLocal =
+        nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    Ptr<Socket> monitor = Socket::CreateSocket(nodes.Get(1), Ipv6RawSocketFactory::GetTypeId());
+    monitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    monitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    monitor->BindToNetDevice(nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+    monitor->SetRecvCallback(MakeCallback(&RplAodvRreqCarriesKnownDestSeqNoTestCase::Capture, this));
+    Ipv6Address targNode("2001:9::99");
+    RplRoutingProtocol::DodagKey first = rpl->DiscoverRoute(targNode);
+    NS_TEST_ASSERT_MSG_NE(first.dodagId, Ipv6Address::GetAny(), "The first discovery did not start");
+
+    // The RREP that completes it, carrying Dest SeqNo 5.
+    RplDioHeader rrepDio;
+    rrepDio.SetInstanceId(first.instanceId); // Delta 0
+    rrepDio.SetVersionNumber(0);
+    rrepDio.SetRank(RPL_MIN_HOPRANKINC);
+    rrepDio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+    rrepDio.SetDodagId(targNode);
+    rrepDio.SetDtsn(0);
+    RplDioHeader::RrepOption rrep;
+    rrep.gratuitous = false;
+    rrep.hopByHop = false;
+    rrep.compr = 0;
+    rrep.lifetime = 1;
+    rrep.rankLimit = 0;
+    rrep.delta = 0;
+    rrep.addressVector = {peerGlobal, targNode};
+    rrepDio.SetRrep(rrep);
+    RplDioHeader::ArtOption rrepArt;
+    rrepArt.destSeqNo = 5;
+    rrepArt.prefixLength = 0;
+    rrepArt.target = ownGlobal; // names this node as the OrigNode
+    rrepDio.SetArt(rrepArt);
+    DeliverRawRplMessage<RplDioHeader>(node,
+                                       1,
+                                       rrepDio,
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       peerLinkLocal,
+                                       nodeLinkLocal);
+    std::vector<Ipv6Address> hops;
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetAodvRoute(targNode, hops),
+                          true,
+                          "The injected RREP did not give the OrigNode a route");
+
+    RplRoutingProtocol::DodagKey second = rpl->DiscoverRoute(targNode);
+    NS_TEST_ASSERT_MSG_NE(second.dodagId,
+                          Ipv6Address::GetAny(),
+                          "The second discovery did not start");
+    NS_TEST_ASSERT_MSG_NE(second.instanceId, first.instanceId, "The discoveries share an ID");
+    m_seen.clear();
+    Simulator::Stop(Seconds(3));
+    Simulator::Run();
+
+    uint32_t checked = 0;
+    for (const auto& [instanceId, destSeqNo] : m_seen)
+    {
+        if (instanceId != second.instanceId)
+        {
+            continue;
+        }
+        checked++;
+        NS_TEST_ASSERT_MSG_EQ(+destSeqNo,
+                              5,
+                              "The second RREQ-DIO's Dest SeqNo is not that of the route the "
+                              "OrigNode already held to the TargNode");
+    }
+    NS_TEST_ASSERT_MSG_GT_OR_EQ(checked, 1, "The second RREQ-DIO was never observed");
+
+    monitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief An RREP-DIO this router drops without handling does not consume the
  *        dedup that a later, genuinely relayable RREP-DIO needs.
  *
@@ -28374,6 +28855,9 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplAodvRejoinBarOnParentLossTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplRrepInstancePerRreqInstanceTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvRrepRelayedOverAnyRouteTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplAodvRrepNeverCarriesReservedSeqNoTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplAodvRelayKeepsReceivedDestSeqNoTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplAodvRreqCarriesKnownDestSeqNoTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplInterfaceRestartTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplRootReaddressTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplParentFreshnessTestCase, TestCase::Duration::QUICK);

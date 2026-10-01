@@ -1106,6 +1106,16 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
             /// exactly one ART (section 4.3) built straight from origNode
             /// instead.
             std::vector<Ipv6Address> targets;
+            /// The Dest SeqNo each target's ART carried (RFC 9854 section
+            /// 4.3: "In RREQ-DIO, if nonzero, it is the Sequence Number for
+            /// the last route that OrigNode stored to the TargNode"), 0 when
+            /// none was known. Seeded at the OrigNode from the route it
+            /// already holds, and at a relay from the ART it received, so
+            /// SendDio() re-emits it instead of 0: every hop used to send 0,
+            /// which made the "OrigNode already knows something newer"
+            /// branch of the Gratuitous RREP rule (section 7) unreachable
+            /// between real nodes (design-constraints.md section 110).
+            std::map<Ipv6Address, uint8_t> targetSeqNos;
             /// Whether this membership's own targets above has been seeded
             /// from a first RREQ-DIO yet. H=0 reads addressVector's own
             /// emptiness for the same question instead (targets is seeded
@@ -2989,9 +2999,11 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     /// judges by it: a route discovery of its own (DiscoverRoute()), and an
     /// RREP answering someone else's, symmetric (SendAodvRrep()) or
     /// asymmetric (StartAodvRrepInstance()) alike. Always advanced before
-    /// the value is emitted, so the reserved "no known information about
-    /// the Sequence Number of TargNode" encoding of zero (section 4.3,
-    /// "not used otherwise") never goes on the wire.
+    /// the value is emitted, and an RREP's Dest SeqNo is advanced past the
+    /// wrap to zero (AdvanceAodvSeqNoForRrep()), so the reserved "no known
+    /// information about the Sequence Number of TargNode" encoding of zero
+    /// (section 4.3, "not used otherwise") does not go on the wire in an
+    /// RREP. Advancing first is not enough on its own: 127 increments to 0.
     ///
     /// Initialised to 0 rather than to RFC 6550 section 7.2 rule 1's
     /// recommended 240, in common with every other sequence counter in this
@@ -3003,6 +3015,21 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     /// holds a larger value: @see m_retainedPathSequence.) @see
     /// design-constraints.md.
     uint8_t m_aodvSeqNo{0};
+
+    /**
+     * @brief Advance m_aodvSeqNo for a Sequence Number a TargNode is about
+     *        to put in an RREP.
+     *
+     * RFC 9854 section 4.3 reserves Dest SeqNo 0 -- "Zero is used if there is
+     * no known information about the Sequence Number of TargNode and not used
+     * otherwise" -- and a TargNode answering always knows its own. RFC 6550
+     * section 7.2 rule 2 has the counter wrap 127 -> 0, so a plain increment
+     * lands on 0 once in 128 advances and the reserved value went on the wire
+     * (design-constraints.md section 110; section 92.3 claimed it could not).
+     * Advanced once more when that happens. Not used for the OrigNode's own
+     * Orig SeqNo, which section 4.1 does not reserve a value for.
+     */
+    void AdvanceAodvSeqNoForRrep();
     /// Imin of the Trickle timer pacing RREQ-DIOs. Separate from
     /// DioIntervalMin because a route discovery has to finish inside its own
     /// 'L' field, which is 16 seconds at the shortest, while the base

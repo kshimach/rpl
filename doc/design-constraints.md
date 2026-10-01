@@ -10405,6 +10405,9 @@ Dest SeqNoを1つ進めた対照では中継が成功し経路が移動した。
 
 ### 92.3 初期値についてのverifier指摘の訂正
 
+> **訂正 (§115)**: 下の「これは誤り」という判断自体が誤りだった。増分を読み取りより前に
+> 置いても、カウンタが127から0へ折り返す回には0が送出される(128回目、実測)。
+
 verifierは「Dest SeqNo=0はRFC 9854 §4.3が
 "Zero is used if there is no known information about the Sequence Number
 of TargNode and not used otherwise"と予約しているので、初期値を
@@ -11754,3 +11757,51 @@ barを'L'満了だけに戻す(修正前の挙動)と、離脱直後に再加入
 送り、RankLimit=0でだけ連鎖する(§110)。これらはbarで離脱後の再加入が止まる分は減るが、
 poison自体は変えていない。`rpl-aodv.cc`のコメントの「AODV-RPLにpoisonの概念は無い」と、親喪失の
 経路がpoison=trueで入ることの矛盾は残る。
+
+## 115. AODV-RPLのDest SeqNo: 予約値0を送らず、RREQのARTに保持している値を載せる(§110 AODV-RPL 6)
+
+RFC 9854 §4.3: "Dest SeqNo ... In RREQ-DIO, if nonzero, it is the Sequence Number for the last route
+that OrigNode stored to the TargNode ... Zero is used if there is no known information about the
+Sequence Number of TargNode and not used otherwise." 実装は2点でこれを外していた(§110で
+検証済み)。
+
+1. **RREPが予約値0を運んだ。** RFC 6550 §7.2 rule 2はカウンタを127から0へ折り返す
+   ("MUST wrap back to zero")。TargNodeは増分してから送るので、0に着地する回、つまり増分128回に
+   1回、Dest SeqNo 0のRREPが出る(131回の探索で128回目、対称・非対称とも、実測)。§92.3の
+   「増分を読み取りより前に置く限り0は二度と送出されない」は誤りだった(§92.3に訂正を足した)。
+   初期値を240にしても直らない(240-255の次もrule 2で0)。避けるには0を明示的に飛ばすしかない。
+   RFC 9854 §4.3の該当文にMUST/SHOULDは無く、MUST違反ではなくフィールドの意味からの逸脱で、
+   相互接続上の問題。モジュール内では0は壊れない(`RplSequenceNewer(0, 127)`はGREATER)。
+   修正: RREPを出す2か所(対称、非対称のRREP-Instance)で`AdvanceAodvSeqNoForRrep()`を使い、
+   0に着地したらもう一度進める。カウンタの折り返しそのものはrule 2のままで、OrigNodeの
+   Orig SeqNo(§4.1は0を予約していない)の`DiscoverRoute()`は変えていない。
+2. **RREQのARTのDest SeqNoが常に0だった。** OrigNodeが経路を保持していても、中継が受け取った値も、
+   `SendDio()`は0を書いていた(130回の探索のうち129回で経路を保持していたが、ARTは全件0)。
+   その結果、§7の「OrigNodeがキャッシュより新しい値を知っていればG-RREPを出さない」分岐は、
+   実ノード間では折り返しの偶然を除いて到達せず、G-RREPが古いキャッシュでも返った(偽造
+   プローブ: キャッシュ40/49に対しARTが50ならG-RREPは出ず、0なら出る)。
+   修正: `AodvRreqState::targetSeqNos`を加え、OrigNodeは`DiscoverRoute()`で保持している経路の
+   seq(AODV経路、なければHop-by-hop経路)を入れ、中継は受け取ったARTの値を入れ、`SendDio()`は
+   それを再送する。保持が無ければ0のまま(RFCの「情報なし」)。
+
+試験(180件になった):
+- `RplAodvRrepNeverCarriesReservedSeqNoTestCase`: 1つのTargNodeに別のOrigNodeから131回RREQを与え、
+  RREPのDest SeqNoに0が無いこと。
+- `RplAodvRelayKeepsReceivedDestSeqNoTestCase`: Dest SeqNo 7のARTを持つRREQを中継に与え、再送された
+  RREQ-DIOのARTが7であること。
+- `RplAodvRreqCarriesKnownDestSeqNoTestCase`: 1本目の探索にDest SeqNo 5のRREPを注入して経路を
+  持たせ、2本目のRREQ-DIOのARTが5であること。
+load-bearing検証(3件それぞれ): 0を飛ばす分岐を外す、`SendDio()`が0を書く、`DiscoverRoute()`が
+0を入れる、のそれぞれで対応する試験がFAILし、復元後に全件通ることを確認した。
+
+退行確認: 25ノード格子、lr-wpan、MRHOF、出荷時の既定のAODV-RPL(`--scenario=3`)、対称・非対称、
+各30シードで、AODV-RPL 4の修正後(§114)と比べた。60行すべて完全一致(成功率、到達率、制御バイトとも
+差の区間は[0, 0])。これは想定どおりで、既定ではG-RREPが無効であり、ARTのseqはG-RREPの判定に
+しか使われず、0の回避は1つのTargNodeが127回答えて初めて効く(1実行の探索は約15回)。
+つまり既定の評価結果は変わらず、効果はG-RREPを有効にした構成と長く動く構成に限られる。
+G-RREPを有効にした構成での測定はしていない。
+
+未修正: キャッシュのseqが112-127のときG-RREPが誤って抑止される(RplSequenceNewer(0, b)が
+b∈[112,127]でGREATER)問題は、ARTに実際の値が載るようになったので、0を比較する場面自体が
+減った。ただし比較関数の挙動は変えていない。TargNodeのseqが127を過ぎた直後に0へ戻ることで、
+その後の探索の新旧の判定(rule 3.2)が一時的に難しくなる点は、§82.2の既知の問題の範囲に残る。

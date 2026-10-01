@@ -1483,10 +1483,14 @@ RplRoutingProtocol::SendDio(DodagMembership& dodag, Ipv6Address dst, uint32_t in
         for (const auto& target : dodag.aodv.targets)
         {
             RplDioHeader::ArtOption art;
-            // The TargNode's own Sequence Number is not known until its
-            // RREP arrives; RFC 9854 section 4.3 has the RREQ carry 0 for
-            // "no known information about the Sequence Number of TargNode".
-            art.destSeqNo = 0;
+            // RFC 9854 section 4.3: "In RREQ-DIO, if nonzero, it is the
+            // Sequence Number for the last route that OrigNode stored to the
+            // TargNode ... Zero is used if there is no known information
+            // about the Sequence Number of TargNode and not used otherwise."
+            // What the OrigNode knew, or the ART a relay received, is
+            // carried on rather than reset to 0 at every hop.
+            auto known = dodag.aodv.targetSeqNos.find(target);
+            art.destSeqNo = known != dodag.aodv.targetSeqNos.end() ? known->second : 0;
             art.prefixLength = 0; // the field holds an address, not a prefix
             art.target = target;
             dio.AddArt(art);
