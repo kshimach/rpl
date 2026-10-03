@@ -3095,6 +3095,21 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     /// DiscoverP2pRoute() and design-constraints.md.
     std::map<uint8_t, P2pInstanceUse> m_p2pInstanceUse;
 
+    /// When each temporary DAG's Stop memory ends, by {RPLInstanceID,
+    /// DODAGID}. RFC 6997 section 9.3: "A router MUST discard a received P2P
+    /// mode DIO with no further processing ... if the router previously
+    /// received a P2P-DRO message with the same RPLInstanceID and DODAGID as
+    /// the received DIO and with the Stop flag set to one". "Previously
+    /// received" is not tied to the router's own membership, which ends at
+    /// 'L'; kept only in the membership, the memory went with it, and a late
+    /// DIO from a router that never heard the Stop pulled a Stopped router back
+    /// in to flood the discovery again. The RFC gives no length, and
+    /// remembering forever breaks the reuse of an RPLInstanceID that section
+    /// 6.1 allows, so a router remembers for one more 'L' after its own
+    /// membership ended (RecordP2pStopMemory()) and the Origin waits long
+    /// enough before reusing the ID (DiscoverP2pRoute()'s membershipBar).
+    std::map<DodagKey, Time> m_p2pStopMemory;
+
     /// A route an AODV-RPL discovery found, held at the OrigNode.
     struct AodvRoute
     {

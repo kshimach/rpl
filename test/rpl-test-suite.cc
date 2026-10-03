@@ -17415,6 +17415,144 @@ RplP2pOriginRejectsMismatchedTargetTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief A router remembers a Stop past the end of its own membership, for a
+ *        bounded time.
+ *
+ * RFC 6997 section 9.3: "A router MUST discard a received P2P mode DIO with
+ * no further processing ... if the router previously received a P2P-DRO
+ * message with the same RPLInstanceID and DODAGID as the received DIO and
+ * with the Stop flag set to one." The record lived in the membership, which
+ * ends at 'L', so a late DIO from a router that never heard the Stop pulled
+ * a Stopped router back in to flood the discovery again
+ * (design-constraints.md section 116). The memory has to end, or the Origin
+ * could never reuse the RPLInstanceID that section 6.1 allows it to: here it
+ * lasts one more 'L'. One router, 'L' = 1 s: join, Stop, 'L' expiry, a DIO
+ * during the memory, a DIO after it.
+ */
+class RplP2pStopRememberedAfterExpiryTestCase : public TestCase
+{
+  public:
+    RplP2pStopRememberedAfterExpiryTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplP2pStopRememberedAfterExpiryTestCase::RplP2pStopRememberedAfterExpiryTestCase()
+    : TestCase("A Stopped router refuses the temporary DAG for a while after its own 'L' "
+              "(RFC 6997 section 9.3)")
+{
+}
+
+void
+RplP2pStopRememberedAfterExpiryTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(1);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.AssignWithoutAddress(devices);
+
+    Ptr<Node> node = nodes.Get(0);
+    rplHelper.SetRoot(node, Ipv6Address("2001:1::"), 64);
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+    Ipv6Address dodagId("2001:2::1"); // an unrelated temporary DAG identity
+    Ipv6Address first("fe80::a");
+    Ipv6Address second("fe80::b");
+    static constexpr uint8_t INSTANCE = 0x81;
+
+    auto deliverDio = [&](Ipv6Address from) {
+        RplDioHeader dio;
+        dio.SetInstanceId(INSTANCE);
+        dio.SetVersionNumber(0);
+        dio.SetRank(3 * RPL_MIN_HOPRANKINC);
+        dio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+        dio.SetGrounded(true);
+        dio.SetDodagId(dodagId);
+        dio.SetDtsn(0);
+        P2pRdoOption rdo;
+        rdo.reply = false;
+        rdo.hopByHop = false;
+        rdo.numRoutes = 0;
+        rdo.lifetime = 0; // 'L' = 1 s
+        rdo.maxRankOrNh = 5;
+        rdo.target = dodagId; // a placeholder, not this node
+        rdo.addressVector = {};
+        dio.SetP2pRdo(rdo);
+        DeliverRawRplMessage<RplDioHeader>(node,
+                                           1,
+                                           dio,
+                                           static_cast<uint8_t>(RPL_CODE_DIO),
+                                           from,
+                                           Ipv6Address(RPL_ALL_NODES_MULTICAST));
+    };
+
+    deliverDio(first);
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(INSTANCE, dodagId), true, "The router never joined");
+
+    // A P2P-DRO with 'S' that names some other router at NH: this router is
+    // off the route but still bound by Stop (section 8).
+    RplP2pDroHeader dro;
+    dro.SetInstanceId(INSTANCE);
+    dro.SetStop(true);
+    dro.SetAckRequested(false);
+    dro.SetSequence(0);
+    dro.SetDodagId(dodagId);
+    P2pRdoOption droRdo;
+    droRdo.reply = false;
+    droRdo.hopByHop = false;
+    droRdo.numRoutes = 0;
+    droRdo.lifetime = 0;
+    droRdo.maxRankOrNh = 1;
+    droRdo.target = Ipv6Address("2001:9::1");
+    droRdo.addressVector = {Ipv6Address("2001:9::2")};
+    dro.SetP2pRdo(droRdo);
+    DeliverRawRplMessage<RplP2pDroHeader>(node,
+                                          1,
+                                          dro,
+                                          static_cast<uint8_t>(RPL_CODE_P2P_DRO),
+                                          first,
+                                          Ipv6Address(RPL_ALL_NODES_MULTICAST));
+
+    // Past this router's own 'L', inside the memory.
+    Simulator::Stop(Seconds(1.5));
+    Simulator::Run();
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(INSTANCE, dodagId),
+                          false,
+                          "The membership did not end at 'L'");
+    deliverDio(second);
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(INSTANCE, dodagId),
+                          false,
+                          "A Stopped router rejoined the temporary DAG on a late DIO: it forgot "
+                          "the Stop when its membership ended");
+
+    // Past the memory as well: the ID can be reused.
+    Simulator::Stop(Seconds(1.5));
+    Simulator::Run();
+    deliverDio(second);
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(INSTANCE, dodagId),
+                          true,
+                          "The Stop is remembered forever: a reused RPLInstanceID is refused");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief A P2P mode DIO is only joined if the router's own resulting
  *        DAGRank would stay within the MaxRank, relaxed by one step for the
  *        Target, mirroring AODV-RPL's own RankLimit boundary test.
@@ -28810,6 +28948,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplP2pTargetOnOtherInterfaceTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pTargetRetriesOnAddresslessInterfaceTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pCollectWindowClampTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pStopRememberedAfterExpiryTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pStopSilencesDiosTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pStopDoesNotReachOtherDodagsTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplMop4WithNoDiscoveryOptionRefusedTestCase, TestCase::Duration::QUICK);

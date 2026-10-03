@@ -92,7 +92,12 @@ RplRoutingProtocol::DiscoverP2pRoute(Ipv6Address target, bool hopByHop)
     // the Origin keeps its stale route, believes it still has one, and
     // blackholes traffic for the rest of PathLifetime. Found by
     // /protocol-test-matrix's angle 4.
-    Time membershipBar = Seconds(2 * RplP2pLifetimeSeconds(m_p2pLifetime));
+    // Three times 'L' rather than the "twice" section 6.1 calls "usually
+    // sufficient": a router that joined up to one 'L' after this Origin
+    // started remembers a Stop until two 'L' after it joined (@see
+    // m_p2pStopMemory), and reusing the ID before that makes it discard the
+    // new discovery's DIOs under section 9.3.
+    Time membershipBar = Seconds(3 * RplP2pLifetimeSeconds(m_p2pLifetime));
     Time routeBar = Seconds(m_pathLifetime * m_lifetimeUnit) + membershipBar;
 
     uint8_t instanceId = 0;
@@ -256,6 +261,19 @@ RplRoutingProtocol::P2pInstanceExpired(DodagKey key)
     // carries routing state to begin with ("MUST NOT be used to route data
     // packets", section 9.1), so there is nothing downstream to withdraw,
     // the same reasoning AodvInstanceExpired() uses for its own instances.
+    // The Stop memory outlives the membership by one 'L' (@see
+    // m_p2pStopMemory), then is swept here rather than left to grow.
+    for (auto memory = m_p2pStopMemory.begin(); memory != m_p2pStopMemory.end();)
+    {
+        memory = memory->second <= Simulator::Now() ? m_p2pStopMemory.erase(memory)
+                                                    : std::next(memory);
+    }
+    auto leaving = m_dodags.find(key);
+    if (leaving->second.p2p.stopped)
+    {
+        m_p2pStopMemory[key] =
+            Simulator::Now() + Seconds(RplP2pLifetimeSeconds(leaving->second.p2p.lifetimeField));
+    }
     LeaveDodag(key, false);
 }
 
@@ -390,6 +408,16 @@ RplRoutingProtocol::ShouldRefuseP2pRdo(const RplDioHeader& dio, Ipv6Address from
     if (existing != m_dodags.end() && existing->second.p2p.stopped)
     {
         NS_LOG_LOGIC("Refusing a P2P mode DIO for a temporary DAG that has already stopped");
+        return true;
+    }
+    // The same rule after the membership is gone: section 9.3's "previously
+    // received" does not end with it (@see m_p2pStopMemory).
+    auto remembered = m_p2pStopMemory.find(key);
+    if (existing == m_dodags.end() && remembered != m_p2pStopMemory.end() &&
+        Simulator::Now() < remembered->second)
+    {
+        NS_LOG_LOGIC("Refusing a P2P mode DIO for a temporary DAG whose Stop this router "
+                     "remembers");
         return true;
     }
 

@@ -11805,3 +11805,44 @@ G-RREPを有効にした構成での測定はしていない。
 b∈[112,127]でGREATER)問題は、ARTに実際の値が載るようになったので、0を比較する場面自体が
 減った。ただし比較関数の挙動は変えていない。TargNodeのseqが127を過ぎた直後に0へ戻ることで、
 その後の探索の新旧の判定(rule 3.2)が一時的に難しくなる点は、§82.2の既知の問題の範囲に残る。
+
+## 116. P2P-RPLのStopを、メンバーシップの満了後も'L'の間覚える(§110 P2P-RPL 1)
+
+RFC 6997 §9.3: "A router MUST discard a received P2P mode DIO with no further processing ... if the
+router previously received a P2P-DRO message with the same RPLInstanceID and DODAGID as the received DIO
+and with the Stop flag set to one." "previously received"は、そのルータのメンバーシップにも時間にも
+結び付いていない。Stopの記録は`DodagMembership::p2p.stopped`だけにあり、'L'満了のeraseで消えた。
+そのため、Stopを聞き得なかったルータが自分の'L'まで送り続けるDIOで、直前に満了したStop済みの
+ルータが再加入し、探索が格子全体で再フラッドされた(§110: 5x5格子で39/100シード)。
+
+修正: `m_p2pStopMemory`を`{RPLInstanceID, DODAGID}`ごとに持ち、'L'満了で、Stopを受けていたら
+満了時刻 + 'L'まで覚える(`P2pInstanceExpired()`、満了のたびに期限切れを掃除する)。
+`ShouldRefuseP2pRdo()`は、メンバーシップが無く、記憶が生きている間、DIOを捨てる。
+
+**記憶期間の設計判断**: RFCは期間を与えない。無期限に覚えると、§6.1が許すRPLInstanceIDの再利用が壊れる
+(2L+0.5秒後の再探索が0/100、§110の反実仮想)。そこで、満了後'L'(加入から合計2L)とした。
+これに合わせてOriginの再利用bar(`DiscoverP2pRoute()`の`membershipBar`)を、§6.1が「通常は十分」と
+呼ぶ2Lから3Lにした。Originの開始から'L'以内に加入したルータは、開始から3L以内に記憶を終える。
+bar中のIDを避ける動作(§96)は変わらない。加入が開始から'L'より遅れるルータがあれば、記憶は
+3Lを超えうるが、これは測っていない。
+
+測定(5x5の単位円格子、SimpleChannel 2 ms、Origin 0 -> Target 24、各100シード、使い捨ての
+プローブ。Stop後に再加入したノードを数える):
+- 修正前: 再加入があったのは39/100シード、再加入ノードは計440、最後のメンバーの時刻の最大は48.7秒、
+  32秒('L'=16秒の2倍)超が39シード、平均23.2秒。
+- 修正後: 9/100シード、計27ノード、32秒超が9シード、最大48.7秒、平均18.2秒。再加入ノード数の
+  差(修正後-修正前)の95%区間は[-5.39, -2.88]/run、最後のメンバーの時刻の差は
+  [-6.59, -3.54]秒。検証側の反実仮想(Stopを無期限に覚える: 9/100)と同水準で、残る9件は、
+  Stopを聞き得なかったルータの再加入であり、§9.6のMUST discard(非メンバーは P2P-DRO を捨てる)
+  のためStopを記録しようがなく、RFC準拠である。
+- ハーネス(25ノード格子、`--scenario=2`、lr-wpan 30シード、単位円 40シード): 探索成功率は
+  修正前後とも1.0000、制御バイト、送信ノード数、DIO送信数の差の95%区間はいずれも0を含み、有意な
+  変化は無かった。ハーネスの探索(ランダムなペア)ではStop後の再フラッドの指標が現れない。
+  barを3Lにしても、ID再利用で探索が失敗する害は見えなかった。
+
+試験: `RplP2pStopRememberedAfterExpiryTestCase`(181件になった)。'L' = 1秒の1台に、加入、Stop、
+満了、記憶の間のDIO、記憶が切れた後のDIO。load-bearing検証: 記憶を参照しないと再加入してFAIL、
+記憶が切れないと、再利用されたIDを拒否してFAILすることを確認した。
+
+未修正: §110の「DODAG設定の無いP2P DIOには、コア側の既定のTrickle設定が使われる」「Stop後に親を
+切り替えたノードが長く INFINITE_RANK の DIO を送る」は未調査のまま。
