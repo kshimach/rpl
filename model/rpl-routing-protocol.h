@@ -3110,6 +3110,45 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     /// enough before reusing the ID (DiscoverP2pRoute()'s membershipBar).
     std::map<DodagKey, Time> m_p2pStopMemory;
 
+    /**
+     * @brief How long after starting a P2P-RPL discovery its RPLInstanceID
+     *        must not be reused for another discovery from this node.
+     *
+     * RFC 6997 section 6.1's "twice the duration indicated by the L field",
+     * lengthened to three times (@see DiscoverP2pRoute()).
+     *
+     * @return the bar
+     */
+    Time P2pMembershipBar() const;
+
+    /**
+     * @brief Whether a Local RPLInstanceID of this node is still barred from
+     *        reuse by the other protocol's earlier discovery.
+     *
+     * Local RPLInstanceIDs are one space: a membership is keyed by
+     * {RPLInstanceID, DODAGID}, and both protocols root theirs at this node's
+     * own address, so an RREQ-Instance and a temporary DAG started under the
+     * same ID share one membership at every router that heard both (RFC 6550
+     * section 5.1: a local RPLInstanceID "MUST be unique for that DODAGID").
+     * Each allocator used to consult only its own protocol's record. These
+     * two read the other's, so DiscoverRoute(), DiscoverP2pRoute() and
+     * StartAodvRrepInstance() choose an ID neither is still using
+     * (design-constraints.md sections 110 and 117).
+     *
+     * @param local the Local RPLInstanceID
+     * @param [out] end when the bar ends, set only if barred
+     * @return true if @p local is still barred by a P2P-RPL discovery
+     */
+    bool P2pIdBarred(uint8_t local, Time& end) const;
+
+    /**
+     * @param local the Local RPLInstanceID
+     * @param dodagId the DODAGID it would be used under, this node's address
+     * @param [out] end when the bar ends, set only if barred
+     * @return true if @p local is still inside an AODV-RPL REJOIN_REENABLE bar
+     */
+    bool AodvIdBarred(uint8_t local, Ipv6Address dodagId, Time& end) const;
+
     /// A route an AODV-RPL discovery found, held at the OrigNode.
     struct AodvRoute
     {

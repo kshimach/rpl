@@ -17553,6 +17553,95 @@ RplP2pStopRememberedAfterExpiryTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief P2P-RPL and AODV-RPL discoveries from one node do not reuse each
+ *        other's RPLInstanceID while it is still barred.
+ *
+ * Both protocols root their local instances at the node's own address and a
+ * router keys a membership by {RPLInstanceID, DODAGID} alone, so two
+ * discoveries under one ID share a membership at every router that heard
+ * both: RFC 6550 section 5.1 requires a local RPLInstanceID to "be unique for
+ * that DODAGID". Each allocator consulted only its own protocol's reuse
+ * record (design-constraints.md sections 110 and 117), so a discovery of one
+ * kind started after the other's had ended took the same ID, 17 s after it
+ * in the measurements that found this. One node, discoveries in both orders,
+ * each started after the previous one's own membership has ended.
+ */
+class RplP2pAodvInstanceIdsDistinctTestCase : public TestCase
+{
+  public:
+    RplP2pAodvInstanceIdsDistinctTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplP2pAodvInstanceIdsDistinctTestCase::RplP2pAodvInstanceIdsDistinctTestCase()
+    : TestCase("A P2P-RPL and an AODV-RPL discovery do not reuse each other's RPLInstanceID "
+              "while it is barred (RFC 6550 section 5.1)")
+{
+}
+
+void
+RplP2pAodvInstanceIdsDistinctTestCase::DoRun()
+{
+    for (bool p2pFirst : {true, false})
+    {
+        NodeContainer nodes;
+        nodes.Create(1);
+
+        Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+        SimpleNetDeviceHelper simpleNetDevice;
+        NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+        RplHelper rplHelper;
+        InternetStackHelper internetv6;
+        internetv6.SetRoutingHelper(rplHelper);
+        internetv6.Install(nodes);
+
+        Ipv6AddressHelper ipv6;
+        ipv6.AssignWithoutAddress(devices);
+
+        Ptr<Node> node = nodes.Get(0);
+        rplHelper.SetRoot(node, Ipv6Address("2001:1::"), 64);
+        Simulator::Stop(Seconds(10));
+        Simulator::Run();
+
+        Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+        Ipv6Address target("2001:9::99");
+
+        RplRoutingProtocol::DodagKey first =
+            p2pFirst ? rpl->DiscoverP2pRoute(target) : rpl->DiscoverRoute(target);
+        NS_TEST_ASSERT_MSG_NE(first.dodagId,
+                              Ipv6Address::GetAny(),
+                              "The first discovery did not start");
+
+        // Past the first discovery's own 'L' (16 s by default) but inside both
+        // protocols' reuse bars.
+        Simulator::Stop(Seconds(20));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(first.instanceId, first.dodagId),
+                              false,
+                              "The first discovery's own membership did not end");
+
+        RplRoutingProtocol::DodagKey second =
+            p2pFirst ? rpl->DiscoverRoute(target) : rpl->DiscoverP2pRoute(target);
+        NS_TEST_ASSERT_MSG_NE(second.dodagId,
+                              Ipv6Address::GetAny(),
+                              "The second discovery did not start");
+        NS_TEST_ASSERT_MSG_NE(second.instanceId,
+                              first.instanceId,
+                              "The second discovery reused the other protocol's RPLInstanceID "
+                              << (p2pFirst ? "(P2P-RPL then AODV-RPL)" : "(AODV-RPL then P2P-RPL)")
+                              << " while it was still barred");
+
+        Simulator::Destroy();
+    }
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief A P2P mode DIO is only joined if the router's own resulting
  *        DAGRank would stay within the MaxRank, relaxed by one step for the
  *        Target, mirroring AODV-RPL's own RankLimit boundary test.
@@ -28949,6 +29038,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplP2pTargetRetriesOnAddresslessInterfaceTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pCollectWindowClampTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pStopRememberedAfterExpiryTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pAodvInstanceIdsDistinctTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pStopSilencesDiosTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pStopDoesNotReachOtherDodagsTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplMop4WithNoDiscoveryOptionRefusedTestCase, TestCase::Duration::QUICK);

@@ -32,6 +32,41 @@ NS_LOG_COMPONENT_DEFINE("RplP2p");
 namespace rpl
 {
 
+Time
+RplRoutingProtocol::P2pMembershipBar() const
+{
+    // Three times 'L' rather than the "twice" section 6.1 calls "usually
+    // sufficient": a router that joined up to one 'L' after this Origin
+    // started remembers a Stop until two 'L' after it joined (@see
+    // m_p2pStopMemory), and reusing the ID before that makes it discard the
+    // new discovery's DIOs under section 9.3.
+    return Seconds(3 * RplP2pLifetimeSeconds(m_p2pLifetime));
+}
+
+bool
+RplRoutingProtocol::P2pIdBarred(uint8_t local, Time& end) const
+{
+    auto used = m_p2pInstanceUse.find(local);
+    if (used == m_p2pInstanceUse.end())
+    {
+        return false;
+    }
+    end = used->second.started + P2pMembershipBar();
+    return Simulator::Now() < end;
+}
+
+bool
+RplRoutingProtocol::AodvIdBarred(uint8_t local, Ipv6Address dodagId, Time& end) const
+{
+    auto blocked = m_aodvRejoinBlocked.find(DodagKey{local, dodagId});
+    if (blocked == m_aodvRejoinBlocked.end())
+    {
+        return false;
+    }
+    end = blocked->second;
+    return Simulator::Now() < end;
+}
+
 RplRoutingProtocol::DodagKey
 RplRoutingProtocol::DiscoverP2pRoute(Ipv6Address target, bool hopByHop)
 {
@@ -92,12 +127,7 @@ RplRoutingProtocol::DiscoverP2pRoute(Ipv6Address target, bool hopByHop)
     // the Origin keeps its stale route, believes it still has one, and
     // blackholes traffic for the rest of PathLifetime. Found by
     // /protocol-test-matrix's angle 4.
-    // Three times 'L' rather than the "twice" section 6.1 calls "usually
-    // sufficient": a router that joined up to one 'L' after this Origin
-    // started remembers a Stop until two 'L' after it joined (@see
-    // m_p2pStopMemory), and reusing the ID before that makes it discard the
-    // new discovery's DIOs under section 9.3.
-    Time membershipBar = Seconds(3 * RplP2pLifetimeSeconds(m_p2pLifetime));
+    Time membershipBar = P2pMembershipBar();
     Time routeBar = Seconds(m_pathLifetime * m_lifetimeUnit) + membershipBar;
 
     uint8_t instanceId = 0;
@@ -114,6 +144,20 @@ RplRoutingProtocol::DiscoverP2pRoute(Ipv6Address target, bool hopByHop)
         }
         if (IsJoinedTo(local, GetGlobalAddress()))
         {
+            continue;
+        }
+        // Not an ID an AODV-RPL discovery of this node is still barred from
+        // reusing either: the two protocols share one Local RPLInstanceID
+        // space (@see P2pIdBarred()).
+        Time aodvEnd;
+        if (AodvIdBarred(local, GetGlobalAddress(), aodvEnd))
+        {
+            anyBarred = true;
+            if (aodvEnd < earliestFree)
+            {
+                earliestFree = aodvEnd;
+                earliestFreeId = local;
+            }
             continue;
         }
         auto used = m_p2pInstanceUse.find(local);

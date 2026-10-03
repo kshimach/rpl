@@ -11846,3 +11846,44 @@ bar中のIDを避ける動作(§96)は変わらない。加入が開始から'L'
 
 未修正: §110の「DODAG設定の無いP2P DIOには、コア側の既定のTrickle設定が使われる」「Stop後に親を
 切り替えたノードが長く INFINITE_RANK の DIO を送る」は未調査のまま。
+
+## 117. P2P-RPLとAODV-RPLが、Local RPLInstanceIDの再利用禁止を互いに見る(§110 P2P-RPL 2)
+
+両プロトコルは、ローカルインスタンスを同じノードのグローバルアドレスをDODAGIDとして立てる。ルータは
+メンバーシップを`{RPLInstanceID, DODAGID}`だけで引くので、同じIDで始めたRREQ-Instanceと一時DAGは、
+両方を聞いたルータで1つのメンバーシップに混ざる。RFC 6550 §5.1は、ローカルのRPLInstanceIDが
+"MUST be unique for that DODAGID"と定める。割当は3か所あり、それぞれ自分のプロトコルの再利用の記録だけを
+見ていた: AODVの`DiscoverRoute()`は`m_aodvRejoinBlocked`、P2Pの`DiscoverP2pRoute()`は
+`m_p2pInstanceUse`、TargNodeの`StartAodvRrepInstance()`は`m_aodvRejoinBlocked`(§109)。共有されて
+いたのは`IsJoinedTo()`だけ(`rpl-p2p.cc`のコメント「IsJoinedTo()が解決する」が、これを根拠にしていた)。
+先の探索が終わった後に別プロトコルの探索を始めると、200/200で同じ鍵が選ばれた(§110、17秒空けた場合)。
+
+害(§110の実測): 混ざったメンバーシップはRREQ-DIOしか送らず、P2P側のStopでTrickleが止まると、
+そのルータのP2Pの'L'が切れるまでAODVの探索が止まる。AODVを始めた後に居残りの一時DAGが再形成され
+(§116)、停止を起こす場合もあった。「4秒超または失敗」は、P2P→AODVで14対3、AODV→P2Pで29対13。
+
+修正: `P2pIdBarred()`(P2Pの`m_p2pInstanceUse`と`P2pMembershipBar()`)と`AodvIdBarred()`
+(AODVの`m_aodvRejoinBlocked`)を加え、3か所の割当がどちらのbarも避ける。全IDがbarの中なら、
+最も早く空くものを使う従来の動作は変えていない。P2Pの`membershipBar`の式は`P2pMembershipBar()`に
+まとめた(§116の3L)。
+
+試験: `RplP2pAodvInstanceIdsDistinctTestCase`(182件になった)。1ノードで、P2P→AODVとAODV→P2Pの
+両方の順に、先の探索のメンバーシップが満了した後(両barの中)に別のプロトコルの探索を始め、
+別のIDが選ばれること。load-bearing検証: AODVの割当がP2Pのbarを見ない、P2Pの割当がAODVのbarを
+見ない、のそれぞれで、対応する順がFAILすることを確認した。TargNodeの割当(3つ目)への追加は
+読んだだけで、専用の試験は無い。
+
+未修正・未測定:
+- 規模での効果は測っていない。§110の測定(5x5格子、200シード)は同じ鍵が選ばれることと、その結果の
+  遅延・失敗を示したが、そのプローブは使い捨てで残っていない。ここでは、同じ鍵が選ばれなくなることを
+  試験で示しただけである。ハーネスは1実行で1プロトコルしか使わないので、この修正は既存の評価結果に
+  影響しない(§110)。
+- **H=1の経路状態の衝突(§110の追加2件のうち1件)は一部しか解けない**: AODV(H=1)の経路は
+  PathLifetime x 単位(既定で30分)生きるが、AODVのREJOIN_REENABLE barは15分で切れる。barが切れた
+  後、同じIDがP2Pに割り当てられると、まだ生きているAODVの経路(同じインスタンス、同じDODAGID)と
+  P2P-DROの次ホップが食い違い、§9.6のMUST discardで捨てられる。つまり衝突が起きる時間帯は約30分から
+  約15分に縮んだが、無くなってはいない。P2Pの`routeBar`(同じTarget、X+2t)に当たる再利用禁止を
+  AODV側にも設けるのは、AODVのIDの回転に影響するので、判断が要る。
+- もう1件の「混ざったメンバーシップをP2P側の'L'が消すとREJOIN_REENABLEのbarが張られない」は、
+  §114で`LeaveDodag()`がAODVの状態を持つメンバーシップの離脱すべてでbarを張るようにしたので、
+  解消している(別途の試験は無い)。

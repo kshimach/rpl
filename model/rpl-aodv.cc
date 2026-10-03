@@ -186,6 +186,20 @@ RplRoutingProtocol::DiscoverRoute(Ipv6Address target, bool hopByHop)
             }
             continue;
         }
+        // Nor one a P2P-RPL discovery of this node may still be using: the
+        // two protocols share one Local RPLInstanceID space (@see
+        // P2pIdBarred()).
+        Time p2pEnd;
+        if (P2pIdBarred(local, p2pEnd))
+        {
+            anyBarred = true;
+            if (p2pEnd < earliestFree)
+            {
+                earliestFree = p2pEnd;
+                earliestFreeId = local;
+            }
+            continue;
+        }
         instanceId = local;
         found = true;
         break;
@@ -1346,6 +1360,19 @@ RplRoutingProtocol::StartAodvRrepInstance(const DodagMembership& rreqDodag, Doda
             if (blocked->second < earliestFree)
             {
                 earliestFree = blocked->second;
+                earliestFreeId = candidate;
+            }
+            continue;
+        }
+        // And not one a P2P-RPL discovery this node started is still using
+        // (@see P2pIdBarred()).
+        Time p2pEnd;
+        if (P2pIdBarred(candidate, p2pEnd))
+        {
+            anyBarred = true;
+            if (p2pEnd < earliestFree)
+            {
+                earliestFree = p2pEnd;
                 earliestFreeId = candidate;
             }
             continue;
