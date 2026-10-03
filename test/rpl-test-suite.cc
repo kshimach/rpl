@@ -17642,6 +17642,139 @@ RplP2pAodvInstanceIdsDistinctTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief The DIO that makes a router join a DODAG does not count towards
+ *        Trickle's redundancy, so its first transmission is not suppressed.
+ *
+ * RFC 6550 section 8.3: only "A DIO from a sender with a lesser DAGRank that
+ * causes no changes to the recipient's parent set, preferred parent, or
+ * Rank" is consistent, and joining is an inconsistency. HandleDio() counted
+ * the joining DIO as consistent anyway; RFC 6206 rule 6 makes the reset that
+ * follows a no-op at I == Imin, so with k = 1 the first interval of every
+ * router ended suppressed (design-constraints.md section 118). One router
+ * with k = 1 and Imin 128 ms: its first DIO has to come within the first
+ * interval, i.e. before 128 ms; suppressed, the next chance is the second
+ * interval, which starts at 128 ms and whose transmission falls in
+ * [256, 384) ms.
+ */
+class RplTrickleJoinDioNotConsistentTestCase : public TestCase
+{
+  public:
+    RplTrickleJoinDioNotConsistentTestCase();
+
+  private:
+    void DoRun() override;
+
+    /// @brief Record when the router under test first transmits a DIO.
+    /// @param socket the monitoring socket
+    void Capture(Ptr<Socket> socket);
+
+    Ipv6Address m_routerLinkLocal; //!< link-local address of the router under test
+    Time m_firstDio{Time::Max()};   //!< when its first DIO reached the monitor
+};
+
+RplTrickleJoinDioNotConsistentTestCase::RplTrickleJoinDioNotConsistentTestCase()
+    : TestCase("The DIO that makes a router join is not counted as consistent by Trickle "
+              "(RFC 6550 section 8.3)")
+{
+}
+
+void
+RplTrickleJoinDioNotConsistentTestCase::Capture(Ptr<Socket> socket)
+{
+    Address sender;
+    Ptr<Packet> packet = socket->RecvFrom(sender);
+    if (!packet)
+    {
+        return;
+    }
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ipv6Header);
+    Icmpv6Header icmpv6Header;
+    packet->RemoveHeader(icmpv6Header);
+    if (icmpv6Header.GetType() == ICMPV6_RPL && icmpv6Header.GetCode() == RPL_CODE_DIO &&
+        ipv6Header.GetSource() == m_routerLinkLocal && m_firstDio == Time::Max())
+    {
+        m_firstDio = Simulator::Now();
+    }
+}
+
+void
+RplTrickleJoinDioNotConsistentTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2); // 0 = the router under test, 1 = the monitor
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    // The monitor runs RPL too, unrooted, only because StartInterface() is
+    // what joins the RPL multicast group on its interface.
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.AssignWithoutAddress(devices);
+
+    Ptr<Node> node = nodes.Get(0);
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+    m_routerLinkLocal = node->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    Ptr<Socket> monitor = Socket::CreateSocket(nodes.Get(1), Ipv6RawSocketFactory::GetTypeId());
+    monitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    monitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    monitor->BindToNetDevice(devices.Get(1));
+    monitor->SetRecvCallback(MakeCallback(&RplTrickleJoinDioNotConsistentTestCase::Capture, this));
+
+    Simulator::Stop(Seconds(2));
+    Simulator::Run();
+
+    Ipv6Address dodagId("2001:1::1");
+    RplDioHeader dio;
+    dio.SetInstanceId(0);
+    dio.SetVersionNumber(0);
+    dio.SetRank(RPL_MIN_HOPRANKINC);
+    dio.SetMop(RPL_MOP_NON_STORING);
+    dio.SetGrounded(true);
+    dio.SetDodagId(dodagId);
+    dio.SetDtsn(0);
+    // Imin 2^7 = 128 ms, k = 1: the Trickle this router adopts from the DIO.
+    dio.SetDagConfiguration(4,
+                            7,
+                            1,
+                            RPL_MAX_RANKINC,
+                            RPL_MIN_HOPRANKINC,
+                            RPL_OCP_OF0,
+                            RPL_DEFAULT_LIFETIME,
+                            RPL_DEFAULT_LIFETIME_UNIT);
+    const Time joined = Simulator::Now();
+    DeliverRawRplMessage<RplDioHeader>(node,
+                                       1,
+                                       dio,
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       Ipv6Address("fe80::a"),
+                                       Ipv6Address(RPL_ALL_NODES_MULTICAST));
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(0, dodagId), true, "The router never joined");
+
+    Simulator::Stop(Seconds(1));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_NE(m_firstDio, Time::Max(), "The router never transmitted a DIO");
+    NS_TEST_ASSERT_MSG_LT(m_firstDio - joined,
+                          MilliSeconds(128),
+                          "The router's first DIO left after its first Trickle interval: the DIO "
+                          "that made it join was counted as consistent and suppressed it");
+
+    monitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief A P2P mode DIO is only joined if the router's own resulting
  *        DAGRank would stay within the MaxRank, relaxed by one step for the
  *        Target, mirroring AODV-RPL's own RankLimit boundary test.
@@ -29039,6 +29172,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplP2pCollectWindowClampTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pStopRememberedAfterExpiryTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pAodvInstanceIdsDistinctTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplTrickleJoinDioNotConsistentTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pStopSilencesDiosTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pStopDoesNotReachOtherDodagsTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplMop4WithNoDiscoveryOptionRefusedTestCase, TestCase::Duration::QUICK);

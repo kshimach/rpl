@@ -11887,3 +11887,43 @@ bar中のIDを避ける動作(§96)は変わらない。加入が開始から'L'
 - もう1件の「混ざったメンバーシップをP2P側の'L'が消すとREJOIN_REENABLEのbarが張られない」は、
   §114で`LeaveDodag()`がAODVの状態を持つメンバーシップの離脱すべてでbarを張るようにしたので、
   解消している(別途の試験は無い)。
+
+## 118. 参加のきっかけのDIOを、Trickleのconsistentに数えない(base RPLのみ)(§104 RPLコア4)
+
+RFC 6550 §8.3: "A DIO from a sender with a lesser DAGRank that causes no changes to the recipient's
+parent set, preferred parent, or Rank SHOULD be considered consistent with respect to the Trickle
+timer."、および"When a node joins a new DODAG Version (e.g., by updating its DODAGVersionNumber,
+joining a new RPL Instance, etc.)"はMUSTのinconsistency。ルータを参加させるDIOは親集合、優先親、Rankの
+すべてを変えるが、`HandleDio()`は`SelectPreferredParent()`より前に無条件で`ConsistencyHit()`を呼んで
+いた。直後の`Reset()`は、始まったばかりのTrickle(I == Imin)ではRFC 6206 rule 6により何もしない
+ので、数えた1が残り、k=1では各ルータの最初の送信が必ず抑制された。
+
+実測(検証側): 5ノードの直列で、base RPLのk=1での収束(node4のjoin)が平均13.5秒 -> 66.9秒
+(32.7-94.6秒)。参加のきっかけのDIOを数えない版ではk=0と同一(13.5秒)。AODV-RPL(既定のk=1、
+generic規則)も、直列の4ノードすべてで最初の送信が抑制され、RREQがTargNodeに届くまで平均3.7秒対
+0.39秒、1/100シードで未到達。25ノードの密な格子では差が小さく、AODV-RPLはむしろ抑制した方が
+制御バイトが少ない場合があった(検証側: 非対称m6で206対273 ms)。
+
+修正: 参加させるDIO(受信前のRankがINFINITE_RANKで、RREQ/RREPでないもの)は`ConsistencyHit()`を
+呼ばない。
+
+**AODV-RPLには適用していない。** §52.6の`AodvDioRedundancy=1`は、このカウントがある状態の掃引で
+採用された。直すと、その動作点と、その上の論文の数値(Tier 2)が動く。同じ効果を出す属性
+`AodvTrickleRankOnlyReset`(参加時に`ConsistencyHit()`しない)は既にあり、検証側の測定では
+RREQ到達の速さが直した版と同一だった。AODV-RPLの既定をこれに替えるかは、掃引で決める判断として
+残す。逆に言えば、AODV-RPLの`k=1`の制御バイト削減には、参加のきっかけのDIOによる初回送信の
+抑制が寄与している。
+
+**出荷時の評価への影響(測った)**: ハーネスは基盤DODAGのkが10で、この修正は参加時の1回のカウントだけを
+変える。それでも、25ノード格子、lr-wpan、MRHOF、AODV-RPL(`--scenario=3`)、各30シードで、直前
+(§115)と比べて60行中53行が変わった。対称: 制御バイトが433,912 -> 422,830(-2.6%、差の95%区間
+[-18,892, -3,150])、成功率の差の区間[-0.0200, +0.0178]、到達率は同一。非対称: 886,365対889,996
+(区間[-31,033, +22,463])、成功率[-0.0111, +0.0156]、到達率[-0.0133, +0.0089]。悪化は無いが、
+**既発表の数値がわずかに動く**(対称で約2.6%の制御バイト減)。この修正を取り込むなら、Tier 2の
+数値(8.3-8.6節)は再測定が要る。取り込まないなら、このコミットを戻す。
+
+試験: `RplTrickleJoinDioNotConsistentTestCase`(183件になった)。k=1、Imin 128 msの1台に参加のDIOを与え、
+最初のDIOが最初の間隔(128 ms未満)に出ること。load-bearing検証: 無条件に数える旧挙動に戻すと、
+最初のDIOが260 msに押し出されてFAILする(第2間隔の送信は[256, 384) msの予測どおり)。
+
+未確認: P2P-RPLは別の分岐(§9.2)で、この数えには関係しない。

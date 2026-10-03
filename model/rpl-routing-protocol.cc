@@ -2113,7 +2113,30 @@ RplRoutingProtocol::HandleDio(const RplDioHeader& dio,
     }
     else
     {
-        dodag->dioTrickle.ConsistencyHit();
+        // RFC 6550 section 8.3: only "A DIO from a sender with a lesser
+        // DAGRank that causes no changes to the recipient's parent set,
+        // preferred parent, or Rank SHOULD be considered consistent", and
+        // "When a node joins a new DODAG Version (e.g., by ... joining a new
+        // RPL Instance, etc.)" is an inconsistency. The DIO that makes this
+        // node join (its Rank is still INFINITE_RANK, JoinDodag() leaves it
+        // there until a parent is picked) changes all three, yet it was
+        // counted as consistent: the Reset() below is a no-op on a Trickle
+        // that has just started (RFC 6206 rule 6, I == Imin), so that
+        // count survived and, with k = 1, every router's first transmission
+        // was suppressed (design-constraints.md section 118: base RPL's
+        // convergence over a line of five nodes went from 13 s to 67 s).
+        //
+        // Not applied to an AODV-RPL RREQ-/RREP-DIO. AodvDioRedundancy = 1
+        // was adopted (section 52.6) with this count in place, and removing
+        // it moves that operating point and the numbers measured on it. The
+        // AodvTrickleRankOnlyReset attribute already provides the other
+        // behaviour for anyone who wants it.
+        const bool joiningDio =
+            dodag->rank == RPL_INFINITE_RANK && !dio.HasRreq() && !dio.HasRrep();
+        if (!joiningDio)
+        {
+            dodag->dioTrickle.ConsistencyHit();
+        }
 
         // Same dangling-pointer hazard as the infinite-rank branch above:
         // SelectPreferredParent() can erase this very entry via LeaveDodag().
