@@ -11927,3 +11927,43 @@ RREQ到達の速さが直した版と同一だった。AODV-RPLの既定をこ�
 最初のDIOが260 msに押し出されてFAILする(第2間隔の送信は[256, 384) msの予測どおり)。
 
 未確認: P2P-RPLは別の分岐(§9.2)で、この数えには関係しない。
+
+## 119. 親が広告する、比較できないDODAG Versionに追従する(§104 RPLコア5)
+
+`HandleDio()`は、DODAG Versionが保持値と比較不能(lollipop空間で差が17以上、RFC 6550 §7.2 rule 3.2.1)
+なDIOを、送り主が優先親であっても丸ごと捨てていた(`RplSequenceNewer()`はGREATERだけを真とする)。
+`parent.lastHeard`の更新より前にreturnするので、親は陳腐化の判定にかかるまで更新されず、
+`GlobalRepairInterval`を有効にして17回以上のrepairを取りこぼしたノードは、旧Versionに44〜50分
+(既定のTrickleでは最大約61分)とどまった。§104の検証で、実測(R-P-Cの直列、GlobalRepairInterval
+1秒、R-Pを30秒遮断): 回線回復から52〜62秒の遅れ。
+
+RFC 6550 §7.2 rule 4は、比較できない場合の優先順位を2段で定める。"give precedence to the sequence
+number that has most recently been observed to increment. Failing this, ... minimize the resulting
+changes to its own state." 実装は後段(「状態の変化を最小にする」)だけを根拠にしていた(コメント、
+`RplSequenceNewer()`のdoc、既存の試験、§2062の要約が揃って前段を落としていた)。DODAGの親は、
+最後に広告したVersionに縛られ(§8.2.2.1 rule 6: 新しいVersionを広告した後に古いVersionのメンバーに
+なってはならない)、そこから別のVersionが届けば、それは増分が観測されたもの。追従しても安全なのは、
+§8.2.2.1が"A parent that advertises the new DODAGVersionNumber cannot belong to the sub-DODAG of a
+node advertising an older DODAGVersionNumber"と述べるため。
+
+修正: `HandleDio()`のbase DODAGのVersion比較で、比較不能かつ送り主が現在の親集合にいれば、
+新しいVersionへ移行する(GREATERと同じ扱い)。親でない隣接の比較不能なVersionは従来どおり捨てる。
+MOP 4の経路探索インスタンスは、Versionを移行させない設計(§94)のままである。テスト用に
+`GetDodagVersion()`を加えた。
+
+試験: `RplIncomparableVersionFromParentTestCase`(184件になった)。Version 18に親p1で参加し、差30の
+Version 48をp1でない隣接から受けても18のままで、親から受けると48へ移ること。load-bearing検証:
+親の例外を外すと、親からのVersion 48に追従せずFAILすることを確認した。
+
+端到端の測定(使い捨てのプローブ、R-P-Cの直列、SimpleChannel、GlobalRepairInterval 1秒、DioIntervalMin
+1024 ms、doublings 5、R-Pを21-51秒遮断、10シード): 遮断解除からPがRのVersionに追従するまで、
+修正前は52.6〜62.8秒(平均56.4秒)、修正後は0.6〜5.2秒(平均1.7秒)。検証側の観測(51〜62秒)と一致した。
+
+出荷時の評価への影響: `GlobalRepairInterval`の既定は`Time::Max()`(無効)で、Versionを増やす経路は
+Global Repairだけなので、既定の構成では比較不能なVersionが届かず、この修正は挙動を変えない。
+Global Repairを有効にしたシナリオでは、長い遮断の後の回復が速くなる。そうしたシナリオの数値
+(Tier 2でGlobal Repairを使った測定)は、取り込むなら再測定が要る。
+
+未修正: 検証側が指摘した「停止期間中、PはVersion 48の親を抱えたままVersion 18を広告し続ける(§8.2.2.1
+rule 1)」は、この修正で停止期間そのものが数秒になったので、実害は小さくなったが、解釈の余地があるため
+手を入れていない。

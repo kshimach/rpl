@@ -785,6 +785,17 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     bool GetPathSequence(uint8_t instanceId, Ipv6Address dodagId, uint8_t& pathSequence) const;
 
     /**
+     * @brief Get the DODAG Version Number a node holds for a DODAG it is a
+     *        member of. Exposed for tests.
+     *
+     * @param instanceId the RPLInstanceID of the DODAG
+     * @param dodagId the DODAGID
+     * @param [out] version the DODAG Version Number
+     * @return true if this node is a member of that DODAG
+     */
+    bool GetDodagVersion(uint8_t instanceId, Ipv6Address dodagId, uint8_t& version) const;
+
+    /**
      * @brief Get the source route a P2P-RPL discovery found to a target.
      *
      * The P2P-RPL counterpart of GetAodvRoute(): every hop from the Origin

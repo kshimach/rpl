@@ -23194,6 +23194,120 @@ RplRrepInstancePerRreqInstanceTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief A parent's DODAG Version that is too far away to order is followed;
+ *        a stranger's is not.
+ *
+ * RFC 6550 section 7.2 rule 4: for counters that cannot be ordered, "give
+ * precedence to the sequence number that has most recently been observed to
+ * increment. Failing this, ... minimize the resulting changes to its own
+ * state." A DODAG parent holds a Version it may not go back on (section
+ * 8.2.2.1 rule 6), so a different one from it has been observed to
+ * increment, and following it is loop-safe because "A parent that advertises
+ * the new DODAGVersionNumber cannot belong to the sub-DODAG of a node
+ * advertising an older" one. HandleDio() ignored every incomparable Version,
+ * so a node that had missed 17 or more of them kept the old one for 44-50
+ * minutes (design-constraints.md section 119). One node, Version 18, then
+ * Version 48 first from a neighbour that was never a parent, then from its
+ * parent.
+ */
+class RplIncomparableVersionFromParentTestCase : public TestCase
+{
+  public:
+    RplIncomparableVersionFromParentTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplIncomparableVersionFromParentTestCase::RplIncomparableVersionFromParentTestCase()
+    : TestCase("A DODAG parent's incomparable Version is followed, a stranger's is not "
+              "(RFC 6550 section 7.2 rule 4)")
+{
+}
+
+void
+RplIncomparableVersionFromParentTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(1);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.AssignWithoutAddress(devices);
+
+    Ptr<Node> node = nodes.Get(0);
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+
+    Simulator::Stop(Seconds(1));
+    Simulator::Run();
+
+    Ipv6Address dodagId("2001:1::1");
+    Ipv6Address parent("fe80::a");
+    Ipv6Address stranger("fe80::b");
+    static constexpr uint8_t OLD_VERSION = 18;
+    static constexpr uint8_t NEW_VERSION = 48; // 30 apart: beyond SEQUENCE_WINDOW (16)
+
+    auto deliver = [&](Ipv6Address from, uint8_t version) {
+        RplDioHeader dio;
+        dio.SetInstanceId(0);
+        dio.SetVersionNumber(version);
+        dio.SetRank(RPL_MIN_HOPRANKINC);
+        dio.SetMop(RPL_MOP_NON_STORING);
+        dio.SetGrounded(true);
+        dio.SetDodagId(dodagId);
+        dio.SetDtsn(0);
+        dio.SetDagConfiguration(4,
+                                6,
+                                0,
+                                RPL_MAX_RANKINC,
+                                RPL_MIN_HOPRANKINC,
+                                RPL_OCP_OF0,
+                                RPL_DEFAULT_LIFETIME,
+                                RPL_DEFAULT_LIFETIME_UNIT);
+        DeliverRawRplMessage<RplDioHeader>(node,
+                                           1,
+                                           dio,
+                                           static_cast<uint8_t>(RPL_CODE_DIO),
+                                           from,
+                                           Ipv6Address(RPL_ALL_NODES_MULTICAST));
+    };
+
+    uint8_t version = 0;
+    deliver(parent, OLD_VERSION);
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetDodagVersion(0, dodagId, version),
+                          true,
+                          "The node never joined");
+    NS_TEST_ASSERT_MSG_EQ(+version, +OLD_VERSION, "The node joined the wrong Version");
+
+    deliver(stranger, NEW_VERSION);
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetDodagVersion(0, dodagId, version), true, "The node left");
+    NS_TEST_ASSERT_MSG_EQ(+version,
+                          +OLD_VERSION,
+                          "A neighbour that is not a parent moved the node to a Version it "
+                          "cannot order");
+
+    deliver(parent, NEW_VERSION);
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetDodagVersion(0, dodagId, version), true, "The node left");
+    NS_TEST_ASSERT_MSG_EQ(+version,
+                          +NEW_VERSION,
+                          "The node's own parent advertised a Version it cannot order and the "
+                          "node stayed on the old one");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Follow a node all the way around the state machine: joined, then
  *        cut off from its only parent until it gives up on the DODAG, then
  *        reconnected and joined again.
@@ -29173,6 +29287,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplP2pStopRememberedAfterExpiryTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pAodvInstanceIdsDistinctTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplTrickleJoinDioNotConsistentTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplIncomparableVersionFromParentTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pStopSilencesDiosTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pStopDoesNotReachOtherDodagsTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplMop4WithNoDiscoveryOptionRefusedTestCase, TestCase::Duration::QUICK);

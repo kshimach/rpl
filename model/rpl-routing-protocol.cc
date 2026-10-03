@@ -1955,7 +1955,24 @@ RplRoutingProtocol::HandleDio(const RplDioHeader& dio,
         // permanently. Rule 4 covers the counters that cannot be ordered at
         // all: not migrating is the answer that "minimize[s] the resulting
         // changes to its own state".
-        if (RplSequenceNewer(dio.GetVersionNumber(), existing->version))
+        //
+        // Except from a parent. RFC 6550 section 7.2 rule 4 puts something
+        // ahead of that fallback: "give precedence to the sequence number
+        // that has most recently been observed to increment". A DODAG parent
+        // is held to the Version it last advertised, which rule 6 of section
+        // 8.2.2.1 forbids it ever to go back on, so a different Version from
+        // it, however far off, is one observed to increment. Section 8.2.2.1
+        // also says why following it is safe: "A parent that advertises the
+        // new DODAGVersionNumber cannot belong to the sub-DODAG of a node
+        // advertising an older DODAGVersionNumber". Ignoring it left a node
+        // that had missed 17 or more Versions on the old one, with parents it
+        // could no longer follow, until its own staleness sweep dropped them
+        // (44 to 50 minutes at the default Trickle; design-constraints.md
+        // section 119). A neighbour that is not a parent keeps the fallback.
+        const RplSequenceOrder order = RplSequenceCompare(dio.GetVersionNumber(), existing->version);
+        const bool fromParent = existing->parents.find(from) != existing->parents.end();
+        if (order == RplSequenceOrder::GREATER ||
+            (order == RplSequenceOrder::NOT_COMPARABLE && fromParent))
         {
             NS_LOG_INFO("DODAG " << existing->dodagId << " moved to version "
                                  << +dio.GetVersionNumber());
@@ -5241,6 +5258,20 @@ RplRoutingProtocol::GetPreferredParent() const
 {
     const DodagMembership* dodag = GetBaseDodag();
     return dodag ? dodag->preferredParent : Ipv6Address::GetAny();
+}
+
+bool
+RplRoutingProtocol::GetDodagVersion(uint8_t instanceId,
+                                    Ipv6Address dodagId,
+                                    uint8_t& version) const
+{
+    auto it = m_dodags.find(DodagKey{instanceId, dodagId});
+    if (it == m_dodags.end())
+    {
+        return false;
+    }
+    version = it->second.version;
+    return true;
 }
 
 bool
