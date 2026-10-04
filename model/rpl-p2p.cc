@@ -980,6 +980,14 @@ RplRoutingProtocol::SendP2pDroRoute(DodagMembership& dodag,
     // /protocol-test-matrix's angle 4 as a regression from section 100's own
     // interface-scoping fix.
     rdo.target = MatchedP2pTargetAddress(dodag);
+    if (rdo.target.IsAny())
+    {
+        // Two discoveries sharing one {RPLInstanceID, DODAGID} can leave no
+        // own address among the named Targets. "::" is not a valid TargetAddr
+        // (section 8.2), and with S=1 it would also silence the other
+        // discovery, so fall back to the receiving interface's address.
+        rdo.target = route.back();
+    }
     dro.SetP2pRdo(rdo);
 
     Ptr<Packet> packet = Create<Packet>();
