@@ -11849,6 +11849,8 @@ bar中のIDを避ける動作(§96)は変わらない。加入が開始から'L'
 
 ## 117. P2P-RPLとAODV-RPLが、Local RPLInstanceIDの再利用禁止を互いに見る(§110 P2P-RPL 2)
 
+(注: 末尾の「H=1の経路状態の衝突」の窓は、プロトコルをまたぐ分について§125で塞いだ。)
+
 両プロトコルは、ローカルインスタンスを同じノードのグローバルアドレスをDODAGIDとして立てる。ルータは
 メンバーシップを`{RPLInstanceID, DODAGID}`だけで引くので、同じIDで始めたRREQ-Instanceと一時DAGは、
 両方を聞いたルータで1つのメンバーシップに混ざる。RFC 6550 §5.1は、ローカルのRPLInstanceIDが
@@ -12117,4 +12119,35 @@ Resetした(§8.3: 変更を起こさない下位Rank送信元のDIOはconsisten
 Imin 128 msが、採用規則を満たす選択肢の中で最も制御バイトが少ない。§122で増えた制御バイト(+5〜9%)は、
 この2つのノブでは取り戻せない。取り戻すには、規則の外(別の抑制の仕組み)が要る。
 `run-aodv-defaults-sweep.sh`に、k・Imin・シード開始位置(`SEED0`)の腕を足した。
+
+## 125. プロトコルをまたぐLocal RPLInstanceIDの再利用を、経路状態の寿命まで禁じる(§117の残り)
+
+§117は、AODV-RPLのREJOIN_REENABLE(15分)とP2P-RPLの3Lの間だけ、別プロトコルの探索へのIDの割当を
+禁じていた。AODV-RPL(H=1)やP2P-RPLの経路状態は、PathLifetime(既定30分)のあいだルータに残る。
+barが切れた後に、同じIDが別プロトコルに割り当てられると、まだ生きている経路(同じインスタンス、
+同じDODAGID)とP2P-DROの次ホップが食い違い、RFC 6997 §9.6のMUST discardで捨てられる。
+
+RFCの読み:
+- RFC 9854 §2はREJOIN_REENABLEを15分と定め、§6.4.3は"A route entry with the same source and
+  destination address and the same RPLInstanceID, but a stale Sequence Number, MUST be deleted"と、
+  同じIDの古い経路をSequence Numberで置き換える。AODV-RPLの内部では、IDの再利用は15分のbarと
+  Sequence Numberでよく、RFCはそれ以上を求めない。AODV同士のbarは変えない。
+- 衝突が残るのはプロトコルをまたぐ場合だけで、P2P-RPLにはSequence Numberがない。RFC 6550 §5.1は
+  "A local RPLInstanceID is autoconfigured by the node that owns the DODAGID and it MUST be unique
+  for that DODAGID"と定める。RFC 6997 §6.1は、再利用の禁止を"if the state created during the previous
+  route discovery might still exist"と、状態が残りうる間に限っている。この2つに沿って、自分が起点に
+  なった経路状態が残りうるあいだは、別プロトコルの探索にそのIDを割り当てない。
+
+修正: `m_aodvRouteStateUntil`(AODVの探索の開始 + 'L' + PathLifetime)を加え、`AodvIdBarred()`が
+`m_aodvRejoinBlocked`と合わせて見る(P2Pの割当だけが読む)。`P2pIdBarred()`の終端を、開始 + 3L から
+開始 + 3L + PathLifetime に延ばした(AODVの割当だけが読む)。同じプロトコル内の規則(AODVの15分、
+P2Pの§6.1の2L/3LとX+2t)は変えていない。
+
+試験: `RplP2pAodvInstanceIdsDistinctTestCase`に1000秒の待ち(AODVのREJOIN_REENABLE 900秒と
+P2Pの3Lを過ぎ、経路状態の寿命内)を加え、両方向で別のIDが選ばれること。両方向それぞれを外すと
+FAILすることを確認した。ハーネスは1実行で1プロトコルしか使わないので、既存の評価結果には影響しない。
+
+残り: 経路が置き換えられた後も、旧経路のルータ側の状態は残る。自分の探索の開始から数える本修正は
+これも覆う(経路の有無によらず開始時刻で数えるため)。他のノードが起点になったインスタンスとのIDの衝突は、
+DODAGIDが違うので鍵が違い、起きない。
 

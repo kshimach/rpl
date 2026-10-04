@@ -3096,6 +3096,18 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     /// finds itself an ordinary member of its own discovery.
     std::map<DodagKey, Time> m_aodvRejoinBlocked;
 
+    /// When the routers may stop holding the route state of an AODV-RPL
+    /// discovery this node originated, by Local RPLInstanceID: the discovery's
+    /// start plus 'L' plus PathLifetime. m_aodvRejoinBlocked ends after
+    /// REJOIN_REENABLE (RFC 9854 section 2, 15 minutes), a third of the
+    /// default PathLifetime, so a P2P-RPL discovery given the same ID then
+    /// meets a live AODV-RPL route under the same {RPLInstanceID, DODAGID},
+    /// and RFC 6997 section 9.6 has the router discard its P2P-DRO. Only
+    /// P2P-RPL's allocator reads it (@see AodvIdBarred()): within AODV-RPL
+    /// the RFC itself replaces a stale route by Sequence Number (section
+    /// 6.4.3). design-constraints.md section 125.
+    std::map<uint8_t, Time> m_aodvRouteStateUntil;
+
     /// What the last P2P-RPL discovery this node originated under a given
     /// Local RPLInstanceID was, so DiscoverP2pRoute() can honour RFC 6997
     /// section 6.1's two reuse rules. AODV-RPL needs no equivalent: its own

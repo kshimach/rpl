@@ -17602,6 +17602,12 @@ RplP2pAodvInstanceIdsDistinctTestCase::RplP2pAodvInstanceIdsDistinctTestCase()
 void
 RplP2pAodvInstanceIdsDistinctTestCase::DoRun()
 {
+    // 20 s is inside both protocols' reuse bars. 1000 s is past AODV-RPL's
+    // REJOIN_REENABLE (900 s) and P2P-RPL's 3 * L, yet well inside the route
+    // state either discovery left on the routers (PathLifetime, 30 minutes by
+    // default), where a reused ID makes the routers discard the next P2P-DRO
+    // (RFC 6997 section 9.6; design-constraints.md section 125).
+    for (double wait : {20.0, 1000.0})
     for (bool p2pFirst : {true, false})
     {
         NodeContainer nodes;
@@ -17635,7 +17641,7 @@ RplP2pAodvInstanceIdsDistinctTestCase::DoRun()
 
         // Past the first discovery's own 'L' (16 s by default) but inside both
         // protocols' reuse bars.
-        Simulator::Stop(Seconds(20));
+        Simulator::Stop(Seconds(wait));
         Simulator::Run();
         NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(first.instanceId, first.dodagId),
                               false,
@@ -17650,7 +17656,7 @@ RplP2pAodvInstanceIdsDistinctTestCase::DoRun()
                               first.instanceId,
                               "The second discovery reused the other protocol's RPLInstanceID "
                               << (p2pFirst ? "(P2P-RPL then AODV-RPL)" : "(AODV-RPL then P2P-RPL)")
-                              << " while it was still barred");
+                              << " " << wait << " s later, while it was still barred");
 
         Simulator::Destroy();
     }

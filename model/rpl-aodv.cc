@@ -286,6 +286,13 @@ RplRoutingProtocol::DiscoverRoute(Ipv6Address target, bool hopByHop)
     // section 6.2.5 has only intermediate routers append to it.
     dodag.aodv.addressVector.clear();
 
+    {
+        Time& until = m_aodvRouteStateUntil[instanceId];
+        until = std::max(until,
+                         Simulator::Now() + Seconds(RplAodvLifetimeSeconds(m_aodvLifetime)) +
+                             Seconds(m_pathLifetime * m_lifetimeUnit));
+    }
+
     // A discovery has to complete within its own 'L' field, so it is paced
     // far faster than the base DODAG's steady-state upkeep.
     dodag.dioIntervalMin = m_aodvDioIntervalMin;

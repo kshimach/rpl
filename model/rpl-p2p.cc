@@ -51,19 +51,27 @@ RplRoutingProtocol::P2pIdBarred(uint8_t local, Time& end) const
     {
         return false;
     }
-    end = used->second.started + P2pMembershipBar();
+    // The route state it established outlives the temporary DAG by far: an
+    // AODV-RPL discovery under the same ID would meet a live P2P-RPL route
+    // under the same {RPLInstanceID, DODAGID} (design-constraints.md section
+    // 125). Read only by AODV-RPL's allocators.
+    end = used->second.started + P2pMembershipBar() + Seconds(m_pathLifetime * m_lifetimeUnit);
     return Simulator::Now() < end;
 }
 
 bool
 RplRoutingProtocol::AodvIdBarred(uint8_t local, Ipv6Address dodagId, Time& end) const
 {
+    end = Time(0);
     auto blocked = m_aodvRejoinBlocked.find(DodagKey{local, dodagId});
-    if (blocked == m_aodvRejoinBlocked.end())
+    if (blocked != m_aodvRejoinBlocked.end())
     {
-        return false;
+        end = blocked->second;
     }
-    end = blocked->second;
+    if (auto state = m_aodvRouteStateUntil.find(local); state != m_aodvRouteStateUntil.end())
+    {
+        end = std::max(end, state->second);
+    }
     return Simulator::Now() < end;
 }
 
