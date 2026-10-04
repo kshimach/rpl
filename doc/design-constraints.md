@@ -12055,3 +12055,8 @@ rule 1)」は、この修正で停止期間そのものが数秒になったの�
   持つインタフェースで受けたコピーにだけ応答する(失敗が「経路なし」として見える。ただし
   `RplP2pTargetOnOtherInterfaceTestCase`が固定する§102の挙動を変える)、のどちらかになる。
 
+決定: (B)を採る。RFC 6997 §9.3は"If one of its IPv6 addresses is listed as a Target address ... the
+router considers itself a Target"と、受信インタフェースに限らず自分のアドレスのどれかで
+Targetとして処理するよう定める。(C)はこのMUSTから外れるので採らない。現状の挙動(0ad3f13)を
+維持し、制限として`doc/rpl.rst`に明記した。
+

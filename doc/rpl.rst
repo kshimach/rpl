@@ -138,6 +138,12 @@ What it does not do (Limitations):
   (RFC 6550 section 11.2) traces and flags the drop, resetting the Trickle timer,
   but |ns3|'s ``Ipv6Option::Process()`` API lacks a mechanism to forcibly halt
   packet delivery. See ``contrib/rpl/doc/design-constraints.md`` section 12.3.
+* **P2P Target Address on Another Interface**: A P2P-RPL Target considers itself a
+  Target if any of its addresses is listed (RFC 6997 section 9.3), whatever interface
+  the DIO arrived on, and the module follows that. When the named address belongs to a
+  different interface than the one the route arrives on, the discovery completes but
+  a stack with the Strong End System Model (the |ns3| default) discards the data at the
+  Target. See ``contrib/rpl/doc/design-constraints.md`` section 121.
 * **Other Routing Metrics**: Only ETX and LQL (RFC 6551 sections 4.3 and 4.6)
   are implemented. Node Energy, Hop Count metric object, Link Throughput, Link
   Latency, and Link Color are not supported.
