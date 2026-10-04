@@ -77,7 +77,17 @@ What the model does:
   the full lollipop sequence rules (Rules 1-4) for DODAGVersionNumber, DTSN,
   DAOSequence, and Path Sequence, correctly handling transitions between the
   linear [128..255] and circular [0..127] spaces, wrap-around, and desynchronization
-  detection within ``SEQUENCE_WINDOW`` (16).
+  detection within ``SEQUENCE_WINDOW`` (16). A DODAG Version that cannot be ordered
+  against the held one is followed when a DODAG parent advertises it (RFC 6550 section
+  7.2 rule 4's "most recently observed to increment") and ignored from any other neighbour.
+* **State Kept Across a Leave and Rejoin**: A node that leaves a DODAG keeps its Path
+  Sequence, its lowest advertised Rank L in each of the last four DODAG Versions it was in, so a
+  rejoin neither restarts the Path Sequence at the root's expense (RFC 6550 section 7.1)
+  nor escapes ``L + DAGMaxRankIncrease`` or rejoins a previous Version (section 8.2.2.4,
+  section 8.2.2.1 rule 6). A Version record lapses after twice the DODAG's Imax. A
+  Version that cannot be ordered against the current one (section 7.2 rule 4) is
+  followed only from a sender whose Rank is lower than the node's own. Route-discovery
+  instances keep nothing.
 * **Loop Avoidance and Data-Plane Validation (RFC 6550 section 11.2, RFC 6553)**:
   Attaches an RFC 6553 RPL Option (RPI) in a Hop-by-Hop header to originated
   packets. Intermediate routers verify rank consistency against the packet's
@@ -271,7 +281,8 @@ AODV-RPL Attributes (RFC 9854)
 * ``AodvDioIntervalDoublings``: Trickle doublings for RREQ-DIOs (default: 4).
 * ``AodvRankLimit``: Maximum DAGRank allowed to join RREQ discovery; 0 for unlimited (default: 8).
 * ``AodvLifetime``: RREQ-Instance lifetime: 0 (unlimited), 1 (16s, default), 2 (64s), 3 (256s).
-* ``AodvRejoinReenable``: Time to refuse rejoining an expired RREQ-Instance (default: 15 min).
+* ``AodvRejoinReenable``: Time to refuse rejoining an RREQ-Instance after leaving it, for any reason: the
+  'L' deadline or the loss of its last parent (default: 15 min).
 * ``AodvForceAsymmetric``: Clear 'S' bit on RREQ-DIOs, forcing asymmetric RREP-Instance flooding (default: false).
 
 P2P-RPL Attributes (RFC 6997)
@@ -311,7 +322,7 @@ Examples
 Tests
 ~~~~~
 
-The comprehensive test suite (``test/rpl-test-suite.cc``) comprises **184 test cases**:
+The comprehensive test suite (``test/rpl-test-suite.cc``) comprises **193 test cases**:
 
 * Serialization and deserialization round trips for all control messages, options,
   SRH, RPI, P2P-RDO, DRO, DRO-ACK, and AODV-RPL options.
@@ -333,7 +344,7 @@ The comprehensive test suite (``test/rpl-test-suite.cc``) comprises **184 test c
 Validation
 ----------
 
-The test suite is formally verified via ``./test.py -s rpl`` (all 184 unit test cases
+The test suite is formally verified via ``./test.py -s rpl`` (all 193 unit test cases
 executing cleanly). Multi-hop topologies with full IEEE 802.15.4 and 6LoWPAN stacks
 demonstrate 100% end-to-end bidirectional ping delivery, correct ETX accumulation, and
 stable operation across lossy radio channels.

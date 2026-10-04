@@ -26,6 +26,7 @@
 #include <map>
 #include <set>
 #include <tuple>
+#include <vector>
 
 namespace ns3
 {
@@ -2979,12 +2980,13 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     /// PathLifetime ran out. Not kept for route-discovery instances, which
     /// send no DAOs.
     std::map<DodagKey, uint8_t> m_retainedPathSequence;
-    /// What this node remembers of a DODAG it has left: the newest Version it
-    /// was a member of and its L (lowest Rank advertised) in that Version.
+    /// What this node remembers of one DODAG Version of a DODAG it has left:
+    /// the Version and its L (lowest Rank advertised) in it.
     struct RetainedRank
     {
-        uint8_t version;    //!< the DODAG Version the node was last a member of
+        uint8_t version;     //!< a DODAG Version the node was a member of
         uint16_t lowestRank; //!< L, RFC 6550 section 8.2.2.4 rule 3, in that Version
+        Time expires;        //!< when the node stops holding itself to this record
     };
     /// Kept across a leave, by DODAG. RFC 6550 section 8.2.2.4 rule 4 and its
     /// closing paragraph: a node that rejoins a DODAG Version it has been a
@@ -2997,7 +2999,16 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     /// membership erased on leaving forgot both, so a lost poison DIO let a
     /// node and its children climb the Rank without bound. Not kept for
     /// route-discovery instances.
-    std::map<DodagKey, RetainedRank> m_retainedRank;
+    ///
+    /// One record per Version left, newest last, at most RETAINED_VERSIONS: a
+    /// single record forgot L of a Version when an intermediate Version, one
+    /// that cannot be ordered against it (section 7.2 rule 4), came in
+    /// between. A record lapses after two of that DODAG's Imax, the local
+    /// timer section 8.2.2.1 rule 6 leaves to the implementation; kept for
+    /// ever, it would refuse a Version once the lollipop counter has come
+    /// round again (section 7.2 rule 3) and restore an L of 128 Versions ago.
+    std::map<DodagKey, std::vector<RetainedRank>> m_retainedRank;
+    static constexpr std::size_t RETAINED_VERSIONS = 4; //!< records kept per DODAG
 
     bool m_hasBaseDodag{false}; //!< whether m_baseDodagKey currently names a real entry
     //!< key of the base DODAG, meaningful only if m_hasBaseDodag
@@ -3092,8 +3103,12 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     /// key, armed when the membership expires.
     struct P2pInstanceUse
     {
-        Ipv6Address target; //!< the Target that discovery was looking for
-        Time started;       //!< when it was initiated
+        Time started; //!< when the latest discovery under this ID was initiated
+        /// When the latest discovery to each Target under this ID was
+        /// initiated. Section 6.1's MUST NOT is about "a previous route
+        /// discovery to this Target", not about the latest one under the ID,
+        /// so a discovery to another Target in between must not clear it.
+        std::map<Ipv6Address, Time> targetStarted;
     };
 
     /// Keyed by Local RPLInstanceID. RFC 6997 section 6.1 bars reuse twice

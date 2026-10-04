@@ -1882,16 +1882,20 @@ RplRoutingProtocol::HandleDio(const RplDioHeader& dio,
         // previous DODAG Version of the same DODAG." Only a strictly older
         // Version is refused: a newer or an incomparable one is a fresh
         // start (@see RplSequenceCompare()).
-        auto retained = m_retainedRank.find(dioKey);
-        if (retained != m_retainedRank.end() &&
-            RplSequenceCompare(dio.GetVersionNumber(), retained->second.version) ==
-                RplSequenceOrder::LESS)
+        if (auto retained = m_retainedRank.find(dioKey); retained != m_retainedRank.end())
         {
-            NS_LOG_LOGIC("Ignoring a DIO for version " << +dio.GetVersionNumber()
-                                                       << ", older than the version "
-                                                       << +retained->second.version
-                                                       << " this node already left");
-            return;
+            for (const auto& record : retained->second)
+            {
+                if (record.expires > Simulator::Now() &&
+                    RplSequenceCompare(dio.GetVersionNumber(), record.version) ==
+                        RplSequenceOrder::LESS)
+                {
+                    NS_LOG_LOGIC("Ignoring a DIO for version "
+                                 << +dio.GetVersionNumber() << ", older than the version "
+                                 << +record.version << " this node already left");
+                    return;
+                }
+            }
         }
         JoinDodag(dio, interface);
     }
@@ -1961,7 +1965,11 @@ RplRoutingProtocol::HandleDio(const RplDioHeader& dio,
         // that has most recently been observed to increment". A DODAG parent
         // is held to the Version it last advertised, which rule 6 of section
         // 8.2.2.1 forbids it ever to go back on, so a different Version from
-        // it, however far off, is one observed to increment. Section 8.2.2.1
+        // it, however far off, is one observed to increment. A parent is a
+        // sender whose Rank is lower than this node's (section 8.2.1 rule 5);
+        // the set of neighbours heard in this Version also holds children and
+        // siblings, whose old Version proves nothing and must not pull a
+        // healthy node away from its root. Section 8.2.2.1
         // also says why following it is safe: "A parent that advertises the
         // new DODAGVersionNumber cannot belong to the sub-DODAG of a node
         // advertising an older DODAGVersionNumber". Ignoring it left a node
@@ -1970,7 +1978,8 @@ RplRoutingProtocol::HandleDio(const RplDioHeader& dio,
         // (44 to 50 minutes at the default Trickle; design-constraints.md
         // section 119). A neighbour that is not a parent keeps the fallback.
         const RplSequenceOrder order = RplSequenceCompare(dio.GetVersionNumber(), existing->version);
-        const bool fromParent = existing->parents.find(from) != existing->parents.end();
+        const bool fromParent =
+            dio.GetRank() != RPL_INFINITE_RANK && dio.GetRank() < existing->rank;
         if (order == RplSequenceOrder::GREATER ||
             (order == RplSequenceOrder::NOT_COMPARABLE && fromParent))
         {
@@ -2239,10 +2248,15 @@ RplRoutingProtocol::JoinDodag(const RplDioHeader& dio, uint32_t interface)
     // Version -- but not for one this node was already a member of, which
     // rule 4 makes it keep observing (@see m_retainedRank).
     dodag.lowestRankThisVersion = RPL_INFINITE_RANK;
-    if (auto retained = m_retainedRank.find(key);
-        retained != m_retainedRank.end() && retained->second.version == dodag.version)
+    if (auto retained = m_retainedRank.find(key); retained != m_retainedRank.end())
     {
-        dodag.lowestRankThisVersion = retained->second.lowestRank;
+        for (const auto& record : retained->second)
+        {
+            if (record.expires > Simulator::Now() && record.version == dodag.version)
+            {
+                dodag.lowestRankThisVersion = record.lowestRank;
+            }
+        }
     }
 
     if (dio.HasDagConfiguration())
@@ -2439,7 +2453,17 @@ RplRoutingProtocol::LeaveDodag(DodagKey key, bool poison)
     if (dodag.mop != RPL_MOP_P2P_ROUTE_DISCOVERY)
     {
         m_retainedPathSequence[key] = dodag.pathSequence;
-        m_retainedRank[key] = RetainedRank{dodag.version, dodag.lowestRankThisVersion};
+        const Time imax = dodag.dioIntervalMin * (int64_t(1) << std::min<uint8_t>(dodag.dioIntervalDoublings, 30));
+        auto& records = m_retainedRank[key];
+        std::erase_if(records, [&](const RetainedRank& record) {
+            return record.expires <= Simulator::Now() || record.version == dodag.version;
+        });
+        records.push_back(
+            RetainedRank{dodag.version, dodag.lowestRankThisVersion, Simulator::Now() + 2 * imax});
+        if (records.size() > RETAINED_VERSIONS)
+        {
+            records.erase(records.begin());
+        }
     }
     m_dodags.erase(it);
 

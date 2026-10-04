@@ -167,8 +167,12 @@ RplRoutingProtocol::DiscoverP2pRoute(Ipv6Address target, bool hopByHop)
             // same Target, which is how section 6.1 scopes it and how
             // m_hopByHopRoutes/m_p2pRoutes are keyed; the SHOULD NOT bar
             // applies whatever the Target.
-            Time freeAt = used->second.started +
-                          (used->second.target == target ? routeBar : membershipBar);
+            Time freeAt = used->second.started + membershipBar;
+            if (auto same = used->second.targetStarted.find(target);
+                same != used->second.targetStarted.end())
+            {
+                freeAt = std::max(freeAt, same->second + routeBar);
+            }
             if (Simulator::Now() < freeAt)
             {
                 anyBarred = true;
@@ -202,7 +206,14 @@ RplRoutingProtocol::DiscoverP2pRoute(Ipv6Address target, bool hopByHop)
                                                            << ": no free Local RPLInstanceID");
         return empty;
     }
-    m_p2pInstanceUse[instanceId] = P2pInstanceUse{target, Simulator::Now()};
+    {
+        P2pInstanceUse& use = m_p2pInstanceUse[instanceId];
+        std::erase_if(use.targetStarted, [&](const auto& entry) {
+            return entry.second + routeBar <= Simulator::Now();
+        });
+        use.started = Simulator::Now();
+        use.targetStarted[target] = Simulator::Now();
+    }
 
     DodagKey key = CreateLocalDodag(instanceId, RPL_MOP_P2P_ROUTE_DISCOVERY);
     if (key.dodagId.IsAny())
@@ -696,6 +707,13 @@ RplRoutingProtocol::HandleP2pRdo(const RplDioHeader& dio, Ipv6Address from, uint
 
     dodag.p2p.addressVector = rdo.addressVector;
     dodag.p2p.addressVector.push_back(ownAddress);
+    // A copy that arrived over an interface without an address was recorded
+    // as an alternate while this vector was still empty, so the duplicate
+    // check at RecordP2pAlternateRoute() could not see it equal the route
+    // that has now become slot 0. Left in, it fills one of the 'N' slots
+    // (RFC 6997 section 9.5: "one plus the value of the N field") with a
+    // route that is sent once anyway.
+    std::erase(dodag.p2p.alternateRoutes, dodag.p2p.addressVector);
     // Measured against the Compr this node's own re-serialization will
     // actually use, computed over the vector with this address already
     // appended -- appending it can itself change Compr, if this node's

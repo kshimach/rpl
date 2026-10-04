@@ -261,11 +261,19 @@ RplRoutingProtocol::DiscoverRoute(Ipv6Address target, bool hopByHop)
         uint8_t knownSeqNo = 0;
         auto stored = m_aodvRoutes.find(target);
         auto hopByHop = m_hopByHopRoutes.find(target);
-        if (stored != m_aodvRoutes.end() && stored->second.expire > Simulator::Now())
+        const bool haveStored = stored != m_aodvRoutes.end() && stored->second.expire > Simulator::Now();
+        const bool haveHopByHop =
+            hopByHop != m_hopByHopRoutes.end() && hopByHop->second.expire > Simulator::Now();
+        if (haveStored)
         {
             knownSeqNo = stored->second.destSeqNo;
         }
-        else if (hopByHop != m_hopByHopRoutes.end() && hopByHop->second.expire > Simulator::Now())
+        // Whichever table holds the more recent Sequence Number (section 4.3
+        // names "the last route" stored): a source route and a hop-by-hop one
+        // to the same Target can both be live, and the older would otherwise
+        // be advertised as what OrigNode knows.
+        if (haveHopByHop &&
+            (!haveStored || RplSequenceNewer(hopByHop->second.seqNo, knownSeqNo)))
         {
             knownSeqNo = hopByHop->second.seqNo;
         }
@@ -1015,7 +1023,11 @@ RplRoutingProtocol::HandleAodvRreq(const RplDioHeader& dio,
         auto cachedRoute = m_hopByHopRoutes.find(dodag.aodv.target);
         if (m_aodvGratuitousRrep && !dodag.aodv.isTarget && cachedRoute != m_hopByHopRoutes.end() &&
             cachedRoute->second.expire > Simulator::Now() &&
-            !RplSequenceNewer(dio.GetArt().destSeqNo, cachedRoute->second.seqNo) &&
+            cachedRoute->second.seqNo != 0 &&
+            (dio.GetArt().destSeqNo == 0 ||
+             RplSequenceCompare(cachedRoute->second.seqNo, dio.GetArt().destSeqNo) ==
+                 RplSequenceOrder::GREATER ||
+             cachedRoute->second.seqNo == dio.GetArt().destSeqNo) &&
             (!m_aodvGratuitousRrepOnce ||
              dodag.aodv.gratuitousRrepSent.insert(dodag.aodv.target).second))
         {
@@ -1276,6 +1288,14 @@ RplRoutingProtocol::StartAodvRrepInstance(const DodagMembership& rreqDodag, Doda
         return;
     }
 
+    // The DODAGID CreateLocalDodag() roots the RREP-Instance at. It is the
+    // node's first global address, which with per-DODAG prefixes (PIO) need
+    // not be the one GetGlobalAddressIn() gives for the RREQ-Instance, so the
+    // InstanceID allocator below checks both: an ID taken or barred under
+    // either would otherwise reach CreateLocalDodag()'s existing-membership
+    // assertion.
+    const Ipv6Address rootAddress = GetGlobalAddress();
+
     // Everything carried over from the RREQ-Instance, read out up front so
     // the rest of this function does not interleave reads of one membership
     // with writes to another. (m_dodags is a std::map, so the insertion
@@ -1349,11 +1369,15 @@ RplRoutingProtocol::StartAodvRrepInstance(const DodagMembership& rreqDodag, Doda
         {
             continue;
         }
-        if (IsJoinedTo(candidate, ownAddress))
+        if (IsJoinedTo(candidate, ownAddress) || IsJoinedTo(candidate, rootAddress))
         {
             continue;
         }
-        auto blocked = m_aodvRejoinBlocked.find(DodagKey{candidate, ownAddress});
+        auto blocked = m_aodvRejoinBlocked.find(DodagKey{candidate, rootAddress});
+        if (blocked == m_aodvRejoinBlocked.end() || Simulator::Now() >= blocked->second)
+        {
+            blocked = m_aodvRejoinBlocked.find(DodagKey{candidate, ownAddress});
+        }
         if (blocked != m_aodvRejoinBlocked.end() && Simulator::Now() < blocked->second)
         {
             anyBarred = true;

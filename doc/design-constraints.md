@@ -11930,6 +11930,8 @@ RREQ到達の速さが直した版と同一だった。AODV-RPLの既定をこ�
 
 ## 119. 親が広告する、比較できないDODAG Versionに追従する(§104 RPLコア5)
 
+(注: 「送り主が`parents`にいる」という判定は§120で「Rankが自分より低い」に改めた。)
+
 `HandleDio()`は、DODAG Versionが保持値と比較不能(lollipop空間で差が17以上、RFC 6550 §7.2 rule 3.2.1)
 なDIOを、送り主が優先親であっても丸ごと捨てていた(`RplSequenceNewer()`はGREATERだけを真とする)。
 `parent.lastHeard`の更新より前にreturnするので、親は陳腐化の判定にかかるまで更新されず、
@@ -11967,3 +11969,63 @@ Global Repairを有効にしたシナリオでは、長い遮断の後の回復�
 未修正: 検証側が指摘した「停止期間中、PはVersion 48の親を抱えたままVersion 18を広告し続ける(§8.2.2.1
 rule 1)」は、この修正で停止期間そのものが数秒になったので、実害は小さくなったが、解釈の余地があるため
 手を入れていない。
+
+
+## 120. 自分の修正§103〜§119の監査で出た不具合を直す
+
+§103〜§119の修正を、4つの`rfc-auditor`が別コンテキストで監査した(Dest SeqNo、AODVの離脱とバー、
+状態の保持、P2P-RPLのStopとID、Trickle)。確認された指摘のうち、以下を直した。各項目は修正だけを
+外して試験が落ちることを確認した(load-bearing)。
+
+1. **§119の退行**(CONFIRMED): 比較不能なVersionに追従する条件を「送り主が`parents`にいる」としたが、
+   `parents`は現在のVersionのDIOを送ってきた候補の全集合で、子や兄弟も入る。子が古いVersionを広告すると、
+   rootのすぐ下の健全なノードが引き戻された(監査の測定: 30通りの組み合わせのうち29で54〜116秒、
+   親の例外を外すと0)。RFC 6550 §8.2.1 rule 5(自分のRankは親集合のどの要素より大きい)に従い、
+   「DIOのRankが自分より小さい(INFINITEでない)送り主」だけを親として扱う。
+   `RplIncomparableVersionFromParentTestCase`の「stranger」を、Rankの高い子に変えた
+   (従来は親と同じRankだったので、新しい条件では親扱いになる)。
+2. **保持の欠落**(§105/§106/§119の監査): 保持が最後のVersion一件だけで、比較不能なVersionを間に挟むと
+   LをVersion 5から忘れた。さらに保持は期限なしで、lollipopが一周した後の正当なVersionを拒否し、
+   128世代前のLを復元しうる。保持を「Versionごと、1つのDODAGにつき最大4件」にし、各記録は
+   そのDODAGのImaxの2倍で失効する(§8.2.2.1 rule 6が実装に任せる局所タイマーに当たる)。
+   `RplRetentionAcrossVersionsTestCase`。
+3. **AODV-RPL: PIO起因のNS_ASSERT中止**(CONFIRMED): `StartAodvRrepInstance()`のInstanceID割り当てが
+   `GetGlobalAddressIn(rreqDodag)`でバー/参加済みを引く一方、`CreateLocalDodag()`は
+   `GetGlobalAddress()`にrootを立てる。PIOで2つ目のグローバルアドレスがあると、後者で既に参加済みの
+   IDが選ばれ、`CreateDodagMembership()`のassertで落ちた。両方のアドレスで調べる。
+   `RplRrepInstanceWithPioTestCase`。
+4. **G-RREPの鮮度判定**: `!RplSequenceNewer(req, cached)`は、比較不能(差が17以上)とcached == 0を
+   「同等以上」に数えた。cachedが0でなく、かつreqが0か、cachedがreq以上と言える場合に限る。
+   `RplAodvGratuitousRrepFreshnessBoundaryTestCase`に比較不能のqueryを追加した。
+5. **`DiscoverRoute()`のDest SeqNo**: 送信元ルートとhop-by-hopの両方が生きているとき、前者を優先して
+   いた。新しい方のSequence Numberを使う。専用の試験はない(上の4と同様、片方の表だけが生きる既存の
+   試験は元から通る)。
+6. **P2P-RPL: 再利用バーが、別Targetの探索で消える**(CONFIRMED、c1e27be以来): `m_p2pInstanceUse`が
+   IDごとに最後のTargetしか覚えず、T、U、Tの順に探索するとTが最初のIDを再び得て、最初の経路状態が
+   生きたまま衝突した(RFC 6997 §6.1 "a previous route discovery to this Target")。
+   IDごとにTarget別の開始時刻を持つ。`RplP2pReuseBarSurvivesOtherTargetTestCase`。
+   あわせて、2L→3Lの変更(db77694/c089722)を固定する試験が無かったので、40秒時点(2Lと3Lの間)の
+   探索が同じIDを取らないことを同じ試験に加えた。`3*`を`2*`に戻すと落ちる。
+7. **P2P-RPL: アドレスの無いインタフェースのコピーが、代替経路の枠を重複で消費**: 最初のコピーで
+   `addressVector`が空のうちに記録された代替経路が、後で`addressVector`になる経路と同一になり、
+   `N` = 1の唯一の枠(§9.5 "one plus the value of the N field")を占めていた。`addressVector`を
+   設定した時点で、同一の代替経路を消す。`RplP2pAddresslessCopyKeepsSlotTestCase`
+   (試験の基底に、アドレスの無い第2インタフェースと配送先の指定を足した)。
+
+§73.4/§73.5の未試験だった5件の修正に、試験を書いた(窓を`N` = 0が閉じる、満了時の`R`再確認、
+満杯の窓で短い経路が長いものを置換、送信時の重複除外、Originでの同長タイ)。各修正を1つずつ
+無効化して、それぞれ自分の試験だけが落ちることを確認した。
+
+**直していない指摘(挙動を変える判断が要るため)**:
+- `0ad3f13`: Originは、複数インタフェースのTargetに対し、探したアドレスを最後のホップとする経路を
+  保存するが、最後から2番目のルータがNSを送る先は、Targetの別インタフェースのlink-localで、
+  受信側のインタフェースでは応答がない。監査の測定(H=0、O/R/T): 0/5が到達し、経路は
+  PathLifetime(既定1800秒)のあいだ黙って捨てる。修正前は経路が無く`send()`が-1を返した。直すには、
+  Originが受信インタフェース側のアドレスを知る必要があり(TargetAddrは§8.2で「Targetのユニキャスト
+  グローバル」であって受信インタフェースとは限らない)、Address Vectorの規則(§9.4)にも触れるため、
+  方針の判断が要る。単一インタフェースのTargetには影響しない。
+- 同じ`0ad3f13`の二つ目のDIOがTargetAddrの違う同一キーの探索のとき、TargetAddr `::`・S=1のP2P-DRO
+  が出うる(「全IDがバー中」のフォールバックか、仕様に従わない相手のみで起きる)。
+- `059b9c5`: Rank INFINITEのまま残るノード(§8.2.2.4 rule 3の状態)は、親のDIOのたびにTrickleを
+  Resetする古い挙動のため、k > 0でも、2秒間隔で400秒に819通のINFINITE_RANK DIOを送る(通常ノードは
+  198通)。既定のk = 0では`059b9c5`自体が働かない。

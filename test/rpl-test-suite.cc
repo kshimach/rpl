@@ -11826,6 +11826,24 @@ RplAodvGratuitousRrepFreshnessBoundaryTestCase::DoRun()
                           "have produced a Gratuitous RREP");
     NS_TEST_ASSERT_MSG_EQ(m_gratuitousCount, 1, "The Gratuitous count should not have changed");
 
+    // Query C: ART destSeqNo 40 against a cached 5. They are further apart
+    // than SEQUENCE_WINDOW, so RFC 6550 section 7.2 rule 4 leaves them
+    // unordered, and "at least as large as" cannot be said of the cache.
+    Ipv6Address origC("2001:9::12");
+    DeliverRawRplMessage<RplDioHeader>(node,
+                                       1,
+                                       buildRreq(0x87, origC, 40),
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       neighbourLinkLocal,
+                                       nodeLinkLocal);
+    Simulator::Stop(MilliSeconds(10));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(m_rrepDioCount,
+                          1,
+                          "A Dest SeqNo that cannot be ordered against the cached route's own "
+                          "produced a Gratuitous RREP");
+
     monitor->Close();
     Simulator::Destroy();
 }
@@ -17775,6 +17793,468 @@ RplTrickleJoinDioNotConsistentTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief Base of the tests of a Target's collection window (RFC 6997 section
+ *        9.5, design-constraints.md sections 72 and 73).
+ *
+ * One Target (the node under test, which also roots the base DODAG so that it
+ * has a global address), one peer that observes the P2P-DRO messages it
+ * multicasts, and a helper that delivers a hand-built P2P mode DIO naming the
+ * Target. Every DIO also names a second Target, which is what lets later
+ * copies of the discovery through the repeat guard of HandleP2pRdo().
+ */
+class RplP2pWindowTestBase : public TestCase
+{
+  protected:
+    /// @param name the test case's name
+    explicit RplP2pWindowTestBase(const std::string& name)
+        : TestCase(name)
+    {
+    }
+
+    /// @brief What the test does once the fixture is up.
+    virtual void Drive() = 0;
+
+    /**
+     * @brief Deliver a P2P mode DIO naming the node under test as a Target.
+     * @param from the neighbour it is heard from
+     * @param rank the Rank it advertises
+     * @param addressVector the Address Vector it carries
+     * @param numRoutes its 'N' field
+     * @param reply its 'R' flag
+     * @param interface the interface it arrives on: 1, the one with the
+     *        global address, or 2, a second one that has only a link-local
+     */
+    void DeliverDio(Ipv6Address from,
+                    uint16_t rank,
+                    const std::vector<Ipv6Address>& addressVector,
+                    uint8_t numRoutes,
+                    bool reply,
+                    uint32_t interface = 1)
+    {
+        RplDioHeader dio;
+        dio.SetInstanceId(INSTANCE);
+        dio.SetVersionNumber(0);
+        dio.SetRank(rank);
+        dio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+        dio.SetGrounded(true);
+        dio.SetDodagId(ORIGIN);
+        dio.SetDtsn(0);
+        P2pRdoOption rdo;
+        rdo.reply = reply;
+        rdo.hopByHop = false;
+        rdo.numRoutes = numRoutes;
+        rdo.lifetime = 3; // 'L' = 64 s: the window, not 'L', is under test
+        rdo.maxRankOrNh = 8;
+        rdo.target = m_ownGlobal;
+        rdo.addressVector = addressVector;
+        dio.SetP2pRdo(rdo);
+        RplDioHeader::TargetOption other;
+        other.target = Ipv6Address("2001:9::77"); // a Target still to be found
+        dio.AddTarget(other);
+        DeliverRawRplMessage<RplDioHeader>(m_node,
+                                           interface,
+                                           dio,
+                                           static_cast<uint8_t>(RPL_CODE_DIO),
+                                           from,
+                                           Ipv6Address(RPL_ALL_NODES_MULTICAST));
+    }
+
+    /// @brief Let simulated time pass.
+    /// @param duration how long
+    void RunFor(Time duration)
+    {
+        Simulator::Stop(duration);
+        Simulator::Run();
+    }
+
+    /// @brief Record a P2P-DRO seen at the monitor.
+    /// @param socket the monitoring socket
+    void Capture(Ptr<Socket> socket)
+    {
+        Address sender;
+        Ptr<Packet> packet = socket->RecvFrom(sender);
+        if (!packet)
+        {
+            return;
+        }
+        Ipv6Header ipv6Header;
+        packet->RemoveHeader(ipv6Header);
+        Icmpv6Header icmpv6Header;
+        packet->RemoveHeader(icmpv6Header);
+        if (icmpv6Header.GetType() == ICMPV6_RPL && icmpv6Header.GetCode() == RPL_CODE_P2P_DRO)
+        {
+            RplP2pDroHeader dro;
+            packet->RemoveHeader(dro);
+            m_dros.push_back(dro);
+        }
+    }
+
+    void DoRun() override
+    {
+        NodeContainer nodes;
+        nodes.Create(2); // 0 = the Target under test and base root, 1 = the observer
+
+        Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+        SimpleNetDeviceHelper simpleNetDevice;
+        NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+        // Interface 2 of the Target under test: up, link-local only, nobody
+        // on it.
+        Ptr<SimpleChannel> sideChannel = CreateObject<SimpleChannel>();
+        NetDeviceContainer sideDevices = simpleNetDevice.Install(nodes.Get(0), sideChannel);
+
+        RplHelper rplHelper;
+        InternetStackHelper internetv6;
+        internetv6.SetRoutingHelper(rplHelper);
+        internetv6.Install(nodes);
+
+        Ipv6AddressHelper ipv6;
+        Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+        interfaces.SetForwarding(0, true);
+        interfaces.SetForwarding(1, true);
+        Ipv6InterfaceContainer sideInterfaces = ipv6.AssignWithoutAddress(sideDevices);
+        sideInterfaces.SetForwarding(0, true);
+
+        rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+        rplHelper.AssignStreams(nodes, 1);
+
+        RunFor(Seconds(10));
+
+        m_node = nodes.Get(0);
+        m_rpl = m_node->GetObject<RplRoutingProtocol>();
+        m_ownGlobal = m_rpl->GetGlobalAddress();
+        NS_TEST_ASSERT_MSG_NE(m_ownGlobal, Ipv6Address::GetAny(), "no global address yet");
+
+        Ptr<Socket> monitor = Socket::CreateSocket(nodes.Get(1), Ipv6RawSocketFactory::GetTypeId());
+        monitor->SetAttribute("Protocol",
+                              UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+        monitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+        monitor->BindToNetDevice(devices.Get(1));
+        monitor->SetRecvCallback(MakeCallback(&RplP2pWindowTestBase::Capture, this));
+
+        Drive();
+
+        monitor->Close();
+        Simulator::Destroy();
+    }
+
+    static constexpr uint8_t INSTANCE = 0x81;       //!< the temporary DAG's RPLInstanceID
+    const Ipv6Address ORIGIN{"2001:7::1"};          //!< its DODAGID
+    const Ipv6Address PARENT1{"fe80::a"};           //!< a neighbour
+    const Ipv6Address PARENT2{"fe80::b"};           //!< a second neighbour
+    const Ipv6Address PARENT3{"fe80::c"};           //!< a third neighbour
+    Ptr<Node> m_node;                               //!< the Target under test
+    Ptr<RplRoutingProtocol> m_rpl;                  //!< its RPL
+    Ipv6Address m_ownGlobal;                        //!< its global address
+    std::vector<RplP2pDroHeader> m_dros;            //!< P2P-DROs seen at the monitor
+};
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief A copy that came in over an interface without an address does not
+ *        take one of the 'N' alternate slots.
+ *
+ * RFC 6997 section 9.5: the Target sends "one plus the value of the N field"
+ * routes. A copy over an interface with no global address was recorded as an
+ * alternate while the Target's own Address Vector was still empty, so the
+ * duplicate check missed it; the same route then arrived over the main
+ * interface as slot 0, and the duplicate occupied the only slot 'N' = 1
+ * allows (design-constraints.md section 120). 'N' = 1: that copy, then
+ * [X1] and [X2] over the main interface; two P2P-DROs are owed.
+ */
+class RplP2pAddresslessCopyKeepsSlotTestCase : public RplP2pWindowTestBase
+{
+  public:
+    RplP2pAddresslessCopyKeepsSlotTestCase()
+        : RplP2pWindowTestBase("A copy over an interface without an address leaves the "
+                              "alternate slots free (RFC 6997 section 9.5)")
+    {
+    }
+
+  private:
+    void Drive() override
+    {
+        const uint16_t rank = 3 * RPL_MIN_HOPRANKINC;
+        const Ipv6Address x1("2001:2::1");
+        const Ipv6Address x2("2001:2::2");
+        DeliverDio(PARENT1, rank, {x1}, 1, true, 2);
+        DeliverDio(PARENT1, rank, {x1}, 1, true, 1);
+        DeliverDio(PARENT2, rank, {x2}, 1, true, 1);
+        RunFor(Seconds(0.6));
+        NS_TEST_ASSERT_MSG_EQ(m_dros.size(),
+                              2,
+                              "'N' = 1 asks for two routes and two distinct ones were heard; the "
+                              "copy over the address-less interface used up the alternate slot");
+    }
+};
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief A copy of the discovery with 'N' = 0 closes an open collection
+ *        window instead of leaving it to send the same P2P-DRO again.
+ *
+ * Design-constraints.md section 73.4 item 1. A multi-Target discovery can
+ * deliver a later DIO with 'N' = 0 while a window opened by an earlier one
+ * with 'N' > 0 is still running. The 'N' = 0 branch replies at once; left
+ * open, the window then fired too and sent the same P2P-DRO a second time,
+ * re-arming the retry timer for a Seq the Origin had already acknowledged.
+ */
+class RplP2pWindowClosedByZeroNTestCase : public RplP2pWindowTestBase
+{
+  public:
+    RplP2pWindowClosedByZeroNTestCase()
+        : RplP2pWindowTestBase("A later DIO with 'N' = 0 closes the open collection window "
+                              "(design-constraints.md section 73.4)")
+    {
+    }
+
+  private:
+    void Drive() override
+    {
+        DeliverDio(PARENT1, 3 * RPL_MIN_HOPRANKINC, {Ipv6Address("2001:2::1")}, 1, true);
+        DeliverDio(PARENT1, 3 * RPL_MIN_HOPRANKINC, {Ipv6Address("2001:2::2")}, 0, true);
+        RunFor(Seconds(0.6)); // past the 256 ms window, before the 1 s retry wait
+        NS_TEST_ASSERT_MSG_EQ(m_dros.size(),
+                              1,
+                              "Exactly one P2P-DRO is owed: the 'N' = 0 reply. A second one "
+                              "means the window it superseded was left open and fired");
+    }
+};
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief A window that closes after 'R' was cleared sends nothing.
+ *
+ * Design-constraints.md section 73.4 item 3. The window used to run inline
+ * with the DIO that opened it, so a later DIO clearing 'R' was seen before
+ * anything was sent. Deferred, the expiry callback has to ask again.
+ * RFC 6997 section 9.5 has the Target reply "If the Reply flag ... is set to
+ * one".
+ */
+class RplP2pWindowExpiryRechecksReplyTestCase : public RplP2pWindowTestBase
+{
+  public:
+    RplP2pWindowExpiryRechecksReplyTestCase()
+        : RplP2pWindowTestBase("A collection window that closes after 'R' was cleared sends "
+                              "nothing (design-constraints.md section 73.4)")
+    {
+    }
+
+  private:
+    void Drive() override
+    {
+        DeliverDio(PARENT1, 3 * RPL_MIN_HOPRANKINC, {Ipv6Address("2001:2::1")}, 1, true);
+        DeliverDio(PARENT1, 3 * RPL_MIN_HOPRANKINC, {Ipv6Address("2001:2::2")}, 1, false);
+        RunFor(Seconds(0.6));
+        NS_TEST_ASSERT_MSG_EQ(m_dros.size(),
+                              0,
+                              "The window sent a P2P-DRO although a later DIO had cleared 'R'");
+    }
+};
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief A full collection buffer gives way to a shorter route instead of
+ *        keeping the first arrivals.
+ *
+ * Design-constraints.md section 73.5. RFC 6997 section 9.5 offers "selecting
+ * the best routes discovered over a certain time period" as an example
+ * method; a buffer that keeps whatever came first is not that. With 'N' = 1
+ * the Target keeps one alternate besides its own route: a 4-hop one arrives
+ * first, a 1-hop one second, and the 1-hop one has to be what goes out.
+ */
+class RplP2pFullWindowKeepsShortestTestCase : public RplP2pWindowTestBase
+{
+  public:
+    RplP2pFullWindowKeepsShortestTestCase()
+        : RplP2pWindowTestBase("A full collection buffer replaces its longest alternate with a "
+                              "shorter one (design-constraints.md section 73.5)")
+    {
+    }
+
+  private:
+    void Drive() override
+    {
+        const uint16_t rank = 3 * RPL_MIN_HOPRANKINC;
+        DeliverDio(PARENT1,
+                   rank,
+                   {Ipv6Address("2001:2::1"), Ipv6Address("2001:2::2"), Ipv6Address("2001:2::3")},
+                   1,
+                   true);
+        DeliverDio(PARENT2,
+                   rank,
+                   {Ipv6Address("2001:3::1"),
+                    Ipv6Address("2001:3::2"),
+                    Ipv6Address("2001:3::3"),
+                    Ipv6Address("2001:3::4")},
+                   1,
+                   true);
+        DeliverDio(PARENT3, rank, {Ipv6Address("2001:4::1")}, 1, true);
+        RunFor(Seconds(0.6));
+        NS_TEST_ASSERT_MSG_EQ(m_dros.size(), 2, "Expected the node's own route plus one alternate");
+        if (m_dros.size() < 2)
+        {
+            return;
+        }
+        const auto& alternate = m_dros[1].GetP2pRdo().addressVector;
+        NS_TEST_ASSERT_MSG_EQ(alternate.size(),
+                              1,
+                              "The alternate sent is not the shortest one collected");
+        if (!alternate.empty())
+        {
+            NS_TEST_ASSERT_MSG_EQ(alternate[0],
+                                  Ipv6Address("2001:4::1"),
+                                  "The alternate sent is not the 1-hop route that arrived last");
+        }
+    }
+};
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief An alternate that has become identical to the Target's own route by
+ *        send time is not sent as a second P2P-DRO.
+ *
+ * Design-constraints.md section 73.5. RecordP2pAlternateRoute() compares
+ * with the Address Vector as it stands when the alternate arrives, and a
+ * preferred-parent switch inside the window rewrites it afterwards. The two
+ * then name one route, and sending both spends a network-wide multicast on a
+ * copy. The comparison is repeated at send time. Here the Target first
+ * learns a route through one neighbour, records another through a second,
+ * then switches to the second as its preferred parent.
+ */
+class RplP2pAlternateEqualAtSendTimeTestCase : public RplP2pWindowTestBase
+{
+  public:
+    RplP2pAlternateEqualAtSendTimeTestCase()
+        : RplP2pWindowTestBase("An alternate that equals the Target's own route by send time is "
+                              "not sent (design-constraints.md section 73.5)")
+    {
+    }
+
+  private:
+    void Drive() override
+    {
+        const uint16_t rank = 3 * RPL_MIN_HOPRANKINC;
+        DeliverDio(PARENT1, rank, {Ipv6Address("2001:2::1")}, 1, true);
+        DeliverDio(PARENT2, rank, {Ipv6Address("2001:3::1")}, 1, true);
+        // The second neighbour now offers a better Rank, so it becomes the
+        // preferred parent and the Target's own Address Vector becomes the
+        // route that was recorded as an alternate.
+        DeliverDio(PARENT2, RPL_MIN_HOPRANKINC, {Ipv6Address("2001:3::1")}, 1, true);
+        RunFor(Seconds(0.6));
+        NS_TEST_ASSERT_MSG_EQ(m_dros.size(),
+                              1,
+                              "The same route was sent twice: the alternate was not compared "
+                              "with the Address Vector again at send time");
+    }
+};
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief Of two equally short routes within one discovery, the later one
+ *        wins at the Origin.
+ *
+ * Design-constraints.md section 73.5, the change of section 72.5's "shortest
+ * wins" from <= to <. A forged P2P-DRO that arrives first and fixes a short
+ * route would otherwise keep every genuine route of the same length out for
+ * good; with < the genuine one overwrites it. One Origin, two P2P-DROs for
+ * the same Target over different routes of the same length.
+ */
+class RplP2pOriginTieGoesToLaterRouteTestCase : public TestCase
+{
+  public:
+    RplP2pOriginTieGoesToLaterRouteTestCase()
+        : TestCase("At the Origin an equally short later route replaces the earlier one "
+                  "(design-constraints.md section 73.5)")
+    {
+    }
+
+  private:
+    void DoRun() override
+    {
+        NodeContainer nodes;
+        nodes.Create(1);
+
+        Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+        SimpleNetDeviceHelper simpleNetDevice;
+        NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+        RplHelper rplHelper;
+        InternetStackHelper internetv6;
+        internetv6.SetRoutingHelper(rplHelper);
+        internetv6.Install(nodes);
+
+        Ipv6AddressHelper ipv6;
+        ipv6.AssignWithoutAddress(devices);
+
+        Ptr<Node> node = nodes.Get(0);
+        rplHelper.SetRoot(node, Ipv6Address("2001:1::"), 64);
+        Simulator::Stop(Seconds(10));
+        Simulator::Run();
+
+        Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+        Ipv6Address target("2001:9::1");
+        RplRoutingProtocol::DodagKey key = rpl->DiscoverP2pRoute(target);
+        NS_TEST_ASSERT_MSG_NE(key.dodagId, Ipv6Address::GetAny(), "The discovery did not start");
+
+        auto deliver = [&](uint8_t sequence, Ipv6Address hop) {
+            RplP2pDroHeader dro;
+            dro.SetInstanceId(key.instanceId);
+            dro.SetStop(false);
+            dro.SetAckRequested(false);
+            dro.SetSequence(sequence);
+            dro.SetDodagId(key.dodagId);
+            P2pRdoOption rdo;
+            rdo.reply = false;
+            rdo.hopByHop = false;
+            rdo.numRoutes = 0;
+            rdo.lifetime = 0;
+            rdo.maxRankOrNh = 1;
+            rdo.target = target;
+            rdo.addressVector = {hop};
+            dro.SetP2pRdo(rdo);
+            DeliverRawRplMessage<RplP2pDroHeader>(node,
+                                                  1,
+                                                  dro,
+                                                  static_cast<uint8_t>(RPL_CODE_P2P_DRO),
+                                                  Ipv6Address("fe80::a"),
+                                                  Ipv6Address(RPL_ALL_NODES_MULTICAST));
+        };
+
+        std::vector<Ipv6Address> hops;
+        deliver(0, Ipv6Address("2001:2::1"));
+        NS_TEST_ASSERT_MSG_EQ(rpl->GetP2pRoute(target, hops), true, "No route after the first DRO");
+        NS_TEST_ASSERT_MSG_EQ(hops.size(), 2, "The first route is the wrong length");
+        deliver(1, Ipv6Address("2001:3::1"));
+        NS_TEST_ASSERT_MSG_EQ(rpl->GetP2pRoute(target, hops), true, "No route after the second DRO");
+        NS_TEST_ASSERT_MSG_EQ(hops.size(), 2, "The second route is the wrong length");
+        if (hops.size() == 2)
+        {
+            NS_TEST_ASSERT_MSG_EQ(hops[0],
+                                  Ipv6Address("2001:3::1"),
+                                  "A later route of the same length did not replace the earlier "
+                                  "one: the first route to arrive is fixed for good");
+        }
+
+        Simulator::Destroy();
+    }
+};
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief A P2P mode DIO is only joined if the router's own resulting
  *        DAGRank would stay within the MaxRank, relaxed by one step for the
  *        Target, mirroring AODV-RPL's own RankLimit boundary test.
@@ -22458,6 +22938,329 @@ RplRejoinKeepsRankCeilingTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief The Rank ceiling and the Version bar outlive an intermediate DODAG
+ *        Version, and lapse after a bounded time.
+ *
+ * RFC 6550 section 8.2.2.4 rule 3 holds a node to L + DAGMaxRankIncrease
+ * "at any point in the life of the DODAG Version", so passing through
+ * another Version that cannot be ordered against it (section 7.2 rule 4:
+ * 5 and 40 are further apart than SEQUENCE_WINDOW) must not make the node
+ * forget L. Section 8.2.2.1 rule 6 leaves the lifetime of the bar on older
+ * Versions to a local timer; with the lollipop counter coming round again a
+ * record kept for ever would refuse a legitimate Version. One node, hand-built
+ * DIOs (design-constraints.md section 120).
+ */
+class RplRetentionAcrossVersionsTestCase : public TestCase
+{
+  public:
+    RplRetentionAcrossVersionsTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplRetentionAcrossVersionsTestCase::RplRetentionAcrossVersionsTestCase()
+    : TestCase("L survives an intermediate incomparable Version and lapses after 2 Imax "
+               "(RFC 6550 section 8.2.2)")
+{
+}
+
+void
+RplRetentionAcrossVersionsTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(1);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.AssignWithoutAddress(devices);
+
+    Ptr<Node> node = nodes.Get(0);
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+
+    Simulator::Stop(Seconds(1));
+    Simulator::Run();
+
+    Ipv6Address dodagId("2001:1::1");
+    Ipv6Address parent("fe80::a");
+    static constexpr uint8_t INSTANCE = 0;
+    static constexpr uint16_t MAX_RANK_INCREASE = 512;
+    static constexpr uint8_t V_OLD = 5;
+    static constexpr uint8_t V_FAR = 40;
+
+    auto deliver = [&](uint8_t version, uint16_t rank) {
+        RplDioHeader dio;
+        dio.SetInstanceId(INSTANCE);
+        dio.SetVersionNumber(version);
+        dio.SetRank(rank);
+        dio.SetMop(RPL_MOP_NON_STORING);
+        dio.SetGrounded(true);
+        dio.SetDodagId(dodagId);
+        dio.SetDtsn(0);
+        // Imin 2^4 ms, 6 doublings: Imax 1.024 s, so a record lapses after 2.048 s.
+        dio.SetDagConfiguration(4,
+                                6,
+                                0,
+                                MAX_RANK_INCREASE,
+                                RPL_MIN_HOPRANKINC,
+                                RPL_OCP_OF0,
+                                RPL_DEFAULT_LIFETIME,
+                                RPL_DEFAULT_LIFETIME_UNIT);
+        DeliverRawRplMessage<RplDioHeader>(node,
+                                           1,
+                                           dio,
+                                           static_cast<uint8_t>(RPL_CODE_DIO),
+                                           parent,
+                                           Ipv6Address(RPL_ALL_NODES_MULTICAST));
+    };
+    const uint16_t farRank = 8 * RPL_MIN_HOPRANKINC;
+
+    deliver(V_OLD, RPL_MIN_HOPRANKINC);
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(INSTANCE, dodagId), true, "The node never joined");
+    deliver(V_OLD, RPL_INFINITE_RANK);
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(INSTANCE, dodagId), false, "The node did not leave");
+
+    // An intermediate Version that cannot be ordered against V_OLD, then gone.
+    deliver(V_FAR, RPL_MIN_HOPRANKINC);
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(INSTANCE, dodagId), true,
+                          "The node refused a Version it cannot order");
+    deliver(V_FAR, RPL_INFINITE_RANK);
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(INSTANCE, dodagId), false, "The node did not leave");
+
+    deliver(V_OLD, farRank);
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(INSTANCE, dodagId), true, "The node did not rejoin");
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetRankIn(INSTANCE, dodagId),
+                          RPL_INFINITE_RANK,
+                          "L of Version 5 was forgotten across the intermediate Version");
+    deliver(V_OLD, RPL_INFINITE_RANK);
+
+    // After the record lapses the same DIO is a fresh start with no ceiling.
+    Simulator::Stop(Seconds(3));
+    Simulator::Run();
+    deliver(V_OLD, farRank);
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(INSTANCE, dodagId), true, "The node did not rejoin");
+    NS_TEST_ASSERT_MSG_NE(rpl->GetRankIn(INSTANCE, dodagId),
+                          RPL_INFINITE_RANK,
+                          "A record of a Version left more than 2 Imax ago still held the node "
+                          "to its old L");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief A TargNode whose RREQ-DIO carries a Prefix Information option still
+ *        roots an RREP-Instance.
+ *
+ * RFC 9854 section 6.3.2: "the TargNode MUST build a DODAG in the
+ * RREP-Instance corresponding to the RREQ-DIO rooted at itself". With a PIO
+ * the node holds a second global address, and StartAodvRrepInstance() chose
+ * the RPLInstanceID by one address while CreateLocalDodag() rooted the DODAG
+ * at another, so an ID the node already held reached an assertion and
+ * aborted the simulation (design-constraints.md section 120). One node that
+ * runs a discovery of its own under 0x80 and is then asked, under 0x80 too,
+ * to be the TargNode of an asymmetric RREQ-DIO with a PIO.
+ */
+class RplRrepInstanceWithPioTestCase : public TestCase
+{
+  public:
+    RplRrepInstanceWithPioTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplRrepInstanceWithPioTestCase::RplRrepInstanceWithPioTestCase()
+    : TestCase("A PIO on the RREQ-DIO does not stop the TargNode rooting an RREP-Instance "
+               "(RFC 9854 section 6.3.2)")
+{
+}
+
+void
+RplRrepInstanceWithPioTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(1);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.SetBase(Ipv6Address("2001:1::"), Ipv6Prefix(64));
+    Ipv6InterfaceContainer interfaces = ipv6.Assign(devices);
+    interfaces.SetForwarding(0, true);
+
+    Ptr<Node> node = nodes.Get(0);
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+
+    Simulator::Stop(Seconds(5));
+    Simulator::Run();
+
+    Ipv6Address self = interfaces.GetAddress(0, 1);
+    Ipv6Address origNode("2001:5::1");
+    auto own = rpl->DiscoverRoute(Ipv6Address("2001:9::99"), false);
+    NS_TEST_ASSERT_MSG_EQ(+own.instanceId, 0x80, "The node's own discovery did not take 0x80");
+
+    RplDioHeader dio;
+    dio.SetInstanceId(0x80);
+    dio.SetVersionNumber(0);
+    dio.SetRank(RPL_MIN_HOPRANKINC);
+    dio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+    dio.SetGrounded(true);
+    dio.SetDodagId(origNode);
+    dio.SetDtsn(0);
+    dio.SetDagConfiguration(0,
+                            20,
+                            RPL_DIO_REDUNDANCY,
+                            RPL_MAX_RANKINC,
+                            RPL_MIN_HOPRANKINC,
+                            RPL_OCP_OF0,
+                            RPL_DEFAULT_LIFETIME,
+                            RPL_DEFAULT_LIFETIME_UNIT);
+    dio.SetPrefixInfo(Ipv6Address("2001:2::"), 64, true, true, 3600, 3600);
+    RplDioHeader::RreqOption rreq;
+    rreq.symmetric = false;
+    rreq.hopByHop = false;
+    rreq.compr = 0;
+    rreq.lifetime = 1;
+    rreq.rankLimit = 0;
+    rreq.origSeqNo = 1;
+    dio.SetRreq(rreq);
+    RplDioHeader::ArtOption art;
+    art.destSeqNo = 0;
+    art.prefixLength = 0;
+    art.target = self;
+    dio.SetArt(art);
+    DeliverRawRplMessage<RplDioHeader>(node,
+                                       1,
+                                       dio,
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       Ipv6Address("fe80::a"),
+                                       Ipv6Address(RPL_ALL_NODES_MULTICAST));
+
+    RplRoutingProtocol::DodagKey rrepKey;
+    NS_TEST_ASSERT_MSG_EQ(rpl->FindAodvRrepInstance(origNode, 0x80, rrepKey),
+                          true,
+                          "The TargNode rooted no RREP-Instance for an RREQ-DIO with a PIO");
+    NS_TEST_ASSERT_MSG_NE(+rrepKey.instanceId, 0x80, "The RREP-Instance reused a held ID");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief A discovery to another Target in between does not clear the
+ *        same-Target reuse bar.
+ *
+ * RFC 6997 section 6.1: "the Origin MUST NOT reuse the RPLInstanceID used in
+ * a previous route discovery to this Target if the state created during the
+ * previous route discovery might still exist". Only the latest Target per
+ * ID was remembered, so discovering T, then U under the same ID once twice
+ * 'L' had passed, and then T again, handed T the ID of its first discovery
+ * with the route state of that one still live (design-constraints.md section
+ * 120). One node: T, U and T again, spaced past twice 'L' of the previous one
+ * but well inside the route lifetime.
+ */
+class RplP2pReuseBarSurvivesOtherTargetTestCase : public TestCase
+{
+  public:
+    RplP2pReuseBarSurvivesOtherTargetTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplP2pReuseBarSurvivesOtherTargetTestCase::RplP2pReuseBarSurvivesOtherTargetTestCase()
+    : TestCase("The same-Target RPLInstanceID bar outlives a discovery to another Target "
+               "(RFC 6997 section 6.1)")
+{
+}
+
+void
+RplP2pReuseBarSurvivesOtherTargetTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(1);
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.AssignWithoutAddress(devices);
+
+    Ptr<Node> node = nodes.Get(0);
+    rplHelper.SetRoot(node, Ipv6Address("2001:1::"), 64);
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+    Ipv6Address targetT("2001:9::11");
+    Ipv6Address targetU("2001:9::22");
+
+    auto first = rpl->DiscoverP2pRoute(targetT, true);
+    NS_TEST_ASSERT_MSG_NE(first.dodagId, Ipv6Address::GetAny(), "The first discovery did not start");
+
+    // 40 s on: past twice 'L' (32 s, section 6.1's "usually sufficient") but
+    // inside three times 'L', which is what a router that joined late still
+    // remembers a Stop for (@see P2pMembershipBar()).
+    Simulator::Stop(Seconds(40));
+    Simulator::Run();
+    auto early = rpl->DiscoverP2pRoute(targetU, true);
+    NS_TEST_ASSERT_MSG_NE(+early.instanceId,
+                          +first.instanceId,
+                          "An ID was reused 40 s after its discovery, inside 3 * 'L'");
+
+    // Past 3 * 'L' (48 s at the default) of the first, far inside the route
+    // lifetime.
+    Simulator::Stop(Seconds(25));
+    Simulator::Run();
+    auto other = rpl->DiscoverP2pRoute(targetU, true);
+    NS_TEST_ASSERT_MSG_EQ(+other.instanceId,
+                          +first.instanceId,
+                          "The precondition failed: the discovery to another Target should "
+                          "find the first one's ID free");
+
+    Simulator::Stop(Seconds(55));
+    Simulator::Run();
+    auto again = rpl->DiscoverP2pRoute(targetT, true);
+    NS_TEST_ASSERT_MSG_NE(again.dodagId, Ipv6Address::GetAny(), "The repeat discovery did not start");
+    NS_TEST_ASSERT_MSG_NE(+again.instanceId,
+                          +first.instanceId,
+                          "A repeat discovery to T took the ID of its earlier one, whose route "
+                          "state is still live, because a discovery to U ran under that ID in "
+                          "between");
+
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Losing the base DODAG never promotes a route-discovery instance to
  *        be the base DODAG.
  *
@@ -23255,11 +24058,11 @@ RplIncomparableVersionFromParentTestCase::DoRun()
     static constexpr uint8_t OLD_VERSION = 18;
     static constexpr uint8_t NEW_VERSION = 48; // 30 apart: beyond SEQUENCE_WINDOW (16)
 
-    auto deliver = [&](Ipv6Address from, uint8_t version) {
+    auto deliver = [&](Ipv6Address from, uint8_t version, uint16_t rank) {
         RplDioHeader dio;
         dio.SetInstanceId(0);
         dio.SetVersionNumber(version);
-        dio.SetRank(RPL_MIN_HOPRANKINC);
+        dio.SetRank(rank);
         dio.SetMop(RPL_MOP_NON_STORING);
         dio.SetGrounded(true);
         dio.SetDodagId(dodagId);
@@ -23281,20 +24084,20 @@ RplIncomparableVersionFromParentTestCase::DoRun()
     };
 
     uint8_t version = 0;
-    deliver(parent, OLD_VERSION);
+    deliver(parent, OLD_VERSION, RPL_MIN_HOPRANKINC);
     NS_TEST_ASSERT_MSG_EQ(rpl->GetDodagVersion(0, dodagId, version),
                           true,
                           "The node never joined");
     NS_TEST_ASSERT_MSG_EQ(+version, +OLD_VERSION, "The node joined the wrong Version");
 
-    deliver(stranger, NEW_VERSION);
+    deliver(stranger, NEW_VERSION, 4 * RPL_MIN_HOPRANKINC);
     NS_TEST_ASSERT_MSG_EQ(rpl->GetDodagVersion(0, dodagId, version), true, "The node left");
     NS_TEST_ASSERT_MSG_EQ(+version,
                           +OLD_VERSION,
-                          "A neighbour that is not a parent moved the node to a Version it "
+                          "A neighbour with a higher Rank (a child) moved the node to a Version it "
                           "cannot order");
 
-    deliver(parent, NEW_VERSION);
+    deliver(parent, NEW_VERSION, RPL_MIN_HOPRANKINC);
     NS_TEST_ASSERT_MSG_EQ(rpl->GetDodagVersion(0, dodagId, version), true, "The node left");
     NS_TEST_ASSERT_MSG_EQ(+version,
                           +NEW_VERSION,
@@ -29288,6 +30091,11 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplP2pAodvInstanceIdsDistinctTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplTrickleJoinDioNotConsistentTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplIncomparableVersionFromParentTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pWindowClosedByZeroNTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pWindowExpiryRechecksReplyTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pFullWindowKeepsShortestTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pAlternateEqualAtSendTimeTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pOriginTieGoesToLaterRouteTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pStopSilencesDiosTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pStopDoesNotReachOtherDodagsTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplMop4WithNoDiscoveryOptionRefusedTestCase, TestCase::Duration::QUICK);
@@ -29326,6 +30134,10 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplParentLossRejoinTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplPathSequenceSurvivesRejoinTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplRejoinKeepsRankCeilingTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplRetentionAcrossVersionsTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplRrepInstanceWithPioTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pReuseBarSurvivesOtherTargetTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pAddresslessCopyKeepsSlotTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplBaseDodagNotPromotedFromDiscoveryTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDisContinuesAfterDiscoveryJoinTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplRreqWithoutArtDroppedTestCase, TestCase::Duration::QUICK);
