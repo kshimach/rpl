@@ -11890,6 +11890,8 @@ bar中のIDを避ける動作(§96)は変わらない。加入が開始から'L'
 
 ## 118. 参加のきっかけのDIOを、Trickleのconsistentに数えない(base RPLのみ)(§104 RPLコア4)
 
+(注: AODV-RPLを対象外にした判断は、RFCの根拠ではなかったので§122で外した。)
+
 RFC 6550 §8.3: "A DIO from a sender with a lesser DAGRank that causes no changes to the recipient's
 parent set, preferred parent, or Rank SHOULD be considered consistent with respect to the Trickle
 timer."、および"When a node joins a new DODAG Version (e.g., by updating its DODAGVersionNumber,
@@ -12059,4 +12061,37 @@ rule 1)」は、この修正で停止期間そのものが数秒になったの�
 router considers itself a Target"と、受信インタフェースに限らず自分のアドレスのどれかで
 Targetとして処理するよう定める。(C)はこのMUSTから外れるので採らない。現状の挙動(0ad3f13)を
 維持し、制限として`doc/rpl.rst`に明記した。
+
+## 122. 参加のきっかけのDIOを、AODV-RPLでもTrickleのconsistentに数えない
+
+§118はbase RPLだけを直し、AODV-RPLのRREQ-/RREP-DIOは、`AodvDioRedundancy` = 1の採用(§52.6)が
+その数え方のもとで測られていたため、動作点を変えないよう除外していた。これはRFCの根拠ではない。
+RFC 9854 §8は、RREQ-/RREP-DIOのTrickle制御が"follows the procedures described in Section 8.3 of
+[RFC6550]"と定め、その§8.3は、親集合・優先親・Rankを変えないDIOだけをconsistentとし、"When a node
+joins a new DODAG Version (e.g., by ... joining a new RPL Instance, etc.)"をinconsistencyとする。
+RREQ-Instanceへの参加は、この「新しいRPL Instanceへの参加」にあたる。RFCに準拠させ、除外を外した。
+
+試験: `RplAodvJoinDioNotConsistentTestCase`(k = 1、Imin 128 msで、RREQ-DIOで参加した中継の最初のRREQ-DIO
+が最初の区間内に出る)。例外を戻すとFAILする(load-bearing確認)。なお、DIOのDODAG Configurationが
+運ぶkが優先される(DIOにk = 10を載せると、この試験は抑制を起こさず、例外の有無に鈍感だった)。
+
+測定(`run-aodv-defaults-sweep.sh`のasisアーム、25ノードgrid、6動作点、30シード、同じシードの
+対、95%ブートストラップCI): 旧に対する差は、制御バイトが+9,658〜+16,209 B(+5〜+9%、全動作点で
+CIが0を外れる)、発見成功率は-0.3件/8件のm9-pen6だけでCIが0を外れる(他は0を含む)、背景PDRは
+全点で0を含む、発見遅延はm9-symだけ+37 ms(CIが0を外れる)。RFCに準拠した結果としてのコストで、
+採用規則(§52.6)の「制御バイトが減ること」は満たさない。`AodvDioRedundancy`の既定(1)を含む
+AODV-RPLのTrickle動作点をRFC準拠のもとで選び直すかは、別の判断として残る。
+
+## 123. Rank INFINITEのまま残るノードが、親のDIOのたびにTrickleをResetしない
+
+`SelectPreferredParent()`の`changed`が、clamp前の`bestRank`と、RFC 6550 §8.2.2.4 rule 3で
+INFINITE_RANKに留められた`dodag.rank`を比べていたため、Rankの上限(L + DAGMaxRankIncrease)に
+当たって親を保持したまま滞留するノードでは、親のDIOのたびに「変化あり」となり、Trickleを
+Resetした(§8.3: 変更を起こさない下位Rank送信元のDIOはconsistent)。監査の測定は、親のDIOが
+2秒間隔のとき、400秒に819通のINFINITE_RANK DIO(通常ノードは198通)。広告するRankで比べるよう直した。
+
+試験: `RplStuckRouterTrickleTestCase`(Imin 128 ms、doublings 4、親が1秒ごとに上限超えのRankを広告、
+20秒間のDIO数)。修正前は60通(閾値30)で、修正後は閾値内。`bestRank`比較に戻すとFAILする。
+既定のハーネス(AODV、6動作点、30シード、同じシードの対)では、制御バイト・発見成功率に差は0で、
+既定の評価には影響しない。
 

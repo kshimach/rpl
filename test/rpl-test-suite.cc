@@ -17793,6 +17793,348 @@ RplTrickleJoinDioNotConsistentTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief The RREQ-DIO that makes a router join an RREQ-Instance does not
+ *        count towards Trickle's redundancy either.
+ *
+ * RFC 9854 section 8: the Trickle control of RREQ-DIO "follows the
+ * procedures described in Section 8.3 of [RFC6550]", where only a DIO that
+ * "causes no changes to the recipient's parent set, preferred parent, or
+ * Rank" is consistent and joining a new RPL Instance is an inconsistency.
+ * Section 118 applied that to base RPL and left AODV-RPL on the old count to
+ * keep a measured operating point; that was not RFC's rule (design-
+ * constraints.md section 122). One router with the module's k = 1 and Imin
+ * 128 ms: its first RREQ-DIO has to leave within the first interval, before
+ * 128 ms; suppressed, the next chance falls in [256, 384) ms.
+ */
+class RplAodvJoinDioNotConsistentTestCase : public TestCase
+{
+  public:
+    RplAodvJoinDioNotConsistentTestCase();
+
+  private:
+    void DoRun() override;
+
+    /// @brief Record when the router under test first transmits an RREQ-DIO.
+    /// @param socket the monitoring socket
+    void Capture(Ptr<Socket> socket);
+
+    Ipv6Address m_routerLinkLocal; //!< link-local address of the router under test
+    Time m_firstRreq{Time::Max()};  //!< when its first RREQ-DIO reached the monitor
+};
+
+RplAodvJoinDioNotConsistentTestCase::RplAodvJoinDioNotConsistentTestCase()
+    : TestCase("The RREQ-DIO that makes a router join is not counted as consistent by Trickle "
+              "(RFC 9854 section 8, RFC 6550 section 8.3)")
+{
+}
+
+void
+RplAodvJoinDioNotConsistentTestCase::Capture(Ptr<Socket> socket)
+{
+    Address sender;
+    Ptr<Packet> packet = socket->RecvFrom(sender);
+    if (!packet)
+    {
+        return;
+    }
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ipv6Header);
+    Icmpv6Header icmpv6Header;
+    packet->RemoveHeader(icmpv6Header);
+    if (icmpv6Header.GetType() == ICMPV6_RPL && icmpv6Header.GetCode() == RPL_CODE_DIO &&
+        m_firstRreq == Time::Max())
+    {
+        RplDioHeader dio;
+        packet->RemoveHeader(dio);
+        if (dio.HasRreq())
+        {
+            m_firstRreq = Simulator::Now();
+        }
+    }
+}
+
+void
+RplAodvJoinDioNotConsistentTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2); // 0 = the router under test and base root, 1 = origin and monitor
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    interfaces.SetForwarding(0, true);
+    interfaces.SetForwarding(1, true);
+
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(10));
+    Simulator::Run();
+
+    Ptr<Node> node = nodes.Get(0);
+    Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> peer = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(peer->IsJoined(), true, "The peer never joined the base DODAG");
+    m_routerLinkLocal = node->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address peerLinkLocal =
+        nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    Ptr<Socket> monitor = Socket::CreateSocket(nodes.Get(1), Ipv6RawSocketFactory::GetTypeId());
+    monitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    monitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    monitor->BindToNetDevice(nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetNetDevice(1));
+    monitor->SetRecvCallback(MakeCallback(&RplAodvJoinDioNotConsistentTestCase::Capture, this));
+
+    static constexpr uint8_t RREQ_INSTANCE = 0x81;
+    Ipv6Address origNode("2001:9::1");
+    Ipv6Address peerGlobal = peer->GetGlobalAddress();
+    NS_TEST_ASSERT_MSG_NE(peerGlobal, Ipv6Address::GetAny(), "The peer has no global address yet");
+
+    RplDioHeader rreqDio;
+    rreqDio.SetInstanceId(RREQ_INSTANCE);
+    rreqDio.SetVersionNumber(0);
+    rreqDio.SetRank(RPL_MIN_HOPRANKINC);
+    rreqDio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+    rreqDio.SetDodagId(origNode);
+    rreqDio.SetDtsn(0);
+    rreqDio.SetDagConfiguration(4,
+                                7,
+                                1, // k = 1
+                                RPL_MAX_RANKINC,
+                                RPL_MIN_HOPRANKINC,
+                                RPL_OCP_OF0,
+                                RPL_DEFAULT_LIFETIME,
+                                RPL_DEFAULT_LIFETIME_UNIT);
+    RplDioHeader::RreqOption rreq;
+    rreq.symmetric = true;
+    rreq.hopByHop = false;
+    rreq.compr = 0;
+    rreq.lifetime = 1;
+    rreq.rankLimit = 0;
+    rreq.origSeqNo = 1;
+    rreq.addressVector = {peerGlobal};
+    rreqDio.SetRreq(rreq);
+    RplDioHeader::ArtOption art;
+    art.destSeqNo = 0;
+    art.prefixLength = 0;
+    art.target = Ipv6Address("2001:9::99"); // not this router: it relays
+    rreqDio.AddArt(art);
+
+    const Time joined = Simulator::Now();
+    DeliverRawRplMessage<RplDioHeader>(node,
+                                       1,
+                                       rreqDio,
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       peerLinkLocal,
+                                       m_routerLinkLocal);
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(RREQ_INSTANCE, origNode),
+                          true,
+                          "The router never joined the RREQ-Instance");
+
+    Simulator::Stop(Seconds(1));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_NE(m_firstRreq, Time::Max(), "The router never relayed the RREQ-DIO");
+    NS_TEST_ASSERT_MSG_LT(m_firstRreq - joined,
+                          MilliSeconds(128),
+                          "The router's first RREQ-DIO left after its first Trickle interval: "
+                          "the DIO that made it join was counted as consistent and suppressed "
+                          "it");
+
+    monitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief A router held at INFINITE_RANK by the Rank ceiling does not reset
+ *        Trickle on every DIO its parent sends.
+ *
+ * RFC 6550 section 8.3: "A DIO from a sender with a lesser DAGRank that
+ * causes no changes to the recipient's parent set, preferred parent, or
+ * Rank SHOULD be considered consistent with respect to the Trickle timer."
+ * SelectPreferredParent() compared the unclamped Rank through the parent
+ * with the node's advertised INFINITE_RANK, so every such DIO counted as a
+ * change and reset the timer: a router stuck that way advertised
+ * INFINITE_RANK at the shortest interval for as long as it stayed there
+ * (design-constraints.md section 123). One router, a parent that advertises
+ * a Rank above L + DAGMaxRankIncrease once a second for 20 s: with Imin 128
+ * ms and four doublings the interval has to grow, so far fewer than the
+ * 60-odd DIOs a timer reset each second would send.
+ */
+class RplStuckRouterTrickleTestCase : public TestCase
+{
+  public:
+    RplStuckRouterTrickleTestCase();
+
+  private:
+    void DoRun() override;
+
+    /// @brief Count the DIOs the router under test transmits.
+    /// @param socket the monitoring socket
+    void Capture(Ptr<Socket> socket);
+
+    /// @brief Deliver the parent's DIO and schedule the next one.
+    void Deliver();
+
+    Ptr<Node> m_node;               //!< the router under test
+    Ipv6Address m_routerLinkLocal;  //!< its link-local address
+    Time m_stop;                    //!< when the parent stops sending
+    uint32_t m_count{0};            //!< DIOs from the router seen at the monitor
+};
+
+RplStuckRouterTrickleTestCase::RplStuckRouterTrickleTestCase()
+    : TestCase("A router held at INFINITE_RANK does not reset Trickle on its parent's DIOs "
+               "(RFC 6550 section 8.3)")
+{
+}
+
+void
+RplStuckRouterTrickleTestCase::Capture(Ptr<Socket> socket)
+{
+    Address sender;
+    Ptr<Packet> packet = socket->RecvFrom(sender);
+    if (!packet)
+    {
+        return;
+    }
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ipv6Header);
+    Icmpv6Header icmpv6Header;
+    packet->RemoveHeader(icmpv6Header);
+    if (icmpv6Header.GetType() == ICMPV6_RPL && icmpv6Header.GetCode() == RPL_CODE_DIO &&
+        ipv6Header.GetSource() == m_routerLinkLocal)
+    {
+        m_count++;
+    }
+}
+
+void
+RplStuckRouterTrickleTestCase::Deliver()
+{
+    RplDioHeader dio;
+    dio.SetInstanceId(0);
+    dio.SetVersionNumber(0);
+    // L is 256 (parent 128 + one hop) and DAGMaxRankIncrease 256, so a Rank
+    // through this parent of 768 is above the ceiling of 512.
+    dio.SetRank(640);
+    dio.SetMop(RPL_MOP_NON_STORING);
+    dio.SetGrounded(true);
+    dio.SetDodagId(Ipv6Address("2001:1::1"));
+    dio.SetDtsn(0);
+    dio.SetDagConfiguration(4,
+                            7,
+                            10,
+                            256,
+                            RPL_MIN_HOPRANKINC,
+                            RPL_OCP_OF0,
+                            RPL_DEFAULT_LIFETIME,
+                            RPL_DEFAULT_LIFETIME_UNIT);
+    DeliverRawRplMessage<RplDioHeader>(m_node,
+                                       1,
+                                       dio,
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       Ipv6Address("fe80::a"),
+                                       Ipv6Address(RPL_ALL_NODES_MULTICAST));
+    if (Simulator::Now() < m_stop)
+    {
+        Simulator::Schedule(Seconds(1), &RplStuckRouterTrickleTestCase::Deliver, this);
+    }
+}
+
+void
+RplStuckRouterTrickleTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2); // 0 = the router under test, 1 = the monitor
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.AssignWithoutAddress(devices);
+
+    m_node = nodes.Get(0);
+    Ptr<RplRoutingProtocol> rpl = m_node->GetObject<RplRoutingProtocol>();
+    m_routerLinkLocal = m_node->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    Ptr<Socket> monitor = Socket::CreateSocket(nodes.Get(1), Ipv6RawSocketFactory::GetTypeId());
+    monitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    monitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    monitor->BindToNetDevice(devices.Get(1));
+    monitor->SetRecvCallback(MakeCallback(&RplStuckRouterTrickleTestCase::Capture, this));
+
+    Simulator::Stop(Seconds(2));
+    Simulator::Run();
+
+    // Join first at a low Rank, which sets L, then keep the parent's Rank high.
+    RplDioHeader first;
+    first.SetInstanceId(0);
+    first.SetVersionNumber(0);
+    first.SetRank(RPL_MIN_HOPRANKINC);
+    first.SetMop(RPL_MOP_NON_STORING);
+    first.SetGrounded(true);
+    first.SetDodagId(Ipv6Address("2001:1::1"));
+    first.SetDtsn(0);
+    first.SetDagConfiguration(4,
+                              7,
+                              10,
+                              256,
+                              RPL_MIN_HOPRANKINC,
+                              RPL_OCP_OF0,
+                              RPL_DEFAULT_LIFETIME,
+                              RPL_DEFAULT_LIFETIME_UNIT);
+    DeliverRawRplMessage<RplDioHeader>(m_node,
+                                       1,
+                                       first,
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       Ipv6Address("fe80::a"),
+                                       Ipv6Address(RPL_ALL_NODES_MULTICAST));
+    NS_TEST_ASSERT_MSG_EQ(rpl->IsJoinedTo(0, Ipv6Address("2001:1::1")), true,
+                          "The router never joined");
+
+    m_stop = Simulator::Now() + Seconds(22);
+    Simulator::Schedule(Seconds(1), &RplStuckRouterTrickleTestCase::Deliver, this);
+    Simulator::Stop(Seconds(3));
+    Simulator::Run();
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetRankIn(0, Ipv6Address("2001:1::1")),
+                          RPL_INFINITE_RANK,
+                          "The router was not held at INFINITE_RANK by the Rank ceiling");
+
+    // Count over the 20 s that follow, once the router is stuck.
+    m_count = 0;
+    Simulator::Stop(Seconds(20));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_LT(m_count,
+                          30,
+                          "A router held at INFINITE_RANK sent a DIO about every 330 ms: its "
+                          "parent's DIOs reset the Trickle timer although nothing changed");
+
+    monitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Base of the tests of a Target's collection window (RFC 6997 section
  *        9.5, design-constraints.md sections 72 and 73).
  *
@@ -30138,6 +30480,8 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplRrepInstanceWithPioTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pReuseBarSurvivesOtherTargetTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplP2pAddresslessCopyKeepsSlotTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplAodvJoinDioNotConsistentTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplStuckRouterTrickleTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplBaseDodagNotPromotedFromDiscoveryTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDisContinuesAfterDiscoveryJoinTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplRreqWithoutArtDroppedTestCase, TestCase::Duration::QUICK);

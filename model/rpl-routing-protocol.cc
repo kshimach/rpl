@@ -2152,13 +2152,10 @@ RplRoutingProtocol::HandleDio(const RplDioHeader& dio,
         // was suppressed (design-constraints.md section 118: base RPL's
         // convergence over a line of five nodes went from 13 s to 67 s).
         //
-        // Not applied to an AODV-RPL RREQ-/RREP-DIO. AodvDioRedundancy = 1
-        // was adopted (section 52.6) with this count in place, and removing
-        // it moves that operating point and the numbers measured on it. The
-        // AodvTrickleRankOnlyReset attribute already provides the other
-        // behaviour for anyone who wants it.
-        const bool joiningDio =
-            dodag->rank == RPL_INFINITE_RANK && !dio.HasRreq() && !dio.HasRrep();
+        // Applied to an AODV-RPL RREQ-/RREP-DIO as well: RFC 9854 section 8
+        // has its Trickle control follow "the procedures described in
+        // Section 8.3 of [RFC6550]", so the rule is the same one.
+        const bool joiningDio = dodag->rank == RPL_INFINITE_RANK;
         if (!joiningDio)
         {
             dodag->dioTrickle.ConsistencyHit();
@@ -4261,7 +4258,19 @@ RplRoutingProtocol::SelectPreferredParent(DodagMembership& dodag)
     // only at rank/parent would leave the advertised pathEtx stale.
     bool pathCostChanged = dodag.ocp == RPL_OCP_MRHOF && !best.IsAny() &&
                           static_cast<uint16_t>(bestPathCost) != dodag.pathEtx;
-    bool changed = (best != dodag.preferredParent) || (bestRank != dodag.rank) || pathCostChanged;
+    // Compared as advertised: a node held at INFINITE_RANK by the Rank
+    // ceiling below keeps its parent, so the unclamped bestRank would differ
+    // from dodag.rank on every call and count each DIO from that parent as a
+    // change, resetting Trickle every time (RFC 6550 section 8.3: a DIO that
+    // "causes no changes to the recipient's parent set, preferred parent, or
+    // Rank" is consistent). design-constraints.md section 123.
+    const uint16_t advertisedBest =
+        (!best.IsAny() &&
+         uint32_t(bestRank) > uint32_t(dodag.lowestRankThisVersion) + dodag.maxRankIncrease)
+            ? RPL_INFINITE_RANK
+            : bestRank;
+    bool changed =
+        (best != dodag.preferredParent) || (advertisedBest != dodag.rank) || pathCostChanged;
     if (!changed)
     {
         return false;
