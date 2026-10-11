@@ -3079,7 +3079,7 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     bool m_aodvGratuitousRrepOnce{true};
     /// Follow a Gratuitous RREP with the unicast RREQ relaying RFC 9854
     /// section 7 pairs it with. @see the AodvGratuitousRrepRelay attribute.
-    bool m_aodvGratuitousRrepRelay{false};
+    bool m_aodvGratuitousRrepRelay{true};
     uint8_t m_aodvRankLimit;   //!< RankLimit put on RREQ-DIOs, 0 meaning no limit
     uint8_t m_aodvLifetime;    //!< the 'L' field put on RREQ-DIOs, 0..3
     /// REJOIN_REENABLE (RFC 9854 section 2): how long after leaving an

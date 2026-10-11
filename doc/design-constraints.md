@@ -12198,3 +12198,35 @@ AODV-RPLに関するもの(§99.1、§84.8、§85の比較)は、現行コード
 未反映(再測定していない): 8.5節のImin表、6.3節・9.4節の「lr-wpanは36ノード以上で崩壊」の記述(§98の
 BUSY_RX修正前の測定が元で、再測定待ち)。
 
+## 128. G-RREPを出すなら、RREQ-DIOのユニキャスト中継を必ず行う(RFC 9854 §7)
+
+RFC 9854 §7は、G-RREPをMAYとしたうえで、出したルータに"After unicasting the G-RREP to the
+OrigNode, the intermediate router then unicasts the RREQ towards TargNode"、hop-by-hopの経路では
+"the intermediate router MUST unicast the received RREQ-DIO to the Next Hop on the route. The Next
+Hop router along the route MUST build new route entries ... Then, the TargNode and each router along
+the path towards OrigNode MUST unicast the RREP-DIO hop-by-hop towards OrigNode"を課す。中継は
+`AodvGratuitousRrepRelay`で実装済みだったが既定がfalseで、`AodvGratuitousRrep`(MAY)だけを有効に
+すると、MUSTを欠いた非準拠の組み合わせになった。中継を確かめる試験も無かった。
+
+変更: `AodvGratuitousRrepRelay`の既定をtrueにした。falseは§52.5の測定を再現するためだけに残す
+(説明文に非準拠と明記)。`AodvGratuitousRrepOnce`の説明文の「中継は未実装」を直した。TargNode自身の
+RREPを作る2か所の「G-RREPは範囲外」というコメント、`HandleAodvRrep()`の「非対称H=1は範囲外
+(ShouldRefuseAodvRreq()のガード参照)」という、存在しないガードを指すコメントも直した。上流の中継
+ルータの"MUST also generate a G-RREP and send it further upstream"は、受けたRREP-DIOをそのまま
+転送するので(Gビットが保たれる)満たしている。
+
+試験: `RplAodvGratuitousRrepRelaysRreqTestCase`(3ノード直列、中継がキャッシュ経路を持つ状態で
+OrigNodeが探索)。中継がG-RREPを出し、TargNodeへRREQ-DIOをユニキャストし、TargNodeがOrigNodeの
+RREQ-InstanceIDでOrigNodeへの経路を作り、TargNode自身のRREP(G=0)がOrigNodeに届くこと。
+中継を切るとFAILする(load-bearing確認)。
+
+既存の`RplAodvMultiArtWorseRankIgnoredTestCase`が落ちた。洪水のコピーをユニキャストで代用して
+いたため、中継の連鎖として優先親の規則を迂回して受理された。RFC 9854 §6.1でRREQ-DIOの洪水は
+all-AODV-RPL-nodesへのマルチキャストで、ユニキャストのRREQ-DIOは§7の連鎖だけなので、試験の宛先を
+マルチキャストに直した(試験が固定する§6.2.2の規則は洪水のコピーについてのもの)。
+
+既定の評価への影響: G-RREPは既定で無効なので、中継は送られない。受信側のユニキャストの扱い
+(連鎖のコピーとして受理)も、既定のハーネスでは差を生まなかった。中継をfalseにした同じバイナリと
+の対比較(6動作点、30シード、対称の応答と`AodvForceAsymmetric`の両方): 180行×2のすべてで、
+制御バイト・発見成功・背景PDR・遅延が完全に一致した。
+

@@ -353,23 +353,24 @@ RplRoutingProtocol::GetTypeId()
                           "own multicast through the section 6.2.2 rule SendDio() already "
                           "applies. Hop-by-hop only: section 7's source-routing half is a "
                           "separate set of MUSTs and an H=0 relay caches nothing to answer from "
-                          "in the first place. False by default until measured. @see "
-                          "design-constraints.md section 52.5.",
-                          BooleanValue(false),
+                          "in the first place. True by default: these are MUSTs for any router "
+                          "that takes the MAY, so false is not a conformant setting and is kept "
+                          "only to reproduce the measurements of design-constraints.md section "
+                          "52.5 (section 128).",
+                          BooleanValue(true),
                           MakeBooleanAccessor(&RplRoutingProtocol::m_aodvGratuitousRrepRelay),
                           MakeBooleanChecker())
             .AddAttribute("AodvGratuitousRrepOnce",
                           "Send at most one Gratuitous RREP per (RREQ-Instance, target) from a "
                           "given router. RFC 9854 section 7 has a relay that takes the G-RREP "
                           "shortcut then \"unicast[] the RREQ towards TargNode\", which is what "
-                          "stops it hearing the multicast RREQ-DIO again and re-firing; that "
-                          "half is not implemented here (@see rpl-aodv.cc's file header), so "
-                          "without this bound the G-RREP repeats once per Trickle interval for "
-                          "the instance's whole life -- measured on a 25-node grid, every one "
-                          "of the 1040 reply-direction packets per run was a G-RREP and none "
-                          "was a real RREP. True by default, but as a stopgap: the RFC's own "
-                          "answer is to implement the unicast relaying, which makes the repeat "
-                          "impossible rather than merely bounded. @see design-constraints.md "
+                          "stops it hearing the multicast RREQ-DIO again and re-firing "
+                          "(AodvGratuitousRrepRelay). With the relaying off, the G-RREP repeats "
+                          "once per Trickle interval for the instance's whole life -- measured "
+                          "on a 25-node grid, every one of the 1040 reply-direction packets per "
+                          "run was a G-RREP and none was a real RREP. With it on, this bound "
+                          "only matters for copies that still arrive before the relay goes "
+                          "quiet. True by default. @see design-constraints.md "
                           "sections 52.5 and 52.6: on its own it saves nothing measurable, "
                           "but alongside AodvDioRedundancy=1 it is worth a further 31-62 KB "
                           "per run at every operating point tested.",
@@ -1427,7 +1428,7 @@ RplRoutingProtocol::SendDio(DodagMembership& dodag, Ipv6Address dst, uint32_t in
         // membership's own state on each transmission exactly as the RREQ
         // case below is.
         RplDioHeader::RrepOption rrep;
-        rrep.gratuitous = false; // section 7's Gratuitous RREP is out of scope
+        rrep.gratuitous = false; // the TargNode's own RREP (section 7: G=0 marks it as such)
         rrep.hopByHop = dodag.aodv.hopByHop; // matching the RREQ's own H bit
         rrep.lifetime = dodag.aodv.lifetimeField;
         rrep.rankLimit = dodag.aodv.rankLimit;

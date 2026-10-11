@@ -9344,7 +9344,6 @@ RplAodvMultiArtWorseRankIgnoredTestCase::DoRun()
 
     Ptr<Node> node = nodes.Get(0);
     Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
-    Ipv6Address nodeLinkLocal = node->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
 
     static constexpr uint8_t RREQ_INSTANCE = 0x86;
     Ipv6Address origNode("2001:9::1");
@@ -9397,7 +9396,10 @@ RplAodvMultiArtWorseRankIgnoredTestCase::DoRun()
                             buildRreq(rank, targets),
                             static_cast<uint8_t>(RPL_CODE_DIO),
                             from,
-                            nodeLinkLocal);
+                            // Multicast, as every flooded copy is (RFC 9854 section 6.1); a
+                            // unicast RREQ-DIO is section 7's relay chain, which the
+                            // preferred-parent rule this test pins does not apply to.
+                            Ipv6Address(RPL_ALL_NODES_MULTICAST));
         Simulator::Stop(MilliSeconds(10));
         Simulator::Run();
     };
@@ -11578,6 +11580,194 @@ RplAodvGratuitousRrepTestCase::DoRun()
     monitor->Close();
     receiver->Close();
     sender->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief A router that answers with a Gratuitous RREP also unicasts the
+ *        RREQ-DIO on towards TargNode, which then answers for real.
+ *
+ * RFC 9854 section 7: "After unicasting the G-RREP to the OrigNode, the
+ * intermediate router then unicasts the RREQ towards TargNode", and for
+ * hop-by-hop routes "the intermediate router MUST unicast the received
+ * RREQ-DIO to the Next Hop on the route. The Next Hop router along the route
+ * MUST build new route entries with the related RPLInstanceID and DODAGID in
+ * the downward direction. ... Then, the TargNode and each router along the
+ * path towards OrigNode MUST unicast the RREP-DIO hop-by-hop towards
+ * OrigNode". No test covered this half (design-constraints.md section 128).
+ * The same three-node line as RplAodvGratuitousRrepTestCase: the relay
+ * caches a route to the TargNode from a discovery of its own, then the
+ * OrigNode discovers the TargNode with the shortcut allowed.
+ */
+class RplAodvGratuitousRrepRelaysRreqTestCase : public TestCase
+{
+  public:
+    RplAodvGratuitousRrepRelaysRreqTestCase();
+
+  private:
+    void DoRun() override;
+
+    /// @brief Count unicast RREQ-DIOs from the relay seen at the TargNode.
+    /// @param socket the monitoring socket
+    void CaptureAtTarg(Ptr<Socket> socket);
+
+    /// @brief Count RREP-DIOs seen at the OrigNode, gratuitous or not.
+    /// @param socket the monitoring socket
+    void CaptureAtOrig(Ptr<Socket> socket);
+
+    Ipv6Address m_relayLinkLocal;     //!< the relay's link-local address
+    uint32_t m_unicastRreq{0};        //!< unicast RREQ-DIOs from the relay at the TargNode
+    uint32_t m_gratuitousRrep{0};     //!< RREP-DIOs with 'G' set at the OrigNode
+    uint32_t m_realRrep{0};           //!< RREP-DIOs with 'G' clear at the OrigNode
+};
+
+RplAodvGratuitousRrepRelaysRreqTestCase::RplAodvGratuitousRrepRelaysRreqTestCase()
+    : TestCase("A router sending a Gratuitous RREP unicasts the RREQ-DIO on to TargNode "
+               "(RFC 9854 section 7)")
+{
+}
+
+void
+RplAodvGratuitousRrepRelaysRreqTestCase::CaptureAtTarg(Ptr<Socket> socket)
+{
+    Address sender;
+    Ptr<Packet> packet = socket->RecvFrom(sender);
+    if (!packet)
+    {
+        return;
+    }
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ipv6Header);
+    Icmpv6Header icmpv6Header;
+    packet->RemoveHeader(icmpv6Header);
+    if (icmpv6Header.GetType() != ICMPV6_RPL || icmpv6Header.GetCode() != RPL_CODE_DIO ||
+        ipv6Header.GetDestination().IsMulticast() || ipv6Header.GetSource() != m_relayLinkLocal)
+    {
+        return;
+    }
+    RplDioHeader dio;
+    packet->RemoveHeader(dio);
+    if (dio.HasRreq())
+    {
+        m_unicastRreq++;
+    }
+}
+
+void
+RplAodvGratuitousRrepRelaysRreqTestCase::CaptureAtOrig(Ptr<Socket> socket)
+{
+    Address sender;
+    Ptr<Packet> packet = socket->RecvFrom(sender);
+    if (!packet)
+    {
+        return;
+    }
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ipv6Header);
+    Icmpv6Header icmpv6Header;
+    packet->RemoveHeader(icmpv6Header);
+    if (icmpv6Header.GetType() != ICMPV6_RPL || icmpv6Header.GetCode() != RPL_CODE_DIO)
+    {
+        return;
+    }
+    RplDioHeader dio;
+    packet->RemoveHeader(dio);
+    if (dio.HasRrep())
+    {
+        (dio.GetRrep().gratuitous ? m_gratuitousRrep : m_realRrep)++;
+    }
+}
+
+void
+RplAodvGratuitousRrepRelaysRreqTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(3); // 0 = OrigNode and base root, 1 = relay, 2 = TargNode
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+    Ptr<SimpleNetDevice> devA = DynamicCast<SimpleNetDevice>(devices.Get(0));
+    Ptr<SimpleNetDevice> devC = DynamicCast<SimpleNetDevice>(devices.Get(2));
+    channel->BlackList(devA, devC);
+    channel->BlackList(devC, devA);
+
+    RplHelper rplHelper;
+    // Section 7's MAY, declined by default; the relaying it brings with it is
+    // left at its default.
+    rplHelper.Set("AodvGratuitousRrep", BooleanValue(true));
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
+    for (uint32_t i = 0; i < nodes.GetN(); i++)
+    {
+        interfaces.SetForwarding(i, true);
+    }
+    rplHelper.SetRoot(nodes.Get(0), Ipv6Address("2001:1::"), 64);
+    rplHelper.AssignStreams(nodes, 1);
+
+    Simulator::Stop(Seconds(250));
+    Simulator::Run();
+
+    Ptr<RplRoutingProtocol> orig = nodes.Get(0)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> relay = nodes.Get(1)->GetObject<RplRoutingProtocol>();
+    Ptr<RplRoutingProtocol> targ = nodes.Get(2)->GetObject<RplRoutingProtocol>();
+    NS_TEST_ASSERT_MSG_EQ(targ->IsJoined(), true, "The base DODAG did not reach the far end");
+    m_relayLinkLocal = nodes.Get(1)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+    Ipv6Address origAddress = orig->GetGlobalAddress();
+    Ipv6Address targAddress = targ->GetGlobalAddress();
+
+    relay->DiscoverRoute(targAddress, true);
+    Simulator::Stop(Seconds(5));
+    Simulator::Run();
+    Ipv6Address nextHop;
+    uint8_t instanceId = 0;
+    NS_TEST_ASSERT_MSG_EQ(relay->GetHopByHopRoute(targAddress, nextHop, instanceId),
+                          true,
+                          "The relay never cached a route to the TargNode");
+
+    Ptr<Socket> atTarg = Socket::CreateSocket(nodes.Get(2), Ipv6RawSocketFactory::GetTypeId());
+    atTarg->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    atTarg->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    atTarg->BindToNetDevice(devices.Get(2));
+    atTarg->SetRecvCallback(
+        MakeCallback(&RplAodvGratuitousRrepRelaysRreqTestCase::CaptureAtTarg, this));
+    Ptr<Socket> atOrig = Socket::CreateSocket(nodes.Get(0), Ipv6RawSocketFactory::GetTypeId());
+    atOrig->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    atOrig->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    atOrig->BindToNetDevice(devices.Get(0));
+    atOrig->SetRecvCallback(
+        MakeCallback(&RplAodvGratuitousRrepRelaysRreqTestCase::CaptureAtOrig, this));
+
+    RplRoutingProtocol::DodagKey origKey = orig->DiscoverRoute(targAddress, true);
+    NS_TEST_ASSERT_MSG_NE(origKey.dodagId, Ipv6Address::GetAny(), "The discovery did not start");
+    Simulator::Stop(Seconds(2));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_GT_OR_EQ(m_gratuitousRrep, 1, "The relay sent no Gratuitous RREP");
+    NS_TEST_ASSERT_MSG_GT_OR_EQ(m_unicastRreq,
+                                1,
+                                "The relay sent a Gratuitous RREP but did not unicast the "
+                                "RREQ-DIO on to its cached next hop");
+    NS_TEST_ASSERT_MSG_EQ(targ->GetHopByHopRoute(origAddress, nextHop, instanceId),
+                          true,
+                          "The TargNode built no route towards the OrigNode from the unicast "
+                          "RREQ-DIO");
+    NS_TEST_ASSERT_MSG_EQ(+instanceId,
+                          +origKey.instanceId,
+                          "The TargNode's route is not under the OrigNode's RREQ-InstanceID");
+    NS_TEST_ASSERT_MSG_GT_OR_EQ(m_realRrep,
+                                1,
+                                "The TargNode's own RREP-DIO never came back to the OrigNode");
+
+    atTarg->Close();
+    atOrig->Close();
     Simulator::Destroy();
 }
 
@@ -30488,6 +30678,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplP2pAddresslessCopyKeepsSlotTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvJoinDioNotConsistentTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplStuckRouterTrickleTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplAodvGratuitousRrepRelaysRreqTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplBaseDodagNotPromotedFromDiscoveryTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDisContinuesAfterDiscoveryJoinTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplRreqWithoutArtDroppedTestCase, TestCase::Duration::QUICK);

@@ -227,7 +227,10 @@ Reactive Discovery: P2P-RPL and AODV-RPL
   P2P-DRO. Intermediate nodes can maintain candidate routes for path diversity.
 * **AODV-RPL (RFC 9854)**: Provides reactive AODV-style discovery on top of RPL.
   Supports symmetric (S=1, unicast RREP) and asymmetric (S=0, flooded RREP-Instance)
-  paths. Intermediate routers with valid routes can respond with Gratuitous RREPs (G=1).
+  paths. Intermediate routers with valid routes can respond with Gratuitous RREPs (G=1)
+  (``AodvGratuitousRrep``, off by default); a router that does so also unicasts the
+  RREQ-DIO on along its cached route, as RFC 9854 section 7 requires
+  (``AodvGratuitousRrepRelay``, on by default).
 
 Usage
 -----
@@ -328,7 +331,7 @@ Examples
 Tests
 ~~~~~
 
-The comprehensive test suite (``test/rpl-test-suite.cc``) comprises **195 test cases**:
+The comprehensive test suite (``test/rpl-test-suite.cc``) comprises **196 test cases**:
 
 * Serialization and deserialization round trips for all control messages, options,
   SRH, RPI, P2P-RDO, DRO, DRO-ACK, and AODV-RPL options.
@@ -350,7 +353,7 @@ The comprehensive test suite (``test/rpl-test-suite.cc``) comprises **195 test c
 Validation
 ----------
 
-The test suite is formally verified via ``./test.py -s rpl`` (all 195 unit test cases
+The test suite is formally verified via ``./test.py -s rpl`` (all 196 unit test cases
 executing cleanly). Multi-hop topologies with full IEEE 802.15.4 and 6LoWPAN stacks
 demonstrate 100% end-to-end bidirectional ping delivery, correct ETX accumulation, and
 stable operation across lossy radio channels.

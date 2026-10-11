@@ -1536,7 +1536,7 @@ RplRoutingProtocol::SendAodvRrep(DodagMembership& dodag, DodagKey key)
     rrep.SetDodagId(ownAddress);
 
     RplDioHeader::RrepOption option;
-    option.gratuitous = false; // section 7's Gratuitous RREP is out of scope
+    option.gratuitous = false; // the TargNode's own RREP (section 7: G=0 marks it as such)
     option.hopByHop = dodag.aodv.hopByHop; // "MUST be set to be the same as the H bit in the RREQ option"
     // compr left at its default: RplDioHeader::Serialize() computes its own
     // from the addresses below and m_dodagId, ignoring this field.
@@ -1623,10 +1623,10 @@ RplRoutingProtocol::HandleAodvRrep(const RplDioHeader& dio, Ipv6Address from, ui
     }
     // No Compr check here, matching ShouldRefuseAodvRreq(): rrep.addressVector
     // is already full addresses regardless of what Compr the wire used (@see
-    // RplDioHeader::Deserialize()). Asymmetric H=1 stays out of scope (@see
-    // ShouldRefuseAodvRreq()'s matching guard); this function only ever
-    // handles the symmetric case (HandleDio() dispatches here for a unicast
-    // RREP-DIO specifically), so no further check is needed here for that.
+    // RplDioHeader::Deserialize()). This function only ever handles the
+    // symmetric case: HandleDio() dispatches here for a unicast RREP-DIO
+    // specifically, and an asymmetric RREP is a flooded RREP-Instance
+    // (HandleAodvRrepInstance()).
 
     // Section 6.3.3 in reverse: the RREQ-InstanceID is the RREP's own
     // RPLInstanceID less Delta, wrapping the way the addition did.
