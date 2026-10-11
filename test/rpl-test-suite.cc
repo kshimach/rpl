@@ -18331,6 +18331,153 @@ RplStuckRouterTrickleTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief A P2P mode DIO without a DODAG Configuration option puts RFC 6997's
+ *        default configuration into effect.
+ *
+ * RFC 6997 section 6.1: "A default DODAG Configuration Option takes effect if
+ * a P2P mode DIO does not carry an explicit one", with DIOIntervalMin 6 (64
+ * ms), DIORedundancyConstant 1, MaxRankIncrease 0 and OCP 0, and "The
+ * remaining parameters have default values as specified in [RFC6550]":
+ * DEFAULT_DIO_INTERVAL_DOUBLINGS 20 and DEFAULT_MIN_HOP_RANK_INCREASE 256
+ * (RFC 6550 section 17). An intermediate router has to carry the values in
+ * effect on in its own DIOs ("MUST set various fields in the DODAG
+ * Configuration Option in the outgoing P2P mode DIOs to the values they had
+ * in the incoming P2P mode DIOs"), so they are read off the first DIO it
+ * sends (design-constraints.md section 129).
+ */
+class RplP2pDefaultDagConfigurationTestCase : public TestCase
+{
+  public:
+    RplP2pDefaultDagConfigurationTestCase();
+
+  private:
+    void DoRun() override;
+
+    /// @brief Keep the first P2P mode DIO the router under test sends.
+    /// @param socket the monitoring socket
+    void Capture(Ptr<Socket> socket);
+
+    Ipv6Address m_routerLinkLocal; //!< link-local address of the router under test
+    bool m_seen{false};            //!< a P2P mode DIO from it was captured
+    RplDioHeader m_dio;            //!< the first one
+};
+
+RplP2pDefaultDagConfigurationTestCase::RplP2pDefaultDagConfigurationTestCase()
+    : TestCase("A P2P mode DIO without a DODAG Configuration option gets RFC 6997's default one "
+               "(RFC 6997 section 6.1)")
+{
+}
+
+void
+RplP2pDefaultDagConfigurationTestCase::Capture(Ptr<Socket> socket)
+{
+    Address sender;
+    Ptr<Packet> packet = socket->RecvFrom(sender);
+    if (!packet || m_seen)
+    {
+        return;
+    }
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ipv6Header);
+    Icmpv6Header icmpv6Header;
+    packet->RemoveHeader(icmpv6Header);
+    if (icmpv6Header.GetType() != ICMPV6_RPL || icmpv6Header.GetCode() != RPL_CODE_DIO ||
+        ipv6Header.GetSource() != m_routerLinkLocal)
+    {
+        return;
+    }
+    RplDioHeader dio;
+    packet->RemoveHeader(dio);
+    if (dio.HasP2pRdo())
+    {
+        m_dio = dio;
+        m_seen = true;
+    }
+}
+
+void
+RplP2pDefaultDagConfigurationTestCase::DoRun()
+{
+    NodeContainer nodes;
+    nodes.Create(2); // 0 = the router under test, 1 = the monitor
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper internetv6;
+    internetv6.SetRoutingHelper(rplHelper);
+    internetv6.Install(nodes);
+
+    Ipv6AddressHelper ipv6;
+    ipv6.SetBase(Ipv6Address("2001:1::"), Ipv6Prefix(64));
+    Ipv6InterfaceContainer interfaces = ipv6.Assign(devices);
+    interfaces.SetForwarding(0, true);
+    interfaces.SetForwarding(1, true);
+
+    Ptr<Node> node = nodes.Get(0);
+    m_routerLinkLocal = node->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
+
+    Ptr<Socket> monitor = Socket::CreateSocket(nodes.Get(1), Ipv6RawSocketFactory::GetTypeId());
+    monitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    monitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    monitor->BindToNetDevice(devices.Get(1));
+    monitor->SetRecvCallback(MakeCallback(&RplP2pDefaultDagConfigurationTestCase::Capture, this));
+
+    Simulator::Stop(Seconds(5)); // let DAD clear the static addresses
+    Simulator::Run();
+
+    RplDioHeader dio;
+    dio.SetInstanceId(0x81);
+    dio.SetVersionNumber(0);
+    dio.SetRank(RPL_MIN_HOPRANKINC);
+    dio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+    dio.SetGrounded(true);
+    dio.SetDodagId(Ipv6Address("2001:7::1"));
+    dio.SetDtsn(0);
+    P2pRdoOption rdo;
+    rdo.reply = true;
+    rdo.hopByHop = false;
+    rdo.numRoutes = 0;
+    rdo.lifetime = 3;
+    rdo.maxRankOrNh = 8;
+    rdo.target = Ipv6Address("2001:9::99"); // not this router: it relays
+    dio.SetP2pRdo(rdo);
+    DeliverRawRplMessage<RplDioHeader>(node,
+                                       1,
+                                       dio,
+                                       static_cast<uint8_t>(RPL_CODE_DIO),
+                                       Ipv6Address("fe80::a"),
+                                       Ipv6Address(RPL_ALL_NODES_MULTICAST));
+
+    Simulator::Stop(Seconds(2));
+    Simulator::Run();
+
+    NS_TEST_ASSERT_MSG_EQ(m_seen, true, "The router never relayed the P2P mode DIO");
+    if (m_seen)
+    {
+        NS_TEST_ASSERT_MSG_EQ(m_dio.HasDagConfiguration(), true, "No configuration carried on");
+        NS_TEST_ASSERT_MSG_EQ(+m_dio.GetIntervalMin(), 6, "DIOIntervalMin is not RFC 6997's 6");
+        NS_TEST_ASSERT_MSG_EQ(+m_dio.GetRedundancy(), 1, "DIORedundancyConstant is not 1");
+        NS_TEST_ASSERT_MSG_EQ(m_dio.GetMaxRankIncrease(), 0, "MaxRankIncrease is not 0");
+        NS_TEST_ASSERT_MSG_EQ(m_dio.GetOcp(), RPL_OCP_OF0, "OCP is not OF0");
+        NS_TEST_ASSERT_MSG_EQ(+m_dio.GetIntervalDoublings(),
+                              20,
+                              "DIOIntervalDoublings is not RFC 6550's default 20");
+        NS_TEST_ASSERT_MSG_EQ(m_dio.GetMinHopRankIncrease(),
+                              256,
+                              "MinHopRankIncrease is not RFC 6550's default 256");
+    }
+
+    monitor->Close();
+    Simulator::Destroy();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Base of the tests of a Target's collection window (RFC 6997 section
  *        9.5, design-constraints.md sections 72 and 73).
  *
@@ -30679,6 +30826,7 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplAodvJoinDioNotConsistentTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplStuckRouterTrickleTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplAodvGratuitousRrepRelaysRreqTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pDefaultDagConfigurationTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplBaseDodagNotPromotedFromDiscoveryTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDisContinuesAfterDiscoveryJoinTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplRreqWithoutArtDroppedTestCase, TestCase::Duration::QUICK);

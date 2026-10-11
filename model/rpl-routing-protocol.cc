@@ -2294,6 +2294,27 @@ RplRoutingProtocol::JoinDodag(const RplDioHeader& dio, uint32_t interface)
                                  << dodag.ocp << ", but only OF0 and MRHOF are implemented");
         }
     }
+    else if (dio.HasP2pRdo())
+    {
+        // RFC 6997 section 6.1: "A default DODAG Configuration Option takes
+        // effect if a P2P mode DIO does not carry an explicit one": OF0,
+        // DIOIntervalMin 6 (64 ms), DIORedundancyConstant 1, MaxRankIncrease
+        // 0, and "The remaining parameters have default values as specified
+        // in [RFC6550]" -- DEFAULT_DIO_INTERVAL_DOUBLINGS 20 and
+        // DEFAULT_MIN_HOP_RANK_INCREASE 256 (RFC 6550 section 17). Without
+        // this a temporary DAG joined from such a DIO ran on this module's
+        // base-DODAG defaults (Imin 4.096 s, k = 0, MaxRankIncrease 1024),
+        // far too slow for a discovery bounded by 'L' (design-constraints.md
+        // section 129). The Default Lifetime and Lifetime Unit defaults
+        // (infinity) are not represented: this module takes route lifetimes
+        // from its own PathLifetime attribute.
+        dodag.ocp = RPL_OCP_OF0;
+        dodag.dioIntervalMin = MilliSeconds(int64_t(1) << 6);
+        dodag.dioIntervalDoublings = 20;
+        dodag.dioRedundancy = 1;
+        dodag.maxRankIncrease = 0;
+        dodag.minHopRankIncrease = 256;
+    }
 
     if (dio.HasPrefixInfo())
     {

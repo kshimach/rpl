@@ -12230,3 +12230,32 @@ all-AODV-RPL-nodesへのマルチキャストで、ユニキャストのRREQ-DIO
 の対比較(6動作点、30シード、対称の応答と`AodvForceAsymmetric`の両方): 180行×2のすべてで、
 制御バイト・発見成功・背景PDR・遅延が完全に一致した。
 
+## 129. DODAG Configuration optionの無いP2P mode DIOに、RFC 6997の既定の設定を当てる
+
+RFC 6997 §6.1: "A default DODAG Configuration Option takes effect if a P2P mode DIO does not carry an
+explicit one"。値はAuthentication Enabled 0、DIOIntervalMin 6(64 ms)、DIORedundancyConstant 1、
+MaxRankIncrease 0、Default Lifetime 0xFF・Lifetime Unit 0xFFFF(無限)、OCP 0、"The remaining parameters
+have default values as specified in [RFC6550]"(RFC 6550 §17: DEFAULT_DIO_INTERVAL_DOUBLINGS 20、
+DEFAULT_MIN_HOP_RANK_INCREASE 256)。`JoinDodag()`は設定が無いと`DodagMembership`の既定(このモジュールの
+base DODAG用の値: Imin 4.096秒、k = 0、MaxRankIncrease 1024、MinHopRankIncrease 128)を使っていた
+(§110の「範囲外の観察」)。'L'で区切られる探索には遅すぎる。
+
+修正: `JoinDodag()`で、設定の無いP2P mode DIO(P2P-RDOを持つもの)には上の既定値を当てる。Default
+LifetimeとLifetime Unitは表さない(このモジュールは経路の寿命を自分の`PathLifetime`属性から取る)。
+AODV-RPLのDIOには対応する規定が無いので、従来どおり。
+
+試験: `RplP2pDefaultDagConfigurationTestCase`(設定の無いP2P mode DIOを受けた中継が送るDIOの設定値が、
+DIOIntervalMin 6、k 1、MaxRankIncrease 0、OCP 0、DIOIntervalDoublings 20、MinHopRankIncrease 256)。
+既定値を外すと、Imin 4.096秒のため2秒以内に中継のDIOが出ずFAILする(load-bearing確認)。
+
+既定の評価への影響: このモジュールの`SendDio()`は全DIOに設定を無条件に載せるので、ハーネスで設定の
+無いDIOは生じず、影響は他実装との相互運用に限られる。
+
+見つけた別の穴(未修正): 中継がDIOに載せるDefault LifetimeとLifetime Unitは、受信値ではなく
+`RPL_DEFAULT_LIFETIME`/`RPL_DEFAULT_LIFETIME_UNIT`(30×60秒)の定数である。RFC 6997 §6.1は"An
+Intermediate Router (or a Target) MUST set various fields in the DODAG Configuration Option in the
+outgoing P2P mode DIOs to the values they had in the incoming P2P mode DIOs"とし、Originは"sets the
+Default Lifetime and Lifetime Unit parameters to indicate the lifetime of the state that the routers
+... maintain for a Hop-by-hop or Source Route"とする。受信値を保持して再送し、経路の寿命に使うには、
+経路寿命を属性からDIOの値に移す変更が要る(Originの値は既定で30×60秒、`PathLifetime`の既定と同じ)。
+
