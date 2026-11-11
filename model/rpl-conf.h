@@ -502,6 +502,20 @@ constexpr uint8_t RPL_FRESHNESS_TARGET = 4;
 constexpr uint8_t RPL_DEFAULT_LIFETIME = 30;
 constexpr uint16_t RPL_DEFAULT_LIFETIME_UNIT = 60;
 
+/// The DODAG Configuration Option that "takes effect if a P2P mode DIO does
+/// not carry an explicit one" (RFC 6997 section 6.1): DIOIntervalMin 6 (64
+/// ms), DIORedundancyConstant 1, MaxRankIncrease 0, Default Lifetime 0xFF and
+/// Lifetime Unit 0xFFFF (infinity), with "The remaining parameters" at RFC
+/// 6550's defaults (section 17: DEFAULT_DIO_INTERVAL_DOUBLINGS 20,
+/// DEFAULT_MIN_HOP_RANK_INCREASE 256).
+constexpr uint8_t RPL_P2P_DEFAULT_DIO_INTERVAL_MIN = 6;
+constexpr uint8_t RPL_P2P_DEFAULT_DIO_INTERVAL_DOUBLINGS = 20;
+constexpr uint8_t RPL_P2P_DEFAULT_DIO_REDUNDANCY = 1;
+constexpr uint16_t RPL_P2P_DEFAULT_MAX_RANK_INCREASE = 0;
+constexpr uint16_t RPL_P2P_DEFAULT_MIN_HOP_RANK_INCREASE = 256;
+constexpr uint8_t RPL_P2P_DEFAULT_LIFETIME = 0xFF;
+constexpr uint16_t RPL_P2P_DEFAULT_LIFETIME_UNIT = 0xFFFF;
+
 /// Defaults for the Prefix Information option (RFC 6550 section 6.7.10),
 /// matching the common Router Advertisement defaults (e.g. radvd's).
 constexpr uint32_t RPL_PREFIX_VALID_LIFETIME = 86400;     //!< 1 day

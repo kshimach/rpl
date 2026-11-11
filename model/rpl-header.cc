@@ -568,6 +568,9 @@ RplDioHeader::Deserialize(Buffer::Iterator start)
     m_hasRreq = false;
     m_hasRrep = false;
     m_hasP2pRdo = false;
+    m_rreqCount = 0;
+    m_rrepCount = 0;
+    m_p2pRdoCount = 0;
     m_arts.clear();
     m_targets.clear();
     while (!i.IsEnd())
@@ -599,6 +602,23 @@ RplDioHeader::Deserialize(Buffer::Iterator start)
                         << +type << " (declared length " << +length << ", only "
                         << i.GetRemainingSize() << " bytes remain), stopping");
             break;
+        }
+
+        // Counted by type alone, before the option's own shape is looked
+        // at: "exactly one" (RFC 9854 sections 4.1 and 4.2, RFC 6997 section
+        // 6.1) is about how many the message carries, and a malformed copy
+        // next to a well-formed one is still a second one.
+        if (type == RPL_OPTION_AODV_RREQ && m_rreqCount < 255)
+        {
+            m_rreqCount++;
+        }
+        else if (type == RPL_OPTION_AODV_RREP && m_rrepCount < 255)
+        {
+            m_rrepCount++;
+        }
+        else if (type == RPL_OPTION_P2P_RDO && m_p2pRdoCount < 255)
+        {
+            m_p2pRdoCount++;
         }
 
         if (type == RPL_OPTION_DAG_CONF && length == DAG_CONF_OPTION_LENGTH)
@@ -1113,6 +1133,7 @@ RplDioHeader::SetRreq(const RreqOption& rreq)
                   "RankLimit does not fit its 7-bit field");
     m_hasRreq = true;
     m_rreq = rreq;
+    m_rreqCount = 1;
 }
 
 const RplDioHeader::RreqOption&
@@ -1141,6 +1162,7 @@ RplDioHeader::SetRrep(const RrepOption& rrep)
                   "Delta does not fit its 6-bit field");
     m_hasRrep = true;
     m_rrep = rrep;
+    m_rrepCount = 1;
 }
 
 const RplDioHeader::RrepOption&
@@ -1207,6 +1229,25 @@ RplDioHeader::SetP2pRdo(const P2pRdoOption& rdo)
                   "MaxRank/NH does not fit its 6-bit field");
     m_hasP2pRdo = true;
     m_p2pRdo = rdo;
+    m_p2pRdoCount = 1;
+}
+
+uint8_t
+RplDioHeader::GetP2pRdoCount() const
+{
+    return m_p2pRdoCount;
+}
+
+uint8_t
+RplDioHeader::GetRreqCount() const
+{
+    return m_rreqCount;
+}
+
+uint8_t
+RplDioHeader::GetRrepCount() const
+{
+    return m_rrepCount;
 }
 
 const P2pRdoOption&
@@ -1339,6 +1380,7 @@ RplP2pDroHeader::Deserialize(Buffer::Iterator start)
     // A P2P-DRO is the last thing in the packet, same as a DIO, so the end
     // of the buffer is the end of the option list.
     m_hasP2pRdo = false;
+    m_p2pRdoCount = 0;
     while (!i.IsEnd())
     {
         uint8_t type = i.ReadU8();
@@ -1362,6 +1404,10 @@ RplP2pDroHeader::Deserialize(Buffer::Iterator start)
 
         if (type == RPL_OPTION_P2P_RDO)
         {
+            if (m_p2pRdoCount < 255)
+            {
+                m_p2pRdoCount++;
+            }
             m_hasP2pRdo = P2pRdoDeserialize(i, length, m_dodagId, m_p2pRdo);
         }
         else
@@ -1459,6 +1505,13 @@ RplP2pDroHeader::SetP2pRdo(const P2pRdoOption& rdo)
                   "MaxRank/NH does not fit its 6-bit field");
     m_hasP2pRdo = true;
     m_p2pRdo = rdo;
+    m_p2pRdoCount = 1;
+}
+
+uint8_t
+RplP2pDroHeader::GetP2pRdoCount() const
+{
+    return m_p2pRdoCount;
 }
 
 const P2pRdoOption&

@@ -128,7 +128,9 @@ RplTrickleTimer::TransmitEvent()
 {
     NS_LOG_FUNCTION(this << m_counter << +m_redundancy);
 
-    // k = 0 disables suppression, following Contiki-NG rpl-conf.h.
+    // RFC 6550 section 8.3.1: "In RPL, when k has the value of 0x00, this is
+    // to be treated as a redundancy constant of infinity in RPL, i.e.,
+    // Trickle never suppresses messages."
     if (m_redundancy == 0 || m_counter < m_redundancy)
     {
         if (!m_callback.IsNull())

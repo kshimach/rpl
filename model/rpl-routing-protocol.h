@@ -316,6 +316,21 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     uint16_t GetRankForInstance(uint8_t instanceId) const;
 
     /**
+     * @brief Get the DAGRank of this node within whichever DODAG it holds
+     *        under a given RPLInstanceID.
+     *
+     * RFC 6550 section 3.5.1: "DAGRank(rank) = floor(rank/MinHopRankIncrease)",
+     * the integer part that Ranks are compared by, and what the RPL Packet
+     * Information carries as SenderRank (section 11.2). The membership is
+     * resolved as in GetRankForInstance().
+     *
+     * @param instanceId the RPLInstanceID of the DODAG
+     * @return the DAGRank, RPL_INFINITE_RANK if this node holds no
+     *         membership under that RPLInstanceID or is at INFINITE_RANK in it
+     */
+    uint16_t GetDagRankForInstance(uint8_t instanceId) const;
+
+    /**
      * @brief Whether this node holds a live Hop-by-hop Route (H=1) to a
      *        destination under a given Instance, without needing its next
      *        hop.
@@ -934,6 +949,13 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
         uint16_t pathEtx{0}; //!< this node's own path ETX under MRHOF, fixed-point (*128)
         uint16_t minHopRankIncrease{RPL_MIN_HOPRANKINC}; //!< MinHopRankIncrease, also the rank of the root
         uint16_t maxRankIncrease{RPL_MAX_RANKINC};       //!< MaxRankIncrease
+        /// Default Lifetime of the DODAG Configuration option (RFC 6550
+        /// section 6.7.6), in lifetime units: the root's own on a DODAG this
+        /// node roots, otherwise the value received, passed on unchanged.
+        uint8_t defaultLifetime{RPL_DEFAULT_LIFETIME};
+        /// Lifetime Unit of the DODAG Configuration option, in seconds; same
+        /// origin as defaultLifetime.
+        uint16_t lifetimeUnit{RPL_DEFAULT_LIFETIME_UNIT};
 
         /**
          * @brief L of RFC 6550 section 8.2.2.4 rule 3: the lowest rank this
@@ -979,6 +1001,16 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
         Ipv6Address preferredParent;           //!< link-local address of the preferred parent
 
         uint8_t daoSequence{0};   //!< sequence of the last DAO this node sent
+        /// DAOSequence of the last DAO sent with the 'K' flag, the one a
+        /// DAO-ACK has to echo while daoAckPending is true. Apart from
+        /// daoSequence, which every DAO this node sends advances, relayed
+        /// and No-Path ones included.
+        uint8_t daoAckSequence{0};
+        /// Content and destination of the prior DAO transmission, with the
+        /// DAOSequence field zeroed: what SendDaoMessage() compares a
+        /// retransmission against to tell whether it is "identical to the
+        /// prior DAO message transmission" (RFC 6550 section 9.3 rule 1).
+        std::vector<uint8_t> lastDaoContent;
         uint8_t pathSequence{0};  //!< path sequence of the route this node advertises
         uint8_t daoRetriesLeft{0}; //!< retries left for the DAO awaiting an acknowledgement
         bool daoAckPending{false}; //!< true while a DAO-ACK is being waited for
@@ -1213,7 +1245,7 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
             /// receive side this module implements via targets/GetArts()).
             /// Each TargNode's reply is its own RREP-Instance, so dropping
             /// the second one as "already handled" loses that TargNode's
-            /// route entirely. Found by /protocol-test-matrix's angle 4.
+            /// route entirely.
             ///
             /// Recorded only once an RREP has actually been handled --
             /// consumed at the OrigNode, or relayed onward at an
@@ -1506,6 +1538,44 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
                         Ipv6Address from,
                         uint32_t interface,
                         bool toMulticast);
+
+    /**
+     * @brief Unicast a DIO to one neighbour, one radio hop away.
+     *
+     * The neighbour is named by a global address, but the message goes to
+     * its link-local one: RouteOutput() never treats a global address as
+     * on-link.
+     *
+     * @param dodag the membership the DIO belongs to, for its parent set
+     * @param dio the DIO to send
+     * @param neighbour the global address of the neighbour
+     * @return false if there is no interface to send it on
+     */
+    bool UnicastDioToNeighbour(const DodagMembership& dodag,
+                               const RplDioHeader& dio,
+                               Ipv6Address neighbour);
+
+    /**
+     * @brief Whether joining through a route discovery DIO would break its
+     *        rank limit: RFC 6997's MaxRank or RFC 9854's RankLimit.
+     *
+     * Both read the same way: a DIO whose advertised DAGRank equals or
+     * exceeds the limit is discarded, a router must not join at a DAGRank
+     * that would reach it, and the far end of the discovery -- the Target
+     * (RFC 6997 section 7), the TargNode of an RREQ or the OrigNode of an
+     * RREP (RFC 9854 sections 4.1 and 4.2) -- may join exactly at it.
+     *
+     * @param dio the DIO received
+     * @param limit the limit, in DAGRank; must not be the "no limit" value
+     * @param defaultMinHopRankIncrease the MinHopRankIncrease in effect when
+     *        the DIO carries no DODAG Configuration option
+     * @param farEnd true if this node is the far end of the discovery
+     * @return true if the DIO must be refused
+     */
+    bool PastRankLimit(const RplDioHeader& dio,
+                       uint8_t limit,
+                       uint16_t defaultMinHopRankIncrease,
+                       bool farEnd) const;
 
     /**
      * @brief Unicast an RREQ-DIO to one neighbour.
@@ -2167,6 +2237,61 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
                             bool pinNextHop = true);
 
     /**
+     * @brief Turn a lifetime in lifetime units into a duration.
+     *
+     * 0xFF means infinity (RFC 6550 section 6.7.8, RFC 6997 section 6.1) and
+     * comes back as Time::Max(); add it to a point in time only through
+     * SaturatingAdd().
+     *
+     * @param lifetime the lifetime, in lifetime units
+     * @param lifetimeUnit the lifetime unit, in seconds
+     * @return the duration
+     */
+    static Time LifetimeToTime(uint8_t lifetime, uint16_t lifetimeUnit);
+
+    /**
+     * @brief DAGRank of this node in a DODAG, RFC 6550 section 3.5.1.
+     * @param dodag the membership
+     * @return floor(rank / MinHopRankIncrease), RPL_INFINITE_RANK at
+     *         INFINITE_RANK
+     */
+    static uint16_t DagRank(const DodagMembership& dodag);
+
+    /**
+     * @brief Add two times, stopping at Time::Max() instead of overflowing.
+     * @param a the first non-negative operand
+     * @param b the second non-negative operand
+     * @return a + b, or Time::Max() if either is Time::Max() or the sum
+     *         would pass it
+     */
+    static Time SaturatingAdd(Time a, Time b);
+
+    /**
+     * @brief The lifetime of a route discovered or advertised in a DODAG:
+     *        the Default Lifetime of the DODAG Configuration option in
+     *        effect, in its Lifetime Units.
+     *
+     * RFC 6997 section 9.5: "The lifetime of this Source Route is specified
+     * by the Default Lifetime and Lifetime Unit parameters inside the DODAG
+     * Configuration Option currently in effect"; RFC 9854 section 6.4.3:
+     * "The lifetime is set according to DODAG configuration (i.e., not the
+     * L field)".
+     *
+     * @param dodag the membership
+     * @return the lifetime, Time::Max() for infinity
+     */
+    static Time RouteLifetime(const DodagMembership& dodag);
+
+    /**
+     * @brief The route lifetime of a DODAG this node roots or is about to
+     *        root: its own PathLifetime attribute in its own lifetime unit,
+     *        which CreateDodagMembership() puts into the DODAG
+     *        Configuration option.
+     * @return the lifetime, Time::Max() for infinity
+     */
+    Time OwnRouteLifetime() const;
+
+    /**
      * @brief Arm the 'L' field's deadline for an RREQ-Instance.
      *
      * A no-op for RFC 9854 section 4.1's "no time limit imposed" encoding.
@@ -2364,25 +2489,24 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
     /**
      * @brief Build and unicast one DAO, RFC 6550 section 6.4/9.8.
      *
-     * The wire-format and destination-resolution core SendDao(), DaoRetry()
-     * and the Storing mode relay path in HandleDao() all share. Sequencing
-     * and DAO-ACK/retry state are each caller's own concern, not this
-     * function's: a Storing mode relay shares dodag.daoSequence's counter
-     * (RFC 6550 section 6.4's DAOSequence has no separate "which target"
-     * concept) but never sets @p ackRequested, so it is deliberately passed
-     * the current value rather than a freshly incremented one -- letting a
-     * relay's own transmissions advance the counter would desync it from
-     * whatever value SendDao()'s own pending self-advertisement is still
-     * waiting to see acknowledged, and HandleDaoAck() would then never match
-     * it. A relayed DAO's own DAOSequence value therefore is not
-     * meaningfully unique per message, a deliberate simplification: nothing
-     * in this module ever needs to distinguish one from another, since none
-     * of them request an acknowledgement to begin with.
+     * The wire-format, destination-resolution and DAOSequence core SendDao(),
+     * DaoRetry() and the Storing mode relay path in HandleDao() all share.
+     *
+     * RFC 6550 section 9.3 rule 1: "If a node sends a DAO message with newer
+     * or different information than the prior DAO message transmission, it
+     * MUST increment the DAOSequence field by at least one. A DAO message
+     * transmission that is identical to the prior DAO message transmission
+     * MAY increment the DAOSequence field." Every DAO sent here therefore
+     * advances dodag.daoSequence, a Storing mode relay's included; only a
+     * @p retransmission whose content and destination equal those of the
+     * prior transmission keeps its DAOSequence. With @p ackRequested the
+     * sequence used also becomes dodag.daoAckSequence, the value
+     * HandleDaoAck() matches, so that a relayed or No-Path DAO sent in
+     * between does not disturb a pending acknowledgement.
      *
      * @param dodag the DODAG to send on behalf of
      * @param target the address being advertised: this node's own in the
      *        ordinary case, or a downstream node's in a Storing mode relay
-     * @param sequence the DAOSequence to stamp on the wire
      * @param pathSequence the Transit Information's own Path Sequence
      * @param pathLifetimeField the Transit Information's own Path Lifetime
      *        field, 0 for a No-Path
@@ -2392,14 +2516,16 @@ class RplRoutingProtocol : public Ipv6RoutingProtocol
      *        3), appended after @p target/@p pathSequence/@p
      *        pathLifetimeField's own pair; empty for an ordinary single-
      *        target DAO
+     * @param retransmission true for a retry of an unacknowledged DAO, which
+     *        keeps the DAOSequence if nothing about it changed
      */
     void SendDaoMessage(DodagMembership& dodag,
                         Ipv6Address target,
-                        uint8_t sequence,
                         uint8_t pathSequence,
                         uint8_t pathLifetimeField,
                         bool ackRequested,
-                        const std::vector<DaoTargetEntry>& additionalTargets = {});
+                        const std::vector<DaoTargetEntry>& additionalTargets = {},
+                        bool retransmission = false);
 
     /**
      * @brief Advertise this node to the root, RFC 6550 section 6.4.

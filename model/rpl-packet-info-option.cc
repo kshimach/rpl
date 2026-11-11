@@ -209,16 +209,18 @@ RplIpv6OptionRpl::Process(Ptr<Packet> packet,
     // DODAG) still owns a distinct rank in each, and this packet only ever
     // belongs to one of them. The RPI carries no DODAGID, so this is
     // resolved by RPLInstanceID alone (@see
-    // RplRoutingProtocol::FindDodagByInstance()); a node with only the base
-    // DODAG sees no behaviour change (GetRankForInstance(RPL_DEFAULT_INSTANCE)
-    // is GetRank()).
-    uint16_t ownRank = rpl->GetRankForInstance(rpi.GetInstanceId());
+    // RplRoutingProtocol::FindDodagByInstance()).
+    //
+    // SenderRank is a DAGRank ("set to ... DAGRank(rank) by a router that
+    // forwards inside the RPL network", RFC 6550 section 11.2), so it is
+    // this node's DAGRank it is compared with and replaced by.
+    uint16_t ownRank = rpl->GetDagRankForInstance(rpi.GetInstanceId());
 
-    // RFC 6550 section 11.2: moving up, the previous hop should be further
-    // from the root, i.e. of higher rank, than this one; moving down, the
-    // opposite. Anything else is a rank inconsistency, e.g. a stale route or
-    // a loop.
-    bool inconsistent = down ? (senderRank >= ownRank) : (senderRank <= ownRank);
+    // RFC 6550 section 11.2.2.2: "A receiver detects an inconsistency if it
+    // receives a packet with either: the 'O' bit set (to Down) from a node
+    // of a higher Rank. the 'O' bit cleared (for Up) from a node of a lower
+    // Rank." An equal DAGRank is neither.
+    bool inconsistent = down ? (senderRank > ownRank) : (senderRank < ownRank);
 
     if (inconsistent)
     {

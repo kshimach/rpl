@@ -1,31 +1,31 @@
 # RPL module 設計制約と理由
 
 本ドキュメントは、contrib/rpl 実装にあたって直面した ns-3 コアの制約と、
-それに対する回避策・設計判断の理由をまとめたもの。ns-3 コア自体は変更しない方針のため、
-制約の多くは model 層でのワークアラウンドとして解決している。
+それに対する回避策・設計判断の理由をまとめたもの。制約の多くは model 層の
+ワークアラウンドで解決しており、ns-3 コアへの変更は `DESIGN_CONSTRAINTS.md` に
+挙げた最小限のものに留めている。
+
+節番号は、コードや試験のコメントから参照される識別子である。内容が古くなって
+削除した節・小節 (30、70、97、37.1 など) の番号は欠番のままにし、詰めない。
+残っている節がそれらを指している箇所は、当時の経緯への言及であり、現在の
+設計の根拠ではない。
 
 ## 1. 動作モード
 
-- **当初は非 storing mode (MOP=1) のみサポート**。storing mode (MOP=2) は
-  実装しない方針だった。
-- 理由: 要件として非 storing mode を明示指定されたため。
-- 影響: 下り経路情報 (Transit Information) は root のみが保持する。中間ノードは
-  トポロジテーブルを持たず、送信元ルーティング (Source Routing Header, RFC 6554) で
-  下り方向のパケットを転送する。
-- **訂正 (§54)**: この節は後に storing mode (MOP=2、multicast 無し) を
-  実装したことで古くなった。RplHelper の `Mop` 属性で選択でき、両モードを
-  同一ネットワークで比較できる (README.md 参照)。この節は non-storing mode
-  時点の影響のみを記す当時の記録として残す。
+- base RPLは非storing mode (MOP=1) とstoring mode (MOP=2、multicast無し) の両方を
+  実装している。rootの`Mop`属性で選び、他のノードはDIOから学ぶ (§54)。
+- 非storing modeでは、下り経路情報 (Transit Information) はrootのみが保持する。
+  中間ノードはトポロジテーブルを持たず、送信元ルーティング (Source Routing
+  Header, RFC 6554) で下り方向のパケットを転送する。
+- storing modeでは、各ノードが子孫ごとの次ホップ (`downwardRoutes`) を持ち、
+  下りパケットをホップごとに転送する。
+- MOP=3 (multicastつきstoring mode) は実装していない。
 
 ## 2. IPv6 拡張ヘッダーを送信元で挿入できない (解消済み: コアフック追加)
 
 - **制約**: `Ipv6L3Protocol::Send()` は `RouteOutput()` 呼び出し前後でペイロード長を
   固定・切り詰める処理を行うため、送信元ノードで IPv6 拡張ヘッダー
   (Routing Header Type 3 など) をパケットに挿入することができない。
-- **旧回避策 (廃止)**: 当初 `RplSourceRouteTag` を `Header` ではなく `Tag` として
-  実装し、RFC 6554 RH3 のワイヤフォーマットをバイト列として PacketTag に
-  格納する方式を採った。これは実際の拡張ヘッダーではなく帯域外メタデータであり、
-  パケットは実際より 8 + 16n バイト軽い、という制約付きの実装だった。
 - **現在の解決策 (ns-3 コア変更)**: 「正確に SRH で non-storing mode を実装」
   という要件のもと、ns-3 コアに最小限のフックを追加し、実際の RFC 6554
   拡張ヘッダーを送信元でパケットに挿入できるようにした。
@@ -51,7 +51,7 @@
     `friend class rpl::RplIpv6ExtensionSourceRouting;` を `ipv6-l3-protocol.h`
     に追加した点を除く)。
   - パケットは各ホップで実際に 8 + 16n バイト分の RH3 バイトを載せて運ばれる。
-    アドレス圧縮 (CmprI/CmprE) は未実装のまま (常に非圧縮、**16節の通り対応済み**)。
+    アドレス圧縮 (CmprI/CmprE) は 16 節。
 - **参考にした先行事例**: TU Wien 2024 の Baranyai の RPL 実装 (thesis) は同種の
   制約 (ただし RPL hop-by-hop header 向け、RH3 向けではない) を Tag で回避して
   いた。本実装は最終的に Tag 方式を廃し、コアにフックを追加する方式へ移行した
@@ -161,43 +161,12 @@
   単一の共有 `SimpleChannel` 上で `BlackList()` を使いホップ関係を表現する
   構成に変更した。
 
-## 10. 未対応・既知の制限 (優先度順に未実装)
+## 10. 未対応・既知の制限
 
-- **Medium (解消)**: SRH 転送の実シミュレーション上での動作は
-  `rpl-6lowpan-simple` 例 (LR-WPAN + 6LoWPAN route-over、3ノード) で
-  end-to-end 確認済み (ping 5/5)。加えて `RplSourceRoutingProcessTestCase`
-  で `RplIpv6ExtensionSourceRouting::Process()` の境界値
-  (segments-left 不整合、マルチキャスト混入、hop limit 枯渇、中継 hop での
-  `stopProcessing`、到達済みパケットの pass-through) を直接検証。
-  `RplNoPathDaoTestCase` で No-Path DAO によるトポロジエントリ削除、
-  `RplDaoAckRetryTestCase` で DAO-ACK タイムアウト・リトライ・
-  リトライ枯渇 (`SendRawRplMessage()` によるパケット手動生成、および
-  root 上の監視用 raw socket による送信回数カウントで検証、private
-  state には触れない) をそれぞれ追加。No-Path DAO の**送信**経路は
-  23 節の通り実装済み。
-- **(完了)**: RFC 6550 section 7.2 の lollipop 比較。DODAG version
-  number (`HandleDio()`)、DAO path sequence (`HandleDao()`)、DTSN
-  (`HandleDio()`) の 3 箇所。「256 回のバージョン変更・親変更が必要に
-  なる程度の実害」という当初の見積もりは誤りで、path sequence の方は
-  回り込みと無関係に、23 節で実装した No-Path DAO の追い越しだけで
-  即座に踏める。27 節を参照。
-- **Low (完了)**: Sphinx モデルドキュメント作成
-  (`contrib/rpl/doc/rpl.rst`、`utils/create-module.py` の標準構成に
-  準拠。本体 doc ビルドへの登録は行っていない — contrib モジュールで
-  upstream 予定もないため)。
-- **既知の非対応事項**: RFC 6553 (RPL Option, RPI) は 12 節の通り実装済み。
-  RFC 6551/6719 (ETX/MRHOF) も 13 節の通り、RFC 6551 の LQL メトリックも
-  14 節の通り実装済み (1 DIO への ETX/LQL 同時搭載も対応)。
-  storing mode (MOP=2) は方針により対象外。RH3 アドレス圧縮
-  (CmprI/CmprE) は 16 節の通り実装済み。6LoWPAN NHC 圧縮は Routing
-  Header では効かない (11 節、RH3 自体の圧縮とは別の話)。RPI の
-  確認済みループ (RFC 6550 section 11.2 の「2 回連続で不整合」) は
-  実際にはパケットを止められない、既知の制約あり (12.2 節)。
-  RFC 6550 section 8.2.2.5 の poisoning は 24 節の通り実装済み
-  (離脱時のみ。section 8.2.2.6 の「detach して floating DODAG の
-  root になる」代替手段の方は実装していない)。storing mode (MOP=2) は
-  方針により対象外としてきたが、AODV-RPL/P2P-RPL への拡張を検討する
-  なら再考が要る。30 節を参照。
+現在の制限は`DESIGN_CONSTRAINTS.md`の"Current known limitations"と、`doc/rpl.rst`の
+"What it does not do"にまとめている。この文書の各節は、それぞれの制限の理由を記す
+(確認済みの rank 不整合でパケットを止められない: 12.3節、6LoWPAN NHCがRouting Header
+を圧縮しない: 11.1節、OF0のstep_of_rank: 25.4節)。
 
 ## 11. ns-3 コアで見つかった既存バグ、および本実装側のバグ
 
@@ -237,8 +206,7 @@
   (`iphcHeader.SetNh(false); iphcHeader.SetNextHeader(nextHeader);`、
   6LoWPAN が知らない Next Header に対して元々用意されている経路) に
   常に流すよう変更した。1 行の修正で安全、かつ「圧縮できる」という
-  誤った申告を取り除くという意味で正しい。RH3 自体のアドレス圧縮を
-  実装しない (10 節) という既存の判断とも整合する。
+  誤った申告を取り除くという意味で正しい。
 - **影響**: Routing Header を含むパケットは 6LoWPAN 上で非圧縮のまま
   送られる。フレームサイズは増えるが、正確性を優先。
 
@@ -532,19 +500,6 @@ non-null をどれも確認済みの上で呼んでいるため、null チェッ
     に違反しなくなる。
   10 ノードのランダムトポロジで root からの ping が 9/9 (100%) 到達する
   ことと、`rpl-test` の全既存ケースが変わらず通ることを確認済み。
-- **既知の残課題 (未修正、次回対応)**: このバグとは独立に、25 ノード以上の
-  規模のランダムトポロジでは、ping を一切送らない状態でも DODAG のランク
-  が時間とともに際限なく増大していく別の不安定化が観測された。OF0
-  (RFC 6552) はヒステリシスを持たないため、輻輳した無線環境で一時的に
-  親を見失うたびに `SelectPreferredParent()` が親を選び直し、それを
-  繰り返すたびにランクが積み上がっていく (13.5 節の MRHOF ヒステリシス
-  のような歯止めが OF0 には無い) ことが疑わしいが未検証。10 ノード規模
-  までは再現しない。
-  **(37 節で再測定済み — この OF0 ヒステリシス説は誤りだった。MRHOF でも
-  同等以上に悪化する。真の原因はグローバル修復 (root 側のバージョン
-  インクリメント) が未実装で、`DAGMaxRankIncrease` の上限に達したノードが
-  永久に復帰できないこと。再現条件もノード数ではなく密度。バグ自体は
-  現在も未修正。)**
 
 ## 13. RFC 6551 / RFC 6719 (ETX / MRHOF) の実装
 
@@ -741,8 +696,6 @@ end-to-end の到達性に影響は無い。ただし直線トポロジのため
   デフォルト値をそのまま使っている (13.1 節)。
 - `PARENT_SET_SIZE` (RFC 6719 の推奨値 3) による候補親数の上限は
   未実装。OF0 も同様に無制限に候補を保持しており、既存の挙動を踏襲。
-- DODAG version number の lollipop 比較が未実装という当時の制限は
-  27 節で解消済み (MRHOF 固有の話ではない)。
 
 ### 13.8 コードレビューで見つかった問題の修正
 
@@ -999,10 +952,7 @@ DIO/DAO/DAO-ACK/DIS のワイヤフォーマットと基本処理、DAG Metric C
 上の ETX/LQL (13, 14 節)、DODAG Configuration option、Target/Transit
 Information option、non-storing mode の DAO、Rank 計算とループ回避、RPI
 (12 節)、SRH のワイヤフォーマットとホップ処理は準拠済みと確認した。
-10 節に記録済みの lollipop 比較未実装・RH3 アドレス圧縮未実装・RPI の
-確認済みループを実際には止められない、の 3 件は優先度が低いため今回も
-対象外、現状維持とした (lollipop 比較はこの見積もりが誤っていたことが
-後に判明し、27 節で実装した)。今回対応したのは次の 2 件:
+対応したのは次の 2 件:
 
 1. RFC 6550 6.7.10 節の Prefix Information option が未実装で、root の
    GUA/ULA プレフィックスを DIO で配布する経路自体が存在しなかった
@@ -1138,32 +1088,6 @@ offset + 2)` でエラーを送り `Ipv6L3Protocol::DROP_ROUTE_ERROR` として
 経路計算 (`ComputeSourceRoute()`) はこの形の経路を単独では作らないため、
 想定される発火条件は経路が古くなった (親が変わった後)、または改ざん
 された場合に限られる。
-
-### 15.8 テストと example の SLAAC 前提への全面書き換え
-
-ユーザー指示により、静的割当は SLAAC に完全置換し、`rpl-test-suite.cc`
-と `rpl-6lowpan-simple.cc` も全面的に書き換えた。`interfaces.GetAddress
-(i, 1)` でグローバルアドレスを取得していた箇所は使えなくなるため、
-`RplRoutingProtocol::GetGlobalAddress()` を private から public に
-公開し、各テストは対応するノードの `RplRoutingProtocol` から直接
-取得する形に変更した。DAD 分の遅延 (既定 `DadTimeout` = 1 秒) が
-新たに乗るため、`RplPacketInfoProcessTestCase` (root の rank が
-確定するのを待つ必要がある) 等、いくつかのテストの `Simulator::Stop()`
-の秒数を実測値に基づいて調整した。`RplDaoAckRetryTestCase` は
-`NS_LOG` でイベントのタイムスタンプを実際に採取し、DAO-ACK のリトライ
-系列がどこに来るかを確認したうえで待ち時間と期待値を合わせている
-(15.4 節の nudge 削除後の系列)。
-
-### 15.9 検証結果
-
-`./ns3 run "test-runner --suite=rpl --verbose"` で全ケース PASS
-(既存ケースの書き換え分に加え、Prefix Information option の
-シリアライズ往復、on-link 検証、SRH ループ検出の新規ケースを含む)。
-`rpl-6lowpan-simple --mrhof --lql` で、root にのみ `RootPrefix`
-(`2001:1::/64`) を設定した状態から 3 ノードの DODAG が形成され、
-各ノードが DIO の Prefix Information option 経由の SLAAC で
-`2001:1::ff:fe00:N` 形式のアドレスを得て、最終ノードから root への
-ping が 5/5 (0% packet loss) で通ることを確認した。
 
 ## 16. RFC 6554 RH3 アドレス圧縮 (CmprI/CmprE) の実装
 
@@ -1685,7 +1609,6 @@ stale 経路と同じ「`erase()` の前に、対象が `m_preferredParent` な�
 確認済みだが、これは「送れないので送らない」という妥当な帰結であり、
 バグではない。
 
-
 ## 24. 離脱時に poisoning していなかった (旧子とのルーティングループ)
 
 23.3 の動作検証中、3 ノードのライントポロジ (root - middle - leaf) で
@@ -1770,13 +1693,10 @@ No-Path DAO が root に届いていることを確認する。poisoning を
 
 ## 25. RFC 準拠監査 (第二次): Trickle / OF0 / MRHOF / DTSN / MaxRankIncrease
 
-15 節の監査は RFC 6550/6551/6553/6554 のワイヤフォーマットと基本処理を
-対象としており、Trickle アルゴリズム本体 (RFC 6206)、目的関数の数値規定
-(RFC 6552 OF0 / RFC 6719 MRHOF)、および RFC 6550 のうち rank 制約と
-DTSN まわりは対象外だった。今回そこを原文と突き合わせた結果を記録する。
-**いずれも今回は修正しておらず、既知の乖離として残している**
-(25.2・25.3・25.5・25.6 は後日 26/28 節で解消済み、25.7 の優先度付けと
-併せて参照。25.4 のみ方針判断待ちで現在も未解消 — @see 25.7)。
+Trickle アルゴリズム本体 (RFC 6206)、目的関数の数値規定 (RFC 6552 OF0 / RFC 6719
+MRHOF)、および RFC 6550 のうち rank 制約と DTSN まわりを原文と突き合わせた。
+見つかった乖離のうち、DAGMaxRankIncrease と DTSN は 26 節、MRHOF の境界比較は
+28 節で直した。残るのは 25.4 の step_of_rank だけである。
 
 ### 25.1 準拠を確認できたもの
 
@@ -1794,58 +1714,6 @@ DTSN まわりは対象外だった。今回そこを原文と突き合わせた
   32768、`PARENT_SWITCH_THRESHOLD` 192 は 5 節の ETX 向け推奨値と一致。
 - **RFC 6719 の `ALLOW_FLOATING_ROOT` 0 相当**: floating root になる
   経路を持たないので、推奨値 0 と等価。
-
-### 25.2 乖離: RFC 6550 8.2.2.4 rule 3 の DAGMaxRankIncrease が未適用 (MUST、**26.1節の通り対応済み**)
-
-> Let L be the lowest Rank within a DODAG Version that a given node has
-> advertised. Within the same DODAG Version, that node MUST NOT advertise
-> an effective Rank higher than L + DAGMaxRankIncrease. ... If a node's
-> Rank were to be higher than allowed by L + DAGMaxRankIncrease, when it
-> advertises Rank, it MUST advertise its Rank as INFINITE_RANK.
-
-`m_maxRankIncrease` は DIO の DODAG Configuration option から受信して
-保存し (`JoinDodag()`)、自分が送る DIO で再広告もしている
-(`SendDio()`) が、**rank 計算にもループ回避にも一切使われていない**。
-L (その DODAG Version で自分が広告した最小 rank) を追跡する変数自体が
-存在しない。
-
-RPL でこの制約は、ノードが際限なく rank を上げ続ける
-(count-to-infinity) ことを防ぐ独立した防御層にあたる。22.2 節・24 節で
-塞いだループはいずれも「親選択の時点で」防ぐ仕組みであり、この rule 3
-は「広告する rank の側で」歯止めをかけるもので、役割が重なっていない。
-
-**追記(後日)**: `lowestRankThisVersion`(L)の追跡と
-`DAGMaxRankIncrease`によるクランプは26.1節で実装した。ただし
-この検出側だけでは不十分で、Lをリセットする回復側(グローバル修復)が
-別途必要であることが37節で判明し、37.6節で`GlobalRepairInterval`を
-実装したが、37.7-37.9節の実測で密なトポロジでは効果が測定できない
-ことも分かっている — 検出側は対応済みだが、回復側は37.10節の通り
-現在も未解決の残課題。
-
-### 25.3 乖離: RFC 6550 9.6 節の DTSN 処理が未実装 (MUST 2 件、**26.2節の通り対応済み**)
-
-> 1. If a node hears one of its DAO parents increment its DTSN, the node
->    MUST schedule a DAO message transmission ...
-> 2. In Non-Storing mode, if a node hears one of its DAO parents
->    increment its DTSN, the node MUST increment its own DTSN.
-
-`Parent::dtsn` に受信値を記録しているだけで (`HandleDio()`)、増加の
-検出も、それを受けた DAO 再送も、自身の `m_dtsn` のインクリメントも
-実装していない。`m_dtsn` は 0 のまま一度も動かない。
-
-閉じた世界 (この実装のノードだけの DODAG) では、誰も DTSN を上げない
-ので相互に整合しており実害は出ない。他実装と混在した場合、root が
-DTSN を上げて sub-DODAG 全体の DAO 更新をトリガーしても、本実装の
-ノードは反応しない。非 storing mode では DTSN の increment が
-sub-DODAG 全体へ伝播する設計なので、本実装のノードがいる枝から先は
-更新が止まる。
-
-**追記(後日)**: rule 1・2 とも26.2節で実装した(検出・自身のDTSN
-インクリメント・DAO再送のスケジューリング)。その後61節でRFC 6550
-section 7.2のlollipop境界ラップに対応、63節でこのDAO再送トリガーに
-レート制限の欠如によるlivelockが見つかり`daoRefreshPending`機構で
-修正、64節で同機構をparent switch側にも拡張、と複数回の増分監査を
-経て現在に至る。
 
 ### 25.4 乖離: RFC 6552 の step_of_rank が既定値と異なる (範囲内、MUST 違反ではない)
 
@@ -1868,53 +1736,6 @@ Contiki-NG rpl-lite の OF0 も同じく Sp=1 相当で、本実装の
 root に近く見え、親として選ばれやすくなる。DAGMaxRankIncrease との
 相対関係も変わる (25.2 は**26.1節の通り対応済み**のため、現在は
 実際にここが効いている)。
-
-### 25.5 乖離: MRHOF の境界比較が 1 単位ずれている (SHOULD/MAY、**28 節の通り対応済み**)
-
-- 5 節 "If the selected metric for a link is greater than
-  MAX_LINK_METRIC, the node SHOULD exclude that link" に対し、実装は
-  `parent.etx >= RPL_MRHOF_MAX_LINK_METRIC` で除外している。ETX が
-  ちょうど 512 (= 4.0) のリンクを、RFC は残し実装は捨てる。
-- 3.2.2 節 rule 3 のヒステリシスは "smaller than cur_min_path_cost by
-  less than PARENT_SWITCH_THRESHOLD" (差が閾値**未満**なら現親を維持)
-  に対し、実装は `currentPathCost <= bestPathCost + THRESHOLD` (差が
-  閾値**以下**で維持)。差がちょうど 192 のとき、RFC は乗り換え、実装は
-  据え置く。
-
-いずれも境界 1 単位の差で、SHOULD/MAY 条項のため違反ではない。
-
-### 25.6 乖離: MRHOF 3.2.2 rule 4 の cur_min_path_cost (MUST、実害なし、**26.4節の通り対応済み**)
-
-> If ALLOW_FLOATING_ROOT is 0 and no neighbors are discovered, the node
-> does not have a preferred parent and MUST set cur_min_path_cost to
-> MAX_PATH_COST.
-
-`LeaveDodag()` は `m_pathEtx` (cur_min_path_cost 相当) を 0 にして
-いる。MAX_PATH_COST (32768) にすべきところ、逆に最良の値になる。
-
-ただし実害は無い: この値が外に出るのは DIO の Metric Container のみで、
-親を失った状態で送る DIO は 24 節の poisoning DIO だけであり、それは
-rank が INFINITE_RANK なので受信側は 8.2.2.5 節に従って親集合から
-除去する (Metric Container は見ない)。**26.4 節の通り対応済み。**
-
-### 25.7 対応方針
-
-修正の優先度は次のとおりと考えている:
-
-1. **25.3 (DTSN)** — MUST 2 件だが、実装は素直 (親の DTSN 増加を検出
-   して自分の DTSN を上げ、DAO を再スケジュールするだけ)。他実装との
-   相互運用性に直結する。**26.2 節の通り対応済み。**
-2. **25.2 (DAGMaxRankIncrease)** — MUST。L の追跡を足す必要があるが、
-   `SendDio()` で広告する rank にクランプを入れるだけで形にはなる。
-   count-to-infinity への独立した防御層が増える。**26.1 節の通り
-   対応済み。**
-3. **25.6 (cur_min_path_cost)** — MUST だが実害なし。1 行。**26.4 節の
-   通り対応済み。**
-4. **25.5 (境界 1 単位)** — 違反ではない。他実装と厳密に挙動を揃える
-   必要が出たときに。**28 節の通り対応済み。**
-5. **25.4 (step_of_rank)** — 方針 (Contiki-NG との一致) と RFC 既定値
-   のどちらを優先するかの判断が要る。変更すると既存テストの期待 rank
-   値がすべて変わる。
 
 ## 26. 25.7 の優先度 1・2 (DTSN, DAGMaxRankIncrease) を実装
 
@@ -2351,103 +2172,6 @@ ns-3 本体に JSON 依存を持ち込まないほうが移植性の面でも良
 (クラッシュはしないが意味不明)。`"never"` を出すよう修正。JSON 側は
 同じケースを `expiresIn: null` として出す。
 
-## 30. AODV-RPL / P2P-RPL への拡張を見据えた検討 (storing mode は先か)
-
-この実装を土台に AODV-RPL と P2P-RPL を追加実装したいという相談を受け、
-「まず storing mode に対応すべきか」を RFC 9854 (AODV-RPL) と
-RFC 6997 (P2P-RPL) の原文で確認した。10 節に「storing mode (MOP=2) は
-方針により対象外」とだけ書いていたが、その判断はこの 2 つの拡張との
-関係を検討する前のものだったので、ここで記録し直す。
-
-### 30.1 AODV-RPL (RFC 9854) は storing mode に直接依存する
-
-用語定義がそのまま答えを出している (原文の "Terminology" 節):
-
-> Hop-by-hop route: A route for which each router along the routing
-> path stores routing information about the next hop. A hop-by-hop
-> route is created using RPL's "storing mode".
-
-Introduction 節にも、AODV-RPL が core RPL から何を引き継ぐかがそのまま
-書いてある:
-
-> AODV-RPL reuses and extends the core RPL functionality to support
-> routes with bidirectional asymmetric links. It retains RPL's DODAG
-> formation, RPL Instance and the associated Objective Function (OF)
-> ..., Trickle timers, and support for storing and non-storing modes.
-
-ただし AODV-RPL の経路は RREQ/RREP オプションの H フラグで
-source routing (H=0) と hop-by-hop (H=1) を選択する方式なので、
-source routing 側だけを先に実装するなら storing mode 抜きでも動く。
-hop-by-hop 側を実装する時点で storing mode 相当の機構が要る、という
-のが正確な依存関係。
-
-### 30.2 P2P-RPL (RFC 6997) は base の storing mode には依存しない
-
-P2P-RPL も Hop-by-hop Route を持つが、AODV-RPL とは違い「RPL の
-storing mode を使う」とは書いていない。P2P-RPL 自身が完結した転送状態
-管理を定義している (12 節 "Packet Forwarding along a Route Discovered
-Using P2P-RPL"):
-
-> Travel along a Hop-by-hop Route, established using P2P-RPL, requires
-> specifying the RPLInstanceID and the DODAGID (of the temporary DAG
-> used for the route discovery) to identify the route. ... both the
-> RPLInstanceID (a local value assigned by the Origin) and the DODAGID
-> ... are required to uniquely identify a P2P-RPL Hop-by-hop Route to a
-> particular destination.
-
-local な RPLInstanceID + DODAGID + 宛先アドレスをキーにした、
-P2P-RPL 専用の転送エントリであり、base DODAG (instance 0) の MOP を
-storing に切り替える話ではない。13 節 "Interoperability with Core RPL"
-も "P2P-RPL operation does not affect core RPL operation, and vice
-versa" と明記している。
-
-### 30.3 より根本的な前提: どちらも「並行する別インスタンス」を要求する
-
-AODV-RPL、P2P-RPL のどちらも、base の DODAG (instance 0) とは別の
-RPL Instance を local な RPLInstanceID で立てる構造そのものが本体。
-
-- P2P-RPL: Origin を根とする一時的な DAG を、その都度 local instance
-  ID で形成する (5 節 "Functional Overview")。
-- AODV-RPL: "Paired DODAGs" — RREQ-Instance (OrigNode 起点) と
-  RREP-Instance (TargNode 起点) という 2 つの RPL Instance を、
-  経路探索のたびにそれぞれ local instance ID で形成する (2 節
-  "Terminology")。base RPL の有無にも依存しない:
-  > AODV-RPL can be operated whether or not P2P-RPL or RPL [RFC6550]
-  > is also running.
-
-この実装の `RplRoutingProtocol` は現状、1 ノードが同時に 1 つの
-DODAG にしか属せない設計になっている。`m_instanceId`、`m_dodagId`、
-`m_version`、`m_rank`、`m_parents`、`m_topology`、`m_dioTrickle` は
-すべてクラスの単一メンバー (instance をキーにしたコンテナではない)。
-AODV-RPL の経路探索 1 回で最低 2 つ、P2P-RPL でも 1 つ、base の
-instance 0 とは別に DODAG 状態を持つ必要があるので、storing mode の
-有無以前に、この単一インスタンス前提そのものが両拡張共通のボトル
-ネックになる。
-
-### 30.4 検討の結論
-
-優先順位は次のとおりと考える:
-
-1. **マルチインスタンス対応** — 複数 DODAG に同時所属できるよう、
-   rank・preferred parent・parent set・Trickle タイマー・topology を
-   instance 単位に持たせる。AODV-RPL・P2P-RPL 双方に共通する前提で、
-   storing mode の有無とは独立に必要。**31 節でストレージ層、32 節で
-   実際に 2 つ目以降の instance を join/生成する経路まで対応済み
-   (受動 join は `HandleDio()`、能動形成は `CreateLocalDodag()`)。
-   ただし 2 つ目以降の DODAG での中継は対象外 (32.6 節)。**
-2. **storing mode** — AODV-RPL の hop-by-hop 側に直接必要
-   (30.1 節)。ここで作る「宛先ごとに next hop を引いて転送する」
-   機構は、P2P-RPL 自身の hop-by-hop 転送状態 (30.2 節) ともほぼ
-   同型なので、instance に紐付く形で汎用的に作っておけば P2P-RPL 側
-   からも流用できる可能性がある (P2P-RPL は RFC 上 base の storing
-   mode を要求してはいないが、実装を分けて二重に持つ理由もない)。
-3. AODV-RPL は source routing (H=0) 側から着手すれば 1, 2 の一部
-   だけで済む。hop-by-hop (H=1) 側は 2 の完了後。
-4. P2P-RPL は 1 の完了後に着手可能。
-
-まだ着手していない。この節は方針決定の記録であり、実装状況は
-10 節を参照。
-
 ## 31. DODAG 状態をインスタンス単位のストレージへ集約 (30 節の実装)
 
 30 節で立てた優先順位の 1 番目、マルチインスタンス対応の土台を実装した。
@@ -2552,15 +2276,6 @@ bind・`DodagKey` に `operator==`/`operator!=` が要ること (ns-3 の
 `Callback` の bound argument が `CallbackComponent<T>::IsEqual()` で
 比較可能性を要求するため) など、事前に設計・検証した点はすべて
 想定通りに機能した。
-
-### 31.4 まだ実装していないこと
-
-30 節の優先順位どおり、これは土台のみ。2 つ目の (local な)
-RPLInstanceID を実際に join/生成する API、AODV-RPL、P2P-RPL は
-未着手。それぞれの実装時に、実際の要求に合わせて `DodagMembership`
-を新規作成する経路 (今回作った `m_dodags[key]` への in-place 構築の
-パターンを流用できるはず) を設計する。(**AODV-RPL は 35 節、
-P2P-RPL は 36 節の通り対応済み**)
 
 ## 32. 複数 DODAG への実際の同時参加 (31 節の続き)
 
@@ -2728,13 +2443,6 @@ preferred parent 経由で返し、一致しなければ base の
 
 ### 32.6 意図的にやらないこと
 
-- **2 つ目以降の DODAG での中継**: `RouteInput()`/
-  `PrepareOutgoingPacket()` は base 専用のまま。あるノードが 2 つ目の
-  DODAG に参加し、その root へ自分の DAO を送ることはできる (32.1/
-  32.4 節) が、別のノードの 2 つ目の DODAG 宛トラフィックを中継は
-  しない。2 つ目以降の DODAG は「root と直接無線到達できるノードだけ
-  が確実に参加できる」という制約になる (32.5 節で見た通り、間接的な
-  join 自体は起こりうるが、それは中継とは別の話)。
 - **Trickle の RNG ストリーム**: `AssignStreams()` は
   `Simulator::Run()` 前に 1 回しか呼ばれず、この時点でそのノードが
   将来いくつの DODAG に join するかは分からない (ns-3 のストリーム
@@ -2780,9 +2488,6 @@ preferred parent 経由で返し、一致しなければ base の
 
 ### 32.8 検証
 
-- `./ns3 build`: 警告・エラー無し。
-- `./test.py -s rpl` 相当 (`test-runner --suite=rpl`): 49/49 PASS、
-  5 回連続。
 - 既存 4 シナリオ、全て 0% packet loss を維持:
   `rpl-6lowpan-simple` (OF0 デフォルト、`--mrhof --lql`)、
   `ns3edit-rpl-mesh`、`ns3edit-rpl-line`。
@@ -3039,12 +2744,6 @@ join させると、それぞれの初回 `SendDao()` が (相手が実在しな
   - 準正常: A 自身の正しい key + 正しい sequence → A だけ解除、
     B は既に解除済みのまま変化無し。
 
-`./test.py -s rpl` 相当 (53 件、新規込み) を 5 回連続実行し全件
-安定して PASS することを確認した。新テストの実行時間は 0.001s
-(旧設計は数秒のシミュレーション時間を要していた) — ND 解決や
-Trickle ジッタの実時間待ちを一切必要としない設計になったこと
-自体も、副次的な確認材料になっている。
-
 ## 34. 非 base DODAG での中継/root 動作の一般化
 
 32 節で対応したのは「このノード自身が root へ DAO を送る」経路
@@ -3173,13 +2872,6 @@ base の DAD 待ちレース対策、こちらは base 固有の問題なので�
   `RouteOutput()`/`PrepareOutgoingPacket()` がそれを見つけて正しい
   RPLInstanceID (base のではなくローカルの) を出力パケットの RPI に
   スタンプすることを `ReadRpiInstanceId()` で読み返して確認。
-
-`./test.py -s rpl` 相当 (57 件、新規 4 件込み) を 5 回連続実行し全件
-安定して PASS することを確認した。4 つの既存シナリオ
-(`rpl-6lowpan-simple` OF0/MRHOF+LQL、`ns3edit-rpl-mesh`、
-`ns3edit-rpl-line`、いずれも DODAG 1 つだけの単純なシナリオ) も
-0% packet loss を維持しており、今回の変更が既存の単一 DODAG シナリオ
-に一切影響していないことを確認した。
 
 ### 34.6 `protocol-test-matrix` スキルで 34 節を監査し直して見つかったバグ
 
@@ -3482,11 +3174,6 @@ ensure that the SRH does not contain loops" と明示的に許しているが、
   経路を得ること、中継ノードには何も残らないこと (H=0 の要点)、そして
   **その経路で実際に UDP データグラムが TargNode まで届くこと**。
 
-`./test.py -s rpl` 相当を 5 回連続実行して全件安定して PASS
-(実測 61 件、うち AODV-RPL 由来の新規テストケースが 3 件。残りの
-新規検証はいずれも既存テストケースへの追加なのでケース数には出ない)。
-4 つの既存シナリオも 0% packet loss を維持。
-
 **過去の節の件数表記について**: 33.8・34.5・34.7 節などに書いた
 「N 件」は当時の記憶や概算に基づくもので、今回 61 件を実測して
 逆算すると少なくとも 34.7 節の「60 件」は誤り (正しくは 58 件) だった。
@@ -3684,86 +3371,6 @@ TargNode のアドレスが出ること、`PrintRoutingTableJson()` の
 `aodvRoutes:[]` のまま (経路情報を持たない) ことを確認。追加前の
 コードに対して実行すると 3 つとも `actual="0"` で確実に落ちることを
 確認済み。修正を戻すと 63+2 件全 PASS (3 回連続)。
-
-### 35.13 Gratuitous RREP (§7) は実装を見送った
-
-§35.11 の続き、3 番目の項目として着手したが、調査の結果コードは
-書かないという判断に至った。判断そのものと根拠を記録する。
-
-**RFC の規定**: 中継ノードが RREQ-DIO を受け取った時点で、その
-TargNode 宛の経路を (十分に新しい Dest SeqNo で) 既に持っていれば、
-RREQ を TargNode まで流しきる前に自分から OrigNode へ G-RREP を
-unicast で返せる、という最適化。「その中継ノードが RREQ を
-TargNode へ unicast で転送する」「以降の中継ノードも自分の
-Address Vector 区間を足しながら G-RREP を積み増して upstream へ
-中継する」ところまでが規定に含まれる。
-
-**このモジュールで壁になった点**: RREQ の伝播は
-`DioTrickleFire()` による ff02::1a への multicast 一本に統一されて
-おり、特定の next hop への unicast 転送という経路が存在しない。
-G-RREP を実装するなら、この中継ノードだけ「多重化して flood」と
-「知っている経路に沿って unicast」という 2 通りの転送方式を
-使い分けることになり、RREQ 伝播の中心的な仕組みに新しい分岐を
-持ち込む規模の変更になる。これは「小さい項目から」という今回の
-着手方針の前提 (数十行程度の局所的な追加) から外れる。
-
-**判断**: RFC 自体が MAY (完全に任意) としている最適化であり、
-届かなければ通常の RREQ flood がそのまま経路を見つける (正しさに
-影響しない、純粋な高速化)。<!-- この「MAY」は G-RREP を送るか否かに
-かかる。G-RREP を送ると決めた後に続く MUST 群については §52.5 の
-訂正 (2026-09-19) を参照 -->かつ、このモジュールでは中継ノードが
-「別の discovery の OrigNode として、たまたま同じ target への経路を
-既に知っている」場合のみ発火する狭いケースで、効果も限定的。
-実装コストと得られる効果を天秤にかけ、見送った。地雷埋め (半端な
-実装を残す) より、明記して除外する方を選ぶ — H=1/S=0 と同じ扱い。
-
-**再考する場合の入口**: RREQ に「知っている経路に沿って unicast
-転送する」経路を新設するタイミングがあれば (例えば H=1 の
-storing mode 対応で per-destination next-hop テーブルを持つように
-なったとき)、その基盤の上に G-RREP を足す方が筋が良い。
-
-**続報 (§52)**: H=1 完了後、この「per-destination next-hop
-テーブル」(`m_hopByHopRoutes`) が実際に揃ったため実装した。
-ただし当時懸念した「RREQ 伝播の中心的な仕組みへの新しい分岐」は
-G-RREP 送信自体には不要と判明 (`SendDio()` は元々 unicast 対応、
-`HandleDio()` の RREQ 分岐も toMulticast 不問) — G-RREP の
-送信のみを実装し、RFC がさらに規定する「RREQ 自体の unicast 中継」
-は干渉リスクを理由に今回も見送った (§52.5)。
-
-### 35.14 複数 ART (§6.2.2 のターゲット集合積集合) も実装を見送った (**42節の通り対応済み**)
-
-§35.11 の 4 番目の項目として調べたが、これも着手時の「小さい項目」
-という見立てが外れていたため、ユーザーに確認の上で見送った。
-
-**RFC の規定**: OrigNode は 1 回の RREQ-Instance で複数の TargNode を
-同時に探索できる (RREQ-DIO に複数の ART option)。中継ノードは、
-異なる経路から届いた複数の ART リストの**積集合**を計算しながら
-flood する必要があり、途中で自分自身が TargNode の 1 つだった場合は
-自分のエントリを削除してから転送、積集合が空になった時点で
-それ以上の転送を止める。
-
-**見積もりが外れた理由**: 現在の `RplDioHeader` は ART option を
-1 個の `bool m_hasArt; ArtOption m_art;` としてしか持っておらず、
-複数 ART 対応にはこれを可変長配列 (`std::vector<ArtOption>`) に
-変えるワイヤフォーマット側の変更が要る (Serialize/Deserialize/
-GetSerializedSize 全て)。加えて `DodagMembership::AodvRreqState`
-の `target` (単一) を「これまでに要求されたターゲット集合」の
-追跡に拡張し、§6.2.2 の積集合ロジックと自己削除・空集合での
-転送停止をまるごと新規実装する必要がある。ワイヤフォーマット変更
-込みで半日仕事規模になり、「小さい項目から」という当初の見立てを
-外れていた (Gratuitous RREP と同様の見誤り)。
-
-**判断**: RFC 自身がこれを「1 つの DODAG 構築で複数ターゲットの
-コストを減らす」ための効率化と位置付けている (§6.2.2 冒頭) —
-機能としては、同じ結果を `DiscoverRoute()` をターゲットの数だけ
-個別に呼ぶことでも得られる (RREQ-Instance が複数立つ分の制御
-オーバーヘッドが増えるだけで、届く経路自体は変わらない)。今回は
-ユーザーに現物の見積もりを提示した上で見送りの判断をもらった。
-
-**再考する場合の入口**: 複数ターゲットを 1 回の flood で同時に
-探す必要が出た (制御トラフィックのコストが実際に問題になる)
-シナリオが出てきたら、まず `RplDioHeader` の ART を配列化する
-ところから着手する。
 
 ### 35.15 Compr (アドレス省略) を実装
 
@@ -4282,118 +3889,22 @@ Vector 蓄積、AODV-RPL の `RplAodvRreqFloodTestCase` 相当)、
 `926bbce4c`/`0cae74bd8` の組は、どちらも「同じ短パケット系バグ
 パターンを 1 クラスずつ別コミットで塞ぐ」流儀を踏襲している。
 
-## 37. 12.3 節の「ランクが際限なく増大する」残課題を再測定: 診断が誤っていた、原因はグローバル修復の欠落
+## 37. グローバル修復の起動契機 (`GlobalRepairInterval`)
 
-12.3 節の末尾に「**既知の残課題 (未修正、次回対応)**: 25 ノード以上の
-規模のランダムトポロジでは、ping を一切送らない状態でも DODAG のランク
-が時間とともに際限なく増大していく」という記録が残っていた。その推定
-原因は「OF0 (RFC 6552) はヒステリシスを持たないため、輻輳した無線環境で
-一時的に親を見失うたびに `SelectPreferredParent()` が親を選び直し、
-それを繰り返すたびにランクが積み上がっていく」というもの (未検証と明記
-されていた)。
+`DAGMaxRankIncrease` (26.1節) は、rankが上限に達したノードに`INFINITE_RANK`を
+広告させる。そのノードが戻るには、rootがDODAGVersionNumberを上げて`L`
+(`lowestRankThisVersion`) をリセットさせる必要がある。受信側 (Versionの移行、
+`JoinDodag()`での`L`のリセット) は27節の時点で揃っており、欠けていたのはroot側の
+起動契機だった。
 
-この記録の**後**に 26 節で `DAGMaxRankIncrease` (RFC 6550 section
-8.2.2.4 rule 3) を実装している。これはランクの際限なき増大をまさに
-上限で縛るための RFC 純正の機構なので、「既に解消しているのではないか」
-という仮説が立つ。実装ゼロで残課題が 1 件閉じる可能性があるため、
-機能追加に着手する前にこれを実測で確かめた。
-
-### 37.1 測定方法
-
-`scratch/rpl-per-comparison.cc` と同じトポロジ・無線設定 (200 m 四方の
-`RandomRectanglePositionAllocator`、LR-WPAN +
-`LogDistancePropagationLossModel`、固定シード) の使い捨てプローブを
-書き、**トラフィックを一切生成せず** (12.3 節の記録が「ping を一切
-送らない状態でも」と明記しているため) 一定間隔で全ノードの
-`GetRank()` を採取した。`RPL_INFINITE_RANK` と未参加は参加ノード数から
-除外して数えた。
-
-### 37.2 結果: 仮説は棄却、バグは健在
-
-**30 ノード / 200 m 四方**: t=400 s で収束し、t=2800 s まで完全に平坦
-(maxRank 384 固定、100 ノードすべて参加のまま)。この規模では問題は
-再現しない。
-
-**100 ノード / 200 m 四方 (同じ面積、3.3 倍の密度)、OF0、12000 s**:
-
-```text
-t=  500s joined=100 maxRank= 512 avgRank= 414.7
-t= 2500s joined=100 maxRank= 768 avgRank= 521.0
-t= 3500s joined= 93 maxRank= 640 avgRank= 546.4
-t= 5500s joined= 88 maxRank= 768 avgRank= 715.6
-t= 7500s joined= 84 maxRank=1024 avgRank= 920.4
-t= 9500s joined= 81 maxRank=1152 avgRank=1031.9
-t=11500s joined= 78 maxRank=1280 avgRank=1155.3
-```
-
-単発の段差ではなく階段状の単調増大で、頭打ちの兆候が無い (avgRank が
-2.8 倍)。加えて 12.3 節の記録に無かった症状として、**参加ノード数が
-100 から 78 へ単調に減少し、一度離脱したノードが復帰しない**。
-
-再現条件はノード数そのものではなく**密度**である (30 ノードは同じ面積で
-平坦、100 ノードで再現)。12.3 節の「25 ノード以上」という表現は、
-当時の観測が密度の効果をノード数に帰していたものと見られる。
-
-### 37.3 12.3 節の診断 (OF0 のヒステリシス欠如) は実測で否定された
-
-原因が OF0 固有かを判別するため、同一条件で MRHOF (13.5 節・28.2 節で
-ヒステリシスを実装済み) でも測定した:
-
-```text
-t=  500s joined=100 maxRank= 640 avgRank= 445.5
-t= 3500s joined= 93 maxRank= 768 avgRank= 567.7
-t= 7500s joined= 83 maxRank= 917 avgRank= 850.0
-t=11500s joined= 66 maxRank=1280 avgRank=1142.3
-```
-
-**MRHOF でも同等以上に悪化する** (ノード脱落は 100 -> 66 で OF0 の
-100 -> 78 より大きい)。ヒステリシスの有無で結果が変わらない以上、
-12.3 節が推定した「OF0 にヒステリシスが無いこと」は原因ではない。
-この推定は当時から未検証と明記されていたもので、今回それが誤りだったと
-確定した。
-
-### 37.4 真の原因: count-to-infinity 対策の回復側が実装されていない
-
-コードを追うと、26 節が実装したのは RFC 6550 の count-to-infinity 対策の
-**検出側だけ**であることが分かる:
-
-- **検出側 (実装済み)**: `SelectPreferredParent()` 末尾で
-  `rank > lowestRankThisVersion + maxRankIncrease`
-  (`RPL_MAX_RANKINC` = 8 * `RPL_MIN_HOPRANKINC` = 1024) なら
-  `RPL_INFINITE_RANK` を広告する。
-- **回復側 (未実装)**: `lowestRankThisVersion` をリセットする経路は
-  `JoinDodag()` ただ 1 つで、それを起こすのは DODAG Version の migration
-  だけ。そして `GlobalRepair`/`LocalRepair`/バージョンをインクリメント
-  する処理はこのモジュールに**一切存在しない** (grep で 0 件)。
-
-つまり、輻輳でランクが微増を繰り返して上限に達したノードは
-`INFINITE_RANK` を広告した後、**root がバージョンを上げないため永久に
-復帰できない**。これが 37.2 で観測したノード数の単調減少そのものである。
-26 節は「際限なきランク増大」を「ランク増大 + 恒久的なノード喪失」に
-置き換えた形になっており、後者はサイレントなネットワーク分断なので
-実害としてはむしろ大きい。
-
-ランクの微増自体は OF に依存しない (どの OF でも輻輳で親を見失えば
-選び直しが起きる) ため、37.3 で MRHOF でも同じ結果になったことと
-整合する。
-
-### 37.5 修正範囲は見た目より小さい (グローバル修復の受信側は実装済み)
-
-グローバル修復の**受信側は既に完全に実装されている**
-(`HandleDio()` の Version 変更処理): RFC 6550 section 7.2 のロリポップ
-比較 (27 節)、`LeaveDodag(..., false)` + `JoinDodag()` による migration、
-その `JoinDodag()` での `lowestRankThisVersion` リセットまで揃っている。
-27 節のコメント自身が「global repair would stop working permanently」と
-書いており、当時から受信側はグローバル修復を前提に設計されていた。
-
-**欠けているのは root 側の起動契機だけ** — root が
-DODAGVersionNumber をインクリメントして新しい Version の DIO を流す
-処理。RFC 6550 section 8.2.2.1 では、グローバル修復を発動するのは
-root の裁量 (policy) であり、発動条件そのものは RFC が規定していない。
+密なlr-wpanトポロジでノードが単調に減り、グローバル修復も効かないように見えた
+現象は、lr-wpan PHYが`BUSY_RX`のまま固着するns-3本体のバグが原因だった (§98)。
+その修正後は、100ノードで全ノードが参加したまま保たれ、グローバル修復のたびに
+非rootの全ノードが新しいVersionへ移る。
 
 ### 37.6 root 側の起動契機を実装: `GlobalRepairInterval`
 
-37.5 の残タスクのうち、発動 policy を周期的なものに決めて実装した。
+発動 policy を周期的なものに決めて実装した。
 RFC 6550 section 18.2.5 が "A RPL implementation SHOULD allow
 configuring whether or not periodic or event triggered mechanisms are
 used by the DODAG root to control DODAGVersionNumber change" と、
@@ -4419,125 +3930,6 @@ window (16) が単発の +1 増分を全ての境界で正しく "newer" と判�
 ことをコード上でトレース済み、@see 37.7 のコメントで残した根拠) の後
 `dioTrickle.Reset()` で即時伝播させ、次回を再スケジュールする。
 `LeaveDodag()` にも `globalRepairEvent.Cancel()` を追加した。
-
-`./ns3 build rpl` clean、`test-runner --suite=rpl` 全件 PASS
-(既定で無効なので当然だが確認した)。
-
-### 37.7 実測: 37 節の測定条件 (100 ノード) では効果ゼロ、原因は root 自身がほぼ聞かれていないこと
-
-`GlobalRepairInterval=300s` を設定し、37.2 と全く同じ条件 (100 ノード /
-200 m 四方 / 12000 s / トラフィック無し / OF0) で再測定したところ、
-**サンプル値が小数点まで無修正のベースラインと完全に一致した**
-(`diff` で `IDENTICAL`)。同条件を再現性確認のため再実行しても同じ結果。
-修復が一切効いていない。
-
-原因を切り分けるため、`SendDio()` に一時的な診断出力を挿入して root
-自身の送信を直接追跡したところ、`GlobalRepairFire()` は設計どおり
-`dodag.version` をインクリメントし、`dioTrickle.Reset()` 後
-数秒でちゃんと `SendDio()` を呼んでいた (t=303s, 604s, 904s に
-version=1,2,3 で送信)。**送信は起きている。** 一方、`HandleDio()` の
-migration 分岐にも同様の診断出力を仕込んで数えたところ、**この
-100 ノードシナリオ全体を通して、どのノードも一度も root 発の
-DIO を version 0 の初回バースト (t=3.14s) 以降、一度も受信していない**
-ことが判明した -- これは新しい repair 由来の DIO に限らず、37.2
-以前から存在する **root の通常の Trickle 再送 (t=10.85s, 21.5s, ...)
-も含めて** 誰にも届いていない。同じ時間帯に他の中継ノード
-(fe80::ff:fe00:a 等) の DIO は複数ノードに問題なく届いており、
-root 特有の現象だった。
-
-### 37.8 根本原因: LR-WPAN のチャネル輻輳と、root の Trickle が伸び切ったまま戻らない構造の複合
-
-`LrWpanCsmaCa` を `level_debug` で有効化すると (`NS_LOG_DEBUG("Channel
-access failure")`, `lr-wpan-csmaca.cc:504`)、この密度では CSMA-CA の
-バックオフ枯渇による送信断念が実際に多数発生していることを確認した:
-30/100 ノード規模で先頭 25 秒間の失敗件数を数えると
-5 / 21 / 31 / 52 / 54 / 76 / 107 / 341 (ノード数 30, 40, 50, 60, 70,
-80, 90, 100) と密度に対して単調に悪化する。
-
-これ単体なら「輻輳した無線環境ではよくある話」で済むが、決定的なのは
-**root だけがこの影響を非対称に受ける構造上の理由がある**こと:
-`HandleDio()` の先頭 (1274 行付近) は "この DIO は自分が root の
-DODAG 宛て" なら即 return するガードを持つ -- root が自分自身の
-DODAG に誤って join するのを防ぐためのものだが、副作用として **root
-は自分の DODAG について飛び交う DIO を一切処理しない**。他の全ての
-ノードは、近隣の DIO を聞くたびに Trickle の
-`ConsistencyHit()`/`Reset()` が (HandleDio() 後半の通常経路を通じて)
-働きうるのに対し、root の `dioTrickle` にはそれが一切効かない。結果、
-root の Trickle 間隔は起動直後から一方的に伸び続け、数百秒で
-Imax (既定 `RPL_DIO_INTERVAL_DOUBLINGS=8`, Imin=4.096s なら
-Imax=1048.576s) に達したきり、二度と Imin に戻らない -- **リセットする
-契機は今回追加した `GlobalRepairFire()` の明示的な `.Reset()` 呼び
-出ししかない**。
-
-この 2 つが組み合わさると: root は「他のどのノードよりも稀にしか送信
-しない参加者」になった状態で、輻輳したチャネルへ送信を試みることになる。
-CSMA-CA のバックオフ枯渇はどの送信者にも起こりうるが、**次のチャンスが
-最大 Imax 秒後になる root にとっては、1 回の失敗の代償が他のどの
-ノードより大きい**。しかも Trickle 自身は `TransmitEvent()` が
-`m_callback()` を同期的に呼んだ時点で「送信した」ことにして
-`IntervalEvent()` へ進み、実際の無線送信が CSMA-CA レベルで成功したか
-どうかを一切フィードバックしない (`SendRplMessageOn()` も
-`Socket::SendTo()` の戻り値を見ていない) -- 失敗は完全にサイレントで、
-Trickle 側の間隔はダブリングを続ける。稀にしか送らない上に、送った
-という記録だけが残り実際には届いていない状態が、指数関数的に間隔が
-伸びる中で積み重なる。
-
-### 37.9 実測: 50/70/100 ノードいずれでも `GlobalRepairInterval` に観測可能な効果なし
-
-37.8 の仮説を検証するため、輻輳の少ない密度で baseline (repair 無効)
-と repair 有効を同一条件で比較した (Imin=300s、8000s または 6000s、
-トラフィック無し、OF0):
-
-- **100 ノード** (37.7 と同条件、12000 s): `IDENTICAL`
-- **70 ノード** (6000 s): t=2400s から baseline が既に劣化開始
-  (70 -> 61)、repair 有効版は **全サンプル点で baseline と完全一致**
-- **50 ノード** (8000 s): t=5200s から baseline が劣化開始 (50 -> 43)、
-  repair 有効版は **全サンプル点で baseline と完全一致**
-
-30 ノード規模でも起動直後に 5 件の Channel access failure が観測される
-(37.8) ため、輻輳が完全にゼロの条件は用意できていない -- 3 つの密度
-全てで repair の効果が測定できなかったのは、37.8 の機序 (root の
-Trickle が Imax に張り付いたまま戻らないため、稀な送信 1 回の失敗の
-代償が非常に大きい) が、この規模のシナリオが持つ最小限の輻輳だけでも
-再現するほど鋭敏であることを示している。
-
-### 37.10 結論と次の課題
-
-**(§98で真因を特定済み: lr-wpan PHYが`BUSY_RX`のまま固着するns-3本体のバグ。以下の診断と対策案は、その二次的な症状を見たものだった。)**
-
-`GlobalRepairInterval` はコード上・RFC 準拠上は正しく動作する
-(root 側の version インクリメント・Trickle リセット・再送スケジュール、
-受信側の migration 処理は全て実装どおりに動く。単体では検証できている)。
-しかし **今回試した 50/70/100 ノードのいずれの密度でも、実際に
-観測可能な形でノード脱落を防ぐ効果は確認できなかった**。原因は
-このモジュール固有の脆弱性 (root の Trickle が他のどのノードとも違う
-扱いを受け、一方的に伸び切ったまま戻らない) と、LR-WPAN の
-CSMA-CA 輻輳という 2 つの要因の組み合わせであり、後者は
-`contrib/rpl` の外側 (`src/lr-wpan`) の一般的な特性のため、この
-モジュール単独では制御できない。
-
-**今回はここまでとし、修正は次の課題として残す**。手を付けるとすれば
-有力な方向は次の 2 つ (どちらも未検証、思いつきの案として記録するに
-留める):
-
-- **root の `dioTrickle` にも通常の consistency/inconsistency の
-  仕組みを適用する**: `HandleDio()` 冒頭の "root は自分の DODAG 宛て
-  DIO を無視する" ガードが、root の Trickle を他のノードと非対称に
-  扱っている直接の原因。ガード自体は自己 join 防止に必要だが、
-  Trickle の Reset()/ConsistencyHit() だけは通す形に分離できれば、
-  root の間隔が Imax に張り付いたままにならず、CSMA-CA の輻輳下でも
-  再送の機会が他のノードと同程度の頻度で得られる可能性がある。
-- **`GlobalRepairFire()` に配送確認・再送を持たせる**: 現状は
-  DAO-ACK のような確認応答の仕組みが無く、Trickle が 1 回
-  `SendDio()` を呼んだら送達したものとして扱う。DAO-ACK 相当の
-  ack/retry を Global Repair 自身に持たせれば、CSMA-CA レベルの
-  1 回の失敗をこの層で吸収できる可能性がある。ただしこれは新しい
-  確認応答プロトコルの新設に近く、コストは小さくない。
-
-検証には `scratch/rpl-rank-stability-probe.cc` 相当のプローブ (使い
-捨て、この節の作業で作成・削除済み) を再現すればよい: 100 ノード /
-200 m 四方の `RandomRectanglePositionAllocator`、無トラフィック、
-一定間隔で `GetRank()` を全ノードから採取。
 
 ## 38. P2P-DRO-ACK (RFC 6997 section 10) を実装
 
@@ -4684,9 +4076,6 @@ membership同様'L'期限で退出する。design-constraints.mdの
 - `IsOwnAddress(from)`ガードは単体では現行スイートを壊さない
   (§38.1.2に記載のとおり、実際の原因はテスト側のzero-Imin)。
 
-`./ns3 build`clean、`./test.py -s rpl`PASS、
-`test-runner --suite=rpl`を3回連続PASS確認。
-
 ## 39. §9.2 の P2P mode DIO 独自 Trickle 一貫性判定を実装(既定値変更は保留、**44節の通り対応済み**)
 
 §36.2 で見送った最後の1項目。RFC 6997 §9.2 の4パターン分類を
@@ -4723,41 +4112,6 @@ Reset() する (変化はした) が、rule 1 は Reset() **しない** (改善�
 広める理由はない) とも整合する。base RPL 側にこの区別を持ち込む変更は
 していない (この節の分岐は P2P-RPL の temporary DAG にのみ適用され、
 `dio.HasP2pRdo()` で汎用パスと排他的に分かれる)。
-
-### 39.2 `P2pDioRedundancy` の既定値変更は今回見送り (**44節の通り対応済み**)
-
-計画では §36.6 で 0 にした既定値を RFC 推奨の 1 に戻す予定だったが、
-**見送った**。理由:
-
-- `P2pDioRedundancy=0` (「絶対に抑制しない」) の下では、
-  `TransmitEvent()` の抑制判定 (`m_redundancy == 0 || m_counter <
-  m_redundancy`) が `m_redundancy==0` の時点で常に真になり、
-  `ConsistencyHit()` が呼ばれるかどうか自体が送信可否に一切影響
-  しない。つまり**今回の分類ロジックは、既定値を変えない限り
-  Reset() の呼び出し条件 (rule 1) だけが実際の挙動を左右し、
-  rule 2/3/4 の違い (ConsistencyHit() を呼ぶかどうか) は既定設定下では
-  無害・無効**。実際、rpl スイート全件が変更前と変わらず PASS した
-  こともこれと整合する (既定動作は変わっていないはず、という予想が
-  裏付けられた)。
-- 一方で、`P2pDioRedundancy` を実際に 1 (RFC 推奨値) 以上に上げると、
-  rule 2/3/4 の判定が初めて実際の送信抑制に影響する — ここを
-  検証するテストを今回は書けていない。Trickle のタイミングに依存する
-  テストはこのセッションで複数回踏み抜いた地雷 (§38.1.2 の
-  zero-Imin ライブロック、以前の増分での同種のバグ) であり、拙速に
-  書いて別の不具合を作り込むリスクの方が、既定値をもう1増分保留する
-  コストより大きいと判断した。
-- **結論**: rule 1〜4 の分類ロジック自体は実装・RFC原文と突き合わせ
-  済みで、既定設定下で無害であることを回帰スイート全件PASSで確認
-  済みだが、**rule 2/3/4 を専用テストで直接検証してはいない**。
-  `P2pDioRedundancy` の既定値変更(0→1)は、そのテストを書いてからの
-  次回増分に持ち越す。
-
-### 39.3 検証
-
-`./ns3 build` clean、`./test.py -s rpl` PASS、`test-runner
---suite=rpl` PASS (既存の全テストに変化なし — 39.2 の分析どおり、
-既定設定下でのconsistencyHit()/Reset()呼び出し条件変更は無害である
-ことの間接的な裏付け)。専用の新規テストは追加していない(39.2参照)。
 
 ## 40. `/protocol-test-matrix` で P2P-DRO-ACK 実装(§38・39)を監査
 
@@ -4801,47 +4155,6 @@ Phase 1の4象限監査を実施した。
 解消。(2) 再送1回分しか見込んでいなかった観測窓(0.5秒)が実際には
 `P2pDroMaxRetransmissions=2`回**両方**の再送を許す長さだった
 (100ms間隔で2回分) — 期待値を「両方の再送が起きる」に修正して解消。
-
-### 40.3 見つけたが今回は塞がなかった穴(意図的に空)
-
-- **異常系: Stopフラグ(`stopped`)がその後のP2P mode DIOを正しく
-  拒否することの直接検証**。`ShouldRefuseP2pRdo()`の実装自体は
-  §38で追加済みで、RFC原文どおりに書かれていることは確認済みだが、
-  「S=1を見た後、改善するはずのDIOが実際に拒否される」ことを直接
-  観測するテストは書いていない。時間都合により次回の監査対象として
-  持ち越す。**(後日対応済み)**: `RplP2pSoleTargetViaOptionStopsTestCase`
-  (test/rpl-test-suite.cc) が、S=1後の repeat DIO が
-  already-answered として黙って無視されることを直接検証している。
-- **異常系: 未知のDodagKey宛てP2P-DRO-ACKの静かな破棄**、
-  **異常系: `isTarget=false`または既にACK済みの状態でのACK重複到達**
-  — いずれもコードレビューでは正しく `return` されることを確認済み
-  だが、専用のプローブ/テストは依然として無い(2026年時点で確認、
-  `RplP2pDroAckWrongSequenceTestCase`は別のシナリオ[誤ったSequence
-  Number]を検証するテストで、この2件はカバーしていない)。
-  **(後日対応済み)**: 3つの新規テストで対応。
-  `RplP2pDroAckUnknownDodagTestCase`(未知のDodagKey)、
-  `RplP2pDroAckDuplicateTestCase`(既にACK済みの状態への重複到達)、
-  `RplP2pDroAckNotTargetTestCase`(isTarget=falseのrelayへの誤配送)。
-  ただし後2者はload-bearing検証の対象外と判明した:
-  `!dodag.p2p.isTarget || !dodag.p2p.droAckPending`の各半分を個別に
-  外しても、`droRetryEvent.Cancel()`(未armのTimerに対して安全な
-  no-op)と`droAckPending = false`(既にfalseへの再代入)という、
-  どちらもブラックボックスからは観測不可能な副作用にしかならない
-  ため、production側のガードを実際に外しても各テスト自身の
-  アサーションは変化しない(§62.3の`daoSequence`と同種の、観測不能な
-  変更)。前者(未知のDodagKey)は`m_dodags.end()`の逆参照という
-  未定義動作を招くため、本物のガード除去では検証せず、代わりに
-  テスト自身の"unknown" ack宛先を実在のkeyへ一時的に差し替えて
-  アサーションが正しく落ちることを確認する形でテスト自体の
-  識別力を確認した(§66.4以降に確立した「本物のリバートがリスクに
-  見合わない場合の代替手段」の踏襲)。
-
-### 40.4 検証
-
-`./ns3 build`clean、`./test.py -s rpl`PASS、`test-runner --suite=rpl`
-3回連続PASS。追加した2つの新規アサーション(ACK到達確認・Seq不一致
-拒否)はいずれも該当コードを一時的に無効化して失敗することを確認
-済み。
 
 ## 41. `/protocol-test-matrix` で P2P-RPL 複数Target対応 (§40の続き) を監査、重大バグ2件を発見
 
@@ -4907,28 +4220,6 @@ Targetシナリオには実害が無かったことも確認した (回帰スイ
 慣習とは違う対応が必要だった、フィールド幅がそもそも異なるため)。
 修正前の状態でテストを再実行しクラッシュを再現、修正後は解消する
 ことを確認済み。
-
-### 41.3 RFC 6997 §9.5 の Stop 適格条件の文言上の限界 (未解決、意図的に記録)
-
-41.2の根本原因を追う過程で、RFC 6997 §9.5自身の文言的な限界に
-気づいた: Stop条件 ("this router is the only Target specified...
-i.e., the corresponding DIO specified a unicast address of the router
-as the TargetAddr **inside the P2P-RDO** with no additional Targets
-specified via RPL Target options") は、**Primary TargetAddr経由で
-一致した場合だけ**を前提にした文言になっている。RPL Target option
-**のみ**で一致したTarget (Primary TargetAddrは別の誰か) が「他に
-本当のTargetがいない」ケースについて、RFC原文は明確な扱いを与えて
-いない — 文字通り読むと、この場合Stopは**決して**適格にならない
-(自分の一致分がリストに残り続ける限り)。今回の実装はRFC原文の
-文言に忠実な解釈 (リストが空かどうかを、自分の一致を除外せずに
-判定する) を維持し、この「RPL Target optionのみで指定された単独
-Targetは、'L'期限まで S=0 のまま関連DIOをTrickleで送り続ける」
-という挙動を**そのまま許容する** (41.2の無限増加はガードで解決した
-ため、S=0のまま送り続けること自体は実害を伴わない — 単にRFCの
-想定するStopの早期終了効果を得られないだけ)。将来この節を厳密化
-するなら、「additionalTargetsから自分自身の一致分を除外したリストが
-空か」という、より寛容な (だが原文からは一段踏み込んだ) 解釈に
-切り替える設計変更が候補になる。
 
 ### 41.4 検証
 
@@ -5106,8 +4397,6 @@ ns3-debug-pitfalls参照)が、実装コードだけでなく**テストの合�
   自体を42.2に明記した。
 - 既存の単一Target AODV-RPLシナリオ(`RplAodvRreqFloodTestCase`
   ほか既存全AODV-RPLテスト)はテスト変更ゼロで回帰確認済み。
-- `./ns3 build`clean、`test-runner --suite=rpl`を複数回連続実行し
-  安定してPASSすることを確認 (42.3のクラッシュ修正後)。
 
 ## 43. `/protocol-test-matrix` でAODV-RPL複数ART対応(§42)を監査
 
@@ -5458,39 +4747,6 @@ Hop-by-hop状態が別のnext hopを指していれば破棄」)を
 `StoreHopByHopRoute()`自身に実装し、`false`を返せば中継せず
 即座にreturnする。
 
-### 46.6 AODV-RPL側は今回見送り: 非対称経路のrank階層の不整合
-
-`RplAodvAsymmetric*TestCase`系が既に実装しているとおり、AODV-RPLの
-非対称 (S=0) 経路は、RREQ-Instance (OrigNode起点) とは別の
-RREP-Instance (TargNode起点) という**もう一つのDODAG**を経由して
-確立される。ところがRFC 9854 §6.4.3は下り経路エントリの
-RPLInstanceIDを「RREQ-InstanceID」(Deltaを引いた値) と明記している
-— つまり保存される経路の**識別キー**はRREQ-Instanceのものだが、
-実際にデータパケットが物理的に通過する経路のトポロジ (各中継
-ルータのrank) はRREP-Instanceという**別のDODAG**のものになる。
-RREQ-InstanceにおけるあるルータのrankとRREP-Instanceにおける
-同じルータのrankは一般に異なるため、RREQ-InstanceIDを載せた
-データパケットにRFC 6550 §11.2の汎用rank整合性チェックをそのまま
-適用すると、物理的には正常な経路でも誤ってrank不整合と判定され
-うる (P2P-RPLには存在しない、AODV-RPL非対称経路固有の問題)。
-
-対称 (S=1) 経路については、RREQ-Instance自身の単一の階層で
-上り・下りとも完結するため、P2P-RPLと同様に問題なく実装できる
-見込みだが、対称・非対称を作り分けるAODV-RPLの実装をまとめて
-検証するには、この非対称ケースの扱い(RREP-InstanceのRankを
-そのまま使うか、RREQ-InstanceIDのままバイパス相当の特別扱いを
-広げるか等、複数の設計選択肢がある)を先に詰める必要があり、
-本セッションの残り時間で拙速に実装するより一旦区切ることを選んだ。
-次回増分の対象として残す。
-
-**訂正 (§48.1)**: 後日の設計検討で、上記の懸念は実は**非対称
-ケースにしか当てはまらない**ことが判明した。`HasHopByHopRoute()`
-バイパスはrankそのものを比較しておらず、RREQ-InstanceIDで独立
-した経路storeにヒットするかどうかしか見ていないため、対称経路は
-この懸念の影響を受けずに実装できる。§48でAODV-RPL側の対称H=1
-("Increment A")を実装した。非対称側 (本節で述べた懸念が実際に
-当てはまるケース)は"Increment B"として引き続き見送り。
-
 ### 46.7 検証
 
 新規テスト2件: `RplP2pHopByHopRouteCompletesTestCase`
@@ -5712,26 +4968,6 @@ H=1版)で、relay1の上り経路だけが確立されrelay2/targには何も
   `StoreHopByHopRoute()`自身の鮮度チェックにより偶然PASSし
   続けた)。
 
-`./ns3 build`(rplモジュール・プロジェクト全体とも)、
-`test-runner --suite=rpl`を複数回連続実行して安定PASSを確認。
-既存の全P2P-RPL/AODV-RPLテスト(H=0、および§46/§47のP2P-RPL H=1)
-は無変更でPASS — 共有インフラ(§48.2のDフラグ処理)がP2P-RPLの
-D=0固定という既存動作に対して安全なno-opであることの裏付け。
-
-### 48.8 引き続き見送り: 非対称(S=0)経路のH=1、"Increment B"
-
-`HandleAodvRrepInstance()`/`StartAodvRrepInstance()`は今回
-一切変更していない。非対称H=1、および`AodvForceAsymmetric`
-属性とH=1の組み合わせのテストは次回増分 ("Increment B") へ
-持ち越す。
-
-**続報 (§50)**: 後日Increment Bとして実装した。当初想定していた
-「非対称固有の複雑さ」は主にnext hopの取得元(§6.4.3: 対称は
-`from`、非対称はRREP-Instance自身のpreferredParent)の違いに
-限られ、それ以外は§48で確立した共有インフラ(D flag、seqNo鮮度
-チェック、RPLInstanceIDのRREQ-Instance固定)がそのまま再利用
-できた。
-
 ## 49. `/protocol-test-matrix`でAODV-RPL H=1対応(§48)を監査
 
 RFC 9854 §6.2.1/6.2.3/6.3.1/6.4.3/6.4.4を原文で再確認した上で、
@@ -5820,12 +5056,6 @@ RFC 9854 §6.2.1/6.2.3/6.3.1/6.4.3/6.4.4を原文で再確認した上で、
   経由しない直接呼び出しでのテストもできない。よって専用テストは
   見送り、この設計上の帰結を上記49.1に記録するに留めた。
 
-### 49.4 検証
-
-`./ns3 build`(rplモジュール・プロジェクト全体とも)、
-`test-runner --suite=rpl`を複数回連続実行して安定PASSを確認。
-既存の全P2P-RPL/AODV-RPLテスト(H=0、H=1双方)は無変更でPASS。
-
 ## 50. AODV-RPL H=1を非対称(S=0)経路にも拡張 ("Increment B")
 
 §48.8で見送った非対称経路のH=1対応を実装した。
@@ -5910,13 +5140,6 @@ RREP-InstanceのものではなくRREQ-InstanceIDであること、(4) Sビッ�
 経路途中で0に変わったにもかかわらず全ホップで上り経路が形成される
 こと(§50.1)、(5) 実データがTargNodeまで届くことを確認。
 
-`./ns3 build`(rplモジュール・プロジェクト全体とも)、
-`test-runner --suite=rpl`を複数回連続実行して安定PASSを確認。
-既存の全P2P-RPL/AODV-RPLテスト(H=0対称・非対称、H=1対称)は
-無変更でPASS — S=0時に上り経路構築のゲートを撤廃した変更が、
-既存のH=0非対称シナリオの挙動(§6.2.4のS bit伝播ロジック自体は
-無変更)に影響していないことの裏付け。
-
 ## 51. `/protocol-test-matrix`でAODV-RPL H=1非対称対応(§50)を監査
 
 ### 51.1 `hopByHop`コピー忘れの横展開確認
@@ -5979,34 +5202,11 @@ load-bearing検証のため`dodag.preferredParent`を`from`に一時的に
   存在する。H=1固有の分岐は無いため、RankLimit境界の追加テストは
   見送った。
 
-### 51.5 検証
-
-`./ns3 build`(rplモジュール・プロジェクト全体とも)、
-`test-runner --suite=rpl`を複数回連続実行して安定PASSを確認。
-既存の全P2P-RPL/AODV-RPLテスト(H=0対称・非対称、H=1対称・非対称)
-は無変更でPASS。
-
 ## 52. Gratuitous RREP (RFC 9854 section 7) を実装
 
 §35.13で一度見送った機能。当時の見送り理由(「RREQ伝播の中心的な
 仕組みに新しい分岐を持ち込む規模の変更になる」)を今回のH=1完了後に
 再検討したところ、想定より軽い実装で済むことが分かった。
-
-### 52.1 §35.13時点の見立てが外れていた点
-
-- **ワイヤ形式は既に存在**: `RplDioHeader::RrepOption::gratuitous`
-  ('G'フラグ、`RPL_AODV_G_FLAG`)はシリアライズ/デシリアライズとも
-  実装済みで、2箇所(`rpl-aodv.cc`/`rpl-routing-protocol.cc`)で
-  `false`固定にしていただけだった。
-- **RREQのunicast中継先自体は既存**: `SendDio(dodag, dst, interface)`
-  は元々unicast対応(`interface != 0`のとき`SendRplMessageOn()`)。
-  「新規インフラが要る」という§35.13の懸念は、正確には
-  「RREQをunicastで**中継**する経路」であって「unicast送信機能
-  そのもの」ではなかった — この区別を最初の設計検討で見誤っていた。
-- **受信側もほぼ無改造で動く**: `HandleDio()`のRREQ分岐は
-  `toMulticast`で場合分けしていない(RREP分岐だけがsymmetric判定に
-  使っている)ため、unicastで届いたRREQでも既存の`HandleAodvRreq()`
-  にそのまま到達する。
 
 ### 52.2 H=1限定である理由(構造的な帰結)
 
@@ -6054,117 +5254,36 @@ Dest SeqNo)が、OrigNodeの持つ知識以上に新しければ発火する。
   そのまま`SendAodvRrepTo(dodag, dio, nextHop)`に渡して中継して
   おり、'G'フラグを含む全フィールドがそのまま転送される。
 
-### 52.5 見送り: RREQ自体のunicast中継(§7後半)
+### 52.5 RREQ自体のunicast中継(§7後半)
 
-RFC本文はG-RREPを送るだけでなく、その中継ルータが「自分の知っている
-経路に沿ってRREQ自体もunicastで中継する」ことも規定している
-(TargNodeまでの各ホップが新しい下り経路エントリを作りながら中継)。
-これは意図的に実装しなかった:
+RFC 9854 §7の"MAY"が支配するのは、G-RREPを送るか否かだけである。送ったルータには
+規範的な要求が続く: "After unicasting the G-RREP to the OrigNode, the intermediate
+router then unicasts the RREQ towards TargNode"、"For establishing hop-by-hop routes,
+the intermediate router MUST unicast the received RREQ-DIO to the Next Hop on the
+route. The Next Hop router along the route MUST build new route entries ... Then, the
+TargNode and each router along the path towards OrigNode MUST unicast the RREP-DIO
+hop-by-hop towards OrigNode"。
 
-- **正しさには不要**: この機能を実装しなくても、既存のTrickle
-  multicast floodが同じRREQを(別経路経由であれ)TargNodeまで
-  独立に届け、TargNode自身の上り経路も通常どおり確立される。
-  G-RREPはOrigNodeに経路を**早く**渡す最適化であり、G-RREPの
-  有無自体は発見の正しさに影響しない。
-- **既存のpreferredParent追跡との干渉リスク**: 実装すると、
-  同じRREQ-Instanceが「通常のmulticast flood経由」と
-  「G-RREPに伴うunicast中継経由」の**2経路**で下流ノードに届く
-  ことになる。`HandleAodvRreq()`の「fromがpreferredParentと
-  一致しなければ無視」ガードは、2つの経路が異なるタイミング・
-  異なるrankで届くケースを想定した設計になっておらず、
-  意図しないpreferredParentの揺れを招く恐れがある。
-- **判断**: 実装コストと干渉リスクに見合う効果が無いと判断した。§35.13/
-  §48.8と同じ「地雷埋めより明記して除外」の方針を踏襲する。
+実装: 中継はキャッシュ経路の次ホップへRREQ-DIOをユニキャストし、そのターゲットを
+`targets`から消す。あとは§6.2.2の既存のガード (`SendDio()`内) がその中継を黙らせる
+ので、同じRREQ-Instanceが洪水とユニキャストの2経路で届く状態は起きない。
 
-> **訂正 (2026-09-19)**: この項は当初「RFC自身が"MAY"の最適化として
-> 位置づけている部分であり」を判断の根拠に挙げていたが、**RFC原文の
-> 読み違いだった**。RFC 9854 §7 の "MAY" が支配するのは「そもそも
-> G-RREPを送るか否か」だけで、送ると決めた後は規範的な要求が続く —
-> 「After unicasting the G-RREP to the OrigNode, the intermediate router
-> then unicasts the RREQ towards TargNode」、および「For establishing
-> hop-by-hop routes, the intermediate router **MUST** unicast the received
-> RREQ-DIO to the Next Hop on the route. The Next Hop router along the
-> route **MUST** build new route entries ... Then, the TargNode and each
-> router along the path towards OrigNode **MUST** unicast the RREP-DIO
-> hop-by-hop towards OrigNode」。同文書 §48.8 側の記述 (「その中継ノードが
-> RREQ を TargNode へ unicast で転送する」…ところまでが規定に含まれる)
-> の方が正しく、本項と矛盾していた。
->
-> したがって現状は「MAYの最適化を見送った」のではなく、**MAYを採りつつ
-> 対になるMUSTを実装していない**状態である。見送りの判断自体は維持するが、
-> 根拠は「RFCが任意としているから」ではなく「実装コストと干渉リスク」の
-> 一点のみになる。なお上に挙げた「干渉リスク」(同じRREQ-Instanceが2経路で
-> 届く) は、RFCの流れではそもそも生じない — MUST側はfloodを**置き換える**
-> ものであって、並走させるものではないからである。
->
-> 実測された代償: G-RREPを出した中継はmulticastのRREQ-DIOを受け続けるため、
-> Trickle間隔ごとにG-RREPを撃ち直す。25ノードGridで応答方向のパケット1,040通
-> (1実行あたり) が**すべて**G-RREPで、真のRREPではなかった。AODV-RPLの制御
-> バイトの約11%にあたる。
->
-> **決着 (2026-09-20)**: MUST側を実装したうえで、3通りを測って結論を出した。
-> &sect;7 のMUSTは「G-RREPを送ったなら」発動するので、準拠する道は2つしかない。
->
-> - **(a) 中継を実装して有効化** (`AodvGratuitousRrepRelay=true`)。実装した。
->   中継はキャッシュ経路の次ホップへRREQ-DIOをユニキャストし、そのターゲットを
->   `targets` から消す &mdash; あとは &sect;6.2.2 の既存ガード (`SendDio()` 内) が
->   その中継を黙らせるので、「同じRREQ-Instanceが2経路で届く」状態は構造的に
->   起きない (本項が当初 見送りの理由に挙げた干渉リスクは、部分実装の産物
->   だったことがこれで確認できた)。**ただし採用しない** &mdash; 6動作点 &times;
->   50シードで制御バイトの有意な減少はゼロ、m9-symでレイテンシ +84.8ms
->   [+20.5,+152.1]、m9-asym6で発見成功率 &minus;0.28 [&minus;0.56,&minus;0.02] と
->   実害が出る。中継が自分を黙らせた後はキャッシュ経路頼みになり、それが古いと
->   本来フラッディングが見つけた経路を失う。ユニキャスト鎖は逐次なので、並列に
->   届くフラッディングより遅い。
-> - **(b) &sect;7 のMAYを辞退する** (`AodvGratuitousRrep=false`)。**これを既定に
->   した。** 同じ掃引で制御バイトが全6動作点で 15〜24 KB/実行 有意に減り、
->   発見成功率・背景PDR・レイテンシのいずれも悪化しない。&sect;7 は
->   「an intermediate router ... **MAY** unicast a Gratuitous RREP-DIO」なので、
->   辞退することは取ることと同じだけ準拠しており、しかも安い。
-> - (c) 従来の「G-RREPは出すが中継しない」は非準拠であり、もはや既定ではない。
->   `AodvGratuitousRrepOnce` (既定 true) は(a)を選ばずG-RREPだけ有効にしたい
->   場合の連射止めとして残す。
->
-> **この結論の射程**: 上の測定は 25ノードGrid・802.15.4・探索が1秒以内に決着、
-> という一つの動作環境でのものである。「MUST側は不要」ではない &mdash; &sect;7 の
-> MAY を取るなら MUST側は義務であり、取らずに済ませているだけである。実装を
-> 残してあるのはそのため (MAYだけ取ってMUSTを放置していた従来の状態は、単純に
-> 誤りだった)。割に合う条件は想定できる &mdash; 探索が長引いて「早く答える」
-> 利得が効く規模、フラッディング自体が高くつく大規模網、キャッシュ経路が安定
-> した環境。いずれも今回測っていない。
->
-> この節の当初の判断 (「実装コストと干渉リスクに見合う効果が無い」) は、
-> 結論としては今回の条件で正しかったが理由が違っていた &mdash; 実装コストの
-> 問題ではなく、**MUST側を正しく実装しても この条件では 測定上の利得が無い**
-> ためである。
->
-> **(§99.4で再測定済み: 下記の「背景PDRとのトレードオフ」という機序は§98の
-> PHY固着バグの産物と判明し撤回。判定は不採用のまま変わらないが、理由は
-> レイテンシに置き換わる。)**
->
-> **再測定 (2026-09-24)**: 上の決着の記録には非対称応答 (`AodvForceAsymmetric`)
-> を掃いたかどうかが残っておらず、決着後に §91〜§96 が同じ経路 (RREP重複判定、
-> 対称RREPのSeqNo、`mayMove`、InstanceID再利用バー) を変えているため、現行コードで
-> 両応答モードを測り直した。アームは既定 (`asis`、G-RREP無効) と中継
-> (`s7relay` = `--aodvGratuitousRrep=1 --aodvGratuitousRrepRelay=1`)。
-> 掃引スクリプトの `s7relay` はG-RREPの既定がfalseになった後も
-> `--aodvGratuitousRrepRelay=1` しか付けておらず、G-RREPが一度も出ない
-> (=中継も発火しない) 空のアームになっていたので、`--aodvGratuitousRrep=1` を
-> 足して直した。6動作点 × 2応答モード × 50シード = 1,200実行、失敗0。採用規則は
-> 掃引前に上と同じもの (`analyze-aodv-defaults.py`) に固定した。
->
-> - 対称応答: 6セル中4セルFAIL。制御バイトは m6-pen6 / m6-asym6 以外で有意に
->   減らず、m6-sym +58.2ms [+9.6,+109.1]・m9-sym +105.7ms [+43.4,+173.2]・
->   m9-asym6 +68.9ms [+0.2,+140.2] とレイテンシが悪化する。前回と同じ形。
-> - 非対称応答 (今回初めて): 制御バイトは全6セルで 14〜44 KB/実行 有意に減る。
->   代わりに背景PDRが4セルで −0.09〜−0.12 有意に下がり (m6-sym, m6-pen6,
->   m9-sym, m9-pen6)、レイテンシが3セルで悪化、m9-symでは発見成功数も
->   −0.32 [−0.54,−0.10] 下がる。MACドロップは全セルで2〜4倍になる。
->
-> 結論は変わらず不採用。非対称モードでは中継が制御バイトを実際に減らすが、
-> その分を背景トラフィックで払っている。ユニキャストのRREQ/RREP鎖がMACのACK・
-> 再送を伴い、ブロードキャストより長く媒体を占有するため、と読んでいるが、
-> この機序は未検証。
+属性:
+
+- `AodvGratuitousRrep` (既定false): §7のMAYを取るかどうか。辞退することは取ることと
+  同じだけ準拠している。
+- `AodvGratuitousRrepRelay` (既定true、§128): G-RREPを出したときにRREQ-DIOを中継する。
+  falseは非準拠で、測定の再現のためだけに残す。
+- `AodvGratuitousRrepOnce` (既定true): G-RREPの連射を止める。
+
+G-RREPを既定で無効にしている理由は測定である (§99.4、§98のPHY修正後、6動作点 ×
+2応答モード × 50シード): 対称応答では制御バイトがほとんど減らず、レイテンシが3つの
+動作点で有意に悪化する。非対称応答では制御バイトが一部の動作点で44〜55 KB/実行減るが、
+低marginで良好なチャネルではユニキャストの鎖の逐次性でレイテンシが悪化する。
+
+この結論の射程: 25ノードGrid・802.15.4・探索が1秒以内に決着する、という一つの動作
+環境でのものである。探索が長引く規模、フラッディング自体が高くつく大規模網、
+キャッシュ経路が安定した環境では割に合う可能性があるが、測っていない。
 
 ### 52.6 テスト
 
@@ -6177,10 +5296,6 @@ RFC本文はG-RREPを送るだけでなく、その中継ルータが「自分�
 データが届くことも確認。トリガー条件の呼び出しを
 `if (false && ...)`へ一時的に無効化してこのテストがFAILすることを
 確認(load-bearing検証)、元に戻して再度PASSを確認。
-
-`./ns3 build`(rplモジュール・プロジェクト全体とも)、
-`test-runner --suite=rpl`を複数回連続実行して安定PASSを確認。
-既存の全P2P-RPL/AODV-RPLテストは無変更でPASS。
 
 ## 53. `/protocol-test-matrix`でGratuitous RREP(§52)を監査
 
@@ -6231,12 +5346,6 @@ RFC 9854 §7を再確認しつつ、§52完了時点で手薄だった境界値�
   壊すようなことがあれば既に検出されていたはずである。専用の
   境界値テストは見送った。
 
-### 53.3 検証
-
-`./ns3 build`(rplモジュール・プロジェクト全体とも)、
-`test-runner --suite=rpl`を複数回連続実行して安定PASSを確認。
-既存の全P2P-RPL/AODV-RPLテストは無変更でPASS。
-
 ## 54. base RPLのStoring mode (RFC 6550 section 9.8, MOP=2) を実装
 
 これまでのbase RPLはNon-Storing mode (MOP=1) のみ対応しており、
@@ -6275,47 +5384,13 @@ preferred parentへlink-local一発送信、Non-Storingならroot
 ケースに合わないため、`SendNoPathDao()`は自前のヘッダ構築と
 宛先解決を保持しつつ、Storing mode分岐だけ追加した。
 
-### 54.3 DAOSequence非インクリメント設計(リレーDAO)
+### 54.3 DAOSequence
 
-RFC 6550 section 6.4のDAOSequenceはメッセージ単位・送信者単位の
-カウンタで、DAO-ACK突き合わせ(`HandleDaoAck()`の
-`daoAck.GetSequence() != dodag->daoSequence`)にのみ使われる。
-Storing modeのリレー(他ノードの経路を代理で再広告するDAO)が
-このカウンタを自分の判断でインクリメントしてしまうと、
-自分自身の自己広告DAOが待っているDAO-ACKの照合がズレて
-永久に届かなくなる。そのため全てのリレーDAOは
-(1) ACKを要求しない(`ackRequested=false`)、(2)
-`dodag.daoSequence`を現在値のまま(インクリメントせずに)使う、
-という2点を徹底した — `DaoRetry()`の既存の再送ロジック
-(既存のDAOSequenceを読むだけでインクリメントしない)と同じ
-考え方の横展開である。Path Sequence(`TopologyEntry::pathSequence`
-/ `DownwardRoute::pathSequence`)とは別物であり、こちらは
-originator(経路の実際の持ち主)がparent切り替え時にのみ
-インクリメントし(`SelectPreferredParent()`)、中継者はコピーして
-転送するだけ、という既存の区別をStoring modeでもそのまま踏襲した。
-
-### 54.4 スコープ修正: 「複数target再広告」は当初の想定より
-     前倒しで必須と判明
-
-当初の実装計画では、マルチホップの下り経路伝播そのものを
-「増分2」として後回しにし、まず「単一ホップの自己DAO送受信」
-だけを増分1として先に完成させる想定だった。しかし実装検討の
-過程で、**伝播の仕組みが無ければStoring modeは1ホップより深い
-DODAGで実質的に機能しない**(あるノードの子孫の存在は、直近の
-親にしか知られず、それ以上上には一切伝わらない)ことに気づいた。
-これは実用に耐えない制約であり、当初「複数target再広告」と
-呼んでいたものの実体は「マルチホップ伝播そのもの」であって、
-真に後回しにできるのは「複数ターゲットを1つのワイヤメッセージへ
-集約する」という帯域最適化(RFC上もMUSTではない)だけだと判断し、
-計画を修正した。
-
-結果として、ワイヤフォーマットは1メッセージ1ターゲットのまま
-(`RplDaoHeader`自体は無変更)、`SendDao()`が自己広告DAOに加えて
-`dodag.downwardRoutes`の生存エントリ1件ごとに個別のDAO
-メッセージを送るループを持つ設計とした(§54.6)。この修正は
-ユーザーへ再確認せず実装内で判断したが、既に承認された計画の
-実装可能性を保つための自然な補正であり、当初計画が「Storing mode
-自体は動くが1ホップ限定」という無意味な区切りになることを避けた。
+リレーDAO (他ノードの経路を代理で再広告するDAO) はDAO-ACKを要求しない
+(`ackRequested=false`)。DAOSequenceは送信のたびに進め、DAO-ACKの照合は'K'を立てて
+送ったDAOの値 (`daoAckSequence`) で行う (§131.6)。Path Sequence
+(`TopologyEntry::pathSequence` / `DownwardRoute::pathSequence`) は別物で、経路の
+持ち主だけが進め、中継者はコピーして転送する。
 
 ### 54.5 `HandleDao()`のゲート拡張とDAO-ACKのインターフェース修正
 
@@ -6409,25 +5484,6 @@ FAILするのではなくクラッシュ(`NS_ASSERT failed, cond="m_ptr"`)
 `test-runner --suite=rpl`を複数回実行して安定PASSを確認。
 既存の全テスト(`RplDioRejectionTestCase`の更新後を含む)は
 PASS。
-
-### 54.10 今回見送った項目
-
-- **MOP 3 (Storing mode with multicast)**: マルチキャストDAO
-  自体が未実装であり、当初計画どおり対象外。
-- **RFC 6550 section 11.2.2.3 (DAO Inconsistency Detection and
-  Recovery)**: RPIの'F' (Forwarding-Error) フラグを使った
-  Storing mode専用の修復機構。既存の'R' (rank inconsistency)
-  フラグが「trace はするが強制はしない」という既知の未実装
-  (§12.2)と同種の、意図的に対象外とした項目。(**71節の通り
-  対応済み**)
-- **複数ターゲットの1メッセージ集約**: §54.4で述べた通り、
-  マルチホップ伝播そのものは今回の対象に含めたが、複数の
-  `downwardRoutes`エントリを1つのDAOメッセージへ集約する
-  帯域最適化(RFC上は任意)は次回増分へ持ち越す。(**59節の通り
-  対応済み**)
-- **`/protocol-test-matrix`による深掘り監査**: このセッションの
-  標準運用(§40/§41/§43/§47/§49/§51/§53)に従い、本実装の
-  コミット後に別途実施する。
 
 ## 55. `/protocol-test-matrix`でStoring mode(§54)を監査、実バグ1件を発見
 
@@ -6641,12 +5697,6 @@ load-bearing検証: `DaoRetry()`の修正を旧実装(Non-Storing専用の
   (`const DodagMembership::DownwardRoute*`を返す)を新設し、
   3箇所全てをこれ経由に統一した。
 
-### 56.5 検証
-
-`./ns3 build`(rplモジュール・プロジェクト全体とも)、
-`test-runner --suite=rpl`を複数回実行して安定PASSを確認。
-既存の全テスト(§54・§55で追加したものを含む)はPASS。
-
 ## 57. `protocol-test-matrix`スキルをcode-review型の5角並列マルチエージェント
      構成へ書き換え、Storing mode(§54-56)に対する初回実地検証で実バグ
      6件・盲点2件を発見
@@ -6659,16 +5709,6 @@ load-bearing検証: `DaoRetry()`の修正を旧実装(Non-Storing専用の
 新設のAngle 5「移行漏れ」で共有ヘルパーへの統合漏れを専門に探す)へ
 書き換えた。本節はその新構成での初回実地検証(対象: Storing mode
 実装全体、コミット範囲94ed3da..ef81db1)の結果を記録する。
-
-### 57.1 監査体制
-
-5角(Angle 1正常系・Angle 2境界値・Angle 3異常系・Angle 4シーケンス
-状態遷移・Angle 5移行漏れ)をそれぞれ独立コンテキストの`Agent`ツール
-サブエージェントとして並列起動。各エージェントは実装セッションの記憶を
-一切引き継がず、RFC 6550原文を自分でcurl取得し、diffと現在のソース
-コードを自分で読んで候補を洗い出した。セッション使用量上限に一度
-達し、Angle 1・2・4の3つが一時失敗、リセット後に再実行して5角
-全て完了させた。
 
 ### 57.2 発見した実バグ(6件、修正済み)
 
@@ -6783,12 +5823,6 @@ load-bearing検証: `DaoRetry()`の修正を旧実装(Non-Storing専用の
 各修正について、対応する変更を一時的に無効化してテストが実際に
 FAILすることを確認(load-bearing検証)、元に戻して再度PASSを確認。
 
-### 57.5 検証
-
-`./ns3 build`(rplモジュール・プロジェクト全体とも)、
-`test-runner --suite=rpl`を複数回実行して安定PASSを確認。
-既存の全テスト(§54-56で追加したものを含む)はPASS。
-
 ## 58. §57で意図的に別増分へ回したPath SequenceのRFC §7.2境界ラップを修正
 
 ### 58.1 問題
@@ -6855,12 +5889,6 @@ load-bearing検証: `RplSequenceIncrement()`の実装を素朴な`++`に
 一時的に戻したところ、このテストが明確にFAILすることを確認
 (127→0が127→128になる境界のアサーションで検出)、元に戻して
 再度PASSを確認。
-
-### 58.4 検証
-
-`./ns3 build`(rplモジュール・プロジェクト全体とも)、
-`test-runner --suite=rpl`を複数回実行して安定PASSを確認。
-既存の全テスト(§54-57で追加したものを含む)はPASS。
 
 ## 59. §54.10で見送った複数downwardRoutesエントリの1メッセージ集約を実装
 
@@ -6968,31 +5996,12 @@ load-bearing検証:
   ところ、このテストが`m_daoCount`実測値4(期待1)で明確にFAILする
   ことを確認、元に戻して再度PASSを確認。
 
-### 59.6 検証
-
-`./ns3 build`(rplモジュール・プロジェクト全体とも)、
-`test-runner --suite=rpl`を複数回実行して安定PASSを確認。
-
 ## 60. `/protocol-test-matrix`によるDAO複数Target集約(§59, `ae1f4a2`)の監査
 
 標準メモリ指示(contrib/rpl実装マイルストーン後は毎回
 `/protocol-test-matrix`を実行)に従い、直近の§59実装(DAO複数
 Target集約)自体を対象に、新5角並列マルチエージェント構成の
 2回目の実地運用として監査を実施。
-
-### 60.1 監査体制
-
-Phase 0(対象確定、非委譲)でSendNoPathDao()が独自にRplDaoHeader
-を組み立てておりSendDaoMessage()を経由しない(§54.2由来の既存の
-意図的設計、viaParentがpreferredParentと異なりうるため)ことを
-確認 — 集約機能の移行漏れ角(角5)が誤検出しないよう、事前に
-「対象外」と整理した上でPhase 1へ。
-
-5角(正常系・境界値・異常系・シーケンス状態遷移・移行漏れ)を
-それぞれ独立コンテキストのAgentサブエージェントとして並列起動。
-セッション上限リセット(13:20 JST)を跨いだため、角4(シーケンス
-状態遷移)・角5(移行漏れ)は一度失敗し、リセット後に再起動して
-完走した。
 
 ### 60.2 発見された候補(Phase 1、重複統合後)
 
@@ -7048,23 +6057,6 @@ Phase 0(対象確定、非委譲)でSendNoPathDao()が独自にRplDaoHeader
 7. `SendNoPathDao()`が集約に参加しない設計判断そのものは正しいが、
    この節の他の設計判断と異なりコメントで明文化されていなかった
    (角5)。
-
-### 60.3 Phase 2 検証結果
-
-候補1・2・3・5はいずれも実プローブ(一時的なテストケース追加→
-`./ns3 build test-runner`→実行→復元)でCONFIRMED。候補4は
-PLAUSIBLE(機構自体は実在するが、フラグメンテーション層により
-実害は緩和されている)。候補6・7はコード読解のみで自明
-(プローブ不要と判断)。
-
-検証プロセス中、複数の並列検証エージェントが同一作業ツリー
-(`contrib/rpl`)に一時的なプローブコードを同時に書き込み、
-互いの変更が干渉する場面があった(あるエージェントが未知の
-`NS_LOG_UNCOND("VERIFIER-PROBE ...")`行を発見する等)。いずれも
-各エージェント自身が`git diff`で自分の変更のみを慎重に復元し、
-最終的な作業ツリーはクリーンな状態に戻ったことを確認済み。今後、
-同一ファイルを触る検証エージェントを多数並列起動する場合は、
-このような一時的な衝突が起こりうる点を踏まえておく。
 
 ### 60.4 修正
 
@@ -7127,13 +6119,6 @@ load-bearing検証: 上記のうち修正1・2・3それぞれについて、対
 明確にFAILすることを確認、元に戻して再度PASSを確認。修正4(ログ
 警告のみ)・5(表示のみ)・6(docコメントのみ)は機能的な正誤に
 関わらないためload-bearing検証の対象外。
-
-### 60.6 検証
-
-`./ns3 build`(rplモジュール・プロジェクト全体とも)、
-`test-runner --suite=rpl`を複数回実行し、既存118件+新規5件=
-123件全てが安定PASSすることを確認。
-既存の全テスト(§54-58で追加したものを含む)はPASS。
 
 ## 61. DTSN・DODAG Version NumberにもRFC 6550 section 7.2境界ラップ修正を適用(§58の対象拡大)
 
@@ -7226,12 +6211,6 @@ load-bearing検証: 両修正それぞれについて、対応行を元の`++`�
 `actual`表示が文字化けしたが、期待値0との不一致自体は明確に検出
 できた)、元に戻して再度PASSを確認。
 
-### 61.4 検証
-
-`./ns3 build`(rplモジュール・プロジェクト全体とも)、
-`test-runner --suite=rpl`を実行し、既存123件+新規2件=125件全てが
-安定PASSすることを確認。
-
 ## 62. `/protocol-test-matrix`による§61(DTSN・Version境界ラップ)の監査
 
 標準メモリ指示に従い、§61(コミット`e855947`)自体を対象に新5角監査を
@@ -7322,10 +6301,6 @@ grepで全数確認(4箇所: Path Sequence x2、DTSN、Version)した上で
 2ノードの本テスト環境では他ICMPv6トラフィックが無いため、これ単体も
 load-bearing化はできない(誤検出を実際には踏んでいない)。
 
-`./ns3 build`(rplモジュール・プロジェクト全体とも)、
-`test-runner --suite=rpl`を実行し、既存125件全てが安定PASSすることを
-確認(新規テストは追加していない)。
-
 ## 63. §62角3で報告されたDTSN follow-parentのレート制限欠如を修正
 
 §62の異常系監査(角3)が報告した項目 — RFC 6550は「DAO parentが
@@ -7411,12 +6386,6 @@ DAO件数を数える。
 load-bearing検証: `daoRefreshPending`のガードを一時的に無効化
 (無条件cancel-and-rearmへ戻す)したところ、このテストが実測3件
 (閾値5未満)で明確にFAILすることを確認、元に戻して再度PASSを確認。
-
-### 63.4 検証
-
-`./ns3 build`(rplモジュール・プロジェクト全体とも)、
-`test-runner --suite=rpl`を実行し、既存125件+新規1件=126件全てが
-安定PASSすることを確認。
 
 ## 64. §63の`daoRefreshPending`機構をparent switch側にも拡張
 
@@ -7547,12 +6516,6 @@ load-bearing検証: `daoRefreshPending`のガードを一時的に無効化し�
 ところ、このテストが実測3件(閾値4未満)で明確にFAILすることを
 確認、元に戻して再度PASSを確認。
 
-### 64.3 検証
-
-`./ns3 build`(rplモジュール・プロジェクト全体とも)、
-`test-runner --suite=rpl`を実行し、既存126件+新規1件=127件全てが
-安定PASSすることを確認。
-
 ## 65. `DodagMembership::dioIntervalMin`のデフォルト値欠如によるTrickle無限ループ
 
 §64の`RplParentSwitchRapidBumpCoalescedTestCase`を開発する過程
@@ -7616,12 +6579,6 @@ load-bearing検証: デフォルト初期化子を除去したところ、
 `test-runner --suite=rpl`(このテストを含む完全なスイート)が
 40秒以上CPU使用率100%のまま戻らないことを確認(バックグラウンド
 watchdogで強制終了)。元に戻して再度全件PASSを確認。
-
-### 65.4 検証
-
-`./ns3 build`(rplモジュール・プロジェクト全体とも)、
-`test-runner --suite=rpl`、`./test.py -s rpl`を実行し、
-既存127件+新規1件=128件全てが安定PASS(3.5秒前後)することを確認。
 
 ## 66. `/protocol-test-matrix`による`9bdff64`(§64・§65)の監査
 
@@ -7742,12 +6699,6 @@ load-bearing検証: クランプを一時的に除去したところ、この
   (RFCが要求する正当なwithdrawalであり、レート制限を課すことは
   古い経路の陳腐化という別の正しさの問題を再導入する)と判定。
 
-### 66.5 検証
-
-`./ns3 build`(rplモジュール・プロジェクト全体とも)、
-`test-runner --suite=rpl`、`./test.py -s rpl`を実行し、
-既存128件+新規1件=129件全てが安定PASS(3.3秒前後)することを確認。
-
 ## 67. §66.4で持ち越したstaleness sweepとparent switchの二重withdrawal送信を修正
 
 §66角1の指摘 — セッション利用上限で検証未完了だったもの — を
@@ -7829,12 +6780,6 @@ load-bearing検証: ガード(`dodag.parents.find(...) != end()`)を
 一時的に除去したところ、このテストが実測2件(期待1件)で
 明確にFAILすることを確認、元に戻して再度PASSを確認。
 
-### 67.4 検証
-
-`./ns3 build`(rplモジュール・プロジェクト全体とも)、
-`test-runner --suite=rpl`、`./test.py -s rpl`を実行し、
-既存129件+新規1件=130件全てが安定PASS(3.6秒前後)することを確認。
-
 ## 68. §66.4角4のrejoin経路カバレッジ欠如を解消
 
 §65の`dioIntervalMin`デフォルト値修正は、`JoinDodag()`を呼ぶ2つの
@@ -7855,12 +6800,6 @@ load-bearing検証: `dioIntervalMin`のデフォルト初期化子を一時的�
 (watchdog強制終了)することを確認 — §65が塞いだのと同一のTrickle
 無限ループが、rejoin経路からも確かに到達可能で、かつ確かに修正で
 塞がれていることを直接確証した。元に戻して全件PASSを再確認。
-
-### 68.1 検証
-
-`./ns3 build`(rplモジュール・プロジェクト全体とも)、
-`test-runner --suite=rpl`、`./test.py -s rpl`を実行し、
-既存130件+新規1件=131件全てが安定PASS(3.6秒前後)することを確認。
 
 ## 69. `m_disTimer`にも`daoRefreshPending`と同じ形のガードを適用、
      その過程で見つけた別バグも修正
@@ -7940,132 +6879,6 @@ root→child方向を恒常的に遮断してから2回目のpoisonを注入す�
 load-bearing検証: 修正2(`JoinDodag()`側の`m_disRefreshPending`
 クリア)を一時的に除去したところ、このテストが明確にFAILする
 ことを確認、元に戻して再度PASSを確認。
-
-### 69.4 検証
-
-`./ns3 build`(rplモジュール・プロジェクト全体とも)、
-`test-runner --suite=rpl`、`./test.py -s rpl`を実行し、
-既存131件+新規1件=132件全てが安定PASS(3.6秒前後)することを確認。
-
-## 70. §37の残課題への2つの候補を検証、両方とも却下(production codeへの変更なし)
-
-論文再現評価(base RPL/P2P-RPL/AODV-RPLの比較、`examples/
-rpl-paper-evaluation.cc`)の実施中に、SimpleNetDevice上でも
-`GetRank() == RPL_INFINITE_RANK`のまま固着するノードが一定割合
-observedされ、これをきっかけに§37の残課題(root自身のTrickleが
-Imaxに張り付いたまま戻らず、`GlobalRepairInterval`が実効性を
-持たない問題)への対応を検討した。
-
-結論から言うと、**production codeへの変更は無い**。§37.10が挙げた
-案1(root自身のdioTrickleにも通常のconsistency/inconsistency処理を
-適用する)はコード調査だけで有望とは言えないと判明し、新たに
-考案した案(GlobalRepairBurstCount、後述)は実機検証の末に効果
-ゼロと確認された。§37.10の案2(`GlobalRepairFire()`へのack/retry
-新設)だけが、依然として否定されていない唯一の残り選択肢である。
-
-### 70.1 §37.10案1の再検討: コード調査だけで有望性が低いと判明
-
-案1は「`HandleDio()`冒頭の"rootは自分DODAG宛てDIOを無視"ガードが
-rootのTrickleを非対称に扱っている」という診断に基づく。しかし
-`HandleDio()`と対になる`HandleDis()`を確認したところ、こちらには
-同種のroot除外ガードが**存在しない**: multicast DIS受信時は
-`m_dodags`の全メンバーシップ(root自身が根を張るものも含む)に
-無条件で`dodag.dioTrickle.Reset()`を呼んでいる(RFC 6550 section
-8.3)。これは机上の読みに留まらず、既存の`RplDisHandlingTestCase`
-(「A multicast DIS did not reset the root's Trickle timer」という
-アサーションメッセージを持つ)によって実際にPASSする形で
-実証済みの現行動作である。
-
-さらに、`GlobalRepairFire()`自身は`HandleDio()`/`HandleDis()`の
-どちらも経由せず、`dodag.dioTrickle.Reset()`を**直接**呼んでいる。
-つまり「rootのTrickleが実際にリセットされる」状況は
-`GlobalRepairInterval`を有効にした時点で既に発生しており、
-§37.7-37.9はまさにその状態を測定して効果ゼロという結果を得ている。
-案1(DIO経由のリセット経路を追加する)は、既に動いている別の
-リセット経路(GlobalRepairFire()の直接呼び出し)が効果ゼロだった
-以上、同じ理由で効果が薄いと判断し、実装には着手しなかった。
-
-(付随して分かったこと: `DisInterval`属性のドキュメントコメントは
-「未joinのノードが送る周期DIS」限定であり、既にjoin済みのノードは
-周期DISを送らない。rank ceilingで固着したノードは`LeaveDodag()`を
-経由しない(`dodag.rank`をINFINITE_RANKにセットするだけでmembership
-自体は残る)ため、固着後もDISを送信しない。長時間安定したネット
-ワークではDIS自体がほぼ発生しないため、HandleDis()経由のリセット
-経路は理論上は非対称ではないが実際にはほとんど使われない。)
-
-### 70.2 新規候補: `GlobalRepairBurstCount`(実装・検証・revert済み)
-
-70.1を踏まえ、「rootのTrickleは既にリセットされているのに、なぜ
-`GlobalRepairInterval`を有効にしても効果が無いのか」という別の
-角度から、`GlobalRepairFire()`が1回の`Reset()`しか行わないことに
-着目した。Reset()は次の送信機会を[Imin/2, Imin)の中のランダムな
-1点にしか作らない。CSMA-CA輻輳下ではこの1回の送信機会が単純に
-失われる可能性があり、失われれば次の`GlobalRepairInterval`
-(実験では300秒)まで何のフォローアップも無い。
-
-**実装**: `GlobalRepairFire()`の1回のResetに続けて、
-`dioIntervalMin`間隔で`GlobalRepairBurstCount - 1`回の追加Reset()を
-発行する仕組みを追加した。新規`uint8_t`属性
-`GlobalRepairBurstCount`(既定値1 = 従来どおり無効、既存の全
-シナリオ・全テストに対して完全なno-op)、`DodagMembership`に新規
-`Timer globalRepairSustainEvent`と`uint8_t
-globalRepairPulsesRemaining`を追加、新規メソッド
-`GlobalRepairSustainFire()`。`CreateDodagMembership()`/
-`LeaveDodag()`への配線は`globalRepairEvent`自身と同じパターンを
-踏襲。
-
-**検証環境**: 本節の測定にはSimpleNetDeviceは使えない(CSMA-CA輻輳
-そのものが存在しないため)。§37.2と同じ条件(100ノード、200m四方、
-`RandomRectanglePositionAllocator`、lr-wpan+6LoWPAN、無トラフィック、
-OF0)を再現する使い捨てのscratchプローブ(`scratch/
-rpl-global-repair-burst-probe.cc`、§37.10の`scratch/
-rpl-rank-stability-probe.cc`と同じ位置づけで作成・検証後に削除済み)
-を新設し、`GlobalRepairInterval=300s`固定で`GlobalRepairBurstCount`
-1(現状)と5(修正)を比較した。
-
-**結果: 3 seed全てで完全に同一**。seed1(12000秒、フル尺):
-joined数が99→74/99まで単調減少する§37.2と同じパターンを再現した
-上で、burstCount=1とburstCount=5の間で全サンプル点(600秒おき、
-20点)が1つも違わず一致。seed2・seed3(6000秒)も同様に、それぞれ
-99→86/99、99→81/99という減少パターンの全サンプル点で完全一致。
-
-**機構が動いていないわけではないことを確認**: 完全一致という結果
-自体が「実は`GlobalRepairSustainFire()`が呼ばれていない」という
-実装バグを疑わせたため、一時的にtrace計装して確認した。設計通り
-1回のGlobal Repairにつき4回追加でfireしており、fire時点の
-`dioTrickle`の`m_interval`は常にIminの2倍(直前のResetからImin
-経過後、`IntervalEvent()`が1回だけ倍加した直後)になっていた —
-RFC 6206 section 4.2の「既にIminならReset()はno-op」には一度も
-該当しておらず、Reset()は毎回実際にIminへ戻す効果を持っていた。
-
-**それでも効果が無かった理由**: このバースト機構が増幅するのは
-root自身の送信頻度のみである。中継ノードが自分自身のTrickleを
-Reset()するのは、自分がまだ聞いていない新しいinconsistencyを
-検知した時だけであり、rootが(version番号を変えずに)同じ内容を
-連投しても、既に一度中継済みの中継ノードにとってはただの
-consistentな重複でしかなく、`ConsistencyHit()`にしかならない。
-つまりこの増幅はrootの1ホップ隣接ノードにしか届かず、多ホップ先で
-詰まっているノードの再送を一切加速しない。3 seedとも「たまたま
-1ホップ隣接に固着ノードが無かった」のではなく、この機構が
-多ホップの固着に対して構造的に無力であることを示している。
-
-**結論**: `GlobalRepairBurstCount`はコード上は正しく動作するが、
-§37の実害(遠方ノードの永久固着)には無関係と判明したため、
-production codeから完全にrevertした(`model/rpl-routing-protocol.h`
-/`.cc`の差分ゼロ、既存135テスト全件PASS変わらず)。検証用
-scratchプローブも役目を終えたため削除した。
-
-### 70.3 残された選択肢
-
-**(§98で真因を特定済み。以下の選択肢はいずれも不要になった。)**
-
-§37.10の案2(`GlobalRepairFire()`にDAO-ACK相当のack/retryを持たせる)
-だけが、本節で否定されていない唯一の方向として残る。ただし
-§37.10自身が指摘する通りコストは小さくなく、RFC 6550のDIOが
-本来fire-and-forget(冗長性による到達性担保)を前提に設計されて
-いることを踏まえると、確認応答プロトコルの新設はRPLの設計思想
-からやや外れる重い解決策でもある。現時点でこれ以上の着手予定は
-無い。
 
 ## 71. RFC 6550 section 11.2.2.3 DAO Inconsistency Detection and Recovery を実装
 
@@ -8178,13 +6991,6 @@ load-bearing検証: (A)を`else if (false && storing)`で無効化した
 `NotifyForwardingError()`呼び出しをコメントアウトしたところ
 `RplForwardingErrorPurgesStaleRouteTestCase`が確実にFAILすることを
 確認、両方とも元に戻して再度PASSを確認した。
-
-### 71.4 検証
-
-`./ns3 build`(rplモジュール・プロジェクト全体とも)、
-`test-runner --suite=rpl`(5回連続実行して安定性を確認)、
-`./test.py -s rpl`を実行し、既存135件+新規2件=137件全てが
-安定PASS(0.9秒前後)することを確認。
 
 ## 72. RFC 6997 section 7 の 'N' (複数 Source Route) を実装
 
@@ -8370,13 +7176,6 @@ load-bearing 検証:
 `alternateRoutes` の上限は `numRoutes` そのものなので、悪意ある大きな
 値でもメモリ上は最大 3 本で頭打ちになる。
 
-### 72.8 検証
-
-`./ns3 build`(rpl モジュール・プロジェクト全体とも)、
-`test-runner --suite=rpl`(5 回連続実行して安定性を確認)、
-`./test.py -s rpl`を実行し、既存 137 件 + 新規 3 件 = 140 件全てが
-安定 PASS (1.0 秒前後) することを確認。
-
 ## 73. §72 への `/protocol-test-matrix` 監査 — MUST 違反1件を含む8件を修正
 
 §72 実装直後に走らせた監査。**5角のうち Angle 2 (境界値) と Angle 4
@@ -8561,28 +7360,6 @@ method" を免罪符として使っていたのも誤りで、この文は**候�
 
 ### 73.6 修正しなかった指摘
 
-- **RFC 6997 §9.4 の中継側多様性 SHOULD が未実装** (Angle 1)。逐語:
-  "To improve the diversity of the routes being discovered, an
-  Intermediate Router SHOULD keep track of multiple routes...one of
-  which SHOULD be selected in a uniform random manner for inclusion in
-  the P2P-RDO inside the router's next DIO." これは 'N' を機能させる
-  ために RFC が**中継ルータ**側に置いた仕組みで、§72.1 が「単一
-  preferred parent モデル」として避けた前提そのもの。未実装のままだと、
-  多様性が中継の親選択から生まれるトポロジ (O→{A,B}→R→T のような、
-  R が等価な親を 2 つ持つ形) では Target のウィンドウは何も集められず、
-  'N' > 0 が実質無効になる。§72 が追加したテストは、代替経路が全て
-  Target への最終ホップになるダイヤモンド型 — §9.4 を必要としない
-  唯一の形状 — を使っているため、この穴を踏まない。**'N' の価値を
-  実際に効かせるには次に着手すべき項目**として記録する。
-  (**75節の通り対応済み**)
-- **Address Vector に載せる自アドレスが受信インタフェースのもので
-  ない** (Angle 1)。§7 逐語: "The IPv6 address that a router adds to
-  the vector MUST belong to the interface on which the router received
-  the DIO containing this P2P-RDO." `GetGlobalAddressIn()` は全
-  インタフェースを走査して最初に prefix が一致したものを返し、
-  `HandleP2pRdo()` が受け取っている `interface` 引数を使っていない。
-  §72 以前からある挙動で primary 経路も同じ形。マルチインタフェース
-  ノードでのみ顕在化する。'N' とは独立の別件として未修正。(§100で修正済み)
 - **'N' を経由ルータが書き換えられる** (Angle 3)。中継は受信値を
   素通しするので、フラッド上の任意のルータが 'N' を 0b11 にすると
   Target は 4 通ぶんのバッチを組む。ただしパディング廃止 (§73.2) に
@@ -8611,13 +7388,6 @@ method" を免罪符として使っていたのも誤りで、この文は**候�
 再現に multi-Target 経路・ウィンドウ中の親切替・偽造 P2P-DRO といった
 仕込みが要り、今回はコードレビューと RFC 照合のみで採用した。次
 サイクルで Angle 2・Angle 4 を実行する際に、ここを起点にする。
-
-### 73.8 検証
-
-`./ns3 build`(rpl モジュール・プロジェクト全体とも)、
-`test-runner --suite=rpl`(5 回連続実行して安定性を確認)、
-`./test.py -s rpl`を実行し、既存 140 件 + 新規 1 件 = 141 件全てが
-安定 PASS (1.0 秒前後) することを確認。
 
 ## 74. 潜在バグ: AODV-RPL H=1 の転送ループ (再現手順つき、**76節の通り対応済み**)
 
@@ -8695,28 +7465,6 @@ payload 74、Next Header 0 (hop-by-hop 拡張) — DAO に RPI が付いたも�
 組み合わせになっており、ストリームが1本ずれると成立する組み合わせに
 なる。つまり**既定値で通っているのは運**であり、トポロジや乱数種を
 変えれば同じ条件は現実に踏みうる。
-
-### 74.4 当時、未修正とした理由 (その後 §76 で修正)
-
-§75 の作業範囲 (P2P-RPL の経路多様性) と完全に別のサブシステム
-(AODV-RPL の H=1 経路設置) の問題であり、修正には `HandleAodvRreq()`/
-`HandleAodvRrep()`/`StoreHopByHopRoute()` の設置ロジックそのものの
-見直しが要る。§75 を止めてまで着手する筋ではないと判断し、記録に
-留めた。
-
-次に着手するときの手掛かり:
-
-1. 上記1行変更でテストを1件だけ登録すれば、確実に再現する。
-2. ループの向きは **TargNode → OrigNode** (Reverse 方向)。
-   `StoreHopByHopRoute()` の呼び出し元のうち、Reverse 方向の next hop を
-   決めている箇所を疑う。
-3. `RplP2pHopByHopRouteConflictTestCase` に相当する衝突検出
-   (§9.6 の「next hop が食い違う経路は捨てる」) が AODV-RPL 側にも
-   効いているか確認する — 効いていればループは張れないはずで、
-   張れているということはどこかで検出をすり抜けている。
-4. ICMPv6 エラーがエラーを生む増幅も、それ自体が独立した堅牢性の
-   問題として見る価値がある (ループが無くても、経路の無いノードで
-   同じ連鎖は起こりうる)。
 
 ## 75. RFC 6997 §9.4 の中継側経路多様性を実装 — 'N' がようやく実効化
 
@@ -8822,13 +7570,6 @@ node 3 が preferred parent 1本に固定され、DIO には 1 経路しか載�
 おり、**確率的に脆かった**。測定対象と観測サンプル数を組み替えた
 経緯は §77.4。
 
-### 75.5 検証
-
-`./ns3 build`(rpl モジュール・プロジェクト全体とも)、
-`test-runner --suite=rpl`(5 回連続実行して安定性を確認)、
-`./test.py -s rpl`を実行し、既存 141 件 + 新規 1 件 = 142 件全てが
-安定 PASS (1.0 秒前後) することを確認。
-
 ## 76. §74 の AODV-RPL H=1 転送ループを修正
 
 §74 が再現手順まで特定して未修正のまま残した件。原因まで到達して直した。
@@ -8909,8 +7650,6 @@ dodag.preferredParent`) は**この router が既に経路を記録した後に
 - 修正後: 同じ条件でスイート全体が先へ進む (load-bearing 検証として、
   `pinNextHop` の判定を `if (false && …)` で無効化すると確実に
   クラッシュが再発することを確認)。
-- 出荷構成 (§74.1 の変更を当てない状態) で `test-runner --suite=rpl`
-  を 5 回連続実行、`./test.py -s rpl`、142 件全て安定 PASS。
 
 ## 77. 乱数軌道スイープという道具と、それが今出している未解決 1 件
 
@@ -8927,34 +7666,9 @@ dodag.preferredParent`) は**この router が既に経路を記録した後に
     return 3;   // was 2
 ```
 
-新しい乱数変数を足す必要すら無い。ノード毎のストリーム割当がずれ、
-全ノードの Trickle ジッタが変わり、シミュレーション軌道全体が変わる。
-`./test.py -s rpl` を回すだけで、既定軌道では踏まない経路を踏む。
-
 角1〜5 が diff スコープに閉じているのに対し、これは
 `/protocol-test-matrix` の Angle 6 (無指向スイープ) と同じ位置づけ —
 一度も diff に入らない行のバグを拾える。
-
-### 77.2 現時点の結果
-
-- **AODV-RPL H=1 転送ループ**: §74 で特定、§76 で修正。
-- **未解決 1 件**: `RplNoPathDaoOnce…` 系のテスト
-  「A preferred parent that goes stale exactly as a better one is heard
-  is withdrawn once, not twice」が、この軌道では
-
-  ```
-  test="noPathDaoCountAfter (actual) == 1 (limit)" actual="2" limit="1"
-  ```
-
-  で落ちる。(**80節の通り切り分け済み — §67 の修正は健在で、
-  テスト側が過大に数えていた**)
-
-### 77.3 §9.4 の乱数がストリームを新設しない理由 (**81節の通り解消**)
-
-§75.3 に書いたとおり。§76 でクラッシュが直った後、専用ストリームに
-戻せるか試したところ、今度は 77.2 の未解決 1 件で落ちた。出荷構成を
-既知良好に保つため `m_jitter` 共用のままにしてあった。§80 で 77.2 が
-解けたので、§81 で専用ストリームへ戻した。
 
 ### 77.4 このスイープが暴いたテスト側の脆さ
 
@@ -9114,13 +7828,6 @@ No-Path DAO 二重送出) まで到達するようになった。**クラッシ�
   張る際に `droRetryEvent.Cancel()`。
 
 ### 78.5 テストが空コンテナを索引していた (Angle 2)
-
-`src/core/model/test.cc` の `m_continueOnFailure` は既定 true で、
-`--stop-on-failure` を付けるのは `test.py` が `--multiple` 無しの
-ときだけ。つまり `AGENTS.md` が NS_LOG デバッグ用に案内している
-`./ns3 run 'test-runner --suite=rpl'` では、`NS_TEST_ASSERT_MSG_EQ`
-は**失敗しても return しない**。
-
 §72/§75 で追加したテストは `m_routes.size()` を確認した直後に
 `m_ackRequested[0]` や `route[0]` を索引していたため、捕捉が空だった
 場合に「expected 3, got 0」という綺麗な失敗が**範囲外アクセス**に
@@ -9141,21 +7848,6 @@ No-Path DAO 二重送出) まで到達するようになった。**クラッシ�
 
 ### 78.7 修正しなかった指摘
 
-- **`RPL_P2P_ADDRESS_VECTOR_MAX_ENTRIES` = 14 は Compr=0 の上限**
-  (Angle 2、単独)。RFC 6997 §7 の
-  `n = (Option Length - 2 - (16 - Compr))/(16 - Compr)` から
-  Option Length が 8 bit であることを使って導くと、上限は
-  **Compr=0 で 14、Compr=8 で 30、Compr=15 で 252**。この モジュールは
-  `P2pElidedPrefixLength()` が同一 /64 では常に 8 を返すので、
-  実運用上の Compr は 8 であり、本来 30 まで載る。現状は 5 箇所
-  (`rpl-conf.h` の定義、`rpl-p2p.cc` の 3 箇所、`rpl-header.cc` の
-  deserializer と assert) が**一貫して 14** を使っている — 互いに
-  ずれてはいないが、揃って厳しすぎる。実害: 16 ホップの一直線
-  トポロジで深さ 14 の ルータが Target の 2 ホップ手前で
-  `LeaveDodag()` し、討伐が打ち切られる。また準拠実装が送る
-  Compr=8・15〜30 エントリの P2P-RDO を malformed として捨てる。
-  §72-§78 のいずれよりも前からある挙動で、修正は上限を Compr 依存に
-  する必要があり、ワイヤ受理範囲を変える。(**79節の通り対応済み**)
 - **retry 予算が DIO 到着ごとにリセットされ
   `MAX_P2P_DRO_RETRANSMISSIONS` が実質束縛しない**、および **2 bit の
   Seq が 4 サイクルで一周し古い P2P-DRO-ACK と衝突しうる** (Angle 4、
@@ -9174,13 +7866,6 @@ No-Path DAO 二重送出) まで到達するようになった。**クラッシ�
   そちらを直し、この判断自体は据え置いた。
 
 ### 78.8 検証
-
-`./ns3 build`(rpl モジュール・プロジェクト全体とも)、
-`test-runner --suite=rpl`(5 回連続実行して安定性を確認)、
-`./test.py -s rpl`を実行し、142 件全てが安定 PASS (1.05 秒前後)。
-あわせて §77.1 の掃き出しを当てた状態でも、クラッシュせず §77.2 の
-既知の未解決項目まで到達することを確認した。
-
 **専用テストを持たない修正**: 78.1・78.2・78.3・78.4 の各修正。
 いずれも再現に multi-Target 経路、ウィンドウ中の親切替、instance
 decay といった仕込みが要る。78.3 だけは §77.1 の掃き出しが事実上の
@@ -9275,13 +7960,6 @@ DODAGID が `2001:a::` 系なのに ノード自身のグローバルアドレ�
 load-bearing 検証: 判定を `RPL_P2P_ADDRESS_VECTOR_MAX_ENTRIES` に戻すと
 `actual="0" limit="1"` で確実に FAIL。
 
-### 79.5 検証
-
-`./ns3 build`(rpl モジュール・プロジェクト全体とも)、
-`test-runner --suite=rpl`(5 回連続実行して安定性を確認)、
-`./test.py -s rpl`を実行し、既存 142 件 + 新規 1 件 = 143 件全てが
-安定 PASS (1.07 秒前後)。
-
 ## 80. §77.2 の No-Path DAO 二重送出を切り分け — 実装ではなくテストの欠陥
 
 §77 の乱数軌道スイープが唯一出し続けていた未解決項目。**実装は正しく、
@@ -9343,8 +8021,6 @@ DAO を 1 秒窓で無差別に数え**、`== 1` を要求していた。これ�
   メッセージは撤回されたプレフィックスを名指しする。
 - **スイープ軌道で 143 件全 PASS**。§77 のスイープが出し続けていた
   未解決項目はこれで無くなった。
-- 出荷構成で `test-runner --suite=rpl` を 5 回連続実行、
-  `./test.py -s rpl`、143 件全て安定 PASS (1.06 秒前後)。
 
 ### 80.5 教訓
 
@@ -9476,14 +8152,6 @@ DIO を 1 回しか配送しないため、この変更の影響範囲に触れ�
 
 load-bearing 検証: 返信分岐の条件を `dodag.p2p.reply` のみに戻すと、
 `m_droCount` が `actual="2"` で確実に FAIL する。
-
-### 82.5 検証
-
-`./ns3 build`(rpl モジュール・プロジェクト全体とも)、
-`test-runner --suite=rpl`(5 回連続実行して安定性を確認)、
-`./test.py -s rpl`を実行し、既存 143 件 + 新規 1 件 = 144 件全てが
-安定 PASS (1.05 秒前後)。§77.1 の乱数ストリーム掃き出しを当てた状態
-でも 144 件全て PASS することを確認した。
 
 ## 83. AODV-RPL H=1 上り経路: instanceId しか見ない照合が別目的のエントリを取り違えていた
 
@@ -9889,11 +8557,6 @@ MUST provide guidance for setting Trickle parameters, particularly Imin and the
 redundancy constant」と続ける。§6.1 の表をチューニングせずに使うことの方が、
 §9.2 に対して不作為である。
 
-### 85.6 検証
-
-`./test.py -s rpl` 全PASS (既定値変更で落ちる試験は無かった)。ハーネス側の既定も
-128ms に合わせ、Tier 2 の3研究 (2,800実行) を測り直した。
-
 ### 85.7 範囲
 
 25ノードGrid・802.15.4・基盤 Trickle Imin 4096ms/k=10 という一つの動作点系での
@@ -9985,13 +8648,6 @@ root; mid宛てのother向けパケットのゲートウェイがroot経由で�
 `Arm*Expiry()`呼び出しを個別に外すと対応する試験が落ちることを確認済み。
 `HandleAodvRrepInstance()`側の対応する専用試験は無い (時間の制約、次点候補)。
 
-### 86.5 未検証で持ち越したもの
-
-角3の残り (P2P-DRO中継のCompr再直列化assert、Serialize()のOpt Data Len不整合、
-doublings上限62/63でのハング) と角5の残り (H=1でのRREQ積集合誤判定の退行、
-`HasOtherP2pTargets()`のTargetAddr不参照) は実証まで進めていない。角4
-(状態遷移) は起動したが上限に達し未完走。次サイクルで拾う。
-
 ## 87. Trickle doublings属性の未クランプ — 単一の属性設定でシミュレータ全体がハングする
 
 §86の角2 (境界値) がプローブで実測した候補を修正した。`RplTrickleTimer::SetParameters()`
@@ -10040,10 +8696,6 @@ doublings上限62/63でのハング) と角5の残り (H=1でのRREQ積集合誤
 必要があったのと同じ理由 (TestCase内で範囲外値をInstall()すると試験系全体が落ちる)。
 3属性それぞれについて上限値(20)が通り、上限+1・62・63が拒否されることを確認。
 チェッカーの上限を外すと確実に落ちることを確認済み (load-bearing)。
-
-### 87.4 検証
-
-`./test.py -s rpl`全PASS。既存試験に影響なし (全既存試験の設定値は最大4)。
 
 ## 88. P2P-DRO中継のCompr再計算不一致 — リモートから1パケットでプロセスを落とせる
 
@@ -10278,11 +8930,6 @@ Address Vectorという非常に稀な入力が要る)、専用試験は追加�
 の追加であり、Comprミスマッチ経路での確認がこの追加パターン自体の
 正しさを裏付けている。
 
-### 90.4 検証
-
-`./ns3 build`clean、`test-runner --suite=rpl`(154件、全PASS)・
-`./test.py -s rpl`PASS。既存試験に回帰なし。
-
 ## 91. `HandleAodvRrep()`のRREP重複判定 — 処理していないRREPで判定を消費し、複数TargNodeを取りこぼす
 
 `/protocol-test-matrix`の角4(シーケンス状態遷移)をモジュール全体に対して
@@ -10354,9 +9001,6 @@ Numberで次ホップだけ違う更新を拒否する)に弾かれてRREP自体
 同試験はbyte-identicalな重複しか注入しないため、**重複判定の粒度((B))に
 対してはload-bearingでない** — 正しく絞ったキーでも通ってしまう。
 verifierの指摘どおりで、本節の新規試験2件がその空白を埋める。
-
-`./ns3 build`clean、`test-runner --suite=rpl`(156件、全PASS)・
-`./test.py -s rpl`PASS。
 
 ## 92. 対称RREPがTargNode自身のSequence Numberを進めていなかった
 
@@ -10444,9 +9088,6 @@ verifierの指摘どおり、**この送出値を観測する試験はこれま�
 既存の`destSeqNo`関連アサート約30箇所はすべて試験自身が捏造した値の
 直列化ラウンドトリップで、実ノードが何を送るかは誰も見ていなかった。
 
-`./ns3 build`clean、`test-runner --suite=rpl`(157件、全PASS)・
-`./test.py -s rpl`PASS。
-
 ## 93. `mayMove`が「消えた隣接」を競合相手として守り、上り経路を古いまま固定していた
 
 角4の3件目。§92の候補を検証していたverifierが、その過程で**別の経路**として
@@ -10512,9 +9153,6 @@ instance指定オーバーロードに任意のout-param(`uint8_t* seqNo = nullp
 RREQ-DIOが`mayMove`に到達する前に拒否されるため。0にせず非ゼロを保った
 のは、§35.4が記録している「近隣のTrickleで即再加入してインスタンスが
 死なない」問題を防ぐ機構を殺さないため。
-
-`./ns3 build`clean、`test-runner --suite=rpl`(158件、全PASS)・
-`./test.py -s rpl`PASS。
 
 ## 94. MOP=4のDODAG Version移行が'L'期限を毎回リセットしていた
 
@@ -10604,9 +9242,6 @@ enough to have new versions"と明言しており、RFC 9854のRREQ-Instanceも
   追加した。欠陥の修正ではない。ガードを無効化すると落ちることを
   確認済み(load-bearing)
 
-`./ns3 build`clean、`test-runner --suite=rpl`(160件、全PASS)・
-`./test.py -s rpl`PASS。
-
 ## 95. AODV-RPLのID割当がREJOIN_REENABLEを見ず、再探索を~884秒間まるごと潰していた
 
 角4の5件目。独立verifierが実プローブでCONFIRMED、gap掃引による定量測定まで
@@ -10690,9 +9325,6 @@ Trickleのコピーごとに並ぶ。
 バー参照を外すと同じIDが再利用されて確実に落ちることを確認済み
 (load-bearing)。
 
-`./ns3 build`clean、`test-runner --suite=rpl`(161件、全PASS)・
-`./test.py -s rpl`PASS。
-
 ## 96. P2P-RPLのID割当がRFC 6997 §6.1の再利用禁止を実装していなかった
 
 角4の6件目(最後)。独立verifierが実プローブでCONFIRMEDし、
@@ -10774,159 +9406,6 @@ P2P-RPLにはREJOIN_REENABLEに相当する規定が無い(§309付近の既存�
 
 窓の判定を外すと同じIDが再利用されて確実に落ちることを確認済み
 (load-bearing)。
-
-`./ns3 build`clean、`test-runner --suite=rpl`(162件、全PASS)・
-`./test.py -s rpl`PASS。
-
-### 96.5 角4の総括
-
-`/protocol-test-matrix`の角4(シーケンス状態遷移)をモジュール全体に対して
-初めて完走させた結果、Phase 1で5候補、Phase 2の独立検証で**5件すべて
-CONFIRMED**、さらに検証中に1件(§93)が追加で見つかり、計6件を§91〜§96で
-修正した。
-
-6件のうち4件(§92・§93・§95・§96)が**「解放済みローカルRPLInstanceIDの
-再利用」と「それが張った派生状態の長い寿命」の不一致**という同一の
-根本原因を共有していた。既に§83・§89でこの系統を2度直していたにも
-かかわらず、別の現れ方がまだ4つ残っていたことになる。角4がdiff範囲でなく
-モジュール全体を対象にしたからこそ届いた領域で、diffスコープの角1〜3では
-原理的に捕まえられなかった。
-
-試験は154件から162件へ。各修正は個別にload-bearing検証済み。
-
-## 97. 角4修正群のPhase 5実測 — 掃引で3シード時の結論が覆った
-
-§91〜§96の修正後、単体試験(162件)を越えたシナリオ回帰として
-`rpl-large-scale-system-test`で修正前後を比較した。
-
-**本節は一度書き直している。** 最初は3シードの単発比較で
-「§91〜§94が配送を+7.7%改善し、§95が+21%の制御コストを持つ」と記録したが、
-30シード×2つの独立したシード帯で掃引し直した結果、**前半は誤りだった**。
-経緯ごと残す。
-
-### 97.1 測定の構成
-
-3つのコミットのバイナリを個別にステージし(rplモジュールは共有ライブラリ側
-なので`.dylib`ごと分離)、同一シードで同一シナリオを走らせて対応ありで比較:
-
-- `before` = `5a1e5e7`(角4着手前)
-- `mid` = `321d7e2`(§91〜§94: RREP重複判定・Dest SeqNo・`mayMove`・Version移行)
-- `after` = `05edb25`(§95・§96を追加: 2つのIDアロケータ)
-
-`mid - before`がRREP側の修正群、`after - mid`がアロケータを切り分ける。
-動作点は`--scenario=3`(AODV)で3つ、各30シード、さらに独立したシード帯
-(1-30と101-130)で全体を2回。統計は対応あり差分のbootstrap CI(20000回)。
-
-`op2`(simTime=900)は**独立した情報を持たなかった**: pdr・探索成功数・
-遅延・ループ数が`op1`(simTime=300)と小数点以下まで完全一致し、制御バイト
-だけが時間に比例して増える。ハーネスの探索・トラフィック日程がsimTimeに
-連動しないため。動作点としては無効。
-
-### 97.2 結論1: アロケータ(§95・§96)は制御バイト**しか**動かさない
-
-| 動作点 | シード帯 | 制御バイト | pdr | 探索成功 | 遅延 | ループ |
-|---|---|---|---|---|---|---|
-| op1-simple300 | 1-30 | **+19.9%*** | +0.0% | +0.0% | +0.0% | +0.0% |
-| op1-simple300 | 101-130 | **+21.3%*** | +0.0% | +0.0% | +0.0% | +0.0% |
-| op3-lrwpan500 | 1-30 | **+22.0%*** | +0.0% | +0.0% | +0.0% | +0.0% |
-| op3-lrwpan500 | 101-130 | **+24.7%*** | +0.0% | +0.0% | +0.0% | +0.0% |
-
-(* = 対応あり差分の95% bootstrap CIが0を除外)
-
-pdr以下の+0.0%は「平均が同じ」ではなく、**全120ペアで1パケットも違わない**。
-制御バイトの増加だけが一貫して有意。
-
-機序: 従来は連続する探索が同じinstanceIdを再利用し、中継はrejoin barで
-それを**拒否**していたため静かだった。修正後は各探索が別IDを取るので中継が
-実際に加入してTrickleを回す。つまり増えた20〜25%は、**従来は黙って何も
-していなかった探索が実際に動くようになった分**である。
-
-そしてその探索が動いても配送は1パケットも増えない — このハーネスのデータ
-フローが、それらの探索が見つける経路に依存していないため。
-
-### 97.3 結論2: §91〜§94の配送への影響は「無し」(3シード時の結論を撤回)
-
-`mid - before`のpdrをシード帯ごとに並べると:
-
-| 動作点 | シード帯1-30 | シード帯101-130 |
-|---|---|---|
-| op1-simple300 | −4.1%(CIが0を除外) | −3.7%(**非有意**) |
-| op3-lrwpan500 | −8.4%(非有意) | **+14.0%(CIが0を除外)** |
-
-**op3で符号が反転している**(−8.4% → +14.0%)。`loopCount`も
-+0.0% → +157%と乱高下する。これは因果ではなく**軌道ノイズ**の署名である:
-プロトコルの挙動が変わると乱数の消費順序が変わり、全ノードの軌道がずれる。
-`/protocol-test-matrix`の角6が挙げるmetamorphic relation
-「乱数ストリームの割当を変えてもプロトコル準拠性は変わらない」を検定に
-使った形で、シード帯を変えるだけで結論が反転するなら、その差は
-プロトコルの性質ではない。
-
-したがって正しい記述は「**§91〜§94は配送を測定可能な形では変えない**
-(どちらの向きにも)」。制御バイトは+1〜2%で非有意。
-
-最初の3シード比較が「+7.7%改善」を示したのも、30シードの1本目が
-「−4.1%有意」を示したのも、どちらも同じ軌道ノイズを別の向きに拾ったもの
-だった。skill自身が警告している
-「サンプル数不足の確率的結論」(候補2本を3回引いて全同一になる確率は25%)
-を地で踏んだことになる。
-
-### 97.4 §95をどう扱うか
-
-測定が言えるのは「**このベンチマークでは**コスト20〜25%、便益0」まで。
-これは「便益が無い」ではなく「**ベンチマークが対象の故障モードを
-カバーしていない**」と読むべきである:
-
-- ハーネスは300〜500秒で1ノードあたり数回しか探索しない。REJOIN_REENABLEの
-  窓は900秒なので、窓の内側での再探索がそもそもほとんど発生しない
-- verifierの狙い撃ちプローブでは、窓の内側の再探索が**約884秒にわたって
-  全中継で拒否され何も起きない**ことを実測している(§95.1のgap掃引表)
-- §95はRFC 9854 §4.1が中継側に**課している**拒否義務との整合を取る修正で、
-  拒否する側を変えることはできない
-
-緩和案「同じTargetへの再探索に限ってバーを見る」は採れない —
-REJOIN_REENABLEは`{instanceId, dodagId}`に紐付き、dodagIdは常にOrigNode
-自身のアドレスなのでTargetは判定に入らない(RFC 9854 §2/§4.1)。
-バーはRREQ-Instance単位であって探索対象単位ではない。
-
-**判断: §95・§96は維持する。** 正しさが実証済みの欠陥修正であり、
-コストは「本来動くべきだった探索が動く分」として説明がつく。ただし
-既定値の変更や既発表の数値の差し替えは行っていない — 制御バイトを
-主要指標に置く測定(Tier 2の制御コスト解析など)を今後行う際は、
-本節の20〜25%を織り込む必要がある。
-
-### 97.5 再現手順
-
-3コミットのバイナリを`/tmp/rpl-sweep/{before,mid,after}/`にステージ
-(`.dylib`を含めて分離)し、`--scenario=3`で動作点3つ×30シードを7並列で
-実行、対応あり差分をbootstrapで比較。解析には
-`scratch/requirements-analysis.txt`の使い捨てvenvを使う。
-
-### 97.6 クリーン再構築での再実施 — 数値は完全再現、1指標だけ訂正
-
-§97.1〜97.4は`git checkout`によるインクリメンタルビルドで3アームを
-用意していた。ビルド系の汚染(古いオブジェクトファイルの残存等)を
-疑う余地を無くすため、各アームごとに該当オブジェクトファイルを削除して
-強制的にフルリコンパイルし、2つのシード帯(1-30、101-130)×2つの有効な
-動作点(op1-simple300、op3-lrwpan500 — op2は§97.1で無効と確認済みのため
-除外)を実施し直した。
-
-**結果: 全セルが小数点まで前回と完全に一致した。** ビルドの汚染は無かった。
-これにより97.2・97.3・97.4の結論(アロケータのコストのみ有意、RREP側は
-配送に測定可能な影響なし)を独立に裏付ける。
-
-一点、前回の記述を訂正する。「`after - mid`はpdr等の指標を全く動かさない」
-は、`discoveryTargetReached`については正確ではなかった。この指標だけは
-4つの動作点×ブロックの組すべてで2〜4/30シードが非ゼロの差を示した
-(方向は4組とも一貫して微増、+0.5%〜+4.5%、いずれも95% CIは0を跨ぎ
-非有意)。一方`pdr`・`discoverySuccess`・`avgDelayMs`・`loopCount`は
-文字どおり全120ペアで厳密に0のままである。
-
-`discoveryTargetReached`は「要求がTargetに到達した回数」であり、実際に
-データが届いたかどうかを表す`pdr`とは別の計数点にある — アロケータが
-別IDを取って中継が実際に加入するようになった分、探索がTargetまで届く
-回数がわずかに増える余地はあっても、その増分が最終的な配送(pdr)にまで
-反映されるとは限らない、という97.2の説明と矛盾しない微小な効果である。
-有意でないため97.4の判断(§95・§96は維持)は変わらない。
 
 ## 98. §37の真因: lr-wpan PHYが`BUSY_RX`のまま固着する (ns-3本体のバグ)
 
@@ -11295,8 +9774,6 @@ load-bearing検証: `RecordP2pStop()`呼び出しを一時的にコメントア�
 ところ、Rankが更新されてしまい(256、期待値512)FAILすることを確認、
 元に戻して再度PASSを確認した。
 
-`./test.py -s rpl`: 164件(新規1件)全件PASS。
-
 ## 102. §73.5の「専用テストを持たない修正」— OriginのTarget未検証への回帰試験を追加
 
 §73.4/§73.5には計7件、「コードは既に直っているが専用テストが無い」修正が
@@ -11323,9 +9800,6 @@ Targetを名乗るP2P-DRO(Sequence Numberは変えて、Sequence側の重複排�
 load-bearing検証: ガードを`if (false && rdo.target != dodag.p2p.target)`
 で無効化 → FAIL(経路が記録されてしまう)を確認、元に戻して再度PASSを
 確認した。
-
-`./test.py -s rpl`: 165件(新規1件)全件PASS。README.md/doc/rpl.rstの
-試験数表記も164→165に更新した。
 
 §73.4/§73.5の残り6件については引き続き専用テスト無し。
 
@@ -11559,13 +10033,6 @@ OrigNodeの最初の探索がこの形になる。
 非対称のRREQ-DIOを2通、別のOrigNodeから同じRREQ-InstanceIDで届ける。1通目のRREP-Instance
 が期限切れになった後、2通目ではDelta 1のIDを使うこと。load-bearing検証: barの判定を
 外すとDelta 0を再利用してFAILすることを確認した。
-
-### §104の対応状況(この時点)
-- RPLコア: 1 -> §105、2 -> §106、3 -> §107。4(Trickleのconsistent判定)と5(比較不能な
-  Version)は既定値に触れるため保留(利用者の判断待ち)。
-- AODV-RPL: 1 -> §109、5 -> §108。2, 3, 4, 6は未対応。
-- P2P-RPL: 3 -> §107(DIS timer)。1, 2, 4は未対応。§103は別途修正済み。
-- AODV-RPLとP2P-RPLの指摘のうち、独立した検証を経たのは今回試験で再現できたものだけである。
 
 ## 110. §104の未修正7件の独立検証
 
@@ -11974,7 +10441,6 @@ Global Repairを有効にしたシナリオでは、長い遮断の後の回復�
 rule 1)」は、この修正で停止期間そのものが数秒になったので、実害は小さくなったが、解釈の余地があるため
 手を入れていない。
 
-
 ## 120. 自分の修正§103〜§119の監査で出た不具合を直す
 
 §103〜§119の修正を、4つの`rfc-auditor`が別コンテキストで監査した(Dest SeqNo、AODVの離脱とバー、
@@ -12241,7 +10707,7 @@ base DODAG用の値: Imin 4.096秒、k = 0、MaxRankIncrease 1024、MinHopRankIn
 (§110の「範囲外の観察」)。'L'で区切られる探索には遅すぎる。
 
 修正: `JoinDodag()`で、設定の無いP2P mode DIO(P2P-RDOを持つもの)には上の既定値を当てる。Default
-LifetimeとLifetime Unitは表さない(このモジュールは経路の寿命を自分の`PathLifetime`属性から取る)。
+LifetimeとLifetime Unit(0xFF / 0xFFFF)は§131.3で扱う。
 AODV-RPLのDIOには対応する規定が無いので、従来どおり。
 
 試験: `RplP2pDefaultDagConfigurationTestCase`(設定の無いP2P mode DIOを受けた中継が送るDIOの設定値が、
@@ -12250,14 +10716,6 @@ DIOIntervalMin 6、k 1、MaxRankIncrease 0、OCP 0、DIOIntervalDoublings 20、M
 
 既定の評価への影響: このモジュールの`SendDio()`は全DIOに設定を無条件に載せるので、ハーネスで設定の
 無いDIOは生じず、影響は他実装との相互運用に限られる。
-
-見つけた別の穴(未修正): 中継がDIOに載せるDefault LifetimeとLifetime Unitは、受信値ではなく
-`RPL_DEFAULT_LIFETIME`/`RPL_DEFAULT_LIFETIME_UNIT`(30×60秒)の定数である。RFC 6997 §6.1は"An
-Intermediate Router (or a Target) MUST set various fields in the DODAG Configuration Option in the
-outgoing P2P mode DIOs to the values they had in the incoming P2P mode DIOs"とし、Originは"sets the
-Default Lifetime and Lifetime Unit parameters to indicate the lifetime of the state that the routers
-... maintain for a Hop-by-hop or Source Route"とする。受信値を保持して再送し、経路の寿命に使うには、
-経路寿命を属性からDIOの値に移す変更が要る(Originの値は既定で30×60秒、`PathLifetime`の既定と同じ)。
 
 ## 130. lr-wpanの規模の再測定(25〜144ノード)と、論文9.4節の予備確認の更新
 
@@ -12285,4 +10743,174 @@ Default Lifetime and Lifetime Unit parameters to indicate the lifetime of the st
 測定の注意: このセッションのBashツールはzshで、引用符なしの`$BASE`は単語分割されない。最初の1回は
 引数が1つに潰れて既定値(scenario 4、cluster)のまま走り、PDR 11.8%という誤った値が出た。`bash`経由で
 渡し、出力の"Scenario/Topology"行で構成を確かめてから集計した。
+
+## 131. RFC準拠のコードレビュー(RFC 6550 / 6997 / 9854 / 6206 / 6553 / 6554)と修正
+
+モジュール全体(`model/`の全ファイル)をRFC原文と突き合わせて読んだ結果。各修正は、対応する修正だけを
+外すと下記の試験が落ち、戻すと通ることを確認した(load-bearing、16変異)。試験は197件から206件。
+
+### 131.1 探索optionの個数
+
+RFC 6997 §6.1: "A received P2P mode DIO MUST be discarded if it does not contain exactly one P2P-RDO."
+§8: "A received P2P-DRO message MUST be discarded if it does not contain exactly one P2P-RDO."
+RFC 9854 §4.1: "Exactly one RREQ option MUST be present in an RREQ-DIO message; otherwise, the message
+MUST be dropped."(§4.2はRREPについて同文)。§4.3: "An RREQ-DIO message MUST carry at least one ART
+option. An RREP-DIO message MUST carry exactly one ART option. Otherwise, the message MUST be dropped."
+
+`RplDioHeader::Deserialize()`と`RplP2pDroHeader::Deserialize()`は同じ型のoptionを後勝ちで読み、
+`HasP2pRdo()`等の真偽だけでは1個と2個を区別できなかった。RREP-DIOのART optionは「1個以上」しか
+見ていなかった。
+
+修正: ヘッダが型ごとの個数(形式が正しいか否かによらない)を数える(`GetP2pRdoCount()`、
+`GetRreqCount()`、`GetRrepCount()`)。`HandleDio()`はMOP 4のDIOで個数の合計が1でなければ破棄、
+`HandleP2pDro()`はP2P-RDOが1個でなければ破棄、`ShouldRefuseAodvRrep()`と`HandleAodvRrep()`はARTが
+1個でなければ破棄。
+
+試験: `RplExactlyOneDiscoveryOptionTestCase`、`RplP2pDroExactlyOneRdoTestCase`。いずれも、option
+を2個載せたメッセージの直後に同じメッセージを1個で渡し、そちらは受理されることを確認する。
+`HandleAodvRrep()`(対称経路のunicast RREP-DIO)側のART個数の検査には専用の試験が無い。
+
+### 131.2 INFINITE_RANKを広告するP2P mode DIO
+
+RFC 6997 §9.3: "A router MUST discard a received P2P mode DIO with no further processing: if the DIO
+advertises INFINITE_RANK as defined in [RFC6550]"。§9.1: 中継は"MUST maintain its membership in the
+temporary DAG for the duration indicated by the L field"。
+
+`ShouldRefuseP2pRdo()`にこの検査が無く、MaxRankが0(無制限)のときDIOが`HandleDio()`の一般の
+INFINITE_RANK分岐に入った。親が消え、最後の親ならtemporary DAGを'L'より前に抜けていた。
+修正: `ShouldRefuseP2pRdo()`で明示的に破棄。試験: `RplP2pInfiniteRankDioTestCase`。
+
+### 131.3 DODAG Configuration optionのDefault LifetimeとLifetime Unit
+
+RFC 6550 §6.7.6: "Nodes other than the DODAG root MUST NOT modify this information when propagating
+the DODAG Configuration option." §6.7.8、Path Lifetime: "The length of time in Lifetime Units
+(obtained from the Configuration option) that the prefix is valid for route determination."
+RFC 6997 §6.1: "An Intermediate Router (or a Target) MUST set various fields in the DODAG
+Configuration Option in the outgoing P2P mode DIOs to the values they had in the incoming P2P mode
+DIOs for this DAG"、"The Origin sets the Default Lifetime and Lifetime Unit parameters to indicate
+the lifetime of the state that the routers, including the Origin and the Target(s), maintain for a
+Hop-by-hop or Source Route discovered using P2P-RPL." §9.5: "The lifetime of this Source Route is
+specified by the Default Lifetime and Lifetime Unit parameters inside the DODAG Configuration Option
+currently in effect." RFC 9854 §6.4.3: "The lifetime is set according to DODAG configuration (i.e.,
+not the L field)"。
+
+受信したDIOの2値は読まれず、全ノードが定数30 / 60を載せ、経路の寿命は各ノード自身の
+`PathLifetime`属性から計算していた(§129の末尾に記した穴)。
+
+修正: `DodagMembership`に`defaultLifetime`と`lifetimeUnit`を持たせる。DODAGを作るノード(root、
+Origin、OrigNode、TargNode)は自分の`PathLifetime`と単位60秒を入れ、参加するノードは受信値を入れる。
+設定の無いP2P mode DIOにはRFC 6997の既定(0xFF / 0xFFFF、無限)を入れる。`SendDio()`はその値を載せる。
+探索で得た経路の寿命は`RouteLifetime(dodag)`(Default Lifetime × Lifetime Unit、0xFFは無限)、DAOの
+Path Lifetimeは所属DODAGのLifetime Unitで読む。無限は`Time::Max()`で表し、時刻への加算は
+`SaturatingAdd()`を通す。P2P-RPLのRPLInstanceID再利用の禁止期間(§125)はOrigin自身の値で計算する。
+
+変えなかった点: ノードが自分のDAOに載せるPath Lifetimeは従来どおり自分の`PathLifetime`属性
+(Default Lifetimeは"default"であり、ノードが別の値を広告することは妨げられない)。全ノードが同じ
+属性値なら従来と同じ寿命になり、既定の評価への影響は無い。
+
+試験: `RplP2pConfiguredRouteLifetimeTestCase`(Default Lifetime 7、Lifetime Unit 11秒のDIOで参加した
+中継が同じ値を載せ、Hop-by-hop Routeの状態が70秒後にあり80秒後に無い)、
+`RplDagConfigurationLifetimeTestCase`(Storing modeで9 / 13秒。子のDAOのPath Lifetime 2が26秒で切れる)、
+`RplP2pDefaultDagConfigurationTestCase`に0xFF / 0xFFFFの確認を追加。
+
+### 131.4 P2P mode DIOのPrefix Information option
+
+RFC 6997 §6.1はP2P mode DIOが運べるoptionを列挙し、"A RPL option other than those listed above MUST
+be ignored when found inside a received P2P mode DIO and MUST NOT be included in the P2P mode DIOs
+that the receiving router generates."とする。Prefix Information optionは列挙に無いが、`JoinDodag()`は
+それを保存してSLAACを行い、`SendDio()`は再送していた。修正: P2P-RDOを持つDIOのPrefix Information
+optionは無視する。RFC 9854には対応する規定が無いのでAODV-RPLのDIOは従来どおり。
+試験: `RplP2pPrefixInfoIgnoredTestCase`。
+
+### 131.5 MinHopRankIncreaseが0のDIO
+
+RFC 6550 §3.5.1: "DAGRank(rank) = floor(rank/MinHopRankIncrease)"。0では定義できない。MaxRank /
+RankLimitの判定は受信DIOの値で割るので、DODAG Configuration optionにMinHopRankIncrease 0を載せた
+DIO 1個で`NS_ASSERT`(最適化ビルドでは0除算)に至った。修正: `HandleDio()`でそのDIOを無視する。
+試験: `RplZeroMinHopRankIncreaseTestCase`(修正を外すとassertで異常終了する)。
+
+### 131.6 DAOSequence
+
+RFC 6550 §9.3規則1: "If a node sends a DAO message with newer or different information than the prior
+DAO message transmission, it MUST increment the DAOSequence field by at least one. A DAO message
+transmission that is identical to the prior DAO message transmission MAY increment the DAOSequence
+field."
+
+Storing modeの中継DAOは、自分のDAOが待っているDAO-ACKとの照合を壊さないよう、DAOSequenceを増やさずに
+送っていた(内容は直前のDAOと異なる)。再送も、Storing modeでは集約する対象が変わりうるのに同じ値を
+使っていた。
+
+修正: DAOSequenceの管理を`SendDaoMessage()`に集める。送信のたびに増やし、再送だけは、内容と宛先が
+直前の送信と同一なら据え置く(`lastDaoContent`で比較)。DAO-ACKの照合は、'K'を立てて送ったDAOの値
+(`daoAckSequence`)で行うので、間に中継DAOやNo-Path DAOが入っても崩れない。
+試験: `RplDaoSequenceOnRelayTestCase`(自分のDAO、子2つの中継DAOの3送信でDAOSequenceが毎回進み、
+最初のDAOの値を返すDAO-ACKで待ちが終わる)。
+
+解釈として残す点: §9.3規則6("Nodes SHOULD ignore DAOs without newer sequence numbers")は、どの
+sequence numberかを言わない。このモジュールはPath Sequenceで古さを判定し(§9.4規則5)、子ごとの
+DAOSequenceは記録しない。
+
+### 131.7 temporary DAGのOrigin宛パケットのRPL Option
+
+RFC 6997 §9.1: "The temporary DAG MUST NOT be used to route data packets." `RouteOutput()`はこれに
+従いbase DODAGで送るが、`PrepareOutgoingPacket()`は宛先がtemporary DAGのDODAGID(Originのアドレス)
+だとそのDAGのRPLInstanceIDとrankをRPL Optionに書いていた。経路上のルータはbase DODAGに属し、その
+Instanceを知らない。修正: RPL Optionを決める探索からMOP 4のmembershipを外す。
+試験: `RplTemporaryDagOriginRpiTestCase`。
+
+### 131.8 MaxRank判定の既定のMinHopRankIncrease
+
+設定の無いP2P mode DIOのDAGRankを、`ShouldRefuseP2pRdo()`は自ノードの`MinHopRankIncrease`属性(128)で
+計算し、`JoinDodag()`はRFC 6997 §6.1の既定(RFC 6550のDEFAULT_MIN_HOP_RANK_INCREASE、256)を
+membershipに入れていた。前者を256に揃えた。`RplP2pMaxRankTestCase`の期待値は属性値に合わせて
+あったので、RFCの既定に直した。
+
+### 131.9 RPL OptionのSenderRank
+
+RFC 6550 §11.2: "SenderRank: 16-bit field set to zero by the source and to DAGRank(rank) by a router
+that forwards inside the RPL network." §11.2.2.2: "A receiver detects an inconsistency if it receives
+a packet with either: the 'O' bit set (to Down) from a node of a higher Rank. the 'O' bit cleared
+(for Up) from a node of a lower Rank."
+
+SenderRankにはDAGRankではなくRankそのものを書き、等しい値も不整合としていた。修正: 送信・中継とも
+DAGRank(`GetDagRankForInstance()`)を書き、比較は厳密な大小にする。等しいDAGRankは不整合ではない。
+`RplPacketInfoProcessTestCase`にあった「等しいrankは両方向で不整合」という期待はRFCの文言に無く、
+改めた。親のrankは必ずMinHopRankIncrease以上小さい(OF0、MRHOFとも)ので、親子の間の検出は変わらない。
+
+RFCどおりにしていない点: 送信元はSenderRankを0ではなく自分のDAGRankにする(このモジュールのノードは
+すべてルータ)。DODAG Versionをまたぐ転送でSenderRankをINFINITE_RANKにする規則(§11.2.2.2)は実装
+していない。
+
+### 131.10 読んで準拠を確認した点
+
+RFC 6206 §4.2のTrickle(tは[I/2, I)、cとkの比較、Imaxでの頭打ち、IがIminのときのリセットは無操作)。
+k = 0を「抑制しない」とするのはRFC 6550 §8.3.1("when k has the value of 0x00, this is to be treated
+as a redundancy constant of infinity")。RFC 6554 §4.2のSRH処理(Segments Leftの範囲、multicast、
+自アドレスの重複によるループ検出、Hop Limit)。RFC 6550 §8.2.2.1(Version)、§8.2.2.4規則3、§8.3
+(unicast DISにはunicast DIOで答えTrickleは触らない)、§9.6(DTSN)、§9.8(Storing modeのDAOの宛先と
+Transit Information)、§11.2.2.3(Forwarding-Error)。RFC 6719のMRHOF。RFC 6997 §6.1(Base Objectの
+各検査)、§9.1(DIS、temporary DAGでデータを送らない)、§9.2(Trickle)、§9.4、§9.6、§9.7。
+
+### 131.11 直さず文書化した点(`doc/rpl.rst`の制限事項に追記)
+
+DISのSolicited Information optionを読まない。Route Information optionを扱わない。G-RREPはH=1のみ
+(§7はMAY)。ノード自身のDAOのPath Lifetimeは属性値。受信した2^20 msを超えるTrickle指数は20に
+切り詰め、その値を再送する(§6.7.6の"MUST NOT modify"から外れるが、シフト量の上限として必要)。
+
+### 131.12 リファクタリング
+
+挙動を変えないもの。MaxRank(RFC 6997)とRankLimit(RFC 9854、RREQ用・RREP用)の3か所の同じ判定を
+`PastRankLimit()`に、`SendAodvRrepTo()`と`SendAodvRreqTo()`の同じ本体を`UnicastDioToNeighbour()`に
+まとめた。RFC 6997の既定の設定値を`rpl-conf.h`の定数にした。`rpl-aodv.cc`と`rpl-p2p.cc`の冒頭説明を
+現状(複数Target、G-RREPの属性)に合わせた。コメントから監査手順への言及の一部を除いた。
+
+手を付けていないもの: Local RPLInstanceIDの割り当てループの重複(`DiscoverRoute()`、
+`StartAodvRrepInstance()`、`DiscoverP2pRoute()`。禁止期間の規則がそれぞれ違い、まとめる利点が
+小さい)。RPL Optionを覗く3関数の重複。作業の経緯を語るコメントは`model/`にまだ残る。
+
+### 131.13 既定の評価への影響
+
+25ノードのlr-wpan格子(margin 6 dB)で、AODV-RPL(対称・非対称)とP2P-RPLを各3シード流し、全72回(9実行×8回)の
+探索が成功することだけを確かめた。性能の主張ではない。SenderRankの変更(§131.9)は「等しいrankを
+不整合と数える」場合を無くすので、Rank-Errorの立ち方が変わりうる。論文の数値の再測定はしていない。
 

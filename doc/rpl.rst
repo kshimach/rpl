@@ -144,6 +144,22 @@ What it does not do (Limitations):
   different interface than the one the route arrives on, the discovery completes but
   a stack with the Strong End System Model (the |ns3| default) discards the data at the
   Target. See ``contrib/rpl/doc/design-constraints.md`` section 121.
+* **DIS Options**: The Solicited Information option of a DIS (RFC 6550 section
+  6.7.9) is not parsed, so every DIS is handled as one without predicates: a multicast
+  DIS resets the Trickle timer and a unicast DIS is answered with a unicast DIO
+  (RFC 6550 section 8.3).
+* **Route Information Option**: The Route Information option (RFC 6550 section 6.7.5)
+  is neither generated nor acted on; a received one is skipped.
+* **Gratuitous RREP for Source Routes**: An intermediate router sends a Gratuitous
+  RREP (RFC 9854 section 7, a MAY) only for a Hop-by-hop Route (H=1). With H=0 it
+  caches nothing to answer from and always relays the RREQ.
+* **Path Lifetime of a Node's Own DAO**: A node advertises its own ``PathLifetime``
+  attribute in its DAOs, in the Lifetime Unit of the DODAG, rather than the Default
+  Lifetime of the DODAG Configuration option. The root's ``PathLifetime`` is what
+  that option carries, so the two agree when every node uses the same value.
+* **Trickle Parameters Above 2^20 ms**: A DIOIntervalMin or DIOIntervalDoublings
+  exponent above 20 in a received DODAG Configuration option is clamped to 20, and
+  the clamped value is what the node passes on.
 * **Other Routing Metrics**: Only ETX and LQL (RFC 6551 sections 4.3 and 4.6)
   are implemented. Node Energy, Hop Count metric object, Link Throughput, Link
   Latency, and Link Color are not supported.
@@ -281,7 +297,11 @@ DAO Attributes
 * ``DaoInterval``: Periodic interval for nodes to repeat DAO advertisements (default: 60s).
 * ``DaoAckTimeout``: Timeout waiting for DAO-ACK before retry (default: 5s).
 * ``DaoRetries``: Maximum retries for unacknowledged DAOs (default: 3).
-* ``PathLifetime``: Lifetime of downward routes in lifetime units (default: 30).
+* ``PathLifetime``: Path Lifetime a node advertises in its DAOs, in lifetime units of
+  60 s (default: 30). On a DODAG root, and on the Origin or OrigNode/TargNode of a route
+  discovery, also the Default Lifetime of the DODAG Configuration option, which every
+  other member passes on unchanged and which sets the lifetime of a discovered route
+  (255 means infinity).
 
 AODV-RPL Attributes (RFC 9854)
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -331,7 +351,7 @@ Examples
 Tests
 ~~~~~
 
-The comprehensive test suite (``test/rpl-test-suite.cc``) comprises **197 test cases**:
+The comprehensive test suite (``test/rpl-test-suite.cc``) comprises **206 test cases**:
 
 * Serialization and deserialization round trips for all control messages, options,
   SRH, RPI, P2P-RDO, DRO, DRO-ACK, and AODV-RPL options.
@@ -353,7 +373,7 @@ The comprehensive test suite (``test/rpl-test-suite.cc``) comprises **197 test c
 Validation
 ----------
 
-The test suite is formally verified via ``./test.py -s rpl`` (all 197 unit test cases
+The test suite is formally verified via ``./test.py -s rpl`` (all 206 unit test cases
 executing cleanly). Multi-hop topologies with full IEEE 802.15.4 and 6LoWPAN stacks
 demonstrate 100% end-to-end bidirectional ping delivery, correct ETX accumulation, and
 stable operation across lossy radio channels.

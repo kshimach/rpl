@@ -7,61 +7,38 @@
  * rpl-routing-protocol.cc. These are methods of RplRoutingProtocol like any
  * other -- the discovery leans on m_dodags, SendDio(), CreateLocalDodag(),
  * SelectPreferredParent() and the per-membership Trickle timers, all of them
- * private -- kept in a translation unit of their own only because
- * rpl-routing-protocol.cc is already some three thousand lines. @see
+ * private -- kept in a translation unit of their own for size. @see
  * design-constraints.md.
  *
- * Scope: source-routed (H=0) and Hop-by-hop (H=1) discovery for a single
- * target, both symmetric (S=1) and asymmetric (S=0). H=1 shares
- * RplRoutingProtocol::m_hopByHopRoutes with P2P-RPL's own (RFC 6997, @see
- * rpl-p2p.cc, which needs none of core RPL's own storing mode either).
- * Unlike P2P-RPL's unidirectional, single-DODAG H=1, AODV-RPL's is
- * bidirectional (RFC 6550 section 5.1's Local RPLInstanceID 'D' flag: set
- * for the upward route, clear for the downward one). The upward route entry
- * (RFC 9854 section 6.2.3) is built the same way regardless of S --
- * HandleAodvRreq() -- since the RFC's own upward-route step has no S bit
- * qualifier at all, only section 6.2.4's choice of which reply mechanism to
- * use does. The downward route entry (section 6.4.3) differs by S: a
- * symmetric route's RREP-DIO is unicast hop-by-hop, so the sender is
- * already the next hop by construction (HandleAodvRrep()); an asymmetric
- * one floods a separate RREP-Instance DODAG rooted at TargNode, so the next
- * hop instead has to be that DODAG's own preferred parent
- * (HandleAodvRrepInstance()) -- both keep the entry's own RPLInstanceID as
- * the RREQ-InstanceID regardless of which DODAG built it, which is what
- * lets HasHopByHopRoute()'s rank-check bypass work for both without ever
- * comparing the RREQ-Instance's and RREP-Instance's unrelated Rank
- * hierarchies.
+ * Scope: source-routed (H=0) and Hop-by-hop (H=1) discovery, for one or
+ * several targets, both symmetric (S=1) and asymmetric (S=0). H=1 shares
+ * RplRoutingProtocol::m_hopByHopRoutes with P2P-RPL (RFC 6997, @see
+ * rpl-p2p.cc). Unlike P2P-RPL's unidirectional, single-DODAG H=1,
+ * AODV-RPL's is bidirectional (RFC 6550 section 5.1's Local RPLInstanceID
+ * 'D' flag: set for the upward route, clear for the downward one). The
+ * upward route entry (RFC 9854 section 6.2.3) is built the same way
+ * regardless of S -- HandleAodvRreq() -- since the RFC's upward-route step
+ * has no S bit qualifier, only section 6.2.4's choice of reply mechanism
+ * does. The downward route entry (section 6.4.3) differs by S: a symmetric
+ * route's RREP-DIO is unicast hop-by-hop, so the sender is the next hop by
+ * construction (HandleAodvRrep()); an asymmetric one floods a separate
+ * RREP-Instance DODAG rooted at TargNode, so the next hop is that DODAG's
+ * preferred parent (HandleAodvRrepInstance()). Both keep the entry's
+ * RPLInstanceID as the RREQ-InstanceID whichever DODAG built it, which is
+ * what lets HasHopByHopRoute()'s rank-check bypass work for both without
+ * comparing the unrelated Rank hierarchies of the two Instances.
  *
- * Also implements the Gratuitous RREP (G-RREP) shortcut of RFC 9854 section
- * 7: an intermediate router relaying an RREQ that already caches a fresh
- * enough Hop-by-hop Route to the target (from some earlier, unrelated
- * discovery) answers OrigNode directly, without waiting for the discovery
- * to reach TargNode and a real RREP to come all the way back
- * (SendAodvGratuitousRrep(), triggered from HandleAodvRreq()). Only
- * meaningful for H=1: an H=0 relay never caches anything to answer from.
- * Both halves of section 7 are implemented: the G-RREP itself, and the
- * unicast relaying a router that has sent one MUST perform
- * (AodvGratuitousRrepRelay). The relaying is not optional once the shortcut
- * is taken, which is why it is here -- taking the MAY without it, as this
- * module used to, is simply wrong.
- *
- * The shortcut is nonetheless declined by default (AodvGratuitousRrep,
- * false), which section 7's MAY permits. That is a configuration choice from
- * one measurement, not a judgement on the mechanism: over a 25-node grid on
- * 802.15.4 at six operating points and 50 seeds, where a discovery settles
- * inside a second, declining saves 15-24 KB of control traffic per run
- * everywhere with no cost in discovery success, background PDR or latency,
- * while taking it with the relaying on saves nothing measurable and loses
- * latency and discovery success at some points -- a relay that has handed the
- * RREQ to a cached route and gone quiet loses whatever the flood would have
- * found if that route is stale. Expect the balance to move where a discovery
- * runs long enough for the head start to matter, where the flood is dear
- * because the network is large, or where cached routes are stable; none of
- * those is what was measured here.
- *
- * Source routing is out of scope either way -- section 7 bounds it with
- * further MUSTs about the Address Vector, and an H=0 relay caches nothing to
- * answer from to begin with. @see design-constraints.md section 52.5.
+ * Also implements the Gratuitous RREP (G-RREP) of RFC 9854 section 7: an
+ * intermediate router relaying an RREQ that already caches a fresh enough
+ * Hop-by-hop Route to the target answers OrigNode directly
+ * (SendAodvGratuitousRrep(), triggered from HandleAodvRreq()), and then
+ * unicasts the RREQ on along the cached route, which section 7 requires of
+ * a router that has sent one (AodvGratuitousRrepRelay). H=1 only: an H=0
+ * relay caches nothing to answer from, and section 7 bounds source routing
+ * with further rules about the Address Vector that are not implemented.
+ * The attributes AodvGratuitousRrep and AodvGratuitousRrepRelay select the
+ * behaviour; @see their descriptions and design-constraints.md sections
+ * 52.5 and 128.
  */
 
 #include "rpl-conf.h"
@@ -146,8 +123,7 @@ RplRoutingProtocol::DiscoverRoute(Ipv6Address target, bool hopByHop)
     // again within the bar meant every relay dropped the new discovery's
     // RREQ-DIO before joining, and the discovery produced nothing at all
     // for the rest of the window (measured at ~884 s with the defaults).
-    // The defect was on this side, not theirs. Found by
-    // /protocol-test-matrix's angle 4.
+    // The defect was on this side, not theirs.
     //
     // m_aodvRejoinBlocked holds this node's own copy of that bar, armed by
     // AodvInstanceExpired() for its own membership. It runs slightly ahead
@@ -288,9 +264,10 @@ RplRoutingProtocol::DiscoverRoute(Ipv6Address target, bool hopByHop)
 
     {
         Time& until = m_aodvRouteStateUntil[instanceId];
-        until = std::max(until,
-                         Simulator::Now() + Seconds(RplAodvLifetimeSeconds(m_aodvLifetime)) +
-                             Seconds(m_pathLifetime * m_lifetimeUnit));
+        until = std::max(
+            until,
+            SaturatingAdd(Simulator::Now() + Seconds(RplAodvLifetimeSeconds(m_aodvLifetime)),
+                          RouteLifetime(dodag)));
     }
 
     // A discovery has to complete within its own 'L' field, so it is paced
@@ -499,19 +476,6 @@ RplRoutingProtocol::ShouldRefuseAodvRreq(const RplDioHeader& dio, Ipv6Address fr
     // plus one hop, so both are decided here, before the join.
     if (rreq.rankLimit != RPL_AODV_RANK_LIMIT_INFINITE)
     {
-        uint16_t minHopRankIncrease =
-            dio.HasDagConfiguration() ? dio.GetMinHopRankIncrease() : m_minHopRankIncrease;
-        NS_ASSERT_MSG(minHopRankIncrease > 0, "MinHopRankIncrease of zero would divide by zero");
-
-        uint16_t advertisedDagRank = dio.GetRank() / minHopRankIncrease;
-        if (advertisedDagRank >= rreq.rankLimit)
-        {
-            NS_LOG_LOGIC("Refusing an RREQ advertising DAGRank " << advertisedDagRank
-                                                                 << ", at or past the RankLimit "
-                                                                 << +rreq.rankLimit);
-            return true;
-        }
-
         // What this node's own rank would become. The TargNode is allowed to
         // sit exactly at the RankLimit ("TargNode can join the RREQ-Instance
         // at a Rank whose integer portion is less than or equal to the
@@ -521,16 +485,13 @@ RplRoutingProtocol::ShouldRefuseAodvRreq(const RplDioHeader& dio, Ipv6Address fr
         // OrigNode can include multiple TargNode addresses via multiple ART
         // options"), not just the first, since this router can be any one of
         // several TargNodes this discovery is looking for.
-        uint16_t ownDagRank = static_cast<uint16_t>(advertisedDagRank + 1);
         bool isTarget = std::any_of(dio.GetArts().begin(),
                                     dio.GetArts().end(),
                                     [this](const RplDioHeader::ArtOption& art) {
                                         return IsOwnAddress(art.target);
                                     });
-        if (isTarget ? (ownDagRank > rreq.rankLimit) : (ownDagRank >= rreq.rankLimit))
+        if (PastRankLimit(dio, rreq.rankLimit, m_minHopRankIncrease, isTarget))
         {
-            NS_LOG_LOGIC("Refusing an RREQ that would put this node at DAGRank "
-                         << ownDagRank << ", past the RankLimit " << +rreq.rankLimit);
             return true;
         }
     }
@@ -551,11 +512,13 @@ RplRoutingProtocol::ShouldRefuseAodvRrep(const RplDioHeader& dio, Ipv6Address fr
         return true;
     }
 
-    // RFC 9854 section 4.3: an RREP-DIO carries exactly one ART option, and
-    // it is what names the OrigNode this RREP-Instance is aimed at.
-    if (!dio.HasArt())
+    // RFC 9854 section 4.3: "An RREP-DIO message MUST carry exactly one ART
+    // option. Otherwise, the message MUST be dropped." It is what names the
+    // OrigNode this RREP-Instance is aimed at.
+    if (dio.GetArts().size() != 1)
     {
-        NS_LOG_WARN("Refusing an RREP-DIO with no ART option");
+        NS_LOG_WARN("Refusing an RREP-DIO with " << dio.GetArts().size()
+                                                 << " ART options, not one");
         return true;
     }
 
@@ -603,29 +566,10 @@ RplRoutingProtocol::ShouldRefuseAodvRrep(const RplDioHeader& dio, Ipv6Address fr
     // every way IsJoinedTo() can see, just without the SendDio() branch
     // (@see the isRrepInstance check there) that would ever advertise
     // anything useful into it.
-    if (rrep.rankLimit != RPL_AODV_RANK_LIMIT_INFINITE)
+    if (rrep.rankLimit != RPL_AODV_RANK_LIMIT_INFINITE &&
+        PastRankLimit(dio, rrep.rankLimit, m_minHopRankIncrease, IsOwnAddress(dio.GetArt().target)))
     {
-        uint16_t minHopRankIncrease =
-            dio.HasDagConfiguration() ? dio.GetMinHopRankIncrease() : m_minHopRankIncrease;
-        NS_ASSERT_MSG(minHopRankIncrease > 0, "MinHopRankIncrease of zero would divide by zero");
-
-        uint16_t advertisedDagRank = dio.GetRank() / minHopRankIncrease;
-        if (advertisedDagRank >= rrep.rankLimit)
-        {
-            NS_LOG_LOGIC("Refusing an RREP-Instance DIO advertising DAGRank "
-                        << advertisedDagRank << ", at or past the RankLimit "
-                        << +rrep.rankLimit);
-            return true;
-        }
-
-        uint16_t ownDagRank = static_cast<uint16_t>(advertisedDagRank + 1);
-        bool isOrigin = IsOwnAddress(dio.GetArt().target);
-        if (isOrigin ? (ownDagRank > rrep.rankLimit) : (ownDagRank >= rrep.rankLimit))
-        {
-            NS_LOG_LOGIC("Refusing an RREP-Instance DIO that would put this node at DAGRank "
-                         << ownDagRank << ", past the RankLimit " << +rrep.rankLimit);
-            return true;
-        }
+        return true;
     }
 
     NS_LOG_LOGIC("Accepting an RREP-Instance DIO from " << from);
@@ -971,7 +915,7 @@ RplRoutingProtocol::HandleAodvRreq(const RplDioHeader& dio,
             // is freed at its own 'L' long before the route it left behind
             // expires (16 s against 30 min at the defaults), so a second
             // discovery from the same OrigNode meets the first one's entry
-            // routinely. Found by /protocol-test-matrix's angle 4.
+            // routinely.
             bool fromLaterDiscovery = RplSequenceNewer(rreq.origSeqNo, storedSeqNo);
 
             auto stored = dodag.parents.find(storedNextHop);
@@ -1000,13 +944,13 @@ RplRoutingProtocol::HandleAodvRreq(const RplDioHeader& dio,
         // G-RREP short circuit and the RREP this router may owe all still
         // apply.
         if (mayMove && !StoreHopByHopRoute(key.instanceId,
-                                          key.dodagId,
-                                          key.dodagId,
-                                          dodag.preferredParent,
-                                          Seconds(m_pathLifetime * m_lifetimeUnit),
-                                          true,
-                                          rreq.origSeqNo,
-                                          false))
+                                           key.dodagId,
+                                           key.dodagId,
+                                           dodag.preferredParent,
+                                           RouteLifetime(dodag),
+                                           true,
+                                           rreq.origSeqNo,
+                                           false))
         {
             NS_LOG_LOGIC("Discarding an RREQ-DIO establishing a Hop-by-hop Route that conflicts "
                         "with or is staler than one already held for OrigNode "
@@ -1114,26 +1058,66 @@ RplRoutingProtocol::SendAodvRrepTo(const DodagMembership& dodag,
                                    const RplDioHeader& dio,
                                    Ipv6Address nextHop)
 {
+    if (UnicastDioToNeighbour(dodag, dio, nextHop))
+    {
+        NS_LOG_INFO("Sent an RREP towards the OrigNode via " << nextHop);
+    }
+}
+
+bool
+RplRoutingProtocol::UnicastDioToNeighbour(const DodagMembership& dodag,
+                                          const RplDioHeader& dio,
+                                          Ipv6Address neighbour)
+{
     // One radio hop, so the message goes to the neighbour's link-local
     // address: RouteOutput() never treats a global address as on-link, and
-    // sending an RREP to a global one would hand it to this node's preferred
-    // parent instead of to the neighbour the Address Vector names.
-    Ipv6Address linkLocal = LinkLocalOf(nextHop);
+    // sending to a global one would hand the DIO to this node's preferred
+    // parent instead of to the neighbour named.
+    Ipv6Address linkLocal = LinkLocalOf(neighbour);
     uint32_t interface = InterfaceForNeighbour(dodag, linkLocal);
     if (interface == 0)
     {
         interface = m_ifcToSocket.empty() ? 0 : m_ifcToSocket.begin()->first;
         if (interface == 0)
         {
-            NS_LOG_WARN("No interface to send an RREP to " << nextHop << " on");
-            return;
+            NS_LOG_WARN("No interface to unicast a DIO to " << neighbour << " on");
+            return false;
         }
     }
 
     Ptr<Packet> packet = Create<Packet>();
     packet->AddHeader(dio);
     SendRplMessageOn(interface, packet, RPL_CODE_DIO, linkLocal);
-    NS_LOG_INFO("Sent an RREP towards the OrigNode via " << nextHop);
+    return true;
+}
+
+bool
+RplRoutingProtocol::PastRankLimit(const RplDioHeader& dio,
+                                  uint8_t limit,
+                                  uint16_t defaultMinHopRankIncrease,
+                                  bool farEnd) const
+{
+    uint16_t minHopRankIncrease =
+        dio.HasDagConfiguration() ? dio.GetMinHopRankIncrease() : defaultMinHopRankIncrease;
+    NS_ASSERT_MSG(minHopRankIncrease > 0, "MinHopRankIncrease of zero would divide by zero");
+
+    uint16_t advertisedDagRank = dio.GetRank() / minHopRankIncrease;
+    if (advertisedDagRank >= limit)
+    {
+        NS_LOG_LOGIC("Refusing a DIO advertising DAGRank " << advertisedDagRank
+                                                           << ", at or past the limit " << +limit);
+        return true;
+    }
+
+    // The rank this node would take is the sender's plus one hop.
+    uint16_t ownDagRank = static_cast<uint16_t>(advertisedDagRank + 1);
+    if (farEnd ? (ownDagRank > limit) : (ownDagRank >= limit))
+    {
+        NS_LOG_LOGIC("Refusing a DIO that would put this node at DAGRank "
+                     << ownDagRank << ", past the limit " << +limit);
+        return true;
+    }
+    return false;
 }
 
 void
@@ -1204,26 +1188,7 @@ RplRoutingProtocol::SendAodvRreqTo(const DodagMembership& dodag,
                                    const RplDioHeader& dio,
                                    Ipv6Address nextHop)
 {
-    // Addressed exactly as SendAodvRrepTo() addresses an RREP, and for the
-    // same reason: one radio hop, so it has to go to the neighbour's
-    // link-local address, because RouteOutput() never treats a global one as
-    // on-link and would hand the packet to this node's own preferred parent
-    // instead of to the neighbour the cached route names.
-    Ipv6Address linkLocal = LinkLocalOf(nextHop);
-    uint32_t interface = InterfaceForNeighbour(dodag, linkLocal);
-    if (interface == 0)
-    {
-        interface = m_ifcToSocket.empty() ? 0 : m_ifcToSocket.begin()->first;
-        if (interface == 0)
-        {
-            NS_LOG_WARN("No interface to unicast an RREQ to " << nextHop << " on");
-            return;
-        }
-    }
-
-    Ptr<Packet> packet = Create<Packet>();
-    packet->AddHeader(dio);
-    SendRplMessageOn(interface, packet, RPL_CODE_DIO, linkLocal);
+    UnicastDioToNeighbour(dodag, dio, nextHop);
 }
 
 void
@@ -1568,7 +1533,6 @@ RplRoutingProtocol::SendAodvRrep(DodagMembership& dodag, DodagKey key)
     // equal-Sequence-Number pin -- same seqNo, different next hop -- and
     // discarded the second discovery's RREP outright, leaving the OrigNode
     // with no reply and the relay pointing down the old, broken path.
-    // Found by /protocol-test-matrix's angle 4.
     AdvanceAodvSeqNoForRrep();
 
     // The ART option of an RREP names the OrigNode, not the target: it is
@@ -1616,9 +1580,10 @@ RplRoutingProtocol::HandleAodvRrep(const RplDioHeader& dio, Ipv6Address from, ui
     // RFC 9854 section 4.2: "Exactly one RREP option MUST be present in an
     // RREP-DIO message, otherwise, the message MUST be dropped", and section
     // 4.3 the same for the one ART option an RREP carries.
-    if (!dio.HasArt())
+    if (dio.GetArts().size() != 1)
     {
-        NS_LOG_WARN("Dropping an RREP-DIO with no ART option");
+        NS_LOG_WARN("Dropping an RREP-DIO with " << dio.GetArts().size()
+                                                 << " ART options, not one");
         return;
     }
     // No Compr check here, matching ShouldRefuseAodvRreq(): rrep.addressVector
@@ -1699,12 +1664,12 @@ RplRoutingProtocol::HandleAodvRrep(const RplDioHeader& dio, Ipv6Address from, ui
     if (rrep.hopByHop)
     {
         if (!StoreHopByHopRoute(rreqInstanceId,
-                               origNode,
-                               targNode,
-                               from,
-                               Seconds(m_pathLifetime * m_lifetimeUnit),
-                               true,
-                               dio.GetArt().destSeqNo))
+                                origNode,
+                                targNode,
+                                from,
+                                RouteLifetime(it->second),
+                                true,
+                                dio.GetArt().destSeqNo))
         {
             NS_LOG_LOGIC("Discarding an RREP establishing a Hop-by-hop Route that conflicts "
                         "with or is staler than one already held for "
@@ -1740,9 +1705,9 @@ RplRoutingProtocol::HandleAodvRrep(const RplDioHeader& dio, Ipv6Address from, ui
         route.rreqInstanceId = rreqInstanceId;
         route.destSeqNo = dio.GetArt().destSeqNo;
         // "The lifetime is set according to DODAG configuration (i.e., not
-        // the L field)" (RFC 9854 section 6.4.3) -- the same PathLifetime
-        // and lifetime unit a DAO-derived route gets.
-        route.expire = Simulator::Now() + Seconds(m_pathLifetime * m_lifetimeUnit);
+        // the L field)" (RFC 9854 section 6.4.3): the Default Lifetime of
+        // the RREQ-Instance this route was discovered in.
+        route.expire = SaturatingAdd(Simulator::Now(), RouteLifetime(it->second));
 
         // The TargNode is the last entry of the Address Vector, which is
         // what the route is keyed by.
@@ -1957,13 +1922,13 @@ RplRoutingProtocol::HandleAodvRrepInstance(const RplDioHeader& dio,
         // RplAodvAsymmetricHopByHopRouteFollowsParentTestCase, which pins
         // exactly that).
         if (!StoreHopByHopRoute(pairedInstanceId,
-                               dodag.aodv.origNode,
-                               key.dodagId,
-                               dodag.preferredParent,
-                               Seconds(m_pathLifetime * m_lifetimeUnit),
-                               true,
-                               dodag.aodv.origSeqNo,
-                               false))
+                                dodag.aodv.origNode,
+                                key.dodagId,
+                                dodag.preferredParent,
+                                RouteLifetime(dodag),
+                                true,
+                                dodag.aodv.origSeqNo,
+                                false))
         {
             NS_LOG_LOGIC("Discarding an RREP-Instance DIO establishing a Hop-by-hop Route that "
                         "conflicts with or is staler than one already held for "
@@ -2049,7 +2014,7 @@ RplRoutingProtocol::HandleAodvRrepInstance(const RplDioHeader& dio,
         route.destSeqNo = dodag.aodv.origSeqNo;
         // "The lifetime is set according to DODAG configuration (i.e., not
         // the L field)" (section 6.4.3), same as the symmetric path.
-        route.expire = Simulator::Now() + Seconds(m_pathLifetime * m_lifetimeUnit);
+        route.expire = SaturatingAdd(Simulator::Now(), RouteLifetime(dodag));
         m_aodvRoutes[dodag.aodv.target] = route;
 
         NS_LOG_INFO("Asymmetric route discovery to " << dodag.aodv.target << " completed over "

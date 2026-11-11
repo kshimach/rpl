@@ -549,6 +549,17 @@ class RplDioHeader : public Header
      * @return the option, default-constructed if none is present
      */
     const RreqOption& GetRreq() const;
+    /**
+     * @brief How many AODV-RPL RREQ options the message carries, well formed
+     *        or not.
+     *
+     * RFC 9854 section 4.1: "Exactly one RREQ option MUST be present in an
+     * RREQ-DIO message; otherwise, the message MUST be dropped." HasRreq()
+     * alone cannot tell one option from several.
+     *
+     * @return the number of RREQ options, saturating at 255
+     */
+    uint8_t GetRreqCount() const;
 
     /**
      * @brief Whether the AODV-RPL RREP option is present.
@@ -566,6 +577,13 @@ class RplDioHeader : public Header
      * @return the option, default-constructed if none is present
      */
     const RrepOption& GetRrep() const;
+    /**
+     * @brief How many AODV-RPL RREP options the message carries, well formed
+     *        or not (RFC 9854 section 4.2, "Exactly one RREP option MUST be
+     *        present in an RREP-DIO message").
+     * @return the number of RREP options, saturating at 255
+     */
+    uint8_t GetRrepCount() const;
 
     /**
      * @brief Whether at least one AODV-RPL Target (ART) option is present.
@@ -661,6 +679,13 @@ class RplDioHeader : public Header
      * @return the option, default-constructed if none is present
      */
     const P2pRdoOption& GetP2pRdo() const;
+    /**
+     * @brief How many P2P-RDOs the message carries, well formed or not (RFC
+     *        6997 section 6.1, "A received P2P mode DIO MUST be discarded if
+     *        it does not contain exactly one P2P-RDO").
+     * @return the number of P2P-RDOs, saturating at 255
+     */
+    uint8_t GetP2pRdoCount() const;
 
     /// The Compr 0 figure, which is the smallest AodvMaxAddressVectorEntries()
     /// ever returns -- what a check has to use when the Compr that will apply
@@ -814,8 +839,10 @@ class RplDioHeader : public Header
 
     bool m_hasRreq;    //!< true if the AODV-RPL RREQ option is present
     RreqOption m_rreq; //!< the AODV-RPL RREQ option
+    uint8_t m_rreqCount{0}; //!< number of RREQ options carried, well formed or not
     bool m_hasRrep;    //!< true if the AODV-RPL RREP option is present
     RrepOption m_rrep; //!< the AODV-RPL RREP option
+    uint8_t m_rrepCount{0}; //!< number of RREP options carried, well formed or not
     /// Every AODV-RPL Target (ART) option attached: RFC 9854 section 6.1
     /// lets an RREQ-DIO carry more than one, though section 4.3 requires
     /// exactly one on an RREP-DIO. SetArt()/GetArt() operate on the first
@@ -824,6 +851,7 @@ class RplDioHeader : public Header
 
     bool m_hasP2pRdo;    //!< true if the P2P Route Discovery Option is present
     P2pRdoOption m_p2pRdo; //!< the P2P Route Discovery Option
+    uint8_t m_p2pRdoCount{0}; //!< number of P2P-RDOs carried, well formed or not
 
     /// Additional Targets named by RPL Target options (RFC 6997's own
     /// reuse of RFC 6550 section 6.7.7), beyond the P2P-RDO's own primary
@@ -952,6 +980,11 @@ class RplP2pDroHeader : public Header
      * @return the option, default-constructed if none is present
      */
     const P2pRdoOption& GetP2pRdo() const;
+    /**
+     * @brief How many P2P-RDOs the message carries, well formed or not.
+     * @return the number of P2P-RDOs, saturating at 255
+     */
+    uint8_t GetP2pRdoCount() const;
 
   private:
     /// Serialized size of the fixed base object -- RPLInstanceID, Version,
@@ -970,6 +1003,7 @@ class RplP2pDroHeader : public Header
 
     bool m_hasP2pRdo;    //!< true if the P2P-RDO is present
     P2pRdoOption m_p2pRdo; //!< the P2P-RDO
+    uint8_t m_p2pRdoCount{0}; //!< number of P2P-RDOs carried, well formed or not
 };
 
 /**

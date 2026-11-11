@@ -6,13 +6,14 @@
  * P2P-RPL (RFC 6997) route discovery, layered on the core RPL machinery in
  * rpl-routing-protocol.cc the same way rpl-aodv.cc layers AODV-RPL on it --
  * these are methods of RplRoutingProtocol like any other, kept in a
- * translation unit of their own only because rpl-routing-protocol.cc is
- * already some three thousand lines. @see design-constraints.md.
+ * translation unit of their own for size. @see design-constraints.md.
  *
- * Scope: a single Target, a single Source Route (H=0) or Hop-by-hop Route
- * (H=1). Neither needs core RPL's own storing mode (MOP 2, DAO-driven) at
- * all -- every field H=1 support needs comes from the P2P-RDO/P2P-DRO
- * messages this module already exchanges; @see design-constraints.md.
+ * Scope: a Source Route (H=0) or a Hop-by-hop Route (H=1) from the Origin
+ * to each Target of a discovery, with up to four routes per Target ('N').
+ * The Origin's own API names one Target per discovery; a router handles a
+ * P2P mode DIO that names further ones in RPL Target options. Neither kind
+ * of route needs core RPL's storing mode (MOP 2, DAO-driven): every field
+ * H=1 needs comes from the P2P-RDO and P2P-DRO.
  */
 
 #include "rpl-conf.h"
@@ -55,7 +56,7 @@ RplRoutingProtocol::P2pIdBarred(uint8_t local, Time& end) const
     // AODV-RPL discovery under the same ID would meet a live P2P-RPL route
     // under the same {RPLInstanceID, DODAGID} (design-constraints.md section
     // 125). Read only by AODV-RPL's allocators.
-    end = used->second.started + P2pMembershipBar() + Seconds(m_pathLifetime * m_lifetimeUnit);
+    end = SaturatingAdd(used->second.started + P2pMembershipBar(), OwnRouteLifetime());
     return Simulator::Now() < end;
 }
 
@@ -133,10 +134,9 @@ RplRoutingProtocol::DiscoverP2pRoute(Ipv6Address target, bool hopByHop)
     // P2P-DRO message with no further processing" when the new one's next
     // hop differs. The second discovery's reply then dies at that router:
     // the Origin keeps its stale route, believes it still has one, and
-    // blackholes traffic for the rest of PathLifetime. Found by
-    // /protocol-test-matrix's angle 4.
+    // blackholes traffic for the rest of PathLifetime.
     Time membershipBar = P2pMembershipBar();
-    Time routeBar = Seconds(m_pathLifetime * m_lifetimeUnit) + membershipBar;
+    Time routeBar = SaturatingAdd(membershipBar, OwnRouteLifetime());
 
     uint8_t instanceId = 0;
     bool found = false;
@@ -179,7 +179,7 @@ RplRoutingProtocol::DiscoverP2pRoute(Ipv6Address target, bool hopByHop)
             if (auto same = used->second.targetStarted.find(target);
                 same != used->second.targetStarted.end())
             {
-                freeAt = std::max(freeAt, same->second + routeBar);
+                freeAt = std::max(freeAt, SaturatingAdd(same->second, routeBar));
             }
             if (Simulator::Now() < freeAt)
             {
@@ -217,7 +217,7 @@ RplRoutingProtocol::DiscoverP2pRoute(Ipv6Address target, bool hopByHop)
     {
         P2pInstanceUse& use = m_p2pInstanceUse[instanceId];
         std::erase_if(use.targetStarted, [&](const auto& entry) {
-            return entry.second + routeBar <= Simulator::Now();
+            return SaturatingAdd(entry.second, routeBar) <= Simulator::Now();
         });
         use.started = Simulator::Now();
         use.targetStarted[target] = Simulator::Now();
@@ -528,6 +528,20 @@ RplRoutingProtocol::ShouldRefuseP2pRdo(const RplDioHeader& dio, Ipv6Address from
         }
     }
 
+    // RFC 6997 section 9.3: "A router MUST discard a received P2P mode DIO
+    // with no further processing: if the DIO advertises INFINITE_RANK as
+    // defined in [RFC6550]". Needed as a check of its own when MaxRank is
+    // zero (no limit), where the MaxRank comparison below does not run:
+    // HandleDio() would otherwise treat the DIO as a poisoned parent and
+    // could take this router out of a temporary DAG it "MUST maintain its
+    // membership in ... for the duration indicated by the L field" (section
+    // 9.1).
+    if (dio.GetRank() == RPL_INFINITE_RANK)
+    {
+        NS_LOG_LOGIC("Discarding a P2P mode DIO advertising INFINITE_RANK");
+        return true;
+    }
+
     // RFC 6997 section 7: "An Intermediate Router MUST NOT join a temporary
     // DAG...if the integer portion of its rank would be equal to or
     // higher...than the MaxRank limit. A Target can join the temporary DAG
@@ -540,24 +554,15 @@ RplRoutingProtocol::ShouldRefuseP2pRdo(const RplDioHeader& dio, Ipv6Address from
     // (@see MatchesP2pTarget(), RFC 6997 section 9.3).
     if (rdo.maxRankOrNh != RPL_P2P_MAX_RANK_INFINITE)
     {
-        uint16_t minHopRankIncrease =
-            dio.HasDagConfiguration() ? dio.GetMinHopRankIncrease() : m_minHopRankIncrease;
-        NS_ASSERT_MSG(minHopRankIncrease > 0, "MinHopRankIncrease of zero would divide by zero");
-
-        uint16_t advertisedDagRank = dio.GetRank() / minHopRankIncrease;
-        if (advertisedDagRank >= rdo.maxRankOrNh)
+        // Without an explicit DODAG Configuration Option the default one
+        // applies, whose MinHopRankIncrease is RFC 6550's
+        // DEFAULT_MIN_HOP_RANK_INCREASE (RFC 6997 section 6.1) -- the value
+        // JoinDodag() gives the membership, not this node's own attribute.
+        if (PastRankLimit(dio,
+                          rdo.maxRankOrNh,
+                          RPL_P2P_DEFAULT_MIN_HOP_RANK_INCREASE,
+                          MatchesP2pTarget(dio)))
         {
-            NS_LOG_LOGIC("Refusing a P2P mode DIO advertising DAGRank "
-                        << advertisedDagRank << ", at or past the MaxRank " << +rdo.maxRankOrNh);
-            return true;
-        }
-
-        uint16_t ownDagRank = static_cast<uint16_t>(advertisedDagRank + 1);
-        bool isTarget = MatchesP2pTarget(dio);
-        if (isTarget ? (ownDagRank > rdo.maxRankOrNh) : (ownDagRank >= rdo.maxRankOrNh))
-        {
-            NS_LOG_LOGIC("Refusing a P2P mode DIO that would put this node at DAGRank "
-                        << ownDagRank << ", past the MaxRank " << +rdo.maxRankOrNh);
             return true;
         }
     }
@@ -633,8 +638,7 @@ RplRoutingProtocol::HandleP2pRdo(const RplDioHeader& dio, Ipv6Address from, uint
     // without this a Target whose first matching copy arrived on such an
     // interface would latch "already the Target" here on every later copy --
     // including one arriving on a different interface that does have an
-    // address -- and never reply for the rest of the discovery. Found by
-    // /protocol-test-matrix's angle 4.
+    // address -- and never reply for the rest of the discovery.
     if (dodag.p2p.isTarget && !dodag.p2p.addressVector.empty() && !HasOtherP2pTargets(dodag))
     {
         NS_LOG_LOGIC("Already the Target of temporary DAG " << +key.instanceId
@@ -1408,9 +1412,12 @@ RplRoutingProtocol::HandleP2pDro(const RplP2pDroHeader& dro, Ipv6Address from, u
 {
     NS_LOG_FUNCTION(this << from << interface);
 
-    if (!dro.HasP2pRdo())
+    // RFC 6997 section 8: "A received P2P-DRO message MUST be discarded if
+    // it does not contain exactly one P2P-RDO."
+    if (!dro.HasP2pRdo() || dro.GetP2pRdoCount() != 1)
     {
-        NS_LOG_WARN("Dropping a P2P-DRO with no P2P-RDO option");
+        NS_LOG_WARN("Dropping a P2P-DRO carrying " << +dro.GetP2pRdoCount()
+                                                   << " P2P-RDOs, not one well-formed one");
         return;
     }
 
@@ -1477,7 +1484,7 @@ RplRoutingProtocol::HandleP2pDro(const RplP2pDroHeader& dro, Ipv6Address from, u
                                     dodag.dodagId,
                                     rdo.target,
                                     nextHop,
-                                    Seconds(m_pathLifetime * m_lifetimeUnit)))
+                                    RouteLifetime(dodag)))
             {
                 NS_LOG_LOGIC("Discarding a P2P-DRO establishing a Hop-by-hop Route that "
                             "conflicts with one already held for "
@@ -1508,14 +1515,10 @@ RplRoutingProtocol::HandleP2pDro(const RplP2pDroHeader& dro, Ipv6Address from, u
             route.hops = rdo.addressVector;
             route.hops.push_back(rdo.target);
             route.instanceId = dodag.instanceId;
-            // "The lifetime is set according to DODAG configuration (i.e.,
-            // not the L field)" -- RFC 9854 section 6.4.3's wording for
-            // the AODV-RPL analogue, and the same PathLifetime/lifetime
-            // unit a DAO-derived route gets; RFC 6997 has no equivalent
-            // sentence of its own but the same reasoning applies (the
-            // temporary DAG's own 'L' bounds discovery, not the route it
-            // finds).
-            route.expire = Simulator::Now() + Seconds(m_pathLifetime * m_lifetimeUnit);
+            // RFC 6997 section 9.5: "The lifetime of this Source Route is
+            // specified by the Default Lifetime and Lifetime Unit parameters
+            // inside the DODAG Configuration Option currently in effect."
+            route.expire = SaturatingAdd(Simulator::Now(), RouteLifetime(dodag));
 
             // Shortest wins within one discovery, rather than last wins.
             // With 'N' = 0 this is a distinction without a difference (the
@@ -1646,7 +1649,7 @@ RplRoutingProtocol::HandleP2pDro(const RplP2pDroHeader& dro, Ipv6Address from, u
                                 dro.GetDodagId(),
                                 rdo.target,
                                 nextHop,
-                                Seconds(m_pathLifetime * m_lifetimeUnit)))
+                                RouteLifetime(dodag)))
         {
             NS_LOG_LOGIC("Discarding a P2P-DRO establishing a Hop-by-hop Route that conflicts "
                         "with one already held for "

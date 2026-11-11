@@ -321,6 +321,14 @@ advertised it propagates to the whole DODAG.
 * **IPv6-in-IPv6 tunneling** for mid-path header insertion (as RFC 6553/6554
   specify) is not implemented; headers are added to the packet directly.
 * **A confirmed rank inconsistency is not actually dropped** — see section 12.
+* **The Solicited Information option of a DIS and the Route Information
+  option of a DIO** are not processed.
+* **A node's own DAO carries its `PathLifetime` attribute**, not the Default
+  Lifetime of the DODAG Configuration option; the Lifetime Unit and the
+  lifetime of a discovered route do come from that option.
+* **The RPL Option's SenderRank is the sender's DAGRank at the source too**
+  (RFC 6550 section 11.2 has a source set zero), and it is not set to
+  INFINITE_RANK across a DODAG Version discontinuity.
 * **Only ETX and LQL are implemented** among RFC 6551's routing metrics;
   Node Energy, Hop Count metric object, Link Throughput, Link Latency, and
   Link Color are not.

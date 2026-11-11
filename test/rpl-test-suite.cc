@@ -100,6 +100,70 @@ SendRawRplMessage(Ptr<Node> node,
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief Hand an already serialized RPL control message body directly to a
+ *        node's Ipv6L3Protocol::Receive().
+ *
+ * What DeliverRawRplMessage() does for a header object, for a body that no
+ * header class would serialize -- a message carrying the same option twice,
+ * say.
+ *
+ * @param node the node to deliver to
+ * @param interface the interface the message is delivered on
+ * @param packet the RPL message body, modified in place
+ * @param code the RPL message code
+ * @param src the source address, both for the ICMPv6 checksum and the IPv6
+ *        header actually carried in
+ * @param dst the destination address, likewise
+ */
+static void
+DeliverRawRplPacket(Ptr<Node> node,
+                    uint32_t interface,
+                    Ptr<Packet> packet,
+                    uint8_t code,
+                    Ipv6Address src,
+                    Ipv6Address dst)
+{
+    Ptr<Ipv6L3Protocol> ipv6 = node->GetObject<Ipv6L3Protocol>();
+    Ptr<NetDevice> device = ipv6->GetNetDevice(interface);
+
+    Icmpv6Header icmpv6Header;
+    icmpv6Header.SetType(ICMPV6_RPL);
+    icmpv6Header.SetCode(code);
+    icmpv6Header.CalculatePseudoHeaderChecksum(src,
+                                               dst,
+                                               packet->GetSize() + icmpv6Header.GetSerializedSize(),
+                                               Icmpv6L4Protocol::GetStaticProtocolNumber());
+    packet->AddHeader(icmpv6Header);
+
+    Ipv6Header ipv6Header;
+    ipv6Header.SetSource(src);
+    ipv6Header.SetDestination(dst);
+    ipv6Header.SetNextHeader(Icmpv6L4Protocol::GetStaticProtocolNumber());
+    ipv6Header.SetPayloadLength(packet->GetSize());
+    ipv6Header.SetHopLimit(255);
+    packet->AddHeader(ipv6Header);
+
+    // 0x86dd is IPv6's EtherType, the protocol number Ipv6L3Protocol is
+    // itself registered under as a protocol handler
+    // (Node::RegisterProtocolHandler(), see ipv6-l3-protocol.cc). The L2
+    // from/to addresses matter for only one thing past logging -- an
+    // opportunistic Neighbour Discovery cache refresh keyed on "from"
+    // (Ipv6L3Protocol::Receive(), the NdiscCache::LookupInverse() branch) --
+    // which the device's own address standing in for both simply misses
+    // (an empty lookup, not an error): harmless, since nothing this
+    // function delivers needs that cache warm.
+    ipv6->Receive(device,
+                 packet,
+                 0x86dd,
+                 device->GetAddress(),
+                 device->GetAddress(),
+                 NetDevice::PACKET_HOST);
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief Hand a hand-built RPL control message directly to a node's
  *        Ipv6L3Protocol::Receive(), as if it had just arrived over its
  *        interface 1 -- bypassing the channel, any blacklist on it, and
@@ -135,44 +199,9 @@ DeliverRawRplMessage(Ptr<Node> node,
                      Ipv6Address src,
                      Ipv6Address dst)
 {
-    Ptr<Ipv6L3Protocol> ipv6 = node->GetObject<Ipv6L3Protocol>();
-    Ptr<NetDevice> device = ipv6->GetNetDevice(interface);
-
     Ptr<Packet> packet = Create<Packet>();
     packet->AddHeader(body);
-
-    Icmpv6Header icmpv6Header;
-    icmpv6Header.SetType(ICMPV6_RPL);
-    icmpv6Header.SetCode(code);
-    icmpv6Header.CalculatePseudoHeaderChecksum(src,
-                                               dst,
-                                               packet->GetSize() + icmpv6Header.GetSerializedSize(),
-                                               Icmpv6L4Protocol::GetStaticProtocolNumber());
-    packet->AddHeader(icmpv6Header);
-
-    Ipv6Header ipv6Header;
-    ipv6Header.SetSource(src);
-    ipv6Header.SetDestination(dst);
-    ipv6Header.SetNextHeader(Icmpv6L4Protocol::GetStaticProtocolNumber());
-    ipv6Header.SetPayloadLength(packet->GetSize());
-    ipv6Header.SetHopLimit(255);
-    packet->AddHeader(ipv6Header);
-
-    // 0x86dd is IPv6's EtherType, the protocol number Ipv6L3Protocol is
-    // itself registered under as a protocol handler
-    // (Node::RegisterProtocolHandler(), see ipv6-l3-protocol.cc). The L2
-    // from/to addresses matter for only one thing past logging -- an
-    // opportunistic Neighbour Discovery cache refresh keyed on "from"
-    // (Ipv6L3Protocol::Receive(), the NdiscCache::LookupInverse() branch) --
-    // which the device's own address standing in for both simply misses
-    // (an empty lookup, not an error): harmless, since nothing this
-    // function delivers needs that cache warm.
-    ipv6->Receive(device,
-                 packet,
-                 0x86dd,
-                 device->GetAddress(),
-                 device->GetAddress(),
-                 NetDevice::PACKET_HOST);
+    DeliverRawRplPacket(node, interface, packet, code, src, dst);
 }
 
 /**
@@ -3093,7 +3122,9 @@ RplDodagFormationTestCase::DoRun()
     NS_TEST_ASSERT_MSG_EQ(+hbh[0], Ipv6Header::IPV6_EXT_ROUTING, "Hop-by-Hop does not lead to Routing");
     NS_TEST_ASSERT_MSG_EQ(+hbh[2], RPL_HBH_OPTION_TYPE, "Wrong option type");
     NS_TEST_ASSERT_MSG_EQ(+hbh[4] & RPL_HDR_OPT_DOWN, RPL_HDR_OPT_DOWN, "The 'O' flag was not set");
-    NS_TEST_ASSERT_MSG_EQ((hbh[6] << 8) | hbh[7], root->GetRank(), "Wrong SenderRank");
+    // SenderRank is DAGRank(rank) (RFC 6550 section 11.2), floor(rank /
+    // MinHopRankIncrease): 1 for the root.
+    NS_TEST_ASSERT_MSG_EQ((hbh[6] << 8) | hbh[7], 1, "Wrong SenderRank");
     downward->RemoveAtStart(sizeof(hbh));
 
     RplSourceRoutingHeader srh;
@@ -7057,13 +7088,19 @@ RplRankInconsistencyPerInstanceTestCase::DoRun()
     ipv6Header.SetDestination(nodeLinkLocal);
     ipv6Header.SetHopLimit(64);
 
-    // Consistent against the base (200 > 128, moving up): checked against
-    // the base's own rank when the RPI names the Global RPLInstanceID.
+    // SenderRank is a DAGRank (RFC 6550 section 11.2), floor(rank /
+    // MinHopRankIncrease): 1 for the base DODAG's root, 2 for the member of
+    // the local one (rank 200 plus one hop, MinHopRankIncrease 128).
+    uint16_t localDagRank = localRank / RPL_MIN_HOPRANKINC;
+    NS_TEST_ASSERT_MSG_EQ(localDagRank, 2, "Unexpected DAGRank in the local-instance DODAG");
+
+    // Consistent against the base (2 > 1, moving up): checked against the
+    // base's own DAGRank when the RPI names the Global RPLInstanceID.
     {
         RplPacketInfoHeader rpi;
         rpi.SetInstanceId(RPL_DEFAULT_INSTANCE);
         rpi.SetDown(false);
-        rpi.SetSenderRank(200);
+        rpi.SetSenderRank(2);
 
         Ptr<Packet> packet = Create<Packet>();
         packet->AddHeader(rpi);
@@ -7079,18 +7116,19 @@ RplRankInconsistencyPerInstanceTestCase::DoRun()
                               false,
                               "Flagged inconsistent against the base when it should not have been");
         NS_TEST_ASSERT_MSG_EQ(received.GetSenderRank(),
-                              RPL_MIN_HOPRANKINC,
-                              "SenderRank was not rewritten to the base's own rank");
+                              1,
+                              "SenderRank was not rewritten to the base's own DAGRank");
     }
 
-    // The identical SenderRank, but under the local instance's own key:
-    // inconsistent there (200 is not greater than localRank), and rewritten
-    // to the local membership's own rank, not the base's.
+    // A SenderRank of 1, moving up, is no inconsistency against the base
+    // (not lower than 1) but is one under the local instance's own key (1 is
+    // lower than 2), where it is rewritten to the local membership's own
+    // DAGRank, not the base's.
     {
         RplPacketInfoHeader rpi;
         rpi.SetInstanceId(LOCAL_INSTANCE);
         rpi.SetDown(false);
-        rpi.SetSenderRank(200);
+        rpi.SetSenderRank(1);
 
         Ptr<Packet> packet = Create<Packet>();
         packet->AddHeader(rpi);
@@ -7107,8 +7145,8 @@ RplRankInconsistencyPerInstanceTestCase::DoRun()
                               "Not flagged inconsistent against the local instance's own rank: the "
                               "base's rank was used instead");
         NS_TEST_ASSERT_MSG_EQ(received.GetSenderRank(),
-                              localRank,
-                              "SenderRank was rewritten to the base's rank, not the local "
+                              localDagRank,
+                              "SenderRank was rewritten to the base's DAGRank, not the local "
                               "membership's own");
     }
 
@@ -18336,7 +18374,8 @@ RplStuckRouterTrickleTestCase::DoRun()
  *
  * RFC 6997 section 6.1: "A default DODAG Configuration Option takes effect if
  * a P2P mode DIO does not carry an explicit one", with DIOIntervalMin 6 (64
- * ms), DIORedundancyConstant 1, MaxRankIncrease 0 and OCP 0, and "The
+ * ms), DIORedundancyConstant 1, MaxRankIncrease 0, Default Lifetime 0xFF,
+ * Lifetime Unit 0xFFFF and OCP 0, and "The
  * remaining parameters have default values as specified in [RFC6550]":
  * DEFAULT_DIO_INTERVAL_DOUBLINGS 20 and DEFAULT_MIN_HOP_RANK_INCREASE 256
  * (RFC 6550 section 17). An intermediate router has to carry the values in
@@ -18468,6 +18507,12 @@ RplP2pDefaultDagConfigurationTestCase::DoRun()
         NS_TEST_ASSERT_MSG_EQ(m_dio.GetMinHopRankIncrease(),
                               256,
                               "MinHopRankIncrease is not RFC 6550's default 256");
+        NS_TEST_ASSERT_MSG_EQ(+m_dio.GetDefaultLifetime(),
+                              0xFF,
+                              "Default Lifetime is not RFC 6997's 0xFF");
+        NS_TEST_ASSERT_MSG_EQ(m_dio.GetLifetimeUnit(),
+                              0xFFFF,
+                              "Lifetime Unit is not RFC 6997's 0xFFFF");
     }
 
     monitor->Close();
@@ -19051,18 +19096,24 @@ RplP2pMaxRankTestCase::DoRun()
 
     Ptr<Node> node = nodes.Get(0);
 
+    // The DIOs carry no DODAG Configuration Option, so the default one is
+    // in effect (RFC 6997 section 6.1), whose MinHopRankIncrease is RFC
+    // 6550's DEFAULT_MIN_HOP_RANK_INCREASE, 256 (section 17) -- not this
+    // node's own MinHopRankIncrease attribute.
+    static constexpr uint16_t minHopRankIncrease = 256;
+
     // Comfortably under the limit (DAGRank 1, own DAGRank 2 < 3): joined
     // whichever role this node plays.
-    NS_TEST_ASSERT_MSG_EQ(TryJoin(node, RPL_MIN_HOPRANKINC, false),
+    NS_TEST_ASSERT_MSG_EQ(TryJoin(node, minHopRankIncrease, false),
                           true,
                           "An ordinary router well within MaxRank was refused");
-    NS_TEST_ASSERT_MSG_EQ(TryJoin(node, RPL_MIN_HOPRANKINC, true),
+    NS_TEST_ASSERT_MSG_EQ(TryJoin(node, minHopRankIncrease, true),
                           true,
                           "The Target well within MaxRank was refused");
 
     // The exact boundary (DAGRank 2, own DAGRank 3 == the MaxRank): an
     // ordinary router must not join, the Target must.
-    uint16_t boundaryRank = static_cast<uint16_t>(2 * RPL_MIN_HOPRANKINC);
+    uint16_t boundaryRank = static_cast<uint16_t>(2 * minHopRankIncrease);
     NS_TEST_ASSERT_MSG_EQ(TryJoin(node, boundaryRank, false),
                           false,
                           "An ordinary router joined at exactly the MaxRank: RFC 6997 section 7 "
@@ -19074,7 +19125,7 @@ RplP2pMaxRankTestCase::DoRun()
 
     // The sender's own advertised DAGRank already at the limit: refused
     // outright, no relaxation for anyone.
-    uint16_t pastLimitRank = static_cast<uint16_t>(3 * RPL_MIN_HOPRANKINC);
+    uint16_t pastLimitRank = static_cast<uint16_t>(3 * minHopRankIncrease);
     NS_TEST_ASSERT_MSG_EQ(TryJoin(node, pastLimitRank, false),
                           false,
                           "An ordinary router joined past the MaxRank");
@@ -29350,8 +29401,14 @@ RplPacketInfoProcessTestCase::DoRun()
 
     Ptr<Node> node = nodes.Get(0);
     Ptr<RplRoutingProtocol> rpl = node->GetObject<RplRoutingProtocol>();
-    uint16_t ownRank = rpl->GetRank();
-    NS_TEST_ASSERT_MSG_EQ(ownRank, RPL_MIN_HOPRANKINC, "The root is not at a fixed, known rank");
+    NS_TEST_ASSERT_MSG_EQ(rpl->GetRank(),
+                          RPL_MIN_HOPRANKINC,
+                          "The root is not at a fixed, known rank");
+    // SenderRank is a DAGRank (RFC 6550 section 11.2: "set to ... DAGRank(rank)
+    // by a router that forwards inside the RPL network"), and
+    // "DAGRank(rank) = floor(rank/MinHopRankIncrease)" (section 3.5.1): 1
+    // for a root.
+    uint16_t ownRank = 1;
 
     Ptr<Ipv6OptionDemux> demux = node->GetObject<Ipv6OptionDemux>();
     Ptr<Ipv6Option> option = demux->GetOption(RPL_HBH_OPTION_TYPE);
@@ -29368,7 +29425,7 @@ RplPacketInfoProcessTestCase::DoRun()
     {
         RplPacketInfoHeader rpi;
         rpi.SetDown(false);
-        rpi.SetSenderRank(ownRank + RPL_MIN_HOPRANKINC);
+        rpi.SetSenderRank(ownRank + 1);
 
         Ptr<Packet> packet = Create<Packet>();
         packet->AddHeader(rpi);
@@ -29388,13 +29445,13 @@ RplPacketInfoProcessTestCase::DoRun()
                               "SenderRank was not rewritten to this node's own rank");
     }
 
-    // An inconsistent upward packet: the sender claims to be no further from
-    // the root than this node, which moving up should never see. Flagged
-    // once, not (yet) treated as a confirmed loop.
+    // An inconsistent upward packet: "the 'O' bit cleared (for Up) from a
+    // node of a lower Rank" (RFC 6550 section 11.2.2.2). Flagged once, not
+    // (yet) treated as a confirmed loop.
     {
         RplPacketInfoHeader rpi;
         rpi.SetDown(false);
-        rpi.SetSenderRank(ownRank);
+        rpi.SetSenderRank(ownRank - 1);
 
         Ptr<Packet> packet = Create<Packet>();
         packet->AddHeader(rpi);
@@ -29426,7 +29483,7 @@ RplPacketInfoProcessTestCase::DoRun()
     {
         RplPacketInfoHeader rpi;
         rpi.SetDown(false);
-        rpi.SetSenderRank(ownRank);
+        rpi.SetSenderRank(ownRank - 1);
         rpi.SetRankError(true);
 
         Ptr<Packet> packet = Create<Packet>();
@@ -29437,11 +29494,11 @@ RplPacketInfoProcessTestCase::DoRun()
         NS_TEST_ASSERT_MSG_EQ(isDropped, true, "A confirmed inconsistency was not traced as dropped");
     }
 
-    // The same check the other way round (RFC 6550 section 11.2): a packet
-    // moving down should come from a sender closer to the root, i.e. of
-    // lower rank. Both sides of the boundary, plus the boundary itself --
-    // an equal rank is an inconsistency in either direction, since a hop
-    // has to change the distance to the root one way or the other.
+    // Both directions, both sides of the boundary and the boundary itself.
+    // RFC 6550 section 11.2.2.2: "A receiver detects an inconsistency if it
+    // receives a packet with either: the 'O' bit set (to Down) from a node
+    // of a higher Rank. the 'O' bit cleared (for Up) from a node of a lower
+    // Rank." A sender of equal Rank is neither.
     struct
     {
         bool down;             //!< the 'O' flag under test
@@ -29450,10 +29507,10 @@ RplPacketInfoProcessTestCase::DoRun()
         const char* what;      //!< what the case is, for the failure message
     } directionCases[] = {
         {false, +1, false, "a sender one step further from the root, moving up"},
-        {false, 0, true, "a sender of equal rank, moving up"},
+        {false, 0, false, "a sender of equal rank, moving up"},
         {false, -1, true, "a sender closer to the root, moving up"},
         {true, -1, false, "a sender one step closer to the root, moving down"},
-        {true, 0, true, "a sender of equal rank, moving down"},
+        {true, 0, false, "a sender of equal rank, moving down"},
         {true, +1, true, "a sender further from the root, moving down"},
     };
 
@@ -29461,8 +29518,7 @@ RplPacketInfoProcessTestCase::DoRun()
     {
         RplPacketInfoHeader rpi;
         rpi.SetDown(testCase.down);
-        rpi.SetSenderRank(
-            static_cast<uint16_t>(ownRank + testCase.senderRankOffset * RPL_MIN_HOPRANKINC));
+        rpi.SetSenderRank(static_cast<uint16_t>(ownRank + testCase.senderRankOffset));
 
         Ptr<Packet> packet = Create<Packet>();
         packet->AddHeader(rpi);
@@ -29488,25 +29544,40 @@ RplPacketInfoProcessTestCase::DoRun()
     }
 
     // Ipv6L3Protocol::Receive() walks the Hop-by-Hop chain twice for a
-    // locally-destined packet; the second call must be a no-op rather than
-    // re-checking the SenderRank this same call already rewrote to this
-    // node's own.
+    // locally-destined packet; the second call must be a no-op. Seen here
+    // through the 'F' flag, which a call that acts on the packet clears
+    // (RFC 6550 section 11.2.2.3): set again after the first call, it has
+    // to survive the second.
     Ptr<Packet> repeated = Create<Packet>();
+    Ptr<Packet> sameUidLater;
     {
         RplPacketInfoHeader rpi;
         rpi.SetDown(false);
-        rpi.SetSenderRank(ownRank + RPL_MIN_HOPRANKINC);
+        rpi.SetSenderRank(ownRank - 1);
         repeated->AddHeader(rpi);
+        // A copy keeps the Uid: the same packet, as it was sent, coming
+        // round again later.
+        sameUidLater = repeated->Copy();
 
         bool isDropped = false;
         option->Process(repeated, 0, ipv6Header, isDropped);
         NS_TEST_ASSERT_MSG_EQ(isDropped, false, "The first call of the pair was dropped");
+
+        RplPacketInfoHeader afterFirst;
+        repeated->RemoveHeader(afterFirst);
+        afterFirst.SetForwardingError(true);
+        repeated->AddHeader(afterFirst);
 
         uint8_t processedAgain = option->Process(repeated, 0, ipv6Header, isDropped);
         NS_TEST_ASSERT_MSG_EQ(isDropped, false, "The second call of the pair acted on the packet");
         NS_TEST_ASSERT_MSG_EQ(processedAgain,
                               6,
                               "Wrong number of bytes reported consumed on the repeat call");
+        RplPacketInfoHeader afterSecond;
+        repeated->RemoveHeader(afterSecond);
+        NS_TEST_ASSERT_MSG_EQ(afterSecond.GetForwardingError(),
+                              true,
+                              "The second call of the pair acted on the packet");
     }
 
     // That suppression is keyed on the Uid *and* the time, not the Uid
@@ -29515,17 +29586,16 @@ RplPacketInfoProcessTestCase::DoRun()
     // CreateFragment()), so the same Uid coming back at a later time is a
     // loop -- exactly what the rank check exists to catch -- and must be
     // checked rather than waved through as the second half of a
-    // Receive()/LocalDeliver() pair. The packet above already carries this
-    // node's own rank, so a genuine recheck finds it inconsistent.
+    // Receive()/LocalDeliver() pair.
     {
         Simulator::Stop(Seconds(1));
         Simulator::Run();
 
         bool isDropped = false;
-        option->Process(repeated, 0, ipv6Header, isDropped);
+        option->Process(sameUidLater, 0, ipv6Header, isDropped);
 
         RplPacketInfoHeader received;
-        repeated->RemoveHeader(received);
+        sameUidLater->RemoveHeader(received);
         NS_TEST_ASSERT_MSG_EQ(received.GetRankError(),
                               true,
                               "The same packet arriving later was suppressed as a duplicate "
@@ -30663,6 +30733,1070 @@ RplPrintRoutingTableJsonTestCase::DoRun()
  * @ingroup rpl
  * @ingroup tests
  *
+ * @brief Base of the tests that hand one router hand-built control messages
+ *        and read what it sends in return.
+ *
+ * Two nodes on one link: the router under test, which runs RPL, and a peer
+ * that does not. The peer only listens -- every DIO the router multicasts
+ * and every DAO the router addresses to it is recorded -- and answers
+ * Neighbour Discovery, so that a test can make the peer the router's parent
+ * (a DIO delivered with the peer's link-local address as its source) and see
+ * the unicasts the router then sends it.
+ */
+class RplConformanceTestBase : public TestCase
+{
+  protected:
+    /**
+     * Constructor.
+     *
+     * @param name the test name
+     */
+    explicit RplConformanceTestBase(const std::string& name);
+
+    /// Create the two nodes and let Duplicate Address Detection finish.
+    void SetUpPair();
+    /// Close the monitoring socket and destroy the simulation.
+    void TearDownPair();
+
+    /**
+     * Run the simulation for a while longer.
+     *
+     * @param duration how long
+     */
+    void RunFor(Time duration);
+
+    /**
+     * Deliver a control message to the router and let it be processed.
+     *
+     * @param body the message body
+     * @param code the RPL message code
+     * @param from the source address
+     * @param to the destination address
+     */
+    void Deliver(Ptr<Packet> body, uint8_t code, Ipv6Address from, Ipv6Address to);
+
+    /**
+     * Deliver a DIO to the router, multicast, and let it be processed.
+     *
+     * @param dio the DIO
+     * @param from the source address
+     */
+    void DeliverDio(const RplDioHeader& dio, Ipv6Address from);
+
+    /**
+     * Build a P2P mode DIO without a DODAG Configuration Option, naming a
+     * Target that is not the router.
+     *
+     * @param instanceId the RPLInstanceID
+     * @param origin the DODAGID
+     * @return the DIO
+     */
+    static RplDioHeader P2pDio(uint8_t instanceId, Ipv6Address origin);
+
+    /**
+     * Build a DIO of an ordinary DODAG, with a DODAG Configuration Option.
+     *
+     * @param mop the Mode of Operation
+     * @param dodagId the DODAGID
+     * @param defaultLifetime the Default Lifetime
+     * @param lifetimeUnit the Lifetime Unit
+     * @return the DIO
+     */
+    static RplDioHeader BaseDio(uint8_t mop,
+                                Ipv6Address dodagId,
+                                uint8_t defaultLifetime,
+                                uint16_t lifetimeUnit);
+
+    /**
+     * A message followed by the options of another one.
+     *
+     * @param message the message, serialized whole
+     * @param donor the message whose options are appended
+     * @param donorBaseSize the size of the donor's base object, left out
+     * @return the body
+     */
+    static Ptr<Packet> WithOptionsOf(const Header& message,
+                                     const Header& donor,
+                                     uint32_t donorBaseSize);
+
+    Ptr<Node> m_router;               //!< the router under test
+    Ptr<RplRoutingProtocol> m_rpl;    //!< its RPL instance
+    Ipv6Address m_routerLinkLocal;    //!< its link-local address
+    Ipv6Address m_routerGlobal;       //!< its global address
+    Ipv6Address m_peerLinkLocal;      //!< the peer's link-local address
+    std::vector<RplDioHeader> m_dios; //!< every DIO the router sent
+    std::vector<RplDaoHeader> m_daos; //!< every DAO the router sent the peer
+
+  private:
+    /// @brief Record a DIO or DAO the router sent.
+    /// @param socket the monitoring socket
+    void Capture(Ptr<Socket> socket);
+
+    Ptr<Socket> m_monitor; //!< the peer's monitoring socket
+};
+
+RplConformanceTestBase::RplConformanceTestBase(const std::string& name)
+    : TestCase(name)
+{
+}
+
+void
+RplConformanceTestBase::Capture(Ptr<Socket> socket)
+{
+    Address sender;
+    Ptr<Packet> packet = socket->RecvFrom(sender);
+    if (!packet)
+    {
+        return;
+    }
+    Ipv6Header ipv6Header;
+    packet->RemoveHeader(ipv6Header);
+    Icmpv6Header icmpv6Header;
+    packet->RemoveHeader(icmpv6Header);
+    if (icmpv6Header.GetType() != ICMPV6_RPL || ipv6Header.GetSource() != m_routerLinkLocal)
+    {
+        return;
+    }
+    if (icmpv6Header.GetCode() == RPL_CODE_DIO)
+    {
+        RplDioHeader dio;
+        packet->RemoveHeader(dio);
+        m_dios.push_back(dio);
+    }
+    else if (icmpv6Header.GetCode() == RPL_CODE_DAO)
+    {
+        RplDaoHeader dao;
+        packet->RemoveHeader(dao);
+        m_daos.push_back(dao);
+    }
+}
+
+void
+RplConformanceTestBase::SetUpPair()
+{
+    NodeContainer nodes;
+    nodes.Create(2); // 0 = the router under test, 1 = the peer
+
+    Ptr<SimpleChannel> channel = CreateObject<SimpleChannel>();
+    SimpleNetDeviceHelper simpleNetDevice;
+    NetDeviceContainer devices = simpleNetDevice.Install(nodes, channel);
+
+    RplHelper rplHelper;
+    InternetStackHelper withRpl;
+    withRpl.SetRoutingHelper(rplHelper);
+    withRpl.Install(nodes.Get(0));
+    InternetStackHelper withoutRpl;
+    withoutRpl.Install(nodes.Get(1));
+
+    Ipv6AddressHelper ipv6;
+    ipv6.SetBase(Ipv6Address("2001:1::"), Ipv6Prefix(64));
+    Ipv6InterfaceContainer interfaces = ipv6.Assign(devices);
+    interfaces.SetForwarding(0, true);
+    interfaces.SetForwarding(1, true);
+
+    m_router = nodes.Get(0);
+    m_rpl = m_router->GetObject<RplRoutingProtocol>();
+    Ptr<Ipv6L3Protocol> routerIpv6 = m_router->GetObject<Ipv6L3Protocol>();
+    m_routerLinkLocal = routerIpv6->GetAddress(1, 0).GetAddress();
+    m_routerGlobal = routerIpv6->GetAddress(1, 1).GetAddress();
+
+    Ptr<Ipv6L3Protocol> peerIpv6 = nodes.Get(1)->GetObject<Ipv6L3Protocol>();
+    m_peerLinkLocal = peerIpv6->GetAddress(1, 0).GetAddress();
+    // Without RPL on the peer nothing has joined the all-RPL-nodes group.
+    peerIpv6->AddMulticastAddress(Ipv6Address(RPL_ALL_NODES_MULTICAST), 1);
+
+    m_monitor = Socket::CreateSocket(nodes.Get(1), Ipv6RawSocketFactory::GetTypeId());
+    m_monitor->SetAttribute("Protocol", UintegerValue(Icmpv6L4Protocol::GetStaticProtocolNumber()));
+    m_monitor->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 0));
+    m_monitor->BindToNetDevice(devices.Get(1));
+    m_monitor->SetRecvCallback(MakeCallback(&RplConformanceTestBase::Capture, this));
+
+    RunFor(Seconds(5)); // let DAD clear the static addresses
+}
+
+void
+RplConformanceTestBase::TearDownPair()
+{
+    m_monitor->Close();
+    m_monitor = nullptr;
+    m_rpl = nullptr;
+    m_router = nullptr;
+    Simulator::Destroy();
+}
+
+void
+RplConformanceTestBase::RunFor(Time duration)
+{
+    Simulator::Stop(duration);
+    Simulator::Run();
+}
+
+void
+RplConformanceTestBase::Deliver(Ptr<Packet> body, uint8_t code, Ipv6Address from, Ipv6Address to)
+{
+    DeliverRawRplPacket(m_router, 1, body, code, from, to);
+    RunFor(MilliSeconds(10));
+}
+
+void
+RplConformanceTestBase::DeliverDio(const RplDioHeader& dio, Ipv6Address from)
+{
+    Ptr<Packet> body = Create<Packet>();
+    body->AddHeader(dio);
+    Deliver(body, RPL_CODE_DIO, from, Ipv6Address(RPL_ALL_NODES_MULTICAST));
+}
+
+RplDioHeader
+RplConformanceTestBase::P2pDio(uint8_t instanceId, Ipv6Address origin)
+{
+    RplDioHeader dio;
+    dio.SetInstanceId(instanceId);
+    dio.SetVersionNumber(0);
+    dio.SetRank(256);
+    dio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+    dio.SetGrounded(true);
+    dio.SetDodagId(origin);
+    dio.SetDtsn(0);
+    P2pRdoOption rdo;
+    rdo.reply = true;
+    rdo.hopByHop = false;
+    rdo.numRoutes = 0;
+    rdo.lifetime = 3;
+    rdo.maxRankOrNh = 0; // no MaxRank limit
+    rdo.target = Ipv6Address("2001:9::99");
+    dio.SetP2pRdo(rdo);
+    return dio;
+}
+
+RplDioHeader
+RplConformanceTestBase::BaseDio(uint8_t mop,
+                                Ipv6Address dodagId,
+                                uint8_t defaultLifetime,
+                                uint16_t lifetimeUnit)
+{
+    RplDioHeader dio;
+    dio.SetInstanceId(RPL_DEFAULT_INSTANCE);
+    dio.SetVersionNumber(240);
+    dio.SetRank(128);
+    dio.SetMop(mop);
+    dio.SetGrounded(true);
+    dio.SetDodagId(dodagId);
+    dio.SetDtsn(240);
+    dio.SetDagConfiguration(8, 8, 0, 1024, 128, RPL_OCP_OF0, defaultLifetime, lifetimeUnit);
+    return dio;
+}
+
+Ptr<Packet>
+RplConformanceTestBase::WithOptionsOf(const Header& message,
+                                      const Header& donor,
+                                      uint32_t donorBaseSize)
+{
+    Ptr<Packet> body = Create<Packet>();
+    body->AddHeader(message);
+    Ptr<Packet> options = Create<Packet>();
+    options->AddHeader(donor);
+    options->RemoveAtStart(donorBaseSize);
+    body->AddAtEnd(options);
+    return body;
+}
+
+/// Size of the DIO Base Object (RFC 6550 section 6.3.1).
+static constexpr uint32_t DIO_BASE_SIZE = 24;
+/// Size of the P2P-DRO base object (RFC 6997 section 8).
+static constexpr uint32_t P2P_DRO_BASE_SIZE = 20;
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief A DIO carrying a second copy of its route discovery option, or an
+ *        RREP-DIO carrying a second ART option, is dropped.
+ *
+ * RFC 6997 section 6.1: "A received P2P mode DIO MUST be discarded if it
+ * does not contain exactly one P2P-RDO." RFC 9854 section 4.1: "Exactly one
+ * RREQ option MUST be present in an RREQ-DIO message; otherwise, the message
+ * MUST be dropped", section 4.2 the same for the RREP option, and section
+ * 4.3: "An RREQ-DIO message MUST carry at least one ART option. An RREP-DIO
+ * message MUST carry exactly one ART option. Otherwise, the message MUST be
+ * dropped." Each malformed DIO is followed by the same DIO with one copy,
+ * which has to be joined: the refusal is then about the count alone.
+ */
+class RplExactlyOneDiscoveryOptionTestCase : public RplConformanceTestBase
+{
+  public:
+    RplExactlyOneDiscoveryOptionTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplExactlyOneDiscoveryOptionTestCase::RplExactlyOneDiscoveryOptionTestCase()
+    : RplConformanceTestBase("A DIO with two P2P-RDO, RREQ or RREP options, or an RREP-DIO with "
+                             "two ART options, is dropped (RFC 6997 section 6.1, RFC 9854 "
+                             "sections 4.1 to 4.3)")
+{
+}
+
+void
+RplExactlyOneDiscoveryOptionTestCase::DoRun()
+{
+    SetUpPair();
+    Ipv6Address neighbour("fe80::a");
+    Ipv6Address multicast(RPL_ALL_NODES_MULTICAST);
+
+    auto discoveryDio = [](uint8_t instanceId, Ipv6Address dodagId) {
+        RplDioHeader dio;
+        dio.SetInstanceId(instanceId);
+        dio.SetVersionNumber(0);
+        dio.SetRank(128);
+        dio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+        dio.SetDodagId(dodagId);
+        dio.SetDtsn(0);
+        dio.SetDagConfiguration(0,
+                                8,
+                                RPL_DIO_REDUNDANCY,
+                                RPL_MAX_RANKINC,
+                                RPL_MIN_HOPRANKINC,
+                                RPL_OCP_OF0,
+                                RPL_DEFAULT_LIFETIME,
+                                RPL_DEFAULT_LIFETIME_UNIT);
+        return dio;
+    };
+
+    // Two P2P-RDOs.
+    {
+        Ipv6Address origin("2001:7::1");
+        RplDioHeader dio = P2pDio(0x81, origin);
+        Deliver(WithOptionsOf(dio, dio, DIO_BASE_SIZE), RPL_CODE_DIO, neighbour, multicast);
+        NS_TEST_EXPECT_MSG_EQ(m_rpl->IsJoinedTo(0x81, origin),
+                              false,
+                              "A P2P mode DIO with two P2P-RDOs was not discarded");
+        DeliverDio(dio, neighbour);
+        NS_TEST_EXPECT_MSG_EQ(m_rpl->IsJoinedTo(0x81, origin),
+                              true,
+                              "The same DIO with one P2P-RDO was refused");
+    }
+
+    // Two RREQ options, one ART option.
+    {
+        Ipv6Address origNode("2001:7::2");
+        RplDioHeader::RreqOption rreq;
+        rreq.symmetric = true;
+        rreq.hopByHop = true;
+        rreq.origSeqNo = 5;
+        RplDioHeader::ArtOption art;
+        art.target = Ipv6Address("2001:9::99");
+        RplDioHeader rreqOnly = discoveryDio(0x82, origNode);
+        rreqOnly.SetRreq(rreq);
+        RplDioHeader dio = rreqOnly;
+        dio.SetArt(art);
+        RplDioHeader bare = discoveryDio(0x82, origNode);
+        RplDioHeader extraRreq = bare;
+        extraRreq.SetRreq(rreq);
+        Ptr<Packet> bareBody = Create<Packet>();
+        bareBody->AddHeader(bare);
+        Deliver(WithOptionsOf(dio, extraRreq, bareBody->GetSize()),
+                RPL_CODE_DIO,
+                neighbour,
+                multicast);
+        NS_TEST_EXPECT_MSG_EQ(m_rpl->IsJoinedTo(0x82, origNode),
+                              false,
+                              "An RREQ-DIO with two RREQ options was not dropped");
+        DeliverDio(dio, neighbour);
+        NS_TEST_EXPECT_MSG_EQ(m_rpl->IsJoinedTo(0x82, origNode),
+                              true,
+                              "The same RREQ-DIO with one RREQ option was refused");
+    }
+
+    // Two RREP options with one ART option, then one RREP option with two
+    // ART options.
+    {
+        Ipv6Address targNode("2001:7::3");
+        RplDioHeader::RrepOption rrep;
+        rrep.hopByHop = true;
+        rrep.delta = 3;
+        RplDioHeader::ArtOption art;
+        art.destSeqNo = 5;
+        art.target = Ipv6Address("2001:9::98");
+        RplDioHeader bare = discoveryDio(0x86, targNode);
+        RplDioHeader extraRrep = bare;
+        extraRrep.SetRrep(rrep);
+        RplDioHeader dio = extraRrep;
+        dio.SetArt(art);
+        Ptr<Packet> bareBody = Create<Packet>();
+        bareBody->AddHeader(bare);
+        Deliver(WithOptionsOf(dio, extraRrep, bareBody->GetSize()),
+                RPL_CODE_DIO,
+                neighbour,
+                multicast);
+        NS_TEST_EXPECT_MSG_EQ(m_rpl->IsJoinedTo(0x86, targNode),
+                              false,
+                              "An RREP-DIO with two RREP options was not dropped");
+
+        RplDioHeader twoArts = dio;
+        RplDioHeader::ArtOption second = art;
+        second.target = Ipv6Address("2001:9::97");
+        twoArts.AddArt(second);
+        DeliverDio(twoArts, neighbour);
+        NS_TEST_EXPECT_MSG_EQ(m_rpl->IsJoinedTo(0x86, targNode),
+                              false,
+                              "An RREP-DIO with two ART options was not dropped");
+
+        DeliverDio(dio, neighbour);
+        NS_TEST_EXPECT_MSG_EQ(m_rpl->IsJoinedTo(0x86, targNode),
+                              true,
+                              "The same RREP-DIO with one RREP and one ART option was refused");
+    }
+
+    TearDownPair();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief A P2P-DRO carrying two P2P-RDOs is discarded.
+ *
+ * RFC 6997 section 8: "A received P2P-DRO message MUST be discarded if it
+ * does not contain exactly one P2P-RDO." The Origin of a discovery is handed
+ * a P2P-DRO for its Target with the option twice, which must establish no
+ * route, then the same message with the option once, which must.
+ */
+class RplP2pDroExactlyOneRdoTestCase : public RplConformanceTestBase
+{
+  public:
+    RplP2pDroExactlyOneRdoTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplP2pDroExactlyOneRdoTestCase::RplP2pDroExactlyOneRdoTestCase()
+    : RplConformanceTestBase("A P2P-DRO with two P2P-RDOs is discarded (RFC 6997 section 8)")
+{
+}
+
+void
+RplP2pDroExactlyOneRdoTestCase::DoRun()
+{
+    SetUpPair();
+    Ipv6Address target("2001:9::1");
+    Ipv6Address neighbour("fe80::a");
+    Ipv6Address multicast(RPL_ALL_NODES_MULTICAST);
+
+    RplRoutingProtocol::DodagKey key = m_rpl->DiscoverP2pRoute(target, true);
+    NS_TEST_ASSERT_MSG_NE(key.dodagId, Ipv6Address::GetAny(), "The discovery did not start");
+
+    RplP2pDroHeader dro;
+    dro.SetInstanceId(key.instanceId);
+    dro.SetSequence(0);
+    dro.SetDodagId(key.dodagId);
+    P2pRdoOption rdo;
+    rdo.reply = false;
+    rdo.hopByHop = true;
+    rdo.lifetime = 3;
+    rdo.maxRankOrNh = 0;
+    rdo.target = target;
+    dro.SetP2pRdo(rdo);
+
+    Ipv6Address nextHop;
+    uint8_t instanceId = 0;
+    Deliver(WithOptionsOf(dro, dro, P2P_DRO_BASE_SIZE), RPL_CODE_P2P_DRO, neighbour, multicast);
+    NS_TEST_EXPECT_MSG_EQ(m_rpl->GetHopByHopRoute(target, nextHop, instanceId),
+                          false,
+                          "A P2P-DRO with two P2P-RDOs established a route");
+
+    Ptr<Packet> single = Create<Packet>();
+    single->AddHeader(dro);
+    Deliver(single, RPL_CODE_P2P_DRO, neighbour, multicast);
+    NS_TEST_EXPECT_MSG_EQ(m_rpl->GetHopByHopRoute(target, nextHop, instanceId),
+                          true,
+                          "The same P2P-DRO with one P2P-RDO was refused");
+
+    TearDownPair();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief A P2P mode DIO advertising INFINITE_RANK is discarded and does not
+ *        take a router out of the temporary DAG.
+ *
+ * RFC 6997 section 9.3: "A router MUST discard a received P2P mode DIO with
+ * no further processing: if the DIO advertises INFINITE_RANK as defined in
+ * [RFC6550]". Section 9.1: a router "MUST maintain its membership in the
+ * temporary DAG for the duration indicated by the L field". The router joins
+ * through one neighbour, which then advertises INFINITE_RANK: the router
+ * must still be a member, at the rank it had.
+ */
+class RplP2pInfiniteRankDioTestCase : public RplConformanceTestBase
+{
+  public:
+    RplP2pInfiniteRankDioTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplP2pInfiniteRankDioTestCase::RplP2pInfiniteRankDioTestCase()
+    : RplConformanceTestBase("A P2P mode DIO advertising INFINITE_RANK is discarded (RFC 6997 "
+                             "section 9.3)")
+{
+}
+
+void
+RplP2pInfiniteRankDioTestCase::DoRun()
+{
+    SetUpPair();
+    Ipv6Address origin("2001:7::1");
+    Ipv6Address neighbour("fe80::a");
+
+    RplDioHeader dio = P2pDio(0x81, origin);
+    DeliverDio(dio, neighbour);
+    NS_TEST_ASSERT_MSG_EQ(m_rpl->IsJoinedTo(0x81, origin), true, "The router did not join");
+    uint16_t rank = m_rpl->GetRankIn(0x81, origin);
+
+    dio.SetRank(RPL_INFINITE_RANK);
+    DeliverDio(dio, neighbour);
+    NS_TEST_EXPECT_MSG_EQ(m_rpl->IsJoinedTo(0x81, origin),
+                          true,
+                          "A P2P mode DIO advertising INFINITE_RANK took the router out of the "
+                          "temporary DAG before 'L' ran out");
+    NS_TEST_EXPECT_MSG_EQ(m_rpl->GetRankIn(0x81, origin),
+                          rank,
+                          "A P2P mode DIO advertising INFINITE_RANK changed the router's rank");
+
+    TearDownPair();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief The Default Lifetime and Lifetime Unit of a temporary DAG's DODAG
+ *        Configuration Option are passed on unchanged and set the lifetime
+ *        of the route discovered.
+ *
+ * RFC 6997 section 6.1: "An Intermediate Router (or a Target) MUST set
+ * various fields in the DODAG Configuration Option in the outgoing P2P mode
+ * DIOs to the values they had in the incoming P2P mode DIOs for this DAG",
+ * and "The Origin sets the Default Lifetime and Lifetime Unit parameters to
+ * indicate the lifetime of the state that the routers, including the Origin
+ * and the Target(s), maintain for a Hop-by-hop or Source Route discovered
+ * using P2P-RPL."
+ *
+ * The router joins from a DIO with Default Lifetime 7 and Lifetime Unit 11 s
+ * and then receives the P2P-DRO that makes it a hop of the Hop-by-hop Route.
+ * 7 * 11 = 77 s: the route state has to be there 70 s later and gone 80 s
+ * later.
+ */
+class RplP2pConfiguredRouteLifetimeTestCase : public RplConformanceTestBase
+{
+  public:
+    RplP2pConfiguredRouteLifetimeTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplP2pConfiguredRouteLifetimeTestCase::RplP2pConfiguredRouteLifetimeTestCase()
+    : RplConformanceTestBase("A temporary DAG's Default Lifetime and Lifetime Unit are passed "
+                             "on and set the route lifetime (RFC 6997 section 6.1)")
+{
+}
+
+void
+RplP2pConfiguredRouteLifetimeTestCase::DoRun()
+{
+    SetUpPair();
+    Ipv6Address origin("2001:7::1");
+    Ipv6Address target("2001:9::99");
+    Ipv6Address neighbour("fe80::a");
+
+    RplDioHeader dio;
+    dio.SetInstanceId(0x81);
+    dio.SetVersionNumber(0);
+    dio.SetRank(256);
+    dio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+    dio.SetGrounded(true);
+    dio.SetDodagId(origin);
+    dio.SetDtsn(0);
+    dio.SetDagConfiguration(20, 6, 1, 0, 256, RPL_OCP_OF0, 7, 11);
+    P2pRdoOption rdo;
+    rdo.reply = true;
+    rdo.hopByHop = true;
+    rdo.lifetime = 3;
+    rdo.maxRankOrNh = 0;
+    rdo.target = target;
+    dio.SetP2pRdo(rdo);
+    DeliverDio(dio, neighbour);
+    NS_TEST_ASSERT_MSG_EQ(m_rpl->IsJoinedTo(0x81, origin), true, "The router did not join");
+
+    RunFor(Seconds(1));
+    bool relayed = false;
+    for (const auto& sent : m_dios)
+    {
+        if (!sent.HasP2pRdo())
+        {
+            continue;
+        }
+        relayed = true;
+        NS_TEST_EXPECT_MSG_EQ(sent.HasDagConfiguration(), true, "No configuration passed on");
+        NS_TEST_EXPECT_MSG_EQ(+sent.GetDefaultLifetime(), 7, "Default Lifetime was modified");
+        NS_TEST_EXPECT_MSG_EQ(sent.GetLifetimeUnit(), 11, "Lifetime Unit was modified");
+    }
+    NS_TEST_ASSERT_MSG_EQ(relayed, true, "The router never relayed the P2P mode DIO");
+
+    // The router is Address[1] of the route and NH is 1: it is this
+    // router's turn, and the Target is its next hop.
+    RplP2pDroHeader dro;
+    dro.SetInstanceId(0x81);
+    dro.SetSequence(0);
+    dro.SetDodagId(origin);
+    P2pRdoOption reply;
+    reply.reply = false;
+    reply.hopByHop = true;
+    reply.lifetime = 3;
+    reply.maxRankOrNh = 1;
+    reply.target = target;
+    reply.addressVector = {m_routerGlobal};
+    dro.SetP2pRdo(reply);
+    Ptr<Packet> body = Create<Packet>();
+    body->AddHeader(dro);
+    Deliver(body, RPL_CODE_P2P_DRO, Ipv6Address("fe80::b"), Ipv6Address(RPL_ALL_NODES_MULTICAST));
+
+    Ipv6Address nextHop;
+    uint8_t instanceId = 0;
+    NS_TEST_ASSERT_MSG_EQ(m_rpl->GetHopByHopRoute(target, nextHop, instanceId),
+                          true,
+                          "The P2P-DRO did not establish the Hop-by-hop Route state");
+    RunFor(Seconds(70));
+    NS_TEST_EXPECT_MSG_EQ(m_rpl->GetHopByHopRoute(target, nextHop, instanceId),
+                          true,
+                          "The route state was gone before Default Lifetime * Lifetime Unit");
+    RunFor(Seconds(10));
+    NS_TEST_EXPECT_MSG_EQ(m_rpl->GetHopByHopRoute(target, nextHop, instanceId),
+                          false,
+                          "The route state outlived Default Lifetime * Lifetime Unit");
+
+    TearDownPair();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief A non-root node passes the DODAG Configuration option's Default
+ *        Lifetime and Lifetime Unit on unchanged and reads a DAO's Path
+ *        Lifetime in that Lifetime Unit.
+ *
+ * RFC 6550 section 6.7.6: "Nodes other than the DODAG root MUST NOT modify
+ * this information when propagating the DODAG Configuration option."
+ * Section 6.7.8, Path Lifetime: "The length of time in Lifetime Units
+ * (obtained from the Configuration option) that the prefix is valid for
+ * route determination."
+ *
+ * The router joins a Storing mode DODAG whose configuration says Default
+ * Lifetime 9, Lifetime Unit 13 s. A child's DAO with Path Lifetime 2 is then
+ * valid for 26 s: there 20 s later, gone 30 s later.
+ */
+class RplDagConfigurationLifetimeTestCase : public RplConformanceTestBase
+{
+  public:
+    RplDagConfigurationLifetimeTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplDagConfigurationLifetimeTestCase::RplDagConfigurationLifetimeTestCase()
+    : RplConformanceTestBase("A non-root node keeps the DODAG's Default Lifetime and Lifetime "
+                             "Unit and applies the unit to a DAO (RFC 6550 sections 6.7.6, "
+                             "6.7.8)")
+{
+}
+
+void
+RplDagConfigurationLifetimeTestCase::DoRun()
+{
+    SetUpPair();
+    Ipv6Address dodagId("2001:1::100");
+
+    DeliverDio(BaseDio(RPL_MOP_STORING_NO_MULTICAST, dodagId, 9, 13), m_peerLinkLocal);
+    NS_TEST_ASSERT_MSG_EQ(m_rpl->IsJoinedTo(RPL_DEFAULT_INSTANCE, dodagId),
+                          true,
+                          "The router did not join");
+
+    RunFor(Seconds(2));
+    NS_TEST_ASSERT_MSG_EQ(m_dios.empty(), false, "The router sent no DIO");
+    for (const auto& sent : m_dios)
+    {
+        NS_TEST_EXPECT_MSG_EQ(sent.HasDagConfiguration(), true, "No configuration passed on");
+        NS_TEST_EXPECT_MSG_EQ(+sent.GetDefaultLifetime(), 9, "Default Lifetime was modified");
+        NS_TEST_EXPECT_MSG_EQ(sent.GetLifetimeUnit(), 13, "Lifetime Unit was modified");
+    }
+
+    RplDaoHeader dao;
+    dao.SetInstanceId(RPL_DEFAULT_INSTANCE);
+    dao.SetDodagId(dodagId);
+    dao.SetSequence(1);
+    dao.SetTarget(Ipv6Address("2001:1::c"));
+    dao.SetTransitInformation(Ipv6Address::GetAny(), 240, 2);
+    Ptr<Packet> body = Create<Packet>();
+    body->AddHeader(dao);
+    Deliver(body, RPL_CODE_DAO, Ipv6Address("fe80::c"), m_routerLinkLocal);
+    NS_TEST_ASSERT_MSG_EQ(m_rpl->GetDownwardRouteCount(RPL_DEFAULT_INSTANCE, dodagId),
+                          1,
+                          "The child's DAO installed no downward route");
+    RunFor(Seconds(20));
+    NS_TEST_EXPECT_MSG_EQ(m_rpl->GetDownwardRouteCount(RPL_DEFAULT_INSTANCE, dodagId),
+                          1,
+                          "The route was gone before Path Lifetime * Lifetime Unit");
+    RunFor(Seconds(10));
+    NS_TEST_EXPECT_MSG_EQ(m_rpl->GetDownwardRouteCount(RPL_DEFAULT_INSTANCE, dodagId),
+                          0,
+                          "The route outlived Path Lifetime * Lifetime Unit");
+
+    TearDownPair();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief A Prefix Information option in a P2P mode DIO is ignored and not
+ *        passed on.
+ *
+ * RFC 6997 section 6.1 lists what a P2P mode DIO may carry (the P2P-RDO, RPL
+ * Target options, Metric Container options, Route Information options and
+ * one DODAG Configuration Option) and goes on: "A RPL option other than
+ * those listed above MUST be ignored when found inside a received P2P mode
+ * DIO and MUST NOT be included in the P2P mode DIOs that the receiving
+ * router generates."
+ */
+class RplP2pPrefixInfoIgnoredTestCase : public RplConformanceTestBase
+{
+  public:
+    RplP2pPrefixInfoIgnoredTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplP2pPrefixInfoIgnoredTestCase::RplP2pPrefixInfoIgnoredTestCase()
+    : RplConformanceTestBase("A Prefix Information option in a P2P mode DIO is ignored and not "
+                             "passed on (RFC 6997 section 6.1)")
+{
+}
+
+void
+RplP2pPrefixInfoIgnoredTestCase::DoRun()
+{
+    SetUpPair();
+    Ipv6Address origin("2001:7::1");
+    Ipv6Address prefix("2001:5::");
+
+    RplDioHeader dio = P2pDio(0x81, origin);
+    dio.SetPrefixInfo(prefix, 64, true, true, 86400, 14400);
+    DeliverDio(dio, Ipv6Address("fe80::a"));
+    NS_TEST_ASSERT_MSG_EQ(m_rpl->IsJoinedTo(0x81, origin), true, "The router did not join");
+
+    RunFor(Seconds(1));
+    bool relayed = false;
+    for (const auto& sent : m_dios)
+    {
+        if (sent.HasP2pRdo())
+        {
+            relayed = true;
+            NS_TEST_EXPECT_MSG_EQ(sent.HasPrefixInfo(),
+                                  false,
+                                  "The Prefix Information option was passed on");
+        }
+    }
+    NS_TEST_ASSERT_MSG_EQ(relayed, true, "The router never relayed the P2P mode DIO");
+
+    Ptr<Ipv6L3Protocol> ipv6 = m_router->GetObject<Ipv6L3Protocol>();
+    bool configured = false;
+    for (uint32_t j = 0; j < ipv6->GetNAddresses(1); j++)
+    {
+        if (Ipv6Prefix(64).IsMatch(ipv6->GetAddress(1, j).GetAddress(), prefix))
+        {
+            configured = true;
+        }
+    }
+    NS_TEST_EXPECT_MSG_EQ(configured,
+                          false,
+                          "The router configured an address from the ignored option");
+
+    TearDownPair();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief A DIO whose DODAG Configuration option carries a MinHopRankIncrease
+ *        of zero is ignored.
+ *
+ * RFC 6550 section 3.5.1: "DAGRank(rank) = floor(rank/MinHopRankIncrease)".
+ * Zero leaves that undefined, and both RFC 6997's MaxRank and RFC 9854's
+ * RankLimit are compared against a DAGRank computed from the received DIO,
+ * so such a DIO must not be joined, and must not stop the simulation.
+ */
+class RplZeroMinHopRankIncreaseTestCase : public RplConformanceTestBase
+{
+  public:
+    RplZeroMinHopRankIncreaseTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplZeroMinHopRankIncreaseTestCase::RplZeroMinHopRankIncreaseTestCase()
+    : RplConformanceTestBase("A DIO with a MinHopRankIncrease of zero is ignored (RFC 6550 "
+                             "section 3.5.1)")
+{
+}
+
+void
+RplZeroMinHopRankIncreaseTestCase::DoRun()
+{
+    SetUpPair();
+    Ipv6Address neighbour("fe80::a");
+
+    Ipv6Address origin("2001:7::1");
+    RplDioHeader p2p;
+    p2p.SetInstanceId(0x81);
+    p2p.SetVersionNumber(0);
+    p2p.SetRank(256);
+    p2p.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+    p2p.SetGrounded(true);
+    p2p.SetDodagId(origin);
+    p2p.SetDagConfiguration(20, 6, 1, 0, 0, RPL_OCP_OF0, 0xFF, 0xFFFF);
+    P2pRdoOption rdo;
+    rdo.reply = true;
+    rdo.lifetime = 3;
+    rdo.maxRankOrNh = 3;
+    rdo.target = Ipv6Address("2001:9::99");
+    p2p.SetP2pRdo(rdo);
+    DeliverDio(p2p, neighbour);
+    NS_TEST_EXPECT_MSG_EQ(m_rpl->IsJoinedTo(0x81, origin),
+                          false,
+                          "A P2P mode DIO with a MinHopRankIncrease of zero was joined");
+
+    Ipv6Address origNode("2001:7::2");
+    RplDioHeader rreqDio;
+    rreqDio.SetInstanceId(0x82);
+    rreqDio.SetVersionNumber(0);
+    rreqDio.SetRank(128);
+    rreqDio.SetMop(RPL_MOP_P2P_ROUTE_DISCOVERY);
+    rreqDio.SetDodagId(origNode);
+    rreqDio.SetDagConfiguration(0, 8, 0, 1024, 0, RPL_OCP_OF0, 30, 60);
+    RplDioHeader::RreqOption rreq;
+    rreq.symmetric = true;
+    rreq.hopByHop = true;
+    rreq.rankLimit = 5;
+    rreq.origSeqNo = 5;
+    rreqDio.SetRreq(rreq);
+    RplDioHeader::ArtOption art;
+    art.target = Ipv6Address("2001:9::99");
+    rreqDio.SetArt(art);
+    DeliverDio(rreqDio, neighbour);
+    NS_TEST_EXPECT_MSG_EQ(m_rpl->IsJoinedTo(0x82, origNode),
+                          false,
+                          "An RREQ-DIO with a MinHopRankIncrease of zero was joined");
+
+    Ipv6Address dodagId("2001:1::100");
+    RplDioHeader base = BaseDio(RPL_MOP_NON_STORING, dodagId, 30, 60);
+    base.SetDagConfiguration(8, 8, 0, 1024, 0, RPL_OCP_OF0, 30, 60);
+    DeliverDio(base, m_peerLinkLocal);
+    NS_TEST_EXPECT_MSG_EQ(m_rpl->IsJoinedTo(RPL_DEFAULT_INSTANCE, dodagId),
+                          false,
+                          "A DIO with a MinHopRankIncrease of zero was joined");
+
+    TearDownPair();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief Every DAO a Storing mode router sends with different information
+ *        has a DAOSequence of its own, relayed ones included, and a DAO-ACK
+ *        is still matched to the DAO that asked for it.
+ *
+ * RFC 6550 section 9.3 rule 1: "If a node sends a DAO message with newer or
+ * different information than the prior DAO message transmission, it MUST
+ * increment the DAOSequence field by at least one." Section 6.5, DAO-ACK:
+ * "DAOSequence: Incremented at each DAO message from a node and echoed in
+ * the DAO-ACK message."
+ *
+ * The router's parent is the peer, so its DAOs are observed. It sends its
+ * own DAO (with 'K'), then relays the DAOs of two children one after the
+ * other: three transmissions, each with different information. A DAO-ACK
+ * echoing the DAOSequence of the first then has to end the wait for an
+ * acknowledgement.
+ */
+class RplDaoSequenceOnRelayTestCase : public RplConformanceTestBase
+{
+  public:
+    RplDaoSequenceOnRelayTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplDaoSequenceOnRelayTestCase::RplDaoSequenceOnRelayTestCase()
+    : RplConformanceTestBase("A relayed DAO increments the DAOSequence and leaves the pending "
+                             "DAO-ACK matchable (RFC 6550 section 9.3 rule 1)")
+{
+}
+
+void
+RplDaoSequenceOnRelayTestCase::DoRun()
+{
+    SetUpPair();
+    Ipv6Address dodagId("2001:1::100");
+
+    DeliverDio(BaseDio(RPL_MOP_STORING_NO_MULTICAST, dodagId, 30, 60), m_peerLinkLocal);
+    NS_TEST_ASSERT_MSG_EQ(m_rpl->IsJoinedTo(RPL_DEFAULT_INSTANCE, dodagId),
+                          true,
+                          "The router did not join");
+    RunFor(Seconds(2));
+    NS_TEST_ASSERT_MSG_EQ(m_daos.size(), 1, "The router's own DAO was not sent exactly once");
+    NS_TEST_ASSERT_MSG_EQ(m_daos[0].GetAckRequested(), true, "The DAO did not ask for a DAO-ACK");
+    NS_TEST_ASSERT_MSG_EQ(m_rpl->IsDaoAckPendingIn(RPL_DEFAULT_INSTANCE, dodagId),
+                          true,
+                          "No DAO-ACK is being waited for");
+
+    auto childDao = [&](const char* target, const char* from) {
+        RplDaoHeader dao;
+        dao.SetInstanceId(RPL_DEFAULT_INSTANCE);
+        dao.SetDodagId(dodagId);
+        dao.SetSequence(1);
+        dao.SetTarget(Ipv6Address(target));
+        dao.SetTransitInformation(Ipv6Address::GetAny(), 240, 30);
+        Ptr<Packet> body = Create<Packet>();
+        body->AddHeader(dao);
+        Deliver(body, RPL_CODE_DAO, Ipv6Address(from), m_routerLinkLocal);
+    };
+    childDao("2001:1::c", "fe80::c");
+    childDao("2001:1::d", "fe80::d");
+
+    NS_TEST_ASSERT_MSG_EQ(m_daos.size(), 3, "The two children's DAOs were not each relayed");
+    NS_TEST_EXPECT_MSG_EQ(m_daos[1].GetTarget(), Ipv6Address("2001:1::c"), "Unexpected relay");
+    NS_TEST_EXPECT_MSG_EQ(m_daos[2].GetTarget(), Ipv6Address("2001:1::d"), "Unexpected relay");
+    NS_TEST_EXPECT_MSG_EQ(RplSequenceNewer(m_daos[1].GetSequence(), m_daos[0].GetSequence()),
+                          true,
+                          "The first relayed DAO did not increment the DAOSequence");
+    NS_TEST_EXPECT_MSG_EQ(RplSequenceNewer(m_daos[2].GetSequence(), m_daos[1].GetSequence()),
+                          true,
+                          "The second relayed DAO did not increment the DAOSequence");
+
+    RplDaoAckHeader ack;
+    ack.SetInstanceId(RPL_DEFAULT_INSTANCE);
+    ack.SetDodagId(dodagId);
+    ack.SetSequence(m_daos[0].GetSequence());
+    ack.SetStatus(0);
+    Ptr<Packet> body = Create<Packet>();
+    body->AddHeader(ack);
+    Deliver(body, RPL_CODE_DAO_ACK, m_peerLinkLocal, m_routerLinkLocal);
+    NS_TEST_EXPECT_MSG_EQ(m_rpl->IsDaoAckPendingIn(RPL_DEFAULT_INSTANCE, dodagId),
+                          false,
+                          "The DAO-ACK echoing the acknowledged DAO's DAOSequence was not "
+                          "matched to it");
+
+    TearDownPair();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
+ * @brief A data packet for the Origin of a temporary DAG carries the RPL
+ *        Option of the DODAG it is routed on.
+ *
+ * RFC 6997 section 9.1: "The temporary DAG MUST NOT be used to route data
+ * packets." A packet for the Origin's address therefore travels on the base
+ * DODAG, and RFC 6550 section 11.2 has every router on the way check the RPL
+ * Packet Information against that Instance: "RPLInstanceID: 8-bit field
+ * indicating the DODAG instance along which the packet is sent", "SenderRank:
+ * 16-bit field set to zero by the source and to DAGRank(rank) by a router
+ * that forwards inside the RPL network."
+ */
+class RplTemporaryDagOriginRpiTestCase : public RplConformanceTestBase
+{
+  public:
+    RplTemporaryDagOriginRpiTestCase();
+
+  private:
+    void DoRun() override;
+};
+
+RplTemporaryDagOriginRpiTestCase::RplTemporaryDagOriginRpiTestCase()
+    : RplConformanceTestBase("A packet for a temporary DAG's Origin carries the base DODAG's "
+                             "RPL Option (RFC 6997 section 9.1)")
+{
+}
+
+void
+RplTemporaryDagOriginRpiTestCase::DoRun()
+{
+    SetUpPair();
+    Ipv6Address dodagId("2001:1::100");
+    Ipv6Address origin("2001:7::1");
+
+    DeliverDio(BaseDio(RPL_MOP_NON_STORING, dodagId, 30, 60), m_peerLinkLocal);
+    NS_TEST_ASSERT_MSG_EQ(m_rpl->IsJoinedTo(RPL_DEFAULT_INSTANCE, dodagId),
+                          true,
+                          "The router did not join the base DODAG");
+    RplDioHeader p2pDio = P2pDio(0x81, origin);
+    p2pDio.SetRank(768);
+    DeliverDio(p2pDio, Ipv6Address("fe80::a"));
+    NS_TEST_ASSERT_MSG_EQ(m_rpl->IsJoinedTo(0x81, origin),
+                          true,
+                          "The router did not join the temporary DAG");
+    // DAGRank(rank) = floor(rank / MinHopRankIncrease) (RFC 6550 section
+    // 3.5.1): 256 / 128 on the base DODAG, 1024 / 256 on the temporary DAG.
+    NS_TEST_ASSERT_MSG_EQ(m_rpl->GetRank(), 256, "Unexpected rank in the base DODAG");
+    NS_TEST_ASSERT_MSG_EQ(m_rpl->GetRankIn(0x81, origin),
+                          1024,
+                          "Unexpected rank in the temporary DAG");
+
+    Ptr<Packet> packet = Create<Packet>(8);
+    Ipv6Header header;
+    header.SetSource(m_routerGlobal);
+    header.SetDestination(origin);
+    header.SetNextHeader(17);
+    Socket::SocketErrno error;
+    Ptr<Ipv6Route> route = m_rpl->RouteOutput(packet, header, nullptr, error);
+    NS_TEST_ASSERT_MSG_NE(route, nullptr, "No route to the Origin");
+    NS_TEST_ASSERT_MSG_EQ(route->GetGateway(),
+                          m_peerLinkLocal,
+                          "The packet is not routed via the base DODAG's parent");
+
+    m_rpl->PrepareOutgoingPacket(packet, header, route);
+    NS_TEST_ASSERT_MSG_EQ(+header.GetNextHeader(),
+                          +Ipv6Header::IPV6_EXT_HOP_BY_HOP,
+                          "No Hop-by-Hop Options header was attached");
+    packet->RemoveAtStart(2); // Next Header and Hdr Ext Len
+    RplPacketInfoHeader rpi;
+    packet->RemoveHeader(rpi);
+    NS_TEST_EXPECT_MSG_EQ(+rpi.GetInstanceId(),
+                          +RPL_DEFAULT_INSTANCE,
+                          "The RPL Option names the temporary DAG's RPLInstanceID");
+    NS_TEST_EXPECT_MSG_EQ(rpi.GetSenderRank(),
+                          2,
+                          "The RPL Option does not carry the DAGRank in the base DODAG");
+
+    TearDownPair();
+}
+
+/**
+ * @ingroup rpl
+ * @ingroup tests
+ *
  * @brief The RPL test suite.
  */
 class RplTestSuite : public TestSuite
@@ -30875,6 +32009,15 @@ RplTestSuite::RplTestSuite()
     AddTestCase(new RplInfiniteLifetimeDaoTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplDtsnWrapTestCase, TestCase::Duration::QUICK);
     AddTestCase(new RplPrintRoutingTableJsonTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplExactlyOneDiscoveryOptionTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pDroExactlyOneRdoTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pInfiniteRankDioTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pConfiguredRouteLifetimeTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplDagConfigurationLifetimeTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplP2pPrefixInfoIgnoredTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplZeroMinHopRankIncreaseTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplDaoSequenceOnRelayTestCase, TestCase::Duration::QUICK);
+    AddTestCase(new RplTemporaryDagOriginRpiTestCase, TestCase::Duration::QUICK);
 }
 
 /// Static variable for test initialization.

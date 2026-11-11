@@ -169,9 +169,8 @@ RplRoutingProtocol::GetTypeId()
                           "std::min(interval, intervalMax) then collapses the interval to that "
                           "negative value on the very first doubling, and Simulator::Schedule() "
                           "with a negative delay fires immediately, re-entering the same code at "
-                          "the same simulated instant forever -- confirmed by "
-                          "/protocol-test-matrix's angle 2, whose probe measured doublings 62 "
-                          "and 63 hang the whole simulator at 100% CPU while 20 and 21 do not. "
+                          "the same simulated instant forever: doublings of 62 and 63 hang the "
+                          "whole simulator at 100% CPU while 20 and 21 do not. "
                           "@see RPL_DIO_INTERVAL_EXPONENT_MAX's own doc comment for the bound's "
                           "derivation.",
                           UintegerValue(RPL_DIO_INTERVAL_DOUBLINGS),
@@ -804,6 +803,8 @@ RplRoutingProtocol::CreateDodagMembership(DodagKey key, uint8_t mop)
     dodag.dioIntervalMin = m_dioIntervalMin;
     dodag.dioIntervalDoublings = m_dioIntervalDoublings;
     dodag.dioRedundancy = m_dioRedundancy;
+    dodag.defaultLifetime = m_pathLifetime;
+    dodag.lifetimeUnit = m_lifetimeUnit;
 
     // No daoRetryEvent binding: a root sends no DAO of its own to await an
     // ACK for. daoEvent is likewise unused for its ordinary purpose here
@@ -1386,8 +1387,8 @@ RplRoutingProtocol::SendDio(DodagMembership& dodag, Ipv6Address dst, uint32_t in
                             dodag.maxRankIncrease,
                             dodag.minHopRankIncrease,
                             dodag.ocp,
-                            RPL_DEFAULT_LIFETIME,
-                            RPL_DEFAULT_LIFETIME_UNIT);
+                            dodag.defaultLifetime,
+                            dodag.lifetimeUnit);
 
     if (dodag.ocp == RPL_OCP_MRHOF)
     {
@@ -1743,6 +1744,17 @@ RplRoutingProtocol::HandleDio(const RplDioHeader& dio,
         return;
     }
 
+    // DAGRank is floor(rank / MinHopRankIncrease) (RFC 6550 section 3.5.1),
+    // which a MinHopRankIncrease of zero leaves undefined; every DAGRank
+    // computed from this DIO or from a membership joined through it would
+    // divide by zero.
+    if (dio.HasDagConfiguration() && dio.GetMinHopRankIncrease() == 0)
+    {
+        NS_LOG_WARN("Ignoring a DIO whose DODAG Configuration option carries a "
+                    "MinHopRankIncrease of zero");
+        return;
+    }
+
     // The MOP and the discovery option have to agree, in both directions,
     // and everything below branches on the option rather than the MOP -- the
     // refusal checks just after this, the join, and HandleP2pRdo()/
@@ -1755,7 +1767,12 @@ RplRoutingProtocol::HandleDio(const RplDioHeader& dio,
     // Route Discovery Mode of Operation' (MOP == 4)"). A MOP 4 DIO with none
     // of the three would otherwise be joined as an ordinary DODAG with no
     // 'L' deadline at all, since only the option handlers arm one; with more
-    // than one, which protocol it belongs to is undefined.
+    // than one, which protocol it belongs to is undefined. Options are
+    // counted by type, well formed or not, so that two copies of the same
+    // option are seen as two (RFC 9854 sections 4.1 and 4.2 say the same of
+    // the RREQ and RREP options: "Exactly one ... MUST be present ...
+    // otherwise, the message MUST be dropped"); the one counted also has to
+    // be the one that parsed.
     //
     // The other direction: RFC 6997 section 6.1 also lists the MOP among
     // the Base object fields whose violation means "A received P2P mode DIO
@@ -1764,16 +1781,19 @@ RplRoutingProtocol::HandleDio(const RplDioHeader& dio,
     // RPL_MOP_P2P_ROUTE_DISCOVERY -- the base-DODAG exclusion in JoinDodag()
     // among them -- looks the other way.
     {
-        uint32_t discoveryOptions = (dio.HasP2pRdo() ? 1 : 0) + (dio.HasRreq() ? 1 : 0) +
-                                    (dio.HasRrep() ? 1 : 0);
+        uint32_t wellFormed =
+            (dio.HasP2pRdo() ? 1 : 0) + (dio.HasRreq() ? 1 : 0) + (dio.HasRrep() ? 1 : 0);
+        uint32_t discoveryOptions =
+            std::max<uint32_t>(wellFormed,
+                               dio.GetP2pRdoCount() + dio.GetRreqCount() + dio.GetRrepCount());
         bool p2pMode = dio.GetMop() == RPL_MOP_P2P_ROUTE_DISCOVERY;
-        if (p2pMode && discoveryOptions != 1)
+        if (p2pMode && (discoveryOptions != 1 || wellFormed != 1))
         {
             NS_LOG_LOGIC("Discarding a P2P mode DIO carrying " << discoveryOptions
                                                                << " discovery options, not one");
             return;
         }
-        if (!p2pMode && discoveryOptions != 0)
+        if (!p2pMode && wellFormed != 0)
         {
             NS_LOG_LOGIC("Discarding a mode " << +dio.GetMop()
                                               << " DIO carrying a route discovery option");
@@ -1947,7 +1967,7 @@ RplRoutingProtocol::HandleDio(const RplDioHeader& dio,
         // conforming peer may legitimately send one. The Version is still
         // adopted and re-emitted below; only the migration is skipped, so
         // this node stays in step with the peer without resetting the
-        // discovery. Found by /protocol-test-matrix's angle 4.
+        // discovery.
         //
         // The DODAGVersionNumber is a lollipop counter (RFC 6550 section
         // 7.1), so which of two Versions is the newer one is decided by the
@@ -2262,6 +2282,12 @@ RplRoutingProtocol::JoinDodag(const RplDioHeader& dio, uint32_t interface)
         dodag.ocp = dio.GetOcp();
         dodag.minHopRankIncrease = dio.GetMinHopRankIncrease();
         dodag.maxRankIncrease = dio.GetMaxRankIncrease();
+        // RFC 6550 section 6.7.6: "Nodes other than the DODAG root MUST NOT
+        // modify this information when propagating the DODAG Configuration
+        // option", so both are kept as received, for SendDio() to pass on
+        // and for every route lifetime derived from this DODAG.
+        dodag.defaultLifetime = dio.GetDefaultLifetime();
+        dodag.lifetimeUnit = dio.GetLifetimeUnit();
         // DIOIntervalMin/DIOIntervalDoublings are each a raw wire byte
         // (0-255, RFC 6550 section 6.7.6 imposes no range of its own) fed
         // directly as a shift exponent below and, for Doublings, again in
@@ -2305,18 +2331,24 @@ RplRoutingProtocol::JoinDodag(const RplDioHeader& dio, uint32_t interface)
         // this a temporary DAG joined from such a DIO ran on this module's
         // base-DODAG defaults (Imin 4.096 s, k = 0, MaxRankIncrease 1024),
         // far too slow for a discovery bounded by 'L' (design-constraints.md
-        // section 129). The Default Lifetime and Lifetime Unit defaults
-        // (infinity) are not represented: this module takes route lifetimes
-        // from its own PathLifetime attribute.
+        // section 129). Default Lifetime 0xFF and Lifetime Unit 0xFFFF make
+        // the lifetime of the routes discovered infinite.
         dodag.ocp = RPL_OCP_OF0;
-        dodag.dioIntervalMin = MilliSeconds(int64_t(1) << 6);
-        dodag.dioIntervalDoublings = 20;
-        dodag.dioRedundancy = 1;
-        dodag.maxRankIncrease = 0;
-        dodag.minHopRankIncrease = 256;
+        dodag.dioIntervalMin = MilliSeconds(int64_t(1) << RPL_P2P_DEFAULT_DIO_INTERVAL_MIN);
+        dodag.dioIntervalDoublings = RPL_P2P_DEFAULT_DIO_INTERVAL_DOUBLINGS;
+        dodag.dioRedundancy = RPL_P2P_DEFAULT_DIO_REDUNDANCY;
+        dodag.maxRankIncrease = RPL_P2P_DEFAULT_MAX_RANK_INCREASE;
+        dodag.minHopRankIncrease = RPL_P2P_DEFAULT_MIN_HOP_RANK_INCREASE;
+        dodag.defaultLifetime = RPL_P2P_DEFAULT_LIFETIME;
+        dodag.lifetimeUnit = RPL_P2P_DEFAULT_LIFETIME_UNIT;
     }
 
-    if (dio.HasPrefixInfo())
+    // Not from a P2P mode DIO: RFC 6997 section 6.1 lists the options one
+    // may carry, and "A RPL option other than those listed above MUST be
+    // ignored when found inside a received P2P mode DIO and MUST NOT be
+    // included in the P2P mode DIOs that the receiving router generates."
+    // The Prefix Information option is not on that list.
+    if (dio.HasPrefixInfo() && !dio.HasP2pRdo())
     {
         dodag.hasPrefixInfo = true;
         dodag.prefix = dio.GetPrefix();
@@ -2567,18 +2599,18 @@ RplRoutingProtocol::LinkLocalOf(Ipv6Address global) const
 void
 RplRoutingProtocol::SendDaoMessage(DodagMembership& dodag,
                                    Ipv6Address target,
-                                   uint8_t sequence,
                                    uint8_t pathSequence,
                                    uint8_t pathLifetimeField,
                                    bool ackRequested,
-                                   const std::vector<DaoTargetEntry>& additionalTargets)
+                                   const std::vector<DaoTargetEntry>& additionalTargets,
+                                   bool retransmission)
 {
     bool storing = dodag.mop == RPL_MOP_STORING_NO_MULTICAST;
 
     RplDaoHeader dao;
     dao.SetInstanceId(dodag.instanceId);
     dao.SetDodagId(dodag.dodagId);
-    dao.SetSequence(sequence);
+    dao.SetSequence(0);
     dao.SetAckRequested(ackRequested);
     dao.SetTarget(target);
     // RFC 6550 section 9.8 rule 1: "The DODAG Parent Address subfield of a
@@ -2631,6 +2663,27 @@ RplRoutingProtocol::SendDaoMessage(DodagMembership& dodag,
                                           << " bytes, over the IPv6 minimum MTU of "
                                           << IPV6_MIN_MTU
                                           << " and will be fragmented to send");
+    }
+
+    // RplSequenceIncrement(), not a plain ++: RFC 6550 section 7.2 rule 2,
+    // the same as every other sequence counter this module increments.
+    {
+        Ptr<Packet> unsequenced = Create<Packet>();
+        unsequenced->AddHeader(dao);
+        std::vector<uint8_t> content(unsequenced->GetSize() + 16);
+        unsequenced->CopyData(content.data(), unsequenced->GetSize());
+        (storing ? dodag.preferredParent : dodag.dodagId)
+            .Serialize(content.data() + unsequenced->GetSize());
+        if (!retransmission || content != dodag.lastDaoContent)
+        {
+            dodag.daoSequence = RplSequenceIncrement(dodag.daoSequence);
+        }
+        dodag.lastDaoContent = std::move(content);
+    }
+    dao.SetSequence(dodag.daoSequence);
+    if (ackRequested)
+    {
+        dodag.daoAckSequence = dodag.daoSequence;
     }
 
     Ptr<Packet> packet = Create<Packet>();
@@ -2721,23 +2774,10 @@ RplRoutingProtocol::SendDao(DodagMembership& dodag)
         }
     }
 
-    // No DAO-ACK requested and dodag.daoSequence deliberately not
-    // incremented again for the aggregated entries -- @see
-    // SendDaoMessage()'s own doc comment for why -- but the message as a
-    // whole still carries the self-advertisement's own incremented
-    // dodag.daoSequence and 'K' bit, so the DAO-ACK this triggers still
-    // confirms the whole aggregated message arrived, not only its primary
-    // target. RplSequenceIncrement(), not a plain ++, for the same RFC
-    // 6550 section 7.2 rule 2 reason every other locally-incremented
-    // sequence counter this module has uses it (@see its own doc comment
-    // in rpl-conf.h) -- harmless here specifically, since DAOSequence is
-    // only ever compared by exact equality, but applied for the same
-    // reason DODAG Version Number's own "practically harmless" argument
-    // was not treated as a reason to stay non-conformant.
-    dodag.daoSequence = RplSequenceIncrement(dodag.daoSequence);
+    // One DAOSequence and one 'K' flag cover the whole aggregated message,
+    // so the DAO-ACK confirms every target in it, not only the primary one.
     SendDaoMessage(dodag,
                   target,
-                  dodag.daoSequence,
                   dodag.pathSequence,
                   m_pathLifetime,
                   true,
@@ -2794,9 +2834,11 @@ RplRoutingProtocol::SendNoPathDao(DodagMembership& dodag, Ipv6Address viaParent)
     RplDaoHeader dao;
     dao.SetInstanceId(dodag.instanceId);
     dao.SetDodagId(dodag.dodagId);
-    // RplSequenceIncrement(), not a plain ++: @see the matching comment in
-    // SendDaoMessage()'s own self-advertisement path.
+    // A DAO transmission of its own (RFC 6550 section 9.3 rule 1), so a
+    // retry of the advertisement sent before it is no longer "identical to
+    // the prior DAO message transmission" either.
     dodag.daoSequence = RplSequenceIncrement(dodag.daoSequence);
+    dodag.lastDaoContent.clear();
     dao.SetSequence(dodag.daoSequence);
     dao.SetTarget(target);
     // Path Lifetime 0, RFC 6550 section 6.4.3: a No-Path. The path sequence
@@ -2893,8 +2935,9 @@ RplRoutingProtocol::DaoRetry(DodagKey key)
     {
         // The path is not getting through. The next periodic DAO will try
         // again, by then possibly through a different parent.
-        NS_LOG_WARN("No DAO-ACK for sequence " << +dodag.daoSequence << ", giving up until the "
-                                                                    "next refresh");
+        NS_LOG_WARN("No DAO-ACK for sequence " << +dodag.daoAckSequence
+                                               << ", giving up until the "
+                                                  "next refresh");
         dodag.daoAckPending = false;
         return;
     }
@@ -2933,12 +2976,12 @@ RplRoutingProtocol::DaoRetry(DodagKey key)
     // mode's own DAO must be addressed link-local, one hop, not to the
     // root's global DODAGID) every time a retry is needed in Storing mode.
     SendDaoMessage(dodag,
-                  GetGlobalAddressIn(dodag),
-                  dodag.daoSequence,
-                  dodag.pathSequence,
-                  m_pathLifetime,
-                  true,
-                  additionalTargets);
+                   GetGlobalAddressIn(dodag),
+                   dodag.pathSequence,
+                   m_pathLifetime,
+                   true,
+                   additionalTargets,
+                   true);
 
     dodag.daoRetryEvent.Cancel();
     dodag.daoRetryEvent.Schedule(m_daoAckTimeout);
@@ -3165,10 +3208,9 @@ RplRoutingProtocol::HandleDao(const RplDaoHeader& dao, Ipv6Address from, uint32_
                     route.interface = interface;
                     route.pathSequence = pathSequence;
                     route.pathLifetime = pathLifetimeField;
-                    route.expire = pathLifetimeField == RPL_INFINITE_LIFETIME
-                                      ? Time::Max()
-                                      : Simulator::Now() +
-                                            Seconds(pathLifetimeField * m_lifetimeUnit);
+                    route.expire =
+                        SaturatingAdd(Simulator::Now(),
+                                      LifetimeToTime(pathLifetimeField, dodag->lifetimeUnit));
                     NS_LOG_INFO("Downward route: " << target << " sits under " << from);
                 }
             }
@@ -3245,9 +3287,9 @@ RplRoutingProtocol::HandleDao(const RplDaoHeader& dao, Ipv6Address from, uint32_
                 // largest of all lifetimes would instead be a merely long one, and
                 // the route the sender asked to have kept indefinitely would be
                 // dropped 255 lifetime units in.
-                entry.expire = pathLifetimeField == RPL_INFINITE_LIFETIME
-                                   ? Time::Max()
-                                   : Simulator::Now() + Seconds(pathLifetimeField * m_lifetimeUnit);
+                entry.expire =
+                    SaturatingAdd(Simulator::Now(),
+                                  LifetimeToTime(pathLifetimeField, dodag->lifetimeUnit));
                 NS_LOG_INFO("Topology: " << target << " sits under " << entry.parent);
             }
         }
@@ -3326,9 +3368,9 @@ RplRoutingProtocol::HandleDao(const RplDaoHeader& dao, Ipv6Address from, uint32_
 
     // Everything that changed goes out together, the same aggregation
     // SendDao()'s own periodic refresh uses (RFC 6550 section 9.4 rule 3),
-    // rather than one relayed message per changed target. No DAO-ACK
-    // requested and dodag->daoSequence deliberately not incremented for
-    // this -- @see SendDaoMessage()'s own doc comment. Each entry's own
+    // rather than one relayed message per changed target. No DAO-ACK is
+    // requested; the message still takes a DAOSequence of its own (@see
+    // SendDaoMessage()). Each entry's own
     // pathLifetime travels verbatim, not this node's own m_pathLifetime
     // attribute: @see the primary target's own equivalent comment above
     // for why substituting it would silently finitize an
@@ -3339,7 +3381,6 @@ RplRoutingProtocol::HandleDao(const RplDaoHeader& dao, Ipv6Address from, uint32_
         std::vector<DaoTargetEntry> rest(toPropagate.begin() + 1, toPropagate.end());
         SendDaoMessage(*dodag,
                       primary.target,
-                      dodag->daoSequence,
                       primary.pathSequence,
                       primary.pathLifetime,
                       false,
@@ -3402,10 +3443,10 @@ RplRoutingProtocol::HandleDaoAck(const RplDaoAckHeader& daoAck, Ipv6Address from
     }
     DodagMembership* dodag = &it->second;
 
-    if (daoAck.GetSequence() != dodag->daoSequence)
+    if (daoAck.GetSequence() != dodag->daoAckSequence)
     {
         NS_LOG_LOGIC("Ignoring a DAO-ACK for sequence " << +daoAck.GetSequence() << ", waiting "
-                                                        << "for " << +dodag->daoSequence);
+                                                        << "for " << +dodag->daoAckSequence);
         return;
     }
 
@@ -3415,7 +3456,7 @@ RplRoutingProtocol::HandleDaoAck(const RplDaoAckHeader& daoAck, Ipv6Address from
         return;
     }
 
-    NS_LOG_INFO("The root acknowledged DAO " << +dodag->daoSequence);
+    NS_LOG_INFO("The root acknowledged DAO " << +dodag->daoAckSequence);
     dodag->daoAckPending = false;
     dodag->daoRetryEvent.Cancel();
 }
@@ -3714,10 +3755,35 @@ RplRoutingProtocol::StoreHopByHopRoute(uint8_t instanceId,
     route.instanceId = instanceId;
     route.dodagId = dodagId;
     route.nextHop = nextHop;
-    route.expire = Simulator::Now() + lifetime;
+    route.expire = SaturatingAdd(Simulator::Now(), lifetime);
     route.seqNo = hasSeqNo ? seqNo : 0;
     m_hopByHopRoutes[destination] = route;
     return true;
+}
+
+Time
+RplRoutingProtocol::LifetimeToTime(uint8_t lifetime, uint16_t lifetimeUnit)
+{
+    return lifetime == RPL_INFINITE_LIFETIME ? Time::Max()
+                                             : Seconds(uint32_t(lifetime) * lifetimeUnit);
+}
+
+Time
+RplRoutingProtocol::SaturatingAdd(Time a, Time b)
+{
+    return (a == Time::Max() || b >= Time::Max() - a) ? Time::Max() : a + b;
+}
+
+Time
+RplRoutingProtocol::RouteLifetime(const DodagMembership& dodag)
+{
+    return LifetimeToTime(dodag.defaultLifetime, dodag.lifetimeUnit);
+}
+
+Time
+RplRoutingProtocol::OwnRouteLifetime() const
+{
+    return LifetimeToTime(m_pathLifetime, m_lifetimeUnit);
 }
 
 RplRoutingProtocol::DodagMembership*
@@ -4810,7 +4876,9 @@ RplRoutingProtocol::PrepareOutgoingPacket(Ptr<Packet> packet, Ipv6Header& header
         RplPacketInfoHeader rpi;
         rpi.SetDown(down);
         rpi.SetInstanceId(wireInstanceId);
-        rpi.SetSenderRank(m_minHopRankIncrease);
+        // The DAGRank of a root, rank MinHopRankIncrease (RFC 6550 section
+        // 8.2.2.2). Not read by any hop of a Hop-by-hop Route.
+        rpi.SetSenderRank(1);
 
         Ipv6ExtensionHopByHopHeader hbh;
         hbh.AddOption(rpi);
@@ -4844,7 +4912,7 @@ RplRoutingProtocol::PrepareOutgoingPacket(Ptr<Packet> packet, Ipv6Header& header
             RplPacketInfoHeader rpi;
             rpi.SetDown(true);
             rpi.SetInstanceId(base->instanceId);
-            rpi.SetSenderRank(base->rank);
+            rpi.SetSenderRank(DagRank(*base));
 
             Ipv6ExtensionHopByHopHeader hbh;
             hbh.AddOption(rpi);
@@ -4961,10 +5029,17 @@ RplRoutingProtocol::PrepareOutgoingPacket(Ptr<Packet> packet, Ipv6Header& header
         // SendDao()/SendNoPathDao()/DaoRetry() addressed to a non-base
         // root -- or, if that finds nothing either, the base DODAG, the
         // same fallback RouteOutput() itself ends on.
+        //
+        // A temporary DAG is skipped, as it is in RouteOutput(): it "MUST
+        // NOT be used to route data packets" (RFC 6997 section 9.1), so a
+        // packet for its Origin travels on the base DODAG and has to carry
+        // the base DODAG's RPLInstanceID and rank, the ones the routers on
+        // that path check (RFC 6550 section 11.2).
         originDodag = GetBaseDodag();
         for (auto& [key, other] : m_dodags)
         {
-            if (&other == originDodag || other.dodagId != dst)
+            if (&other == originDodag || other.dodagId != dst ||
+                other.mop == RPL_MOP_P2P_ROUTE_DISCOVERY)
             {
                 continue;
             }
@@ -4980,7 +5055,11 @@ RplRoutingProtocol::PrepareOutgoingPacket(Ptr<Packet> packet, Ipv6Header& header
     RplPacketInfoHeader rpi;
     rpi.SetDown(originDodag ? originDodag->isRoot : false);
     rpi.SetInstanceId(originDodag ? originDodag->instanceId : RPL_DEFAULT_INSTANCE);
-    rpi.SetSenderRank(originDodag ? originDodag->rank : RPL_INFINITE_RANK);
+    // "SenderRank: 16-bit field set to zero by the source and to
+    // DAGRank(rank) by a router that forwards inside the RPL network" (RFC
+    // 6550 section 11.2). This node is a router, so its own packets carry
+    // its DAGRank as the ones it forwards do.
+    rpi.SetSenderRank(originDodag ? DagRank(*originDodag) : RPL_INFINITE_RANK);
 
     Ipv6ExtensionHopByHopHeader hbh;
     hbh.AddOption(rpi);
@@ -5354,6 +5433,23 @@ RplRoutingProtocol::GetRankIn(uint8_t instanceId, Ipv6Address dodagId) const
 {
     auto it = m_dodags.find(DodagKey{instanceId, dodagId});
     return it != m_dodags.end() ? it->second.rank : RPL_INFINITE_RANK;
+}
+
+uint16_t
+RplRoutingProtocol::DagRank(const DodagMembership& dodag)
+{
+    if (dodag.rank == RPL_INFINITE_RANK || dodag.minHopRankIncrease == 0)
+    {
+        return RPL_INFINITE_RANK;
+    }
+    return dodag.rank / dodag.minHopRankIncrease;
+}
+
+uint16_t
+RplRoutingProtocol::GetDagRankForInstance(uint8_t instanceId) const
+{
+    const DodagMembership* dodag = FindDodagByInstance(instanceId);
+    return dodag ? DagRank(*dodag) : RPL_INFINITE_RANK;
 }
 
 uint16_t
